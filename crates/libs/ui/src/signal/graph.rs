@@ -1,10 +1,11 @@
 //! The signal graph: one arena of nodes, two-level marking, and a flush that allocates
 //! nothing.
 //!
-//! Every node belongs to the app thread. A node holds its dependency and subscriber lists
-//! as `Vec`s that are cleared, never dropped, and a disposed node returns to a free list
-//! with that capacity intact, so mounting and unmounting a screen repeatedly allocates on
-//! the first cycle only.
+//! A cell, a memo, an effect, a retained resource and a disposal scope are one node with a
+//! role tag. A node's payload is an `Rc<dyn Any>` — a cell's `RefCell<T>`, a memo's cached
+//! `RefCell<Option<T>>`, a resource's `T` — and its work is one `FnMut() -> bool` answering
+//! whether the value moved, which is a memo's cutoff and an effect's constant `false`. A
+//! scope's `subs` column holds what it owns instead of what reads it.
 //!
 //! # Edges are generational indices
 //!
@@ -14,181 +15,125 @@
 //!
 //! # The graph is never borrowed across application code
 //!
-//! Every path that runs a closure — recomputing a memo, running an effect, reading a cell
-//! through `with` — clones an `Rc` out and drops the borrow first. A memo's cell and an
-//! effect's closure are `Rc` rather than `Box` for that reason, and it is what lets such a
-//! closure read and even write other signals.
+//! Every path that runs a closure clones the `Rc` out and drops the borrow first, which is
+//! what lets such a closure read and even write other signals.
 
-use super::shared;
 use core::any::Any;
 use core::cell::RefCell;
 use std::rc::Rc;
-use windows_scene::{Id, Ids, Slots};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use windows_window::{Tick, Wake};
+
+use crate::seam::Ring;
 
 /// How many passes a flush may take before it stops.
 ///
-/// An [`Effect`](super::Effect) that writes a [`Cell`](super::Cell) adds a pass; one that
-/// writes a cell it also reads never settles. A flush that has not settled after this many
-/// passes trips a debug assertion and returns.
-pub(super) const MAX_PASSES: u32 = 8;
+/// An effect that writes a cell adds a pass; one that writes a cell it also reads never
+/// settles. A flush that has not settled after this many passes trips a debug assertion.
+const MAX_PASSES: u32 = 8;
 
-/// A node's identity: which graph, a dense index into it, and the generation that minted
-/// the node in that slot.
+pub(crate) const CELL: u8 = 0;
+pub(crate) const MEMO: u8 = 1;
+pub(crate) const EFFECT: u8 = 2;
+pub(crate) const RESOURCE: u8 = 3;
+pub(crate) const SCOPE: u8 = 4;
+const ROLE: u8 = 0b0000_0111;
+
+const CLEAN: u8 = 0;
+const CHECK: u8 = 0b0000_1000;
+const DIRTY: u8 = 0b0001_0000;
+const STATE: u8 = CHECK | DIRTY;
+const QUEUED: u8 = 0b0010_0000;
+pub(crate) const GEOMETRY: u8 = 0b0100_0000;
+
+const UPDATE: usize = 0;
+const GEOM: usize = 1;
+
+/// A node's identity: which graph, a dense index into it, and the generation that minted the
+/// node in that slot.
 ///
-/// `Copy`, with no reference count, so a `move ||` closure captures one at no cost.
-///
-/// The graph is part of the identity rather than implied by the thread, because a
-/// producer's staged write is looked up by id from a thread other than the one that minted
-/// it, and an index is unique only within the graph that minted it. Without the graph
-/// field, two graphs would alias each other's staged writes.
+/// `Copy` with no reference count, so a `move ||` closure captures one at no cost. The graph
+/// is part of the identity rather than implied by the thread, because a producer's staged
+/// write is looked up by id from a thread other than the one that minted it, and an index is
+/// unique only within the graph that minted it.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct SignalId {
-    pub(super) graph: u32,
-    pub(super) id: Id<Signal>,
+    graph: u32,
+    edge: Edge,
 }
 
-/// The family a signal node belongs to.
-#[derive(Debug)]
-pub struct Signal;
+/// An edge within one graph: a slot, and the generation that minted the node in it.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+struct Edge {
+    index: u32,
+    generation: u32,
+}
 
-/// The family a disposal scope belongs to.
-#[derive(Debug)]
-pub struct Owner;
-
-/// How far a node is from being up to date.
+/// One node's work: recompute, and answer whether the value moved.
 ///
-/// Two levels rather than one make a diamond evaluate its shared node once: `Check` says
-/// only that a transitive dependency may have changed, and resolving it walks the
-/// dependencies rather than recomputing.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum State {
-    Clean,
-    Check,
-    Dirty,
-}
+/// `Rc<RefCell<..>>` rather than `Box`, so the graph borrow is released before the closure
+/// runs and the closure may read and write other signals.
+pub(crate) type Work = Rc<RefCell<dyn FnMut() -> bool>>;
 
-/// A memo's closure, cached value and equality comparison, behind a type the graph can
-/// name.
-///
-/// The graph recomputes a memo, and a reader reaches its cache, without naming the closure
-/// type. An implementation must write into the existing cache rather than allocating a new
-/// one, so that a memo recomputing on every flush allocates nothing.
-pub(super) trait MemoCell {
-    /// Recomputes the value and returns whether it changed.
-    fn recompute(&self) -> bool;
-    /// Returns the cache, a `RefCell<Option<T>>` erased to `dyn Any`.
-    fn value(&self) -> &dyn Any;
-}
-
-/// Effect queues share the graph; geometry runs only after layout settles.
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub(crate) enum Phase {
-    Update,
-    Geometry,
-}
-
-enum Kind {
-    /// A cell. The payload is `RefCell<T>`, behind an `Rc` so a reader can take it out of
-    /// the graph before running a closure over it.
-    Source(Rc<dyn Any>),
-    Resource(Rc<dyn Any>),
-    Memo(Rc<dyn MemoCell>),
-    Effect(Rc<RefCell<dyn FnMut()>>, Phase),
-    /// A node parked for reuse, holding nothing.
-    ///
-    /// A payload may own an [`Owner`](super::Owner) — a `Branch`'s arm and a `Keyed`'s row
-    /// both do — so dropping one disposes a scope. A parked node keeps its `deps` and `subs`
-    /// capacity and never its payload, which is what lets [`Graph::mint`] overwrite the kind
-    /// of a reused node without that overwrite re-entering the graph it has borrowed.
-    Parked,
-}
-
-struct Node {
-    state: State,
-    kind: Kind,
-    /// Creation order. Effects run in it, so a parent's effect lands before its child's.
-    order: u64,
-    /// What this node read, most recently.
-    deps: Vec<SignalId>,
-    /// What read this node.
-    subs: Vec<SignalId>,
-    /// Already in the effect queue, so a burst of writes to one cell enqueues its effects
-    /// once and no scan of the queue is needed.
-    queued: bool,
-    /// How many times this node's value has moved. Read by a consumer that wants change
-    /// detection without the value.
-    version: u64,
-}
-
-/// A disposal scope's identity.
-pub(super) type OwnerId = Id<Owner>;
-
-/// What a scope disposes, in reverse creation order.
-#[derive(Copy, Clone)]
-enum Child {
-    Signal(SignalId),
-    Owner(OwnerId),
-}
-
-#[derive(Default)]
-struct OwnerNode {
-    children: Vec<Child>,
-}
+/// Detached graph payload, dropped after the caller releases its runtime borrow.
+pub(crate) type RetiredEffect = Work;
 
 /// The signal runtime. One per thread that builds signals.
+#[derive(Default)]
 struct Graph {
     /// This graph's process-unique id, stamped into every [`SignalId`] it mints.
     id: u32,
-    node_ids: Ids<Signal>,
-    nodes: Slots<Signal, Node>,
-    /// Disposed nodes, parked for their edge buffers.
-    ///
-    /// A recycled node keeps its `deps` and `subs` capacity, so the second mount of a
-    /// screen allocates no edge storage.
-    spare: Vec<Node>,
-    owner_ids: Ids<Owner>,
-    owners: Slots<Owner, OwnerNode>,
-    owner_spare: Vec<OwnerNode>,
+    generation: Vec<u32>,
+    flags: Vec<u8>,
+    /// Creation order. Effects run in it, so a parent's effect lands before its child's.
+    order: Vec<u64>,
+    /// How many times this node's value has moved.
+    version: Vec<u64>,
+    /// What this node read, most recently.
+    deps: Vec<Vec<Edge>>,
+    /// What read this node — or, for a scope, what it owns, in creation order.
+    subs: Vec<Vec<Edge>>,
+    value: Vec<Option<Rc<dyn Any>>>,
+    work: Vec<Option<Work>>,
+    /// Disposed nodes, parked for their edge buffers. A recycled node keeps its `deps` and
+    /// `subs` capacity, so the second mount of a screen allocates no edge storage.
+    free: Vec<u32>,
+    /// Live nodes other than scopes, which is what a leak assertion counts.
+    live: u32,
+    next_order: u64,
     /// The node currently collecting dependencies, if any.
-    observer: Option<SignalId>,
+    observer: Option<Edge>,
     /// The scope new nodes register with, if any.
-    scope: Option<OwnerId>,
-    order: u64,
-    /// Effects marked since the last pass.
-    queue: [Vec<SignalId>; 2],
+    scope: Option<Edge>,
+    /// Effects marked since the last pass, per phase.
+    queue: [Vec<Edge>; 2],
     /// The pass being drained. Separate from `queue`, so a write from inside an effect
     /// appends to the *next* pass rather than to the one in progress.
-    running: Vec<SignalId>,
+    spare: Vec<Edge>,
     /// The `Check` propagation frontier. Pooled: marking allocates nothing.
-    stack: Vec<SignalId>,
+    stack: Vec<Edge>,
     /// Cross-thread writes, held between drains so the buffer keeps its capacity.
-    staged: Vec<(SignalId, shared::Apply)>,
+    inbox: Vec<(Edge, Post)>,
     flushing: bool,
 }
 
 /// Hands each graph the process-unique id it stamps into every [`SignalId`].
-static NEXT_GRAPH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static GRAPHS: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
     static GRAPH: RefCell<Graph> = RefCell::new(Graph {
-        // Relaxed: nothing is published through this counter, and the atomic
-        // read-modify-write alone is what makes every returned id distinct.
-        id: NEXT_GRAPH.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-        node_ids: Ids::new(),
-        nodes: Slots::new(),
-        spare: Vec::new(),
-        owner_ids: Ids::new(),
-        owners: Slots::new(),
-        owner_spare: Vec::new(),
-        observer: None,
-        scope: None,
-        order: 0,
-        queue: [Vec::new(), Vec::new()],
-        running: Vec::new(),
-        stack: Vec::new(),
-        staged: Vec::new(),
-        flushing: false,
+        // `Relaxed`: the counter publishes no data, and only its uniqueness is read.
+        id: GRAPHS.fetch_add(1, Ordering::Relaxed),
+        ..Graph::default()
     });
+
+    /// What to call when this graph acquires update work; installed by [`set_waker`].
+    ///
+    /// Held outside [`Graph`] so it can be called with no graph borrow held: a waker is host
+    /// code and may re-enter the graph.
+    static WAKER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
 }
 
 /// Runs `f` with the graph borrowed. `f` must not call application code, which may re-enter
@@ -197,313 +142,320 @@ fn with<R>(f: impl FnOnce(&mut Graph) -> R) -> R {
     GRAPH.with(|g| f(&mut g.borrow_mut()))
 }
 
-thread_local! {
-    /// What to call when this graph acquires work; installed by [`set_waker`].
-    ///
-    /// Held outside [`Graph`] so it can be called with no graph borrow held: a waker is
-    /// host code and may re-enter the graph.
-    static WAKER: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
-}
-
-/// Installs the callback this graph invokes when its effect queue goes from empty to
-/// non-empty.
-///
-/// Without a waker a write schedules nothing: [`Cell::set`](super::Cell::set) marks nodes
-/// and queues effects, and nothing downstream runs until a caller invokes [`flush`]. A host
-/// that blocks its loop between frames learns through this callback that a frame is owed.
-/// The driver's `arm_posts` registration wakes the graph's thread for producer-thread writes
-/// instead. On the app thread that waker need only raise a flag: a write made on the thread
-/// that flushes is drained by the loop's own next flush, so nothing has to cross a seam to
-/// schedule it.
-///
-/// The callback runs on the empty-to-non-empty transition and at no other time, so a burst
-/// of writes asks once. A write made from inside a flush does not call it: that flush picks
-/// the work up on its next pass. It runs with no borrow of the graph held, so it may write
-/// signals.
-pub fn set_waker(f: impl Fn() + 'static) {
-    WAKER.with(|w| *w.borrow_mut() = Some(Box::new(f)));
-}
-
-/// Routes producer writes to this graph's thread until the returned guard drops.
-///
-/// `how` names how that thread is reached: a [`Wake`](windows_window::Wake) for a graph
-/// flushed from a window's pump, an [`Arc<Ring>`](crate::seam::Ring) for one flushed from a
-/// loop parked on a doorbell.
-pub(crate) fn arm_posts(how: impl Into<shared::PostWake>) -> shared::PostGuard {
-    shared::arm(with(|g| g.id), how.into())
-}
-
-/// Calls the waker, holding no borrow of either the graph or the waker slot while it runs.
-fn wake() {
-    let waker = WAKER.with(|w| w.borrow_mut().take());
-    if let Some(waker) = waker {
-        waker();
-        WAKER.with(|w| {
-            let mut slot = w.borrow_mut();
-            // A waker that installed a new one during the call keeps it: this is putting the
-            // borrowed one back, not overwriting whatever is there now.
-            if slot.is_none() {
-                *slot = Some(waker);
-            }
-        });
-    }
-}
-
 /// Runs `f` with the graph borrowed, answering `None` where the graph is not reachable.
 ///
 /// The graph is unreachable while the thread's locals are being destroyed and its own node
 /// storage is dropping. A node can hold an [`Owner`](super::Owner) — a `Branch`'s arm and a
-/// `Keyed`'s row both do — so dropping one asks the graph to dispose a scope from inside
-/// the graph's own destructor. `with` panics there, inside a `Drop`, which aborts the
-/// process; every path reached from a `Drop` uses this instead.
+/// `Keyed`'s row both do — so dropping one asks the graph to dispose a scope from inside the
+/// graph's own destructor. `with` panics there, inside a `Drop`, which aborts the process;
+/// every path reached from a `Drop` uses this instead.
 fn try_with<R>(f: impl FnOnce(&mut Graph) -> R) -> Option<R> {
     GRAPH.try_with(|g| f(&mut g.borrow_mut())).ok()
 }
 
 impl Graph {
-    fn node(&self, id: SignalId) -> Option<&Node> {
-        if id.graph != self.id {
-            return None;
-        }
-        self.nodes.get(id.id)
+    fn slot(&self, e: Edge) -> Option<usize> {
+        (self.generation.get(e.index as usize) == Some(&e.generation)).then_some(e.index as usize)
     }
 
-    fn node_mut(&mut self, id: SignalId) -> Option<&mut Node> {
-        if id.graph != self.id {
-            return None;
-        }
-        self.nodes.get_mut(id.id)
-    }
-
-    fn mint(&mut self, kind: Kind) -> SignalId {
-        super::assert_writable();
-        self.order += 1;
-        let order = self.order;
-        // A parked node keeps its `deps` and `subs` capacity, which is what makes the second
-        // mount of a screen allocation-free. Its kind is [`Kind::Parked`], so the assignment
-        // below drops nothing.
-        let node = match self.spare.pop() {
-            Some(mut node) => {
-                node.state = State::Dirty;
-                node.kind = kind;
-                node.order = order;
-                node.queued = false;
-                node.version = 0;
-                node
+    /// Mints a node, registering it with the scope in force.
+    fn mint(&mut self, role: u8, value: Option<Rc<dyn Any>>, work: Option<Work>) -> Edge {
+        let order = self.next_order;
+        self.next_order += 1;
+        let index = match self.free.pop() {
+            Some(index) => index,
+            None => {
+                self.generation.push(1);
+                self.flags.push(0);
+                self.order.push(0);
+                self.version.push(0);
+                self.deps.push(Vec::new());
+                self.subs.push(Vec::new());
+                self.value.push(None);
+                self.work.push(None);
+                self.generation.len() as u32 - 1
             }
-            None => Node {
-                state: State::Dirty,
-                kind,
-                order,
-                deps: Vec::new(),
-                subs: Vec::new(),
-                queued: false,
-                version: 0,
-            },
         };
-        let id = SignalId {
-            graph: self.id,
-            id: self.nodes.insert(&mut self.node_ids, node),
-        };
-        if let Some(scope) = self.scope {
-            self.attach(scope, Child::Signal(id));
+        let i = index as usize;
+        // Minted `Dirty`: a memo's first read is what runs it, and `resolve` recomputes only
+        // what is marked.
+        self.flags[i] = role | DIRTY;
+        self.order[i] = order;
+        self.version[i] = 0;
+        self.value[i] = value;
+        self.work[i] = work;
+        if role & ROLE != SCOPE {
+            self.live += 1;
         }
-        id
+        let e = Edge { index, generation: self.generation[i] };
+        if let Some(scope) = self.scope.and_then(|s| self.slot(s)) {
+            // A replaced binding retires its node before its scope ends, so reclaim the dead
+            // entries before growing: lifetime storage stays bounded by live work.
+            if self.subs[scope].len() == self.subs[scope].capacity() {
+                let mut owned = core::mem::take(&mut self.subs[scope]);
+                owned.retain(|&child| self.slot(child).is_some());
+                self.subs[scope] = owned;
+            }
+            self.subs[scope].push(e);
+        }
+        e
     }
 
-    fn attach(&mut self, scope: OwnerId, child: Child) {
-        // Replacing a binding retires its graph node before its owner. Reclaim those
-        // stale entries before growing, keeping lifetime storage bounded by live work.
-        if let Some(owner) = self.owners.get_mut(scope)
-            && owner.children.len() == owner.children.capacity()
-        {
-            let mut children = core::mem::take(&mut owner.children);
-            children.retain(|child| match *child {
-                Child::Signal(id) => self.node(id).is_some(),
-                Child::Owner(id) => self.owners.get(id).is_some(),
-            });
-            self.owners.get_mut(scope).unwrap().children = children;
-        }
-        if let Some(owner) = self.owners.get_mut(scope) {
-            owner.children.push(child);
-        }
-    }
-
-    /// Records that the current observer read `dep`, if a read is being tracked.
-    fn track(&mut self, dep: SignalId) {
-        let Some(observer) = self.observer else {
-            return;
-        };
+    /// Records that the current observer read `dep`.
+    fn record(&mut self, dep: Edge) {
+        let Some(obs) = self.observer else { return };
         // A node reads the same dependency more than once per recompute all the time
         // (`a.get() + a.get()`); the edge is a set, and `deps` is short enough that a scan
         // beats a hash.
-        let fresh = self.node_mut(observer).is_some_and(|node| {
-            let fresh = !node.deps.contains(&dep);
-            if fresh {
-                node.deps.push(dep);
-            }
-            fresh
-        });
-        if fresh && let Some(source) = self.node_mut(dep) {
-            source.subs.push(observer);
+        let deps = &mut self.deps[obs.index as usize];
+        if deps.contains(&dep) {
+            return;
         }
+        deps.push(dep);
+        self.subs[dep.index as usize].push(obs);
     }
 
-    /// Marks everything downstream of `id`.
+    /// Marks everything downstream of `e`: its direct subscribers `Dirty`, everything below
+    /// them `Check`, which is what makes a diamond's shared node evaluate once.
     ///
-    /// Direct subscribers become `Dirty`; everything below them becomes `Check`. The
-    /// frontier walk uses the pooled `stack`, so a write of any fan-out allocates nothing.
-    fn invalidate(&mut self, id: SignalId) {
-        self.push_subs(id, State::Dirty);
-        while let Some(next) = self.stack.pop() {
-            self.push_subs(next, State::Check);
+    /// The frontier walk uses the pooled stack, so a write of any fan-out allocates nothing.
+    fn mark(&mut self, e: Edge) {
+        let mut stack = core::mem::take(&mut self.stack);
+        let mut from = e;
+        let mut state = DIRTY;
+        loop {
+            for i in 0..self.subs[from.index as usize].len() {
+                // Re-indexed each step rather than held: `raise` never touches a subscriber
+                // list, so the position stays valid across the call.
+                let sub = self.subs[from.index as usize][i];
+                self.raise(sub, state, &mut stack);
+            }
+            state = CHECK;
+            match stack.pop() {
+                Some(next) => from = next,
+                None => break,
+            }
         }
+        self.stack = stack;
     }
 
-    fn push_subs(&mut self, id: SignalId, state: State) {
-        let len = self.node(id).map_or(0, |node| node.subs.len());
-        for i in 0..len {
-            // Re-resolved each step rather than indexed once: `set_state` never touches a
-            // subscriber list, so the position stays valid, and reaching the node through
-            // its id keeps every read on the generation-checked path.
-            let Some(sub) = self.node(id).and_then(|node| node.subs.get(i).copied()) else {
-                break;
-            };
-            self.set_state(sub, state);
-        }
-    }
-
-    /// Raises `id` to `state`, queues it if it is an effect, and puts it on the frontier
-    /// the first time it is raised at all.
-    fn set_state(&mut self, id: SignalId, state: State) {
-        let Some(node) = self.node_mut(id) else {
-            return;
-        };
-        let was = node.state;
-        if was == State::Dirty || (was == State::Check && state == State::Check) {
+    /// Raises `e` to `state`, queues it if it is an effect, and puts it on the frontier the
+    /// first time it is raised at all.
+    fn raise(&mut self, e: Edge, state: u8, stack: &mut Vec<Edge>) {
+        let Some(i) = self.slot(e) else { return };
+        let was = self.flags[i];
+        if was & STATE >= state {
             return;
         }
-        node.state = state;
-        let queue = !node.queued && matches!(node.kind, Kind::Effect(..));
-        if queue {
-            node.queued = true;
-            let Kind::Effect(_, phase) = node.kind else {
-                unreachable!()
-            };
-            self.queue[phase as usize].push(id);
+        self.flags[i] = (was & !STATE) | state;
+        if was & ROLE == EFFECT && was & QUEUED == 0 {
+            self.flags[i] |= QUEUED;
+            self.queue[usize::from(was & GEOMETRY != 0)].push(e);
         }
         // Only a first raise propagates: a node already `Check` has already pushed `Check`
         // through everything below it, and promoting it to `Dirty` changes nothing there.
-        if was == State::Clean {
-            self.stack.push(id);
+        if was & STATE == CLEAN {
+            stack.push(e);
         }
     }
-}
 
-// ── minting ─────────────────────────────────────────────────────────────────────
-
-pub(super) fn source(value: Rc<dyn Any>) -> SignalId {
-    with(|g| g.mint(Kind::Source(value)))
-}
-
-pub(super) fn resource(value: Rc<dyn Any>) -> SignalId {
-    with(|g| {
-        assert!(g.scope.is_some(), "a retained resource requires an Owner");
-        g.mint(Kind::Resource(value))
-    })
-}
-
-pub(super) fn read_resource(id: SignalId) -> Option<Rc<dyn Any>> {
-    with(|g| match g.node(id).map(|node| &node.kind) {
-        Some(Kind::Resource(value)) => Some(Rc::clone(value)),
-        _ => None,
-    })
-}
-
-pub(super) fn memo(cell: Rc<dyn MemoCell>) -> SignalId {
-    // Nothing runs here: a memo is lazy, and one that is never read must never compute.
-    with(|g| g.mint(Kind::Memo(cell)))
-}
-
-pub(super) fn effect(f: Rc<RefCell<dyn FnMut()>>, phase: Phase, immediate: bool) -> SignalId {
-    let id = with(|g| g.mint(Kind::Effect(Rc::clone(&f), phase)));
-    if immediate {
-        run_effect(id, &f);
-    } else {
-        with(|g| {
-            g.node_mut(id).unwrap().queued = true;
-            g.queue[phase as usize].push(id);
-        });
+    /// Clears `e`'s mark and answers whether it was `Dirty`.
+    fn take_dirty(&mut self, e: Edge) -> bool {
+        let Some(i) = self.slot(e) else { return false };
+        let was = self.flags[i];
+        self.flags[i] = was & !STATE;
+        was & STATE == DIRTY
     }
-    id
+
+    /// Drops every edge between `e` and what it reads, so a recompute collects a fresh set.
+    ///
+    /// A node that stops reading a source stops being woken by it, so a hidden branch costs
+    /// nothing once its arm has stopped reading.
+    fn clear_deps(&mut self, e: Edge) {
+        // Taken rather than drained in place, because the loop borrows the columns again.
+        // The capacity goes back at the end.
+        let mut deps = core::mem::take(&mut self.deps[e.index as usize]);
+        for dep in deps.drain(..) {
+            if let Some(i) = self.slot(dep) {
+                self.subs[i].retain(|&s| s != e);
+            }
+        }
+        self.deps[e.index as usize] = deps;
+    }
+
+    /// Disposes `e`, and everything created under it in reverse creation order where it is a
+    /// scope, pushing each payload onto `out` for the caller to drop outside the borrow.
+    fn release(&mut self, e: Edge, out: &mut Vec<(Option<Rc<dyn Any>>, Option<Work>)>) {
+        let Some(i) = self.slot(e) else { return };
+        self.generation[i] = self.generation[i].wrapping_add(1);
+        let scope = self.flags[i] & ROLE == SCOPE;
+        if !scope {
+            self.live -= 1;
+        }
+        self.clear_deps(e);
+        let mut owned = core::mem::take(&mut self.subs[i]);
+        if scope {
+            // Reverse creation order: a child's effect that reads its parent's cell is torn
+            // down before the cell is.
+            while let Some(child) = owned.pop() {
+                self.release(child, out);
+            }
+        }
+        // A subscriber that outlives its source is legal: it is never woken again, and its
+        // stale edge is pruned by the generation check the next time it is walked.
+        owned.clear();
+        self.subs[i] = owned;
+        out.push((self.value[i].take(), self.work[i].take()));
+        // Parked: holds nothing, and keeps its edge capacity for the next mint.
+        self.flags[i] = 0;
+        self.free.push(e.index);
+    }
 }
 
-pub(crate) fn schedule(id: SignalId) {
+/// Restores a graph slot on the way out, including where application code panicked.
+struct Restore(fn(&mut Graph) -> &mut Option<Edge>, Option<Edge>);
+
+impl Restore {
+    fn set(slot: fn(&mut Graph) -> &mut Option<Edge>, to: Option<Edge>) -> Self {
+        Self(slot, with(|g| core::mem::replace(slot(g), to)))
+    }
+}
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        let prev = self.1;
+        try_with(|g| *self.0(g) = prev);
+    }
+}
+
+/// Mints a node of `role`, registering it with the scope in force.
+pub(crate) fn mint(role: u8, value: Option<Rc<dyn Any>>, work: Option<Work>) -> SignalId {
+    super::assert_writable();
     with(|g| {
-        g.set_state(id, State::Dirty);
-        g.stack.clear();
+        assert!(role & ROLE != RESOURCE || g.scope.is_some(), "retain outside a scope");
+        SignalId { graph: g.id, edge: g.mint(role, value, work) }
+    })
+}
+
+/// Runs `f` with the graph borrowed, and asks the waker where `f` left update work behind
+/// where there was none. The waker runs with no borrow held, so it may write signals.
+fn writing<R>(f: impl FnOnce(&mut Graph) -> R) -> R {
+    let (r, asks) = with(|g| {
+        let idle = g.queue[UPDATE].is_empty() && !g.flushing;
+        let r = f(g);
+        (r, idle && !g.queue[UPDATE].is_empty())
+    });
+    if asks {
+        wake();
+    }
+    r
+}
+
+/// Returns a node's payload, recording the read against the current observer.
+///
+/// `None` where the node was disposed: the generation check makes a stale handle read nothing
+/// rather than whatever now occupies its slot.
+pub(crate) fn read(id: SignalId) -> Option<Rc<dyn Any>> {
+    with(|g| {
+        let i = g.slot(id.edge)?;
+        g.record(id.edge);
+        g.value[i].clone()
+    })
+}
+
+/// Returns a node's payload without recording a dependency.
+pub(crate) fn peek(id: SignalId) -> Option<Rc<dyn Any>> {
+    with(|g| g.slot(id.edge).and_then(|i| g.value[i].clone()))
+}
+
+/// Bumps `id`'s version and marks everything downstream of it. The push half of propagation,
+/// and the only place a version moves.
+pub(crate) fn bump(id: SignalId) {
+    writing(|g| {
+        if let Some(i) = g.slot(id.edge) {
+            g.version[i] += 1;
+            g.mark(id.edge);
+        }
     });
 }
 
-// ── reading ─────────────────────────────────────────────────────────────────────
+/// Queues `id` to run at its phase's next drain, whatever it last read.
+pub(crate) fn schedule(id: SignalId) {
+    writing(|g| {
+        let Some(i) = g.slot(id.edge) else { return };
+        if g.flags[i] & QUEUED != 0 {
+            return;
+        }
+        g.flags[i] = (g.flags[i] & !STATE) | QUEUED | DIRTY;
+        g.queue[usize::from(g.flags[i] & GEOMETRY != 0)].push(id.edge);
+    });
+}
 
-/// Returns a cell's payload, recording the read against the current observer.
+/// Returns how many times `id`'s value has moved. Zero for a node that is gone.
+pub(crate) fn version(id: SignalId) -> u64 {
+    with(|g| g.slot(id.edge).map_or(0, |i| g.version[i]))
+}
+
+/// Returns whether this thread's graph holds `id` and it is live.
+pub(crate) fn alive(id: SignalId) -> bool {
+    try_with(|g| g.id == id.graph && g.slot(id.edge).is_some()).unwrap_or(false)
+}
+
+/// Returns whether this thread's graph minted `id`, which separates the owning thread's
+/// direct write from a producer's staged one.
+pub(crate) fn owns(id: SignalId) -> bool {
+    try_with(|g| g.id == id.graph).unwrap_or(false)
+}
+
+/// Returns how many signal nodes are live on this thread.
 ///
-/// `None` where the cell was disposed: the generation check makes a stale handle read
-/// nothing rather than whatever now occupies its slot.
-pub(super) fn read_source(id: SignalId) -> Option<Rc<dyn Any>> {
-    with(|g| {
-        g.track(id);
-        match g.node(id).map(|node| &node.kind) {
-            Some(Kind::Source(value)) => Some(Rc::clone(value)),
-            _ => None,
-        }
-    })
-}
-
-/// Returns a cell's payload without recording a dependency.
-pub(super) fn peek_source(id: SignalId) -> Option<Rc<dyn Any>> {
-    with(|g| match g.node(id).map(|node| &node.kind) {
-        Some(Kind::Source(value)) => Some(Rc::clone(value)),
-        _ => None,
-    })
-}
-
-/// Returns a memo's cache, resolving the memo first and recording the read.
-pub(super) fn read_memo(id: SignalId) -> Option<Rc<dyn MemoCell>> {
-    let cell = with(|g| {
-        g.track(id);
-        match g.node(id).map(|node| &node.kind) {
-            Some(Kind::Memo(cell)) => Some(Rc::clone(cell)),
-            _ => None,
-        }
-    })?;
-    resolve(id);
-    Some(cell)
+/// A disposal scope is a node and is not counted: this is the instrument leak assertions
+/// read, and what they assert is that mounting and unmounting a screen returns the number of
+/// cells, memos, effects and resources to its baseline.
+pub fn live_nodes() -> usize {
+    with(|g| g.live as usize)
 }
 
 /// Brings `id` up to date if anything it reads changed. The pull half of propagation.
-fn resolve(id: SignalId) {
-    match state_of(id) {
-        None | Some(State::Clean) => {}
-        Some(State::Dirty) => recompute(id),
-        Some(State::Check) => {
-            // Walk by index and re-read each step: resolving a dependency can promote this
-            // node to `Dirty`, at which point the rest are irrelevant.
-            let mut i = 0;
-            while let Some(dep) = with(|g| g.node(id).and_then(|node| node.deps.get(i).copied())) {
-                resolve(dep);
-                if state_of(id) == Some(State::Dirty) {
-                    break;
-                }
-                i += 1;
-            }
-            if state_of(id) == Some(State::Dirty) {
-                recompute(id);
-            } else {
-                mark_clean(id);
-            }
-        }
+pub(crate) fn resolve(id: SignalId) {
+    let mut n = 0;
+    // A `Check` node recomputes only where a dependency actually changed: resolving one may
+    // promote this node to `Dirty`, and nothing else does, so the state is re-read each round.
+    while let Some(dep) = with(|g| match g.slot(id.edge).map(|i| g.flags[i] & STATE) {
+        Some(CHECK) => g.deps[id.edge.index as usize].get(n).copied(),
+        _ => None,
+    }) {
+        resolve(SignalId { graph: id.graph, edge: dep });
+        n += 1;
+    }
+    if with(|g| g.take_dirty(id.edge)) {
+        recompute(id);
+    }
+}
+
+/// Runs `id`'s work with no borrow of the graph held, and propagates where it moved.
+pub(crate) fn recompute(id: SignalId) {
+    let Some(work) = with(|g| {
+        let i = g.slot(id.edge)?;
+        // Cleared here as well as in `resolve`, so the one caller that runs an effect the
+        // moment it is created leaves it `Clean` and a later write can raise it again.
+        g.flags[i] &= !STATE;
+        g.clear_deps(id.edge);
+        g.work[i].clone()
+    }) else {
+        return;
+    };
+    let moved = {
+        let _tracking = Restore::set(|g| &mut g.observer, Some(id.edge));
+        let mut work = work.borrow_mut();
+        work()
+    };
+    if moved {
+        // Where the value did not move, subscribers stay `Check` and are not cleared.
+        // Clearing them is unsound in the shape two-level marking exists for: in a diamond
+        // whose two branches resolve in sequence, clearing drops the first branch's `Dirty`
+        // and the shared node answers from a stale cache.
+        bump(id);
     }
 }
 
@@ -512,367 +464,286 @@ fn resolve(id: SignalId) {
 /// The read this exists for is one taken while building, inside an effect that reconciles
 /// structure: without it a row's own bound value is recorded as a dependency of the list's
 /// reconcile effect, and changing one label rebuilds the list.
-///
-/// The previous observer is restored even if `f` panics.
 pub fn untracked<R>(f: impl FnOnce() -> R) -> R {
-    // A guard rather than a line after the call: `f` is application code, and a panic that
-    // skipped the restore would leave the graph with no observer for the life of the
-    // thread, so every effect created afterwards would subscribe to nothing.
-    struct Restore(Option<SignalId>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            try_with(|g| g.observer = self.0.take());
-        }
-    }
-    let _restore = Restore(with(|g| g.observer.take()));
+    let _tracking = Restore::set(|g| &mut g.observer, None);
     f()
 }
 
-fn recompute(id: SignalId) {
-    let Some(cell) = with(|g| match g.node(id).map(|node| &node.kind) {
-        Some(Kind::Memo(cell)) => Some(Rc::clone(cell)),
-        _ => None,
-    }) else {
-        mark_clean(id);
-        return;
-    };
-
-    let outer = with(|g| {
-        clear_deps(g, id);
-        g.observer.replace(id)
-    });
-    // Application code, with the graph free.
-    let changed = cell.recompute();
-
-    with(|g| {
-        g.observer = outer;
-        if let Some(node) = g.node_mut(id) {
-            node.state = State::Clean;
-        }
-        if changed {
-            // Only the direct subscribers are promoted. Everything below them is already
-            // `Check` from the write that started this, and each promotes its own
-            // subscribers if its value moves.
-            //
-            // Where the value did not change, subscribers stay `Check` and are not marked
-            // `Clean`. Clearing them is unsound in the shape two-level marking exists for:
-            // in a diamond whose two branches resolve in sequence, clearing drops the first
-            // branch's `Dirty` and the shared node answers from a stale cache. A `Check`
-            // node re-asks its dependencies before believing its cache.
-            g.push_subs(id, State::Dirty);
-            g.stack.clear();
-        }
-    });
-}
-
-fn state_of(id: SignalId) -> Option<State> {
-    with(|g| g.node(id).map(|node| node.state))
-}
-
-fn mark_clean(id: SignalId) {
-    with(|g| {
-        if let Some(node) = g.node_mut(id) {
-            node.state = State::Clean;
-        }
-    });
-}
-
-/// Drops every edge between `id` and its dependencies, so a recompute collects a fresh set.
-///
-/// A node that stops reading a source stops being woken by it, so a hidden branch costs
-/// nothing once its arm has stopped reading.
-fn clear_deps(g: &mut Graph, id: SignalId) {
-    let Some(node) = g.node_mut(id) else {
-        return;
-    };
-    // Taken rather than drained, because the loop borrows the graph again. The capacity
-    // goes back at the end.
-    let mut deps = core::mem::take(&mut node.deps);
-    for dep in deps.drain(..) {
-        if let Some(source) = g.node_mut(dep)
-            && let Some(at) = source.subs.iter().position(|sub| *sub == id)
-        {
-            source.subs.swap_remove(at);
-        }
-    }
-    if let Some(node) = g.node_mut(id) {
-        node.deps = deps;
-    }
-}
-
-// ── writing ─────────────────────────────────────────────────────────────────────
-
-/// Bumps `id`'s version and marks everything downstream of it. The push half of
-/// propagation, and the only place a version moves.
-pub(super) fn invalidate(id: SignalId) {
-    let acquired = with(|g| {
-        if let Some(node) = g.node_mut(id) {
-            node.version = node.version.wrapping_add(1);
-        }
-        // Read before the marking, so the comparison afterwards reflects this write alone.
-        let idle = !g.flushing && g.queue.iter().all(Vec::is_empty);
-        g.invalidate(id);
-        g.stack.clear();
-        idle && !g.queue.iter().all(Vec::is_empty)
-    });
-    // Outside the borrow: a waker is host code and may do anything, including write a signal.
-    if acquired {
-        wake();
-    }
-}
-
-/// Returns how many times `id`'s value has moved. Zero for a node that is gone.
-pub(super) fn version(id: SignalId) -> u64 {
-    with(|g| g.node(id).map_or(0, |node| node.version))
-}
-
-/// Returns whether this thread's graph holds `id`, which separates the owning thread's
-/// direct write from a producer's staged one.
-pub(super) fn owns(id: SignalId) -> bool {
-    GRAPH.with(|g| g.try_borrow().is_ok_and(|g| g.node(id).is_some()))
-}
-
-// ── the flush ───────────────────────────────────────────────────────────────────
-
-fn run_effect(id: SignalId, f: &Rc<RefCell<dyn FnMut()>>) {
-    let outer = with(|g| {
-        clear_deps(g, id);
-        g.observer.replace(id)
-    });
-    // Application code, with the graph free: an effect may read and even write signals.
-    (f.borrow_mut())();
-    with(|g| {
-        g.observer = outer;
-        if let Some(node) = g.node_mut(id) {
-            node.state = State::Clean;
-            node.queued = false;
-        }
-    });
-}
-
-/// Applies staged cross-thread writes, resolves every marked memo and runs every marked
-/// update-phase effect, in creation order.
-///
-/// Returns whether anything moved *or* a geometry effect is owed, since a caller that
-/// solves on the answer has to solve before [`flush_geometry`] can report a settled box.
-///
-/// Effects run after memos, so no effect observes a half-updated graph. A pass allocates
-/// nothing: both queues are drained rather than dropped, the staging buffer is swapped
-/// back, and the sort is in place.
-///
-/// A call made while a flush is running returns immediately, leaving the work to the
-/// running flush.
-pub fn flush() -> bool {
-    flush_phase(Phase::Update) || with(|g| !g.queue[Phase::Geometry as usize].is_empty())
-}
-
-pub(crate) fn flush_geometry() {
-    flush_phase(Phase::Geometry);
-}
-
-fn flush_phase(phase: Phase) -> bool {
-    if with(|g| core::mem::replace(&mut g.flushing, true)) {
-        // A write from inside an effect appends to the queue the running flush picks up on
-        // its next pass. Starting a second flush here would run effects out of creation
-        // order.
-        return false;
-    }
-
-    // Whether a staged write landed or an effect ran: a host deciding whether the model is
-    // worth solving asks this rather than solving on every wake.
-    // Admit one producer batch per flush. Completions arriving while effects run
-    // own the next wake; they are not iterations of this graph's settling pass.
-    let mut worked = phase == Phase::Update && apply_staged();
-    for pass in 0..MAX_PASSES {
-        let empty = with(|g| {
-            debug_assert!(g.running.is_empty());
-            core::mem::swap(&mut g.running, &mut g.queue[phase as usize]);
-            // Creation order is the contract: a parent's effect writes the container a
-            // child's effect fills. Sorting in place allocates nothing.
-            let nodes = &g.nodes;
-            g.running
-                .sort_unstable_by_key(|id| nodes.get(id.id).map_or(u64::MAX, |node| node.order));
-            g.running.is_empty()
-        });
-        if empty {
-            break;
-        }
-        worked = true;
-
-        let mut i = 0;
-        while let Some(id) = with(|g| g.running.get(i).copied()) {
-            i += 1;
-            let Some(f) = with(|g| match g.node(id).map(|node| &node.kind) {
-                Some(Kind::Effect(f, _)) => Some(Rc::clone(f)),
-                // Disposed between being marked and being run, which is legal: an effect
-                // in one scope may dispose another.
-                _ => None,
-            }) else {
-                continue;
-            };
-
-            // An effect marked only `Check` re-asks its dependencies, and does not run if
-            // none of them moved. The value-equality cutoff, one level below a memo.
-            if state_of(id) == Some(State::Check) {
-                let mut d = 0;
-                while let Some(dep) = with(|g| g.node(id).and_then(|n| n.deps.get(d).copied())) {
-                    resolve(dep);
-                    if state_of(id) == Some(State::Dirty) {
-                        break;
-                    }
-                    d += 1;
-                }
-            }
-            if state_of(id) == Some(State::Dirty) {
-                run_effect(id, &f);
-            } else {
-                with(|g| {
-                    if let Some(node) = g.node_mut(id) {
-                        node.state = State::Clean;
-                        node.queued = false;
-                    }
-                });
-            }
-        }
-        with(|g| g.running.clear());
-
-        debug_assert!(
-            pass + 1 < MAX_PASSES || with(|g| g.queue[phase as usize].is_empty()),
-            "signal flush did not settle in {MAX_PASSES} passes: an effect writes a cell it \
-             also reads"
-        );
-    }
-
-    with(|g| g.flushing = false);
-    worked
-}
-
-/// Applies whatever producer threads staged, coalesced to at most one write per cell.
-/// Returns whether anything was staged.
-fn apply_staged() -> bool {
-    let (graph, mut staged) = with(|g| (g.id, core::mem::take(&mut g.staged)));
-    shared::take(graph, &mut staged);
-    let any = !staged.is_empty();
-    for (id, apply) in staged.drain(..) {
-        let Some(value) = peek_source(id) else {
-            continue;
-        };
-        // The write itself gates on equality, so a producer republishing an unchanged
-        // value costs a lock and nothing else.
-        if apply(&*value) {
-            invalidate(id);
-        }
-    }
-    // Back with its capacity, so a steady producer stages and drains without allocating.
-    with(|g| g.staged = staged);
-    any
-}
-
-// ── scopes ──────────────────────────────────────────────────────────────────────
-
-pub(super) fn open_scope() -> OwnerId {
-    super::assert_writable();
-    with(|g| {
-        // A parked scope keeps its child list's capacity, which is what makes remounting a
-        // screen free.
-        let owner = g.owner_spare.pop().unwrap_or_default();
-        let id = g.owners.insert(&mut g.owner_ids, owner);
-        // A scope opened inside another is disposed by it, so a subtree's scopes need no
-        // separate bookkeeping and no parent walk.
-        if let Some(parent) = g.scope {
-            g.attach(parent, Child::Owner(id));
-        }
-        id
-    })
-}
-
-/// Installs `id` as the scope new nodes register with, and returns the previous one.
-pub(super) fn enter_scope(id: Option<OwnerId>) -> Option<OwnerId> {
-    with(|g| core::mem::replace(&mut g.scope, id))
+/// Runs `f` with `scope` installed as the scope new nodes register with.
+pub(crate) fn in_scope<R>(scope: Option<SignalId>, f: impl FnOnce() -> R) -> R {
+    let _scope = Restore::set(|g| &mut g.scope, scope.map(|s| s.edge));
+    f()
 }
 
 /// Disposes a scope and everything created under it, in reverse creation order.
-pub(super) fn dispose_scope(id: OwnerId) {
-    // Fallible because this runs from a `Drop`, as `try_with` describes. A graph already
-    // being destroyed disposes this scope by dropping it, so the walk below has nothing
-    // left to do.
-    let Some(Some(mut children)) = try_with(|g| {
-        let owner = g.owners.get_mut(id)?;
-        Some(core::mem::take(&mut owner.children))
-    }) else {
+pub(crate) fn dispose(id: SignalId) {
+    // The payloads outlive the borrow: one may own an `Owner`, and dropping it asks the graph
+    // to dispose a scope.
+    let mut out = Vec::new();
+    try_with(|g| g.release(id.edge, &mut out));
+}
+
+/// Disposes one node and returns its work for the caller to drop outside its own borrow.
+pub(crate) fn retire(id: SignalId) -> Option<RetiredEffect> {
+    let mut out = Vec::new();
+    try_with(|g| g.release(id.edge, &mut out));
+    out.pop().and_then(|(_, work)| work)
+}
+
+/// Installs the callback this graph invokes when its effect queue goes from empty to
+/// non-empty.
+///
+/// Without a waker a write schedules nothing: a write marks nodes and queues effects, and
+/// nothing downstream runs until a caller invokes [`flush`]. The callback runs on the
+/// empty-to-non-empty transition and at no other time, so a burst of writes asks once. A write
+/// made from inside a flush does not call it: that flush picks the work up on its next pass.
+/// It runs with no borrow of the graph held, so it may write signals.
+pub fn set_waker(f: impl Fn() + 'static) {
+    WAKER.with(|w| *w.borrow_mut() = Some(Rc::new(f)));
+}
+
+/// Calls the waker, holding no borrow of either the graph or the waker slot while it runs.
+fn wake() {
+    let waker = WAKER.with(|w| w.borrow().clone());
+    if let Some(waker) = waker {
+        waker();
+    }
+}
+
+/// Applies staged cross-thread writes and runs every marked update-phase effect, in creation
+/// order.
+///
+/// Returns whether anything moved *or* a geometry effect is owed, since a caller that solves
+/// on the answer has to solve before [`flush_geometry`] can report a settled box.
+///
+/// Effects run after the memos they read have resolved, so no effect observes a half-updated
+/// graph. A pass allocates nothing: both queues are drained rather than dropped, the staging
+/// buffer is swapped back, and the sort is in place. A call made while a flush is running
+/// returns immediately, leaving the work to the running flush.
+pub fn flush() -> bool {
+    if with(|g| core::mem::replace(&mut g.flushing, true)) {
+        return false;
+    }
+    // Both sides run: one producer batch is admitted per flush, and the effects it marks are
+    // drained by the same call.
+    let moved = apply_posts() | drain(UPDATE);
+    with(|g| g.flushing = false);
+    moved || with(|g| !g.queue[GEOM].is_empty())
+}
+
+/// Runs the geometry effects the update phase held back, once the solve has settled.
+pub(crate) fn flush_geometry() {
+    if with(|g| core::mem::replace(&mut g.flushing, true)) {
         return;
-    };
-
-    // Reverse creation order: a child's effect that reads its parent's cell is torn down
-    // before the cell is.
-    while let Some(child) = children.pop() {
-        match child {
-            Child::Signal(signal) => dispose(signal),
-            Child::Owner(owner) => dispose_scope(owner),
-        }
     }
+    drain(GEOM);
+    with(|g| g.flushing = false);
+}
 
-    try_with(|g| {
-        if let Some(mut owner) = g.owners.remove(&mut g.owner_ids, id) {
-            // The `Vec` goes back with its capacity, which is what makes remounting free.
-            owner.children = children;
-            g.owner_spare.push(owner);
+/// Drains one phase to a fixed point, and answers whether anything ran.
+fn drain(phase: usize) -> bool {
+    let mut moved = false;
+    for _ in 0..MAX_PASSES {
+        if !run_phase(phase) {
+            return moved;
         }
+        moved = true;
+    }
+    debug_assert!(
+        with(|g| g.queue[phase].is_empty()),
+        "signal flush did not settle in {MAX_PASSES} passes: an effect writes a cell it also \
+         reads"
+    );
+    moved
+}
+
+/// Runs one pass of `phase`'s queue, in creation order.
+fn run_phase(phase: usize) -> bool {
+    let (graph, mut queued) = with(|g| {
+        let mut queued = core::mem::take(&mut g.spare);
+        core::mem::swap(&mut queued, &mut g.queue[phase]);
+        // Creation order is the contract: a parent's effect writes the container a child's
+        // effect fills. Sorting in place allocates nothing.
+        queued.sort_unstable_by_key(|e| g.order[e.index as usize]);
+        for &e in &queued {
+            if let Some(i) = g.slot(e) {
+                g.flags[i] &= !QUEUED;
+            }
+        }
+        (g.id, queued)
     });
+    let ran = !queued.is_empty();
+    for edge in queued.drain(..) {
+        // Resolved rather than run: an effect marked only `Check` re-asks its dependencies and
+        // does not run if none of them moved, which is the memo's cutoff one level down.
+        resolve(SignalId { graph, edge });
+    }
+    with(|g| g.spare = queued);
+    ran
 }
 
-/// Disposes one node: drops its outgoing edges, releases its payload, and frees its slot.
-pub(super) fn dispose(id: SignalId) {
-    // The payload is taken out under the graph's borrow and dropped after it is released.
-    // A payload can own an `Owner`, and dropping one disposes that scope — which borrows the
-    // graph again. Dropping it in place would therefore panic inside a `Drop`, which aborts.
-    let payload = dispose_taking_payload(id);
-    drop(payload);
-}
+/// A staged write: puts its value into the cell's payload and returns whether it moved.
+pub(crate) type Post = Box<dyn FnOnce(&dyn Any) -> bool + Send>;
 
-/// Disposes node `id` and returns its payload for the caller to drop.
+/// How a staged write reaches the thread that owns the graph.
 ///
-/// Split from [`dispose`] so the payload outlives the graph borrow this takes.
-fn dispose_taking_payload(id: SignalId) -> Option<Kind> {
-    // Fallible for the same reason `dispose_scope` is: this is reached from a `Drop`.
-    try_with(|g| {
-        if g.node(id).is_none() {
-            return None;
-        }
-        clear_deps(g, id);
-        shared::release(id);
-        let Some(mut node) = g.nodes.remove(&mut g.node_ids, id.id) else {
-            return None;
-        };
-        // A subscriber that outlives its source is legal: it is never woken again, and its
-        // stale edge is pruned by the generation check the next time it is walked. What
-        // must not survive is this node's entry in anyone else's subscriber list, which
-        // `clear_deps` above removes.
-        node.subs.clear();
-        node.state = State::Clean;
-        node.queued = false;
-        // Parked with its buffers and without its payload. Vacancy is the store's fact, so a
-        // node needs no `Free` variant of its own.
-        let payload = core::mem::replace(&mut node.kind, Kind::Parked);
-        g.spare.push(node);
-        Some(payload)
-    })
-    .flatten()
+/// A graph flushed from a window's pump has no wait of its own, so the write asks the pacer
+/// for a frame and the frame message carries the flush. A graph flushed from a loop parked on
+/// a doorbell has no clock, so the write rings that doorbell instead.
+pub(crate) enum PostWake {
+    /// A window thread: the write holds a frame request until the frame that drains it.
+    Pacer(Wake),
+    /// A thread parked on a doorbell: the write rings it.
+    Ring(Arc<Ring>),
 }
 
-pub(super) fn retire_effect(id: SignalId) -> Option<Rc<RefCell<dyn FnMut()>>> {
-    match dispose_taking_payload(id) {
-        Some(Kind::Effect(callback, _)) => Some(callback),
-        None => None,
-        _ => unreachable!("an Effect names an effect node"),
+impl From<Wake> for PostWake {
+    fn from(wake: Wake) -> Self {
+        Self::Pacer(wake)
     }
 }
 
-/// Returns how many signal nodes are live on this thread.
+impl From<Arc<Ring>> for PostWake {
+    fn from(ring: Arc<Ring>) -> Self {
+        Self::Ring(ring)
+    }
+}
+
+/// The outstanding wake for a graph's staged writes.
+enum Held {
+    /// A live frame request. Kept for its `Drop`, which releases the request and parks the
+    /// pacer once no other holder wants a frame.
+    Tick(#[expect(dead_code, reason = "held for its Drop, which releases the frame request")] Tick),
+    /// The doorbell has been rung. It holds the signal until the sleeper consumes it, so there
+    /// is nothing to keep beyond the fact that the edge has been taken.
+    Rung,
+}
+
+/// One graph's staged writes.
 ///
-/// The instrument leak assertions read: mounting and unmounting a screen returns this count
-/// to its baseline.
-#[must_use]
-pub fn live_nodes() -> usize {
-    with(|g| g.nodes.len())
+/// Indexing by graph and then by node index makes replacing a pending write O(1) with no hash
+/// and no scan, and keeps two graphs from aliasing each other's staged writes: a node index is
+/// unique only within the graph that minted it.
+#[derive(Default)]
+struct Inbox {
+    how: Option<PostWake>,
+    held: Option<Held>,
+    /// The pending write per slot, with the generation it was staged against: a producer
+    /// holding a stale handle must not replace a newer pending write at the same index.
+    slots: Vec<Option<(u32, Post)>>,
+    /// Which slots are occupied, so a drain costs O(pending) rather than O(cells).
+    pending: Vec<u32>,
+}
+
+/// Every graph's staged writes, indexed by graph id.
+static INBOX: Mutex<Vec<Inbox>> = Mutex::new(Vec::new());
+
+/// Locks the inbox, recovering from poisoning.
+///
+/// A producer panicking mid-post leaves the table structurally sound: the slot it was writing
+/// is either replaced or not, so a poisoned lock is taken rather than propagated.
+fn inbox() -> MutexGuard<'static, Vec<Inbox>> {
+    INBOX.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Holds a graph's post routing. Dropping it releases the routing and any wake it held.
+pub(crate) struct PostGuard(u32);
+
+impl Drop for PostGuard {
+    fn drop(&mut self) {
+        let mut inbox = inbox();
+        let graph = &mut inbox[self.0 as usize];
+        graph.how = None;
+        graph.held = None;
+    }
+}
+
+/// Routes producer writes to this graph's thread until the returned guard drops.
+pub(crate) fn arm_posts(how: impl Into<PostWake>) -> PostGuard {
+    let id = with(|g| g.id);
+    let mut inbox = inbox();
+    if inbox.len() <= id as usize {
+        inbox.resize_with(id as usize + 1, Inbox::default);
+    }
+    let how = how.into();
+    let graph = &mut inbox[id as usize];
+    // Writes staged before the routing existed are still owed a wake, and the new routing is
+    // the first thing that can deliver one.
+    graph.held = (!graph.pending.is_empty()).then(|| raise(&how));
+    graph.how = Some(how);
+    PostGuard(id)
+}
+
+/// Stages a write and holds one wake until this graph drains it.
+pub(crate) fn stage(id: SignalId, post: Post) {
+    let (index, age) = (id.edge.index as usize, id.edge.generation);
+    let mut inbox = inbox();
+    // Grown rather than looked up: a write staged before this graph armed its routing is still
+    // owed a wake, which `arm_posts` raises.
+    if inbox.len() <= id.graph as usize {
+        inbox.resize_with(id.graph as usize + 1, Inbox::default);
+    }
+    let graph = &mut inbox[id.graph as usize];
+    if graph.slots.len() <= index {
+        graph.slots.resize_with(index + 1, || None);
+    }
+    // A producer holding a stale handle must not replace a newer pending write at this index.
+    if graph.slots[index].as_ref().is_some_and(|(pending, _)| *pending > age) {
+        return;
+    }
+    if graph.slots[index].replace((age, post)).is_none() {
+        graph.pending.push(id.edge.index);
+    }
+    // Raised on the empty-to-pending transition only, so a producer writing at any rate leaves
+    // at most one signal in flight.
+    if graph.held.is_none() {
+        graph.held = graph.how.as_ref().map(raise);
+    }
+}
+
+/// Raises one wake on the graph's thread.
+///
+/// The pacer arm returns the frame request, so the pending batch keeps it live. The ring arm
+/// returns nothing to keep: a ring signals only the parked-to-running edge, so a second ring
+/// while the sleeper is already running is not a second wake.
+fn raise(how: &PostWake) -> Held {
+    match how {
+        PostWake::Pacer(wake) => Held::Tick(wake.tick()),
+        PostWake::Ring(ring) => {
+            ring.ring();
+            Held::Rung
+        }
+    }
+}
+
+/// Applies whatever producer threads staged, coalesced to at most one write per cell, and
+/// answers whether anything was staged.
+fn apply_posts() -> bool {
+    let (id, mut staged) = with(|g| (g.id, core::mem::take(&mut g.inbox)));
+    {
+        let mut inbox = inbox();
+        if let Some(graph) = inbox.get_mut(id as usize) {
+            for index in graph.pending.drain(..) {
+                if let Some((generation, post)) = graph.slots[index as usize].take() {
+                    staged.push((Edge { index, generation }, post));
+                }
+            }
+            graph.held = None;
+        }
+    }
+    // The lock is released before any of it is applied, so a producer never waits on the
+    // graph's own work.
+    let any = !staged.is_empty();
+    for (edge, post) in staged.drain(..) {
+        let id = SignalId { graph: id, edge };
+        // A write in flight when a screen unmounts reads nothing here and is dropped: the
+        // generation check is the one every read already makes.
+        let Some(value) = peek(id) else { continue };
+        if post(&*value) {
+            bump(id);
+        }
+    }
+    // Back with its capacity, so a steady producer stages and drains without allocating.
+    with(|g| g.inbox = staged);
+    any
 }

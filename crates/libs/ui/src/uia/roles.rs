@@ -1,8 +1,8 @@
-//! Maps a [`UiaRole`] to what automation is told about it: one row per role.
+//! One `const` row per [`UiaRole`], and the three lookups over it.
 //!
 //! A row carries the control type, the spoken type name, the patterns the role answers to,
-//! and whether the element appears in the content view. The table is indexed by the enum
-//! through [`index`], so each role has exactly one row.
+//! and whether the element appears in the content view. The table is indexed by the enum's
+//! own discriminant, so each role has exactly one row.
 
 use crate::bindings::{
     UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
@@ -29,8 +29,8 @@ impl Patterns {
     pub const SELECTION: Self = Self(1 << 4);
     pub const SELECTION_ITEM: Self = Self(1 << 5);
     pub const EXPAND: Self = Self(1 << 6);
-    pub const SCROLL_ITEM: Self = Self(1 << 8);
-    pub const TEXT: Self = Self(1 << 9);
+    pub const SCROLL_ITEM: Self = Self(1 << 7);
+    pub const TEXT: Self = Self(1 << 8);
 
     /// Returns whether every pattern in `other` is in this set.
     #[must_use]
@@ -63,105 +63,104 @@ pub struct Row {
     pub content: bool,
 }
 
+impl Row {
+    const fn new(
+        control_type: i32,
+        localized: &'static str,
+        patterns: Patterns,
+        content: bool,
+    ) -> Self {
+        Self {
+            control_type,
+            localized,
+            patterns,
+            content,
+        }
+    }
+}
+
 const P: Patterns = Patterns::NONE;
 
-/// Indexed by [`UiaRole`] through [`row`], never by a bare integer.
+/// Indexed by [`UiaRole`]'s discriminant through [`row`], never by a bare integer.
+///
+/// `UiaRole` is fieldless and its variants carry no explicit discriminant, so a role's
+/// position in that declaration is its index here, and `every_role_has_its_own_row` is what
+/// holds the two orders together.
 static ROWS: [Row; 13] = [
     // None — never published; present so the table is total over the enum.
-    Row {
-        control_type: UIA_CustomControlTypeId,
-        localized: "",
-        patterns: P,
-        content: false,
-    },
-    Row {
-        control_type: UIA_TextControlTypeId,
-        localized: "text",
-        // A static run publishes its body as a text document, so it can be read, selected
-        // and navigated. An editable document belongs to text services and is not this
-        // pattern.
-        patterns: P.or(Patterns::TEXT),
-        content: true,
-    },
-    Row {
-        control_type: UIA_GroupControlTypeId,
-        localized: "group",
-        patterns: P,
-        content: false,
-    },
-    Row {
-        control_type: UIA_ButtonControlTypeId,
-        localized: "button",
-        // A button that opens a flyout is still a button, so the role carries
-        // expand-collapse; whether an element answers it is the entry's `EXPANDS` flag.
-        patterns: P.or(Patterns::INVOKE).or(Patterns::EXPAND),
-        content: true,
-    },
-    Row {
-        control_type: UIA_CheckBoxControlTypeId,
-        localized: "check box",
-        patterns: P.or(Patterns::TOGGLE),
-        content: true,
-    },
+    Row::new(UIA_CustomControlTypeId, "", P, false),
+    // A static run publishes its body as a text document, so it can be read, selected and
+    // navigated. An editable document belongs to text services and is not this pattern.
+    Row::new(UIA_TextControlTypeId, "text", P.or(Patterns::TEXT), true),
+    Row::new(UIA_GroupControlTypeId, "group", P, false),
+    // A button that opens a flyout is still a button, so the role carries expand-collapse;
+    // whether an element answers it is the entry's `EXPANDS` flag.
+    Row::new(
+        UIA_ButtonControlTypeId,
+        "button",
+        P.or(Patterns::INVOKE).or(Patterns::EXPAND),
+        true,
+    ),
+    Row::new(
+        UIA_CheckBoxControlTypeId,
+        "check box",
+        P.or(Patterns::TOGGLE),
+        true,
+    ),
     // A radio button reports `SelectionItem`, which a screen reader announces as "3 of 5"
     // rather than as "checked".
-    Row {
-        control_type: UIA_RadioButtonControlTypeId,
-        localized: "radio button",
-        patterns: P.or(Patterns::SELECTION_ITEM),
-        content: true,
-    },
-    Row {
-        control_type: UIA_SliderControlTypeId,
-        localized: "slider",
-        patterns: P.or(Patterns::RANGE).or(Patterns::VALUE),
-        content: true,
-    },
-    Row {
-        control_type: UIA_EditControlTypeId,
-        localized: "edit",
-        // Queries read the published document; writes return through the editor queue.
-        patterns: P.or(Patterns::VALUE).or(Patterns::TEXT),
-        content: true,
-    },
-    Row {
-        control_type: UIA_ComboBoxControlTypeId,
-        localized: "combo box",
-        patterns: P.or(Patterns::EXPAND).or(Patterns::VALUE),
-        content: true,
-    },
-    Row {
-        control_type: UIA_ListControlTypeId,
-        localized: "list",
-        patterns: P.or(Patterns::SELECTION).or(Patterns::SCROLL_ITEM),
-        content: true,
-    },
-    Row {
-        control_type: UIA_MenuControlTypeId,
-        localized: "menu",
-        patterns: P,
-        content: true,
-    },
-    Row {
-        control_type: UIA_ProgressBarControlTypeId,
-        localized: "progress bar",
-        patterns: P.or(Patterns::RANGE).or(Patterns::VALUE),
-        content: true,
-    },
+    Row::new(
+        UIA_RadioButtonControlTypeId,
+        "radio button",
+        P.or(Patterns::SELECTION_ITEM),
+        true,
+    ),
+    Row::new(
+        UIA_SliderControlTypeId,
+        "slider",
+        P.or(Patterns::RANGE).or(Patterns::VALUE),
+        true,
+    ),
+    // Queries read the published document; writes return through the editor queue.
+    Row::new(
+        UIA_EditControlTypeId,
+        "edit",
+        P.or(Patterns::VALUE).or(Patterns::TEXT),
+        true,
+    ),
+    Row::new(
+        UIA_ComboBoxControlTypeId,
+        "combo box",
+        P.or(Patterns::EXPAND).or(Patterns::VALUE),
+        true,
+    ),
+    Row::new(
+        UIA_ListControlTypeId,
+        "list",
+        P.or(Patterns::SELECTION).or(Patterns::SCROLL_ITEM),
+        true,
+    ),
+    Row::new(UIA_MenuControlTypeId, "menu", P, true),
+    Row::new(
+        UIA_ProgressBarControlTypeId,
+        "progress bar",
+        P.or(Patterns::RANGE).or(Patterns::VALUE),
+        true,
+    ),
     // Automation has no graph control type, so a graph is a custom control that reports a
     // value, which is what makes a presented analyzer readable.
-    Row {
-        control_type: UIA_CustomControlTypeId,
-        localized: "graph",
-        patterns: P.or(Patterns::VALUE).or(Patterns::RANGE),
-        content: true,
-    },
+    Row::new(
+        UIA_CustomControlTypeId,
+        "graph",
+        P.or(Patterns::VALUE).or(Patterns::RANGE),
+        true,
+    ),
 ];
 
 /// Returns the row for `role`.
 #[must_use]
 pub fn row(role: UiaRole) -> &'static Row {
-    &ROWS[index(role)]
+    &ROWS[role as usize]
 }
 
 /// Returns the control type `role` reports inside `parent`.
@@ -187,34 +186,16 @@ pub const DIALOG_CONTROL_TYPE: i32 = UIA_WindowControlTypeId;
 #[must_use]
 pub fn pattern_of(id: i32) -> Patterns {
     match id {
-        _ if id == UIA_InvokePatternId => Patterns::INVOKE,
-        _ if id == UIA_TogglePatternId => Patterns::TOGGLE,
-        _ if id == UIA_ValuePatternId => Patterns::VALUE,
-        _ if id == UIA_RangeValuePatternId => Patterns::RANGE,
-        _ if id == UIA_SelectionPatternId => Patterns::SELECTION,
-        _ if id == UIA_SelectionItemPatternId => Patterns::SELECTION_ITEM,
-        _ if id == UIA_ExpandCollapsePatternId => Patterns::EXPAND,
-        _ if id == UIA_ScrollItemPatternId => Patterns::SCROLL_ITEM,
-        _ if id == UIA_TextPatternId => Patterns::TEXT,
+        UIA_InvokePatternId => Patterns::INVOKE,
+        UIA_TogglePatternId => Patterns::TOGGLE,
+        UIA_ValuePatternId => Patterns::VALUE,
+        UIA_RangeValuePatternId => Patterns::RANGE,
+        UIA_SelectionPatternId => Patterns::SELECTION,
+        UIA_SelectionItemPatternId => Patterns::SELECTION_ITEM,
+        UIA_ExpandCollapsePatternId => Patterns::EXPAND,
+        UIA_ScrollItemPatternId => Patterns::SCROLL_ITEM,
+        UIA_TextPatternId => Patterns::TEXT,
         _ => Patterns::NONE,
-    }
-}
-
-const fn index(role: UiaRole) -> usize {
-    match role {
-        UiaRole::None => 0,
-        UiaRole::Text => 1,
-        UiaRole::Group => 2,
-        UiaRole::Button => 3,
-        UiaRole::CheckBox => 4,
-        UiaRole::RadioButton => 5,
-        UiaRole::Slider => 6,
-        UiaRole::Edit => 7,
-        UiaRole::ComboBox => 8,
-        UiaRole::List => 9,
-        UiaRole::Menu => 10,
-        UiaRole::ProgressBar => 11,
-        UiaRole::Graph => 12,
     }
 }
 
@@ -222,8 +203,8 @@ const fn index(role: UiaRole) -> usize {
 mod tests {
     use super::*;
 
-    /// The table is indexed by the enum, so a role added without a row would read
-    /// whichever row sits at its position.
+    /// The table is indexed by the enum's discriminant, so a role added without a row would
+    /// read whichever row sits at its position.
     #[test]
     fn every_role_has_its_own_row() {
         let all = [
@@ -243,7 +224,7 @@ mod tests {
         ];
         assert_eq!(all.len(), ROWS.len(), "a role was added without a row");
         for (at, role) in all.into_iter().enumerate() {
-            assert_eq!(index(role), at, "{role:?} indexes the wrong row");
+            assert_eq!(role as usize, at, "{role:?} indexes the wrong row");
         }
         // Every published role names its type; only `None`, which is never published, may
         // be silent.

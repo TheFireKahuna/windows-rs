@@ -1,28 +1,180 @@
-use super::*;
-use crate::{
-    build::Host,
-    input::{KeyEvent, KeyKind, Mods, PointerFlags, PointerType, Sample},
-    signal::{Cell, Owner},
-    widget::{Gesturing, ScalarPart, ScalarValue, TextStyle},
-};
-use windows_scene::{Model, Point};
+//! The value path, driven against a real compositor.
+//!
+//! The rig mints its own nodes and publishes its own hit array rather than mounting an
+//! application tree: what is under test is the front thread's writer, and a scene is the only
+//! part of the rest of the system it actually writes through.
 
-pub(super) fn publish(
-    down: &mut crate::seam::Down,
-    controls: &mut Controls,
-    front: &mut Front<'_>,
-) -> Result<()> {
-    down.clear();
-    crate::signal::flush();
-    Host::flush(&mut down.patch);
-    Host::with(|h| {
-        h.fill(down);
-    });
-    front.scene.apply(&mut down.patch, front.back, front.env)?;
-    controls.adopt(&down.chrome, &down.released, front)
+use super::*;
+use crate::gesture::{DragUpdate, Manip};
+use crate::input::{KeyEvent, Mods, PointerFlags, PointerType, Sample};
+use crate::uia::Action;
+use crate::widget::roles::{ScalarPart, TURN_SWEEP};
+use windows_color::{DisplayCapability, OutputTransform};
+use windows_scene::{
+    BackdropSpec, Backends, ContactKind, Env, HitEntry, HitFlags, Ids, NO_ENTRY, NODE, NodeKind,
+    Op, Point, Scene, SinkPatch,
+};
+
+/// A window, a scene and the two id authorities, so a test drives the production writer against
+/// a real compositor rather than against a stand-in for one.
+pub(super) struct Rig {
+    pub controls: Controls,
+    pub ids: Ids<CONTROL>,
+    scene: Scene,
+    back: Backends,
+    env: Env,
+    nodes: Ids<NODE>,
+    patch: SinkPatch,
+    _window: windows_window::Window,
 }
 
-pub(super) fn press(target: ControlId) -> Report {
+impl Rig {
+    pub fn new(title: &str) -> Result<Self> {
+        windows_window::ensure_dispatcher_queue(windows_window::Apartment::Asta)?;
+        let env = Env::new(
+            96.0,
+            OutputTransform::for_display(DisplayCapability::Sdr, 203.0),
+        );
+        let window = windows_window::Window::new(title)
+            .size_dips(800.0, 600.0)
+            .create()?;
+        let back = Backends::new(
+            windows_composition::Compositor::new()?,
+            &windows_d2d::Gpu::for_window()?,
+            windows_text::FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"]),
+        )?;
+        let scene = Scene::new_at(window.handle(), &back, env, BackdropSpec::default())?;
+        let mut nodes = Ids::default();
+        // Both halves seat the root at the first id without exchanging it, so the first mint
+        // here would name a node the scene already holds.
+        let _root = nodes.mint();
+        Ok(Self {
+            controls: Controls::new(),
+            ids: Ids::default(),
+            scene,
+            back,
+            env,
+            nodes,
+            patch: SinkPatch::default(),
+            _window: window,
+        })
+    }
+
+    /// Mints a group under the content band and returns it, applied immediately.
+    pub fn node(&mut self) -> Result<NodeId> {
+        let id = self.nodes.mint();
+        self.patch.push(Op::New {
+            id,
+            kind: NodeKind::Group,
+            parent: windows_scene::Attach::Window,
+            after: None,
+        });
+        self.apply()?;
+        Ok(id)
+    }
+
+    /// Replaces the hit array, which is what a pointer and the focus ring resolve through.
+    pub fn publish_hits(&mut self, entries: &[HitEntry]) -> Result<()> {
+        self.patch.hits_mut().extend_from_slice(entries);
+        let mut index: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .map(|(at, entry)| (entry.id, at as u32))
+            .collect();
+        index.sort_unstable_by_key(|&(id, _)| id);
+        self.patch.index_mut().extend_from_slice(&index);
+        let (entries, index) = (self.patch.hits_span(), self.patch.index_span());
+        self.patch.push(Op::Hits { entries, index });
+        self.apply()
+    }
+
+    fn apply(&mut self) -> Result<()> {
+        self.scene.apply(&mut self.patch, &self.back, self.env)?;
+        Ok(())
+    }
+
+    pub fn animations(&self) -> u64 {
+        self.scene.census().animations
+    }
+
+    pub fn visuals_minted(&self) -> u64 {
+        self.scene.census().visuals_minted
+    }
+
+    /// Applies one tick against this rig's own scene.
+    pub fn tick(&mut self, reports: &[Report], out: &mut Vec<Intent>) -> Result<()> {
+        let Self {
+            controls,
+            scene,
+            back,
+            env,
+            ..
+        } = self;
+        let mut front = Front {
+            scene,
+            back,
+            env: *env,
+        };
+        controls.tick(reports, &mut front, out)
+    }
+
+    /// Adopts rows the way a patch does, through the one call the driver makes.
+    pub fn adopt(
+        &mut self,
+        chrome: &[(ControlId, ChromeRow)],
+        values: &[(ControlId, ValueRow)],
+        released: &[ControlId],
+    ) -> Result<()> {
+        let Self {
+            controls,
+            scene,
+            back,
+            env,
+            ..
+        } = self;
+        let mut front = Front {
+            scene,
+            back,
+            env: *env,
+        };
+        controls.adopt(chrome, values, released, &mut front)
+    }
+
+    /// Applies automation actions against this rig's own scene.
+    pub fn automation(&mut self, actions: &[Action], out: &mut Vec<Intent>) -> Result<()> {
+        let Self {
+            controls,
+            scene,
+            back,
+            env,
+            ..
+        } = self;
+        let mut front = Front {
+            scene,
+            back,
+            env: *env,
+        };
+        controls.automation(actions, &mut front, out)
+    }
+}
+
+/// An interactive entry over the box `(x0, y0)`–`(x1, y1)`, with no ancestry.
+pub(super) fn entry(id: ControlId, x0: f32, y0: f32, x1: f32, y1: f32) -> HitEntry {
+    HitEntry {
+        x0,
+        y0,
+        x1,
+        y1,
+        touch_inflate: 0.0,
+        clip_parent: NO_ENTRY,
+        parent: NO_ENTRY,
+        flags: HitFlags::INTERACTIVE,
+        scroll_src: NodeId::NONE,
+        id,
+    }
+}
+
+pub(super) fn press_at(target: ControlId, at: Point) -> Report {
     Report::Pressed {
         target,
         contact: 1,
@@ -31,8 +183,8 @@ pub(super) fn press(target: ControlId) -> Report {
             id: 1,
             ptype: PointerType::Mouse,
             flags: PointerFlags(0),
-            at: Point::default(),
-            raw: Point::default(),
+            at,
+            raw: at,
             contact: (0.0, 0.0),
             pen: None,
             time: 0,
@@ -41,356 +193,428 @@ pub(super) fn press(target: ControlId) -> Report {
     }
 }
 
-fn drag(target: ControlId, fraction: f32) -> Report {
+pub(super) fn press(target: ControlId) -> Report {
+    press_at(target, Point::default())
+}
+
+fn moved(target: ControlId, at: Point) -> Report {
+    let Report::Pressed { sample, .. } = press_at(target, at) else {
+        unreachable!("the constructor above builds exactly one variant")
+    };
+    Report::Moved {
+        target,
+        contact: 1,
+        sample,
+    }
+}
+
+fn dragged(target: ControlId, phase: Phase, decided: bool) -> Report {
     Report::Dragged {
         target,
         contact: 1,
         update: DragUpdate {
-            phase: DragPhase::Locked(crate::gesture::Axis::Vertical),
-            delta: Point {
-                x: 0.0,
-                y: -fraction * TURN_SPAN,
-            },
+            phase,
+            delta: Point { x: 0.0, y: 12.0 },
             from: Point::default(),
-            at: Point::default(),
-            decided: true,
+            at: Point { x: 0.0, y: 12.0 },
+            decided,
         },
     }
 }
 
+/// A slider row over a 100-DIP rail inset 13 DIPs into a 126-DIP hit box, snapping to a tenth.
+fn slider_row(thumb: NodeId) -> ValueRow {
+    ValueRow {
+        parts: [
+            (thumb, ScalarPart::Thumb { vertical: false }),
+            (NodeId::NONE, ScalarPart::None),
+            (NodeId::NONE, ScalarPart::None),
+            (NodeId::NONE, ScalarPart::None),
+        ],
+        min: -24.0,
+        span: 48.0,
+        rest: 13.0,
+        travel: 100.0,
+        fraction: 0.5,
+        step: 0.1,
+        revision: 0,
+    }
+}
+
+fn committed(out: &[Intent]) -> usize {
+    out.iter()
+        .filter(|i| matches!(i.what, What::Scalar { commit: true, .. }))
+        .count()
+}
+
 #[test]
-fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> {
-    windows_window::ensure_dispatcher_queue(windows_window::Apartment::Asta)?;
-    let (_owner, result) =
-        Owner::scope(|| -> Result<()> {
-            let _ = crate::build::tests::fixture();
-            let (env, scope) = Host::with(|h| (h.env, h.root_scope));
-            let mut model = Model::new(crate::layout::root());
-            model.set_window(windows_numerics::Vector2 { x: 800.0, y: 600.0 });
-            Host::install(model, env, scope);
-            let window = windows_window::Window::new("scalar ownership")
-                .size_dips(800.0, 600.0)
-                .create()?;
-            let back = Backends::new(
-                windows_composition::Compositor::new()?,
-                &windows_d2d::Gpu::for_window()?,
-                windows_text::FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"]),
-            )?;
-            Host::install_text(back.ladder().clone())?;
-            let mut scene = Scene::new_at(
-                window.handle(),
-                &back,
-                env,
-                windows_scene::BackdropSpec::default(),
-            )?;
-            let mut front = Front {
-                scene: &mut scene,
-                back: &back,
-                env,
-            };
-            let source = Cell::new(ScalarValue {
-                value: 0.25,
-                epoch: 0,
-            });
-            let accepted = Cell::new(0_usize);
-            let live = Cell::new(None::<f64>);
-            let shown = Cell::new(true);
-            let _held = crate::build::Ui::mount_root(|ui| {
-                let geom = ui.geometry(&[
-                    windows_scene::PathVerb::Move {
-                        to: windows_numerics::Vector2::default(),
-                        filled: false,
-                    },
-                    windows_scene::PathVerb::Line(windows_numerics::Vector2 { x: 30.0, y: 30.0 }),
-                    windows_scene::PathVerb::End { closed: false },
-                ]);
-                ui.scalar(None, Interaction::Turn(Range::UNIT), source, |ui| {
-                    ui.when(shown, move |ui| {
-                        ui.text(TextStyle::new(crate::role::TypeRole::Body), "value")
-                            .at(0, 0);
-                        ui.grid(|_| {})
-                            .thumb()
-                            .at(0, 0)
-                            .scalar_part(ScalarPart::Rotation { from: 0.0, to: 4.0 });
-                        ui.path(geom)
-                            .stroke(
-                                crate::role::Role::Data(crate::role::DataRole(1)),
-                                crate::role::Metric::HairlineW,
-                            )
-                            .at(0, 0)
-                            .scalar_part(ScalarPart::TrimEnd);
-                    });
-                })
-                .layout(|l| l.flow = Some(crate::layout::Preset::Grid))
-                .width(crate::role::Metric::CardMinW)
-                .height(crate::role::Metric::CardMinW)
-                .live(live)
-                .on_gesture(move |phase| {
-                    if let Gesturing::Committed(value) = phase {
-                        accepted.set(accepted.get() + 1);
-                        source.set(ScalarValue {
-                            value,
-                            epoch: source.get().epoch,
-                        });
-                    }
-                });
-            });
-            let mut controls = Controls::new();
-            let mut down = crate::seam::Down::default();
-            publish(&mut down, &mut controls, &mut front)?;
-            let row = *down
-                .chrome
-                .iter()
-                .find(|r| r.scalar_parts.iter().flatten().count() == 2)
-                .unwrap();
-            let id = row.id;
-            // Branch churn must release part slots and the control's accessible text.
-            for showing in [false, true].into_iter().cycle().take(12) {
-                shown.set(showing);
-                publish(&mut down, &mut controls, &mut front)?;
-                let row = controls.rows.get(id).unwrap();
-                assert_eq!(
-                    row.scalar_parts.iter().flatten().count(),
-                    if showing { 2 } else { 0 }
-                );
-                assert_eq!(row.thumb.is_some(), showing);
-                Host::with(|host| {
-                    let label = host
-                        .controls
-                        .get(id)
-                        .unwrap()
-                        .text
-                        .and_then(|key| host.text.str_of(key));
-                    assert_eq!(label, showing.then_some("value"));
-                });
-            }
-            let mut out = Vec::with_capacity(32);
-            let before = *front.scene.census();
-            assert_eq!(before.animations, 0, "initial control state must snap");
-            controls.tick(&[press(id), drag(id, 0.25)], &mut front, &mut out)?;
-            assert_eq!(source.get().value, 0.25, "app work is deliberately delayed");
-            assert_eq!(controls.rows.get(id).unwrap().fraction, 0.5);
-            assert!(front.scene.census().animations >= before.animations + 2);
-            assert_eq!(front.scene.census().visuals_minted, before.visuals_minted);
-            // A resize may move the same nodes, but cannot adopt the older source fraction.
-            Host::with(|h| {
-                h.model()
-                    .set_window(windows_numerics::Vector2 { x: 900.0, y: 650.0 })
-            });
-            publish(&mut down, &mut controls, &mut front)?;
-            assert_eq!(controls.rows.get(id).unwrap().fraction, 0.5);
-            controls.tick(
-                &[Report::Released {
-                    target: id,
-                    contact: 1,
-                    at: Point::default(),
-                }],
-                &mut front,
-                &mut out,
-            )?;
-            // A second gesture starts before the application receives the first commit.
-            controls.tick(&[press(id), drag(id, 0.25)], &mut front, &mut Vec::new())?;
-            Host::dispatch(&out);
-            assert_eq!(accepted.get(), 1);
-            publish(&mut down, &mut controls, &mut front)?;
-            assert_eq!(controls.pressed, Some(id));
-            assert_eq!(
-                controls.rows.get(id).unwrap().fraction,
-                0.75,
-                "a commit echo must preserve the newer gesture"
-            );
-            // Same-value document replacement still invalidates a queued commit by epoch.
-            out.clear();
-            controls.tick(
-                &[Report::Released {
-                    target: id,
-                    contact: 1,
-                    at: Point::default(),
-                }],
-                &mut front,
-                &mut out,
-            )?;
-            source.set(ScalarValue {
-                value: 0.5,
-                epoch: 1,
-            });
-            publish(&mut down, &mut controls, &mut front)?;
-            Host::dispatch(&out);
-            assert_eq!(accepted.get(), 1);
-            assert_eq!(source.get().value, 0.5);
-            // Cancellation restores the starting value and emits no accepted commit.
-            out.clear();
-            controls.tick(
-                &[
-                    press(id),
-                    drag(id, 0.2),
-                    Report::Canceled {
-                        target: id,
-                        contact: 1,
-                    },
-                ],
-                &mut front,
-                &mut out,
-            )?;
-            assert_eq!(controls.rows.get(id).unwrap().fraction, 0.5);
-            assert!(matches!(out.last().unwrap().what, What::Canceled(_)));
-            Host::dispatch(&out);
-            assert_eq!(accepted.get(), 1);
-            // UIA, keyboard and rotary share snapping and produce one committed action each.
-            out.clear();
-            controls.automation(
-                &[crate::uia::Action::SetValue(id, 2.0)],
-                &mut front,
-                &mut out,
-            )?;
-            controls.tick(
-                &[
-                    Report::Key {
-                        target: Some(id),
-                        event: KeyEvent {
-                            kind: KeyKind::Down,
-                            key: 0x24,
-                            repeat: false,
-                            mods: Mods::default(),
-                        },
-                    },
-                    Report::Rotary {
-                        target: Some(id),
-                        steps: 1.0,
-                        degrees: 1.0,
-                    },
-                ],
-                &mut front,
-                &mut out,
-            )?;
-            assert_eq!(
-                out.iter()
-                    .filter(|i| matches!(i.what, What::Scalar { commit: true, .. }))
-                    .count(),
-                3
-            );
-            assert!(out.iter().all(
-                |i| matches!(i.what, What::Scalar { value, .. } if (0.0..=1.0).contains(&value))
-            ));
-            // The stock switch uses the same scene-owned offset path.
-            let on = Cell::new(false);
-            let root = Host::with(|h| h.model().root());
-            let _toggle = crate::build::Ui::mount_at(root, None, scope, None, |ui| {
-                ui.toggle(on);
-            });
-            publish(&mut down, &mut controls, &mut front)?;
-            let before = front.scene.census().animations;
-            on.set(true);
-            publish(&mut down, &mut controls, &mut front)?;
-            assert!(
-                front.scene.census().animations > before,
-                "source adoption springs the real composition thumb"
-            );
-            // Measure the production driver and compositor calls after their buffers warm.
-            // This counts Rust allocations on this thread, not allocations inside Windows.
-            out.clear();
-            controls.tick(&[press(id), drag(id, 0.1)], &mut front, &mut out)?;
-            let animations = front.scene.census().animations;
-            let before = crate::counting::allocations();
-            for step in 0..1_000 {
-                out.clear();
-                controls.tick(
-                    &[drag(id, if step % 2 == 0 { 0.2 } else { 0.1 })],
-                    &mut front,
-                    &mut out,
-                )?;
-            }
-            let allocated = crate::counting::allocations() - before;
-            assert_eq!(
-                front.scene.census().animations - animations,
-                2_000,
-                "the allocation probe must actually retarget both native parts"
-            );
-            assert_eq!(allocated, 0, "warm scalar retargeting allocated");
-            out.clear();
-            controls.tick(
-                &[Report::Canceled {
-                    target: id,
-                    contact: 1,
-                }],
-                &mut front,
-                &mut out,
-            )?;
-            publish(&mut down, &mut controls, &mut front)?;
-            let before = crate::counting::allocations();
-            for _ in 0..100 {
-                publish(&mut down, &mut controls, &mut front)?;
-            }
-            assert_eq!(
-                crate::counting::allocations() - before,
-                0,
-                "unchanged flush/apply allocated"
-            );
-            // The in-flight value is readable for exactly as long as a gesture owns it.
-            assert_eq!(live.get(), None, "a settled control publishes no value");
-            out.clear();
-            controls.tick(&[press(id), drag(id, 0.1)], &mut front, &mut out)?;
-            Host::dispatch(&out);
-            let standing = f64::from(controls.rows.get(id).unwrap().fraction);
-            assert_eq!(
-                live.get(),
-                Some(standing),
-                "a moving gesture publishes the fraction the front thread stands at"
-            );
-            // Publication rides the existing dispatch, so a warm gesture still allocates
-            // nothing on this thread.
-            let before = crate::counting::allocations();
-            for step in 0..200 {
-                out.clear();
-                controls.tick(
-                    &[drag(id, if step % 2 == 0 { 0.2 } else { 0.1 })],
-                    &mut front,
-                    &mut out,
-                )?;
-                Host::dispatch(&out);
-            }
-            assert_eq!(
-                crate::counting::allocations() - before,
-                0,
-                "warm in-flight publication allocated"
-            );
-            assert!(live.get().is_some());
-            out.clear();
-            controls.tick(
-                &[Report::Canceled {
-                    target: id,
-                    contact: 1,
-                }],
-                &mut front,
-                &mut out,
-            )?;
-            Host::dispatch(&out);
-            assert_eq!(
-                live.get(),
-                None,
-                "a canceled gesture clears the value it was showing"
-            );
-            out.clear();
-            controls.tick(
-                &[
-                    press(id),
-                    drag(id, 0.1),
-                    Report::Released {
-                        target: id,
-                        contact: 1,
-                        at: Point::default(),
-                    },
-                ],
-                &mut front,
-                &mut out,
-            )?;
-            Host::dispatch(&out);
-            assert_eq!(
-                live.get(),
-                None,
-                "a committed gesture clears the value it was showing"
-            );
-            Ok(())
-        });
-    result
+fn native_one_writer_carries_every_value_and_a_changed_revision_supersedes_a_gesture() -> Result<()>
+{
+    let mut rig = Rig::new("scalar ownership")?;
+    let thumb = rig.node()?;
+    let id = rig.ids.mint();
+    rig.publish_hits(&[entry(id, 0.0, 0.0, 126.0, 32.0)])?;
+    let chrome = ChromeRow {
+        flags: flag::SLIDE,
+        ..ChromeRow::default()
+    };
+    let row = slider_row(thumb);
+    rig.adopt(&[(id, chrome)], &[(id, row)], &[])?;
+
+    // A mount arrives carried, so the thumb is placed rather than sprung to zero.
+    assert_eq!(rig.animations(), 0, "an adopted value must snap");
+    let minted = rig.visuals_minted();
+
+    let mut out = Vec::with_capacity(32);
+    // The pointer lands 13 DIPs in, which is the rail's own origin: the value is the floor.
+    rig.tick(&[press(id), moved(id, Point { x: 13.0, y: 8.0 })], &mut out)?;
+    assert_eq!(
+        out.iter()
+            .filter_map(|i| match i.what {
+                What::Scalar { value, .. } => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        [-24.0, -24.0],
+        "the hit box's half-thumb gutters are outside the value range"
+    );
+    // The press sprang and the move carried, which is the whole of the two platform facts.
+    assert_eq!(rig.animations(), 1);
+    out.clear();
+
+    rig.tick(&[moved(id, Point { x: 63.0, y: 8.0 })], &mut out)?;
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out[0].what, What::Scalar { value, commit: false, .. } if value == 0.0));
+    out.clear();
+
+    // A release at the far gutter settles at the ceiling and commits exactly once.
+    rig.tick(
+        &[Report::Released {
+            target: id,
+            contact: 1,
+            at: Point { x: 140.0, y: 8.0 },
+        }],
+        &mut out,
+    )?;
+    assert_eq!(committed(&out), 1);
+    assert!(matches!(out[0].what, What::Scalar { value, .. } if value == 24.0));
+    out.clear();
+
+    // A geometry-only update repeats the revision, so the pointer's fraction stands.
+    rig.adopt(
+        &[(id, chrome)],
+        &[(
+            id,
+            ValueRow {
+                rest: 20.0,
+                travel: 180.0,
+                ..row
+            },
+        )],
+        &[],
+    )?;
+    rig.tick(&[], &mut out)?;
+    assert!(out.is_empty(), "adopting geometry raises nothing");
+    rig.tick(&[press(id)], &mut out)?;
+    out.clear();
+
+    // A changed revision under a live contact adopts the application's value and supersedes
+    // the gesture standing on it, which is raised on the next tick.
+    rig.adopt(
+        &[(id, chrome)],
+        &[(
+            id,
+            ValueRow {
+                revision: 1,
+                fraction: 0.25,
+                ..row
+            },
+        )],
+        &[],
+    )?;
+    rig.tick(&[], &mut out)?;
+    assert_eq!(
+        out,
+        [Intent {
+            target: id,
+            what: What::Canceled(1)
+        }]
+    );
+    out.clear();
+
+    // A key, a detent and an automation set reach the same writer, so each snaps the same way
+    // and commits exactly once.
+    let mut front_out = Vec::new();
+    rig.automation(&[Action::SetValue(id, 2.0)], &mut front_out)?;
+    rig.tick(
+        &[
+            Report::Key {
+                target: Some(id),
+                event: KeyEvent {
+                    kind: KeyKind::Down,
+                    key: 0x24,
+                    repeat: false,
+                    mods: Mods::default(),
+                },
+            },
+            Report::Rotary {
+                target: Some(id),
+                degrees: 10.0,
+                steps: 1.0,
+            },
+        ],
+        &mut front_out,
+    )?;
+    // The rotary arm needs the turn flag, so only the key and the automation set land here.
+    assert_eq!(committed(&front_out), 2);
+    assert!(front_out.iter().all(|i| matches!(
+        i.what,
+        What::Scalar { value, .. } if (-24.0..=24.0).contains(&value)
+    )));
+    assert_eq!(
+        rig.visuals_minted(),
+        minted,
+        "the value path mints no visual"
+    );
+    Ok(())
+}
+
+#[test]
+fn native_a_turn_reads_the_rotation_about_its_own_centre_and_a_cancel_restores_it() -> Result<()> {
+    let mut rig = Rig::new("knob rotation")?;
+    let needle = rig.node()?;
+    let id = rig.ids.mint();
+    rig.publish_hits(&[entry(id, 0.0, 0.0, 48.0, 48.0)])?;
+    let chrome = ChromeRow {
+        flags: flag::TURN,
+        ..ChromeRow::default()
+    };
+    let row = ValueRow {
+        parts: [
+            (
+                needle,
+                ScalarPart::Rotation {
+                    from: 0.0,
+                    to: TURN_SWEEP,
+                },
+            ),
+            (NodeId::NONE, ScalarPart::None),
+            (NodeId::NONE, ScalarPart::None),
+            (NodeId::NONE, ScalarPart::None),
+        ],
+        min: 0.0,
+        span: 1.0,
+        rest: 0.0,
+        travel: 0.0,
+        fraction: 0.5,
+        step: 0.0,
+        revision: 0,
+    };
+    rig.adopt(&[(id, chrome)], &[(id, row)], &[])?;
+
+    let mut out = Vec::with_capacity(16);
+    rig.tick(&[press(id)], &mut out)?;
+    assert!(out.is_empty(), "a press on a turned control moves nothing");
+    // A quarter of the sweep clockwise, in the degrees the platform reports.
+    let quarter = (TURN_SWEEP * 0.25).to_degrees();
+    rig.tick(
+        &[Report::Gesture {
+            target: id,
+            contact: 1,
+            event: Recognised::ManipulationUpdated {
+                at: Point::default(),
+                delta: Manip::default(),
+                cumulative: Manip {
+                    rotation: quarter,
+                    ..Manip::default()
+                },
+            },
+        }],
+        &mut out,
+    )?;
+    assert_eq!(out.len(), 1);
+    assert!(
+        matches!(out[0].what, What::Scalar { value, .. } if (value - 0.75).abs() < 1e-5),
+        "a turn is a displacement from the fraction the contact landed on"
+    );
+    out.clear();
+
+    // A contact taken away puts the value back where it found it and commits nothing.
+    rig.tick(
+        &[Report::Canceled {
+            target: id,
+            contact: 1,
+        }],
+        &mut out,
+    )?;
+    assert_eq!(committed(&out), 0);
+    assert!(matches!(
+        out.last().expect("a cancel is reported").what,
+        What::Canceled(0)
+    ));
+    assert!(
+        out.iter()
+            .any(|i| matches!(i.what, What::Scalar { value, .. } if (value - 0.5).abs() < 1e-5))
+    );
+    Ok(())
+}
+
+#[test]
+fn native_a_canceled_decided_drag_raises_exactly_one_report() -> Result<()> {
+    let mut rig = Rig::new("drag cancellation")?;
+    let id = rig.ids.mint();
+    rig.publish_hits(&[entry(id, 0.0, 0.0, 200.0, 32.0)])?;
+    let chrome = ChromeRow {
+        flags: flag::DRAGS,
+        ..ChromeRow::default()
+    };
+    rig.adopt(&[(id, chrome)], &[], &[])?;
+
+    let mut out = Vec::with_capacity(8);
+    rig.tick(
+        &[
+            press(id),
+            dragged(id, Phase::Vertical, true),
+            // A locked drag reports zero on the axis it does not own, so a later sample can
+            // look undecided; the lock is never revisited and neither is this.
+            dragged(id, Phase::Undecided, false),
+            Report::Canceled {
+                target: id,
+                contact: 1,
+            },
+        ],
+        &mut out,
+    )?;
+    assert_eq!(
+        out.iter()
+            .filter(|i| matches!(
+                i.what,
+                What::DragEnded(_) | What::Canceled(_) | What::Tapped
+            ))
+            .count(),
+        1,
+        "a canceled decided drag ends once and is neither a tap nor a separate cancel"
+    );
+    assert_eq!(out.last().map(|i| i.what), Some(What::DragEnded(None)));
+    out.clear();
+
+    // Below the threshold a drag has no meaning, so a nudge while clicking is still a click.
+    rig.tick(
+        &[
+            press(id),
+            dragged(id, Phase::Undecided, false),
+            Report::Released {
+                target: id,
+                contact: 1,
+                at: Point::default(),
+            },
+        ],
+        &mut out,
+    )?;
+    assert_eq!(out.last().map(|i| i.what), Some(What::Tapped));
+    Ok(())
+}
+
+#[test]
+fn native_a_warm_gesture_allocates_nothing() -> Result<()> {
+    let mut rig = Rig::new("scalar allocation")?;
+    let thumb = rig.node()?;
+    let id = rig.ids.mint();
+    rig.publish_hits(&[entry(id, 0.0, 0.0, 126.0, 32.0)])?;
+    rig.adopt(
+        &[(
+            id,
+            ChromeRow {
+                flags: flag::SLIDE,
+                ..ChromeRow::default()
+            },
+        )],
+        &[(id, slider_row(thumb))],
+        &[],
+    )?;
+    let mut out = Vec::with_capacity(32);
+    rig.tick(&[press(id), moved(id, Point { x: 40.0, y: 8.0 })], &mut out)?;
+
+    // This counts Rust allocations on this thread, not allocations inside Windows.
+    let before = crate::counting::allocations();
+    let animations = rig.animations();
+    for step in 0..1_000 {
+        out.clear();
+        let x = if step % 2 == 0 { 40.0 } else { 80.0 };
+        rig.tick(&[moved(id, Point { x, y: 8.0 })], &mut out)?;
+    }
+    assert_eq!(
+        crate::counting::allocations() - before,
+        0,
+        "warm scalar retargeting allocated"
+    );
+    assert_eq!(
+        rig.animations(),
+        animations,
+        "a carried value is a write and not a spring"
+    );
+    Ok(())
+}
+
+#[test]
+fn native_retirement_takes_a_control_out_of_every_slot_it_is_held_in() -> Result<()> {
+    let mut rig = Rig::new("control lifetime")?;
+    let thumb = rig.node()?;
+    let id = rig.ids.mint();
+    rig.publish_hits(&[entry(id, 0.0, 0.0, 126.0, 32.0)])?;
+    rig.adopt(
+        &[(
+            id,
+            ChromeRow {
+                flags: flag::SLIDE | flag::DRAGS,
+                ..ChromeRow::default()
+            },
+        )],
+        &[(id, slider_row(thumb))],
+        &[],
+    )?;
+    let mut out = Vec::new();
+    rig.tick(
+        &[
+            Report::HoverChanged {
+                from: None,
+                to: Some(id),
+                at: Point::default(),
+                qpc: 0,
+            },
+            press(id),
+            dragged(id, Phase::Vertical, true),
+        ],
+        &mut out,
+    )?;
+    out.clear();
+
+    rig.adopt(&[], &[], &[id])?;
+    // A late report about a retired control reaches nothing, and the hit array still names it,
+    // so the miss is the table's own and not the router's.
+    rig.tick(
+        &[
+            Report::Released {
+                target: id,
+                contact: 1,
+                at: Point::default(),
+            },
+            Report::Canceled {
+                target: id,
+                contact: 1,
+            },
+        ],
+        &mut out,
+    )?;
+    assert!(
+        out.is_empty(),
+        "a retired generation cannot move a visual or raise an intent"
+    );
+    // The scene still answers for the point, which is what makes the miss a table decision.
+    assert!(
+        rig.scene
+            .hit(Point { x: 10.0, y: 10.0 }, ContactKind::Mouse)
+            .is_some()
+    );
+    Ok(())
 }

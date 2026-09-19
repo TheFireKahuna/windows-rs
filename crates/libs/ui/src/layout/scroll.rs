@@ -8,43 +8,42 @@
 //! because both are shaped by the widget that consumes them. `windows-scene` supplies the
 //! tracker and the binding.
 
-use crate::bindings::GestureSettings;
+use crate::GestureSettings;
+use crate::build::control::ControlRow;
 use crate::build::{Element, Host, Node, Ui};
-use crate::gesture::{Commit, DragAxes, DragDecl, DragPhase, GestureDecl};
+use crate::gesture::{DragDecl, DragUpdate, GestureDecl, Phase};
 use crate::input::Report;
-use crate::role::Metric;
+use crate::layout::{Edge, Layout, Len, Position, Preset, Rect, Table, anchors, probe};
+use crate::role::{Metric, metric};
 use crate::seam::{ScrollFront, ScrollOp};
 use crate::signal::{Cell, Effect, Memo};
 use crate::widget::Front;
 use core::cell::RefCell;
 use core::ops::Range;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use windows_core::Result;
 use windows_numerics::Vector2;
 use windows_scene::{
-    Anim, Bind, ControlId, GroupId, HitDecl, HitFlags, NodeId, Prop, SceneEvent, SpriteId,
+    Affine, Anim, Axes, Bind, ControlId, GroupId, HitDecl, HitFlags, Id, NodeId, Observed,
+    Phase as TrackerPhase, Prop, SceneEvent, SpriteId, TRACKER, TrackerAxis, TrackerId,
     TrackerRequest, Tuning, Value, unpack_offset,
 };
 
-use super::{Len, Preset, Table, anchors, probe};
+// ── the thumb ────────────────────────────────────────────────────────────────────
 
 /// When the thumb is visible.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum Reveal {
-    /// Always, taking room from the content.
-    Always,
-    /// Never — for a surface whose extent is obvious from what is in it.
-    Never,
     /// While the content is moving, while the pointer is over the surface, and for a moment
     /// after either ends.
     #[default]
     OnDemand,
+    /// Always, taking room from the content.
+    Always,
+    /// Never — for a surface whose extent is obvious from what is in it.
+    Never,
 }
-
-// ── thumb geometry ───────────────────────────────────────────────────────────────
-//
-// Raw DIPs: these are the scrollbar's own dimensions rather than the palette's spacing
-// scale, so they carry no `Metric` and do not move with density.
 
 /// How wide the thumb is.
 pub const THUMB_W: f32 = 6.0;
@@ -55,20 +54,20 @@ pub const THUMB_MARGIN: f32 = 2.0;
 pub const THUMB_MIN_H: f32 = 24.0;
 /// How far past the thumb a pointer still counts as over it. The drawn bar is 6 DIP, under
 /// the system's minimum target, so the hit entry is inflated rather than the bar widened.
-const THUMB_GRAB: f32 = 8.0;
-
-/// How long a concealed thumb waits before fading, once the reason to show it ends.
+const GRAB_INFLATE: f32 = 8.0;
+/// How much content must be out of view before the rail is worth arming, in DIPs.
 ///
-/// A delay on the spring rather than a timer: the compositor holds it, so a re-reveal
-/// inside the window is a retarget and the front thread never wakes for either edge.
+/// Sub-pixel overflow is a rounding residue of the solve rather than something to scroll.
+const OVERFLOW_FLOOR: f32 = 0.5;
+/// How long a thumb stays lit after the last reason to show it ends, in milliseconds.
+///
+/// The fade carries it as its own delay, so the compositor measures the wait and a reason
+/// arriving inside it replaces the fade rather than racing it.
 const CONCEAL_MS: u32 = 700;
 
 /// What a scrollbar is, at one pair of extents.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub struct ThumbGeom {
-    /// Whether there is anything to scroll. A viewport larger than its content has no
-    /// thumb and no tracker travel.
-    pub overflow: bool,
     /// How far the content can move.
     pub max_scroll: f32,
     /// How tall the thumb is.
@@ -77,30 +76,80 @@ pub struct ThumbGeom {
     pub travel: f32,
 }
 
+impl ThumbGeom {
+    /// What a container the half that moves thumbs has not been told about holds.
+    ///
+    /// `NaN` compares unequal to every geometry including itself, so the first publication is
+    /// emitted without a flag recording that none has happened.
+    pub const UNSENT: Self = Self {
+        max_scroll: f32::NAN,
+        thumb_h: 0.0,
+        travel: 0.0,
+    };
+
+    /// Returns whether there is anything to scroll and room to show a thumb in.
+    ///
+    /// Derived rather than stored, so the three numbers cannot disagree across the seam.
+    #[must_use]
+    pub fn overflow(self) -> bool {
+        self.max_scroll > OVERFLOW_FLOOR && self.travel > 0.0
+    }
+
+    /// Returns how big the thumb is drawn.
+    #[must_use]
+    pub fn size(self) -> Vector2 {
+        Vector2 {
+            x: THUMB_W,
+            y: self.thumb_h,
+        }
+    }
+
+    /// Returns where the thumb rests in a viewport `view_w` DIPs wide, at the content's origin.
+    #[must_use]
+    pub fn offset(self, view_w: f32) -> Vector2 {
+        Vector2 {
+            x: view_w - THUMB_W - THUMB_MARGIN,
+            y: THUMB_MARGIN,
+        }
+    }
+
+    /// Returns the map from the tracker's position to the thumb's own offset.
+    ///
+    /// [`thumb_y_for_scroll`] written as the affine the compositor evaluates, so the thumb the
+    /// user grabs and the value the binding renders are one function.
+    #[must_use]
+    pub fn affine(self) -> Affine {
+        Affine {
+            m: if self.max_scroll > 0.0 {
+                self.travel / self.max_scroll
+            } else {
+                0.0
+            },
+            c: THUMB_MARGIN,
+        }
+    }
+}
+
 /// Returns the scrollbar geometry for a viewport of `viewport_h` showing `content_h` of
 /// content.
 #[must_use]
 pub fn thumb_geom(viewport_h: f32, content_h: f32) -> ThumbGeom {
     let max_scroll = (content_h - viewport_h).max(0.0);
     let track_h = (viewport_h - 2.0 * THUMB_MARGIN).max(0.0);
-    if max_scroll <= 0.0 || track_h <= 0.0 {
-        return ThumbGeom {
-            overflow: false,
-            max_scroll: 0.0,
-            thumb_h: 0.0,
-            travel: 0.0,
-        };
-    }
-    // Proportional, then floored at THUMB_MIN_H and capped at the track: a very long
-    // document keeps a grabbable thumb, and the travel below subtracts the floored height
-    // rather than the proportional one.
-    let ratio = (viewport_h / content_h).clamp(0.0, 1.0);
-    let thumb_h = (track_h * ratio).max(THUMB_MIN_H).min(track_h);
+    // Proportional, then floored at THUMB_MIN_H and capped at the track: a very long document
+    // keeps a grabbable thumb, and the travel subtracts the floored height rather than the
+    // proportional one.
+    let (thumb_h, travel) = if max_scroll > 0.0 && track_h > 0.0 {
+        let ratio = (viewport_h / content_h).clamp(0.0, 1.0);
+        let thumb_h = (track_h * ratio).max(THUMB_MIN_H).min(track_h);
+        (thumb_h, track_h - thumb_h)
+    } else {
+        (0.0, 0.0)
+    };
     ThumbGeom {
-        overflow: true,
         max_scroll,
         thumb_h,
-        travel: track_h - thumb_h,
+        travel,
     }
 }
 
@@ -110,10 +159,12 @@ pub fn thumb_geom(viewport_h: f32, content_h: f32) -> ThumbGeom {
 /// value the binding is rendering.
 #[must_use]
 pub fn thumb_y_for_scroll(scroll: f32, geom: ThumbGeom) -> f32 {
-    if geom.max_scroll <= 0.0 {
-        return THUMB_MARGIN;
-    }
-    THUMB_MARGIN + (scroll / geom.max_scroll).clamp(0.0, 1.0) * geom.travel
+    let frac = if geom.max_scroll > 0.0 {
+        (scroll / geom.max_scroll).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    THUMB_MARGIN + frac * geom.travel
 }
 
 /// Returns the content offset a thumb dragged to `thumb_y` means, inverting
@@ -126,112 +177,114 @@ pub fn scroll_for_thumb_y(thumb_y: f32, geom: ThumbGeom) -> f32 {
     ((thumb_y - THUMB_MARGIN) / geom.travel).clamp(0.0, 1.0) * geom.max_scroll
 }
 
-/// Returns the rail's style: a strip down the right edge of the viewport, full height.
+/// The rail: a strip down the right edge of the viewport, full height.
 ///
 /// **The rail is the grab target, and the thumb is not.** The compositor moves the thumb, so
 /// its layout rect stays where the solve put it however far the content has travelled, and a
 /// hit entry on it would stop being under the drawn bar. The rail is static geometry, and
 /// where inside it a press landed is answered from the reported position.
 ///
-/// Pinned rather than scrolled: it lives inside the container it reports on and does not
-/// move with it.
-#[must_use]
-pub fn rail_style() -> windows_scene::taffy::Style {
-    use windows_scene::taffy;
-    use windows_scene::taffy::style_helpers::{TaffyAuto, TaffyZero};
-    taffy::Style {
-        position: taffy::Position::Absolute,
-        size: taffy::Size {
-            width: taffy::Dimension::length(THUMB_W + 2.0 * THUMB_MARGIN),
-            height: taffy::Dimension::AUTO,
-        },
-        inset: taffy::Rect {
-            left: taffy::LengthPercentageAuto::AUTO,
-            right: taffy::LengthPercentageAuto::ZERO,
-            top: taffy::LengthPercentageAuto::ZERO,
-            bottom: taffy::LengthPercentageAuto::ZERO,
-        },
-        ..taffy::Style::DEFAULT
+/// Pinned rather than scrolled: it lives inside the container it reports on and does not move
+/// with it.
+pub const RAIL: Layout = Layout {
+    position: Position::Pin(Edge::Right),
+    width: Len::dip(THUMB_W + 2.0 * THUMB_MARGIN),
+    height: Len::pct(1.0),
+    ..Layout::DEFAULTS[Preset::Layer as usize]
+};
+
+/// Returns the rail's hit entry: interactive, unscrolled, and inflated for touch.
+pub(crate) fn grab_hit(control: ControlId) -> HitDecl {
+    HitDecl {
+        // Pinned: the rail lives inside the container it reports on and does not move with it,
+        // so its rect must not resolve through that container's offset.
+        flags: HitFlags::INTERACTIVE.union(HitFlags::UNSCROLLED),
+        id: control,
+        touch_inflate: Some(GRAB_INFLATE),
     }
 }
 
-/// What a scroll container is declared with.
+/// Returns the rail's gesture declaration, so a pointer can grab the bar in it.
 ///
-/// The state travels with the reveal policy so that a list and the mount reporting into it
-/// share one [`ListState`]; a second handle would be a second answer to where the content
-/// is. Ordinary containers hold no application state; their position stays in the
-/// scene-side shadow shared with input hit testing.
-#[derive(Copy, Clone, Debug)]
-pub struct ScrollDecl {
-    pub reveal: Reveal,
-    pub state: Option<ListState>,
-}
-
-/// Returns a scrolling container over `children`, with the default reveal policy.
-///
-/// The children go into a content group of their own, because the viewport must not move:
-/// it is what clips, and an offset on it would take the clip with it.
-pub fn scroll<'a>(ui: &'a mut Ui<'_>, children: impl FnOnce(&mut Ui<'_>)) -> Element<'a> {
-    scroll_with(ui, Reveal::default(), children)
-}
-
-/// Creates a scrolling container with an explicit thumb reveal policy.
-pub fn scroll_with<'a>(
-    ui: &'a mut Ui<'_>,
-    reveal: Reveal,
-    children: impl FnOnce(&mut Ui<'_>),
-) -> Element<'a> {
-    ui.scroll(
-        ScrollDecl {
-            reveal,
-            state: None,
-        },
-        children,
-    )
+/// A hit entry and a drag, with no wash and no chrome row: the thumb's opacity is retargeted
+/// from the front half, and a control the front table adopted would give that channel two
+/// owners.
+pub(crate) fn grab_decl() -> GestureDecl {
+    GestureDecl {
+        settings: GestureSettings::None,
+        drag: Some(DragDecl {
+            horizontal: false,
+            // Below the default: a scrollbar is aimed at, so the grab should follow the first
+            // pixel rather than absorb six of them.
+            threshold: 1.0,
+            // The content tracks the thumb rather than landing when it is let go.
+            live: true,
+            ..DragDecl::default()
+        }),
+        ..GestureDecl::default()
+    }
 }
 
 // ── where the content is, and how tall it is ─────────────────────────────────────
 
-/// Where a list's content is, and what the solve has measured of it.
+/// Where a list's content stands and what it has been asked for, as one value.
 ///
-/// A tracker's own getter answers with what was last set rather than with what the
-/// compositor is evaluating, so the position reported in a [`SceneEvent`] is **the only
-/// trustworthy read of one**. [`observe`] writes what it was told into here, and everything
-/// above reads it as an ordinary signal — the realization window is a [`Memo`] over it.
-///
-/// The extent table rides here too, because the container and the band group it holds are
-/// two nodes and one list: the container reports where the content is, the band group states
-/// how tall it is, and a second handle would be a second answer to either.
-#[derive(Copy, Clone, Debug)]
-pub struct ListState {
-    offset: Cell<f32>,
-    /// Where inertia will rest, for as long as it is running.
+/// One signal rather than seven: every field but [`Pos::band_y`] is an input to the
+/// realization window, so a write to any of them has to wake it, and the window's own equality
+/// gate stops the one that does not.
+#[derive(Copy, Clone, PartialEq, Debug, Default)]
+pub struct Pos {
+    /// The content offset the tracker last reported.
+    pub offset: f32,
+    /// The viewport's solved height.
+    pub viewport: f32,
+    /// How far the band group sits below the top of the content, in DIPs.
+    ///
+    /// The rows are placed in the group's own space and the tracker reports the content's, so
+    /// this is what carries one into the other.
+    pub band_y: f32,
+    /// Where inertia will rest, `NaN` while nothing is in flight.
     ///
     /// Held **beside** the offset and never in place of it: the destination is realized as
     /// soon as it is known, while the rows the offset still names stay realized too.
-    target: Cell<Option<f32>>,
-    /// The viewport's solved height.
-    viewport: Cell<f32>,
+    pub target: f32,
     /// The extent the content is held at until the tracker goes idle, in row heights.
     ///
     /// Zero while it is idle. A measurement landing mid-interaction may lengthen the content
     /// and may never shorten it, so the maximum position climbs toward the truth and never
     /// steps back under a moving finger.
-    held: Cell<f32>,
+    pub held: f32,
     /// The row the list realizes wherever the content stands, under the application's own
     /// identity for it.
     ///
     /// What keeps a focused row on the tree: an unrealized row has no node, so it has no hit
     /// entry, no focus ring and nothing for the focus order to land on.
-    pinned: Cell<Option<u64>>,
+    pub pin: Option<u64>,
     /// The row to bring into view, cleared by the flush that asks for it.
-    reveal: Cell<Option<u64>>,
-    /// How far the band group sits below the top of the content, in DIPs.
-    ///
-    /// The rows are placed in the group's own space and the tracker reports the content's, so
-    /// this is what carries one into the other. Whatever the list is declared above — an
-    /// inset, a heading, a command — is ordinary flow content and this is its height.
-    lead: Cell<f32>,
+    pub reveal: Option<u64>,
+}
+
+impl Pos {
+    /// Returns where inertia will rest, or `None` when nothing is in flight.
+    #[must_use]
+    pub fn target(self) -> Option<f32> {
+        (!self.target.is_nan()).then_some(self.target)
+    }
+}
+
+/// Where a list's content is, and what the solve has measured of it.
+///
+/// A tracker's own getter answers with what was last set rather than with what the compositor
+/// is evaluating, so the position reported in a [`SceneEvent`] is **the only trustworthy read
+/// of one**. [`observe`] writes what it was told into here, and everything above reads it as
+/// an ordinary signal — the realization window is a [`Memo`] over it.
+///
+/// The extent table rides here too, because the container and the band group it holds are two
+/// nodes and one list: the container reports where the content is, the band group states how
+/// tall it is, and a second handle would be a second answer to either.
+#[derive(Copy, Clone, Debug)]
+pub struct ListState {
+    pos: Cell<Pos>,
     rows: Cell<Rows>,
 }
 
@@ -239,48 +292,46 @@ pub struct ListState {
 #[must_use]
 pub fn list_state() -> ListState {
     ListState {
-        offset: Cell::new(0.0),
-        target: Cell::new(None),
-        viewport: Cell::new(0.0),
-        held: Cell::new(0.0),
-        pinned: Cell::new(None),
-        reveal: Cell::new(None),
-        lead: Cell::new(0.0),
+        pos: Cell::new(Pos {
+            target: f32::NAN,
+            ..Pos::default()
+        }),
         rows: Cell::new(Rows::default()),
     }
 }
 
 impl ListState {
-    /// Records the content offset the tracker reported.
-    pub fn moved(self, y: f32) {
-        self.offset.set(y);
+    /// Returns where the content stands and what it has been asked for.
+    #[must_use]
+    pub fn pos(self) -> Pos {
+        self.pos.get()
     }
 
-    /// Records where inertia will rest.
-    ///
-    /// `y` must be the **modified** destination: snap points are applied to that one and not
-    /// to the natural one.
-    pub fn flinging_to(self, y: f32) {
-        self.target.set(Some(y));
+    /// Returns the content offset the tracker last reported.
+    #[must_use]
+    pub fn offset(self) -> f32 {
+        self.pos.get().offset
     }
 
-    /// Holds the content's extent where it now stands, for as long as the tracker is moving.
-    pub fn interacting(self) {
-        if self.held.peek() <= 0.0 {
-            self.held.set(self.rows.with(Rows::span));
-        }
+    /// Returns the viewport's height.
+    #[must_use]
+    pub fn viewport(self) -> f32 {
+        self.pos.get().viewport
     }
 
-    /// Clears the destination and the held extent once the tracker stops, leaving nothing
-    /// ahead to realize and the measured extent free to shorten.
-    pub fn settled(self) {
-        self.target.set(None);
-        self.held.set(0.0);
+    /// Records the viewport's own height, from the solved layout.
+    pub fn resized(self, height: f32) {
+        self.edit(|at| at.viewport = height);
+    }
+
+    /// Records how far the band group sits below the top of the content.
+    pub fn banded(self, y: f32) {
+        self.edit(|at| at.band_y = y);
     }
 
     /// Keeps the row `key` names realized, or releases the one that was.
     pub fn pin(self, key: Option<u64>) {
-        self.pinned.set(key);
+        self.edit(|at| at.pin = key);
     }
 
     /// Asks the tracker to bring the row `key` names into view.
@@ -289,7 +340,7 @@ impl ListState {
     /// request rather than a write: the compositor owns the position, so the scroll is
     /// animated by it and the rows are realized from what it reports back.
     pub fn reveal(self, key: u64) {
-        self.reveal.set(Some(key));
+        self.edit(|at| at.reveal = Some(key));
     }
 
     /// Returns where the content has to stand for the revealed row to be inside a viewport of
@@ -298,18 +349,17 @@ impl ListState {
     /// `None` where nothing was asked for, where the row has left the list, or where it is
     /// already in view — a reveal that asked for the position the content already has would
     /// interrupt whatever the user is doing to arrive where they are.
-    pub(crate) fn take_reveal(self, viewport_h: f32) -> Option<f32> {
-        let key = self.reveal.peek()?;
-        self.reveal.set(None);
-        let lead = self.lead.peek();
-        let now = self.offset.peek();
+    pub fn take_reveal(self, viewport_h: f32) -> Option<f32> {
+        let at = self.pos.peek();
+        let key = at.reveal?;
+        self.edit(|held| held.reveal = None);
         self.rows.with(|rows| {
-            let at = rows.index_of(key)?;
-            let top = lead + rows.offset(at);
-            let bottom = top + rows.extent(at);
-            if bottom > now + viewport_h {
+            let index = rows.index_of(key)?;
+            let top = at.band_y + rows.offset(index);
+            let bottom = top + rows.extent(index);
+            if bottom > at.offset + viewport_h {
                 Some((bottom - viewport_h).max(0.0))
-            } else if top < now {
+            } else if top < at.offset {
                 Some(top)
             } else {
                 None
@@ -317,27 +367,13 @@ impl ListState {
         })
     }
 
-    /// Records the viewport's own height, from the solved layout.
-    pub fn resized(self, height: f32) {
-        self.viewport.set(height);
-    }
-
-    /// Returns the content offset the tracker last reported.
+    /// Returns the extent the content is laid out at, in row heights.
+    ///
+    /// The held extent wins while a manipulation is live, so a measurement landing under a
+    /// moving finger lengthens the content and never shortens it.
     #[must_use]
-    pub fn offset(self) -> f32 {
-        self.offset.get()
-    }
-
-    /// Returns where inertia will rest, or `None` when nothing is in flight.
-    #[must_use]
-    pub fn target(self) -> Option<f32> {
-        self.target.get()
-    }
-
-    /// Returns the viewport's height.
-    #[must_use]
-    pub fn viewport(self) -> f32 {
-        self.viewport.get()
+    pub fn extent(self) -> f32 {
+        self.rows.with(Rows::total_units).max(self.pos.get().held)
     }
 
     /// Calls `f` with the extent table, registering a dependency for the reading effect or
@@ -349,9 +385,14 @@ impl ListState {
         self.rows.with(f)
     }
 
-    /// Returns the extent the content is laid out at, in row heights.
-    pub(crate) fn extent(self) -> f32 {
-        self.rows.with(Rows::span).max(self.held.get())
+    /// Applies one change to the position.
+    ///
+    /// The one writer of [`Pos`], so a transition that has to move two fields together wakes
+    /// the realization window once.
+    pub(crate) fn edit(self, f: impl FnOnce(&mut Pos)) {
+        let mut at = self.pos.peek();
+        f(&mut at);
+        self.pos.set(at);
     }
 }
 
@@ -360,25 +401,25 @@ impl ListState {
 /// Where a list puts every row, whether it is realized or not.
 ///
 /// **Offsets are counted in the list's own row height**, not in DIPs, so a placement is a
-/// [`Len::Times`] of the metric the list was declared with and re-lowers with the type ramp
-/// like any other length. [`Rows::unit`] carries what one of them measures, which is what
-/// turns a count back into the DIPs a pointer arrives in.
+/// `Len::times` of the metric the list was declared with and re-lowers with the type ramp.
+/// [`Rows::unit`] carries what one of them measures, which is what turns a count back into the
+/// DIPs a pointer arrives in.
 ///
 /// A row is either **estimated** — [`ListSpec::estimate`], until the solve has reported a box
 /// for it — or **measured**. A measurement is kept once taken, so a row scrolled out of the
 /// window and back does not revert to the estimate and the offsets above the viewport stop
 /// moving once they have been visited.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Default, Debug)]
 pub struct Rows {
-    /// One row height in DIPs, at the scope the band group was solved at. Zero until the
-    /// first solve has reported one.
+    /// One row height in DIPs, at the scope the band group was solved at. Zero until the first
+    /// solve has reported one.
     unit: f32,
     /// The application's identity for each row, in list order.
     keys: Vec<u64>,
-    /// Each row's extent, in row heights.
-    extent: Vec<f32>,
-    /// Whether that extent is the solve's or the estimate.
-    measured: Vec<bool>,
+    /// Row `i`'s extent in row heights, **negated while it is still the estimate**. A zero box
+    /// is never a measurement, so the sign answers for every row and no parallel column of
+    /// flags can fall out of step with it.
+    extents: Vec<f32>,
     /// `prefix[i]` is row `i`'s offset and `prefix[len]` is the whole list's extent, both in
     /// row heights. One entry longer than [`Rows::keys`], so both answers are a lookup.
     prefix: Vec<f32>,
@@ -406,7 +447,7 @@ impl Rows {
     /// Returns the position `key` holds in the list, or `None` where it holds none.
     #[must_use]
     pub fn index_of(&self, key: u64) -> Option<usize> {
-        self.keys.iter().position(|&k| k == key)
+        self.keys.iter().position(|&held| held == key)
     }
 
     /// Returns the key at `index`, or `None` past the end of the list.
@@ -418,76 +459,83 @@ impl Rows {
     /// Returns row `index`'s top edge in DIPs, measured from the band group's own corner.
     #[must_use]
     pub fn offset(&self, index: usize) -> f32 {
-        self.prefix.get(index).copied().unwrap_or(0.0) * self.unit
+        self.offset_units(index) * self.unit
     }
 
     /// Returns row `index`'s own height in DIPs.
     #[must_use]
     pub fn extent(&self, index: usize) -> f32 {
-        self.extent.get(index).copied().unwrap_or(0.0) * self.unit
+        self.extents.get(index).map_or(0.0, |e| e.abs()) * self.unit
     }
 
     /// Returns the whole list's height in DIPs.
     #[must_use]
     pub fn total(&self) -> f32 {
-        self.span() * self.unit
+        self.total_units() * self.unit
     }
 
     /// Returns whether row `index`'s extent is what the solve measured rather than the
     /// estimate.
     #[must_use]
     pub fn is_measured(&self, index: usize) -> bool {
-        self.measured.get(index).copied().unwrap_or(false)
+        self.extents.get(index).is_some_and(|&e| e > 0.0)
+    }
+
+    /// Returns row `index`'s offset in row heights, which is what a placement states.
+    #[must_use]
+    pub fn offset_units(&self, index: usize) -> f32 {
+        self.prefix.get(index).copied().unwrap_or(0.0)
+    }
+
+    /// Returns the whole list's extent, in row heights.
+    #[must_use]
+    pub fn total_units(&self) -> f32 {
+        self.prefix.last().copied().unwrap_or(0.0)
     }
 
     /// Returns the row the content position `y` falls in, clamped to the list.
     ///
-    /// **Answers inside `0..len` at any `y`.** A tracker's position travels outside its
-    /// bounds during a manipulation — the overpan is the bounce — so this is asked about
-    /// positions past both ends of the content.
+    /// **Answers inside `0..len` at any `y`.** A tracker's position travels outside its bounds
+    /// during a manipulation — the overpan is the bounce — so this is asked about positions
+    /// past both ends of the content.
     #[must_use]
     pub fn at(&self, y: f32) -> usize {
-        if self.keys.is_empty() || self.unit <= 0.0 {
+        let Some(units) = self.units_at(y) else {
             return 0;
-        }
-        let u = y / self.unit;
-        // `prefix` ascends, so the row is the last one whose offset is at or before `u`, and
-        // the search is over the offsets alone rather than over the whole table.
-        self.prefix[..self.keys.len()]
-            .partition_point(|&at| at <= u)
+        };
+        // The row is the last one whose top edge is at or before `units`, so a boundary
+        // belongs to the row it opens.
+        self.tops()
+            .partition_point(|&top| top <= units)
             .saturating_sub(1)
     }
 
-    /// Returns the first row whose top edge is at or below `y`, which is one past the last
-    /// row a span reaching `y` shows.
+    /// Returns the first row whose top edge is at or below `y`, which is one past the last row
+    /// a span reaching `y` shows.
     ///
     /// At least one, so a viewport with no height still realizes the row under its top edge
     /// and the list has something to measure before it has a scale.
-    fn past(&self, y: f32) -> usize {
-        let count = self.keys.len();
-        if count == 0 {
-            return 0;
-        }
-        if self.unit <= 0.0 {
-            return 1;
-        }
-        self.prefix[..count]
-            .partition_point(|&at| at < y / self.unit)
-            .max(1)
+    #[must_use]
+    pub fn past(&self, y: f32) -> usize {
+        let Some(units) = self.units_at(y) else {
+            return usize::from(!self.keys.is_empty());
+        };
+        self.tops().partition_point(|&top| top < units).max(1)
     }
 
-    /// Returns the whole list's extent, in row heights.
-    fn span(&self) -> f32 {
-        self.prefix.last().copied().unwrap_or(0.0)
+    /// Returns the rows' top edges, which is the prefix table without the list's own total.
+    fn tops(&self) -> &[f32] {
+        &self.prefix[..self.keys.len()]
     }
 
-    /// Returns row `index`'s offset in row heights, which is what a placement states.
-    fn units(&self, index: usize) -> f32 {
-        self.prefix.get(index).copied().unwrap_or(0.0)
+    /// Returns `y` in row heights, or `None` for an empty list or one with no scale yet.
+    fn units_at(&self, y: f32) -> Option<f32> {
+        (self.unit > 0.0 && !self.keys.is_empty()).then(|| y / self.unit)
     }
 
     /// Returns whether `keys` names a different list from the one held.
-    fn stale(&self, keys: &[u64]) -> bool {
+    #[must_use]
+    pub fn differs(&self, keys: &[u64]) -> bool {
         self.keys != keys
     }
 
@@ -496,56 +544,60 @@ impl Rows {
     /// A key that was not in the list before is the estimate, and one that has left takes its
     /// measurement with it. Reordering is therefore free of re-measurement, which is what
     /// keeps a dragged row from changing height as it lands.
-    fn sync(&mut self, keys: &[u64], estimate: f32) {
-        let carried: Vec<(f32, bool)> = keys
-            .iter()
-            .map(|&key| {
-                self.index_of(key)
-                    .filter(|&at| self.measured[at])
-                    .map_or((estimate, false), |at| (self.extent[at], true))
-            })
-            .collect();
+    pub fn take(&mut self, keys: &[u64], estimate: f32) {
+        let was = core::mem::take(&mut self.extents);
+        let mut cursor = 0;
+        for &key in keys {
+            // A reorder moves few rows, so the scan resumes where the last key was found and
+            // wraps once, rather than searching the whole list for every key.
+            let found = self.keys[cursor..]
+                .iter()
+                .position(|&held| held == key)
+                .map(|at| at + cursor)
+                .or_else(|| self.keys[..cursor].iter().position(|&held| held == key));
+            cursor = found.map_or(cursor, |at| at + 1).min(self.keys.len());
+            // Only a measurement is carried: an unmeasured row takes whatever the list now
+            // guesses, so a changed estimate reaches every row that has not been visited.
+            self.extents.push(
+                found
+                    .map(|at| was[at])
+                    .filter(|&extent| extent > 0.0)
+                    .unwrap_or(-estimate),
+            );
+        }
         self.keys.clear();
         self.keys.extend_from_slice(keys);
-        self.extent.clear();
-        self.measured.clear();
-        for (extent, measured) in carried {
-            self.extent.push(extent);
-            self.measured.push(measured);
-        }
-        self.rebuild();
+        self.reflow();
     }
 
     /// Returns whether `table` reports a scale or an extent the held table does not have.
-    fn differs(&self, table: &Table, unit: f32) -> bool {
-        if self.unit != unit {
-            return true;
-        }
-        table.iter().any(|entry| {
-            self.index_of(entry.key).is_some_and(|at| {
-                measured_units(entry.rect, unit).is_some_and(|extent| self.extent[at] != extent)
+    ///
+    /// Read-only, because the write is what wakes every reader of the extents: a solve that
+    /// measured nothing new must not wake them.
+    #[must_use]
+    pub fn needs(&self, table: &Table, unit: f32) -> bool {
+        unit != self.unit
+            || table.iter().any(|row| {
+                matches!(
+                    (row_units(row.rect, unit), self.index_of(row.key)),
+                    (Some(extent), Some(at)) if self.extents[at] != extent
+                )
             })
-        })
     }
 
     /// Writes every realized row's measured extent, and the scale they were measured at.
     ///
-    /// A key the table reports and the list does not hold is dropped: the two are published
-    /// by different passes of one flush, so a row can be measured on the solve that removed
-    /// it from the document.
-    fn absorb(&mut self, table: &Table, unit: f32) {
+    /// A key the table reports and the list does not hold is dropped: the two are published by
+    /// different passes of one flush, so a row can be measured on the solve that removed it
+    /// from the document.
+    pub fn write(&mut self, table: &Table, unit: f32) {
         self.unit = unit;
-        for entry in table.iter() {
-            let Some(at) = self.index_of(entry.key) else {
-                continue;
-            };
-            let Some(extent) = measured_units(entry.rect, unit) else {
-                continue;
-            };
-            self.extent[at] = extent;
-            self.measured[at] = true;
+        for row in table.iter() {
+            if let (Some(extent), Some(at)) = (row_units(row.rect, unit), self.index_of(row.key)) {
+                self.extents[at] = extent;
+            }
         }
-        self.rebuild();
+        self.reflow();
     }
 
     /// Recomputes the offsets from the extents.
@@ -553,14 +605,13 @@ impl Rows {
     /// One pass over the list and no allocation once the table has been sized: correcting a
     /// row's extent moves every row below it, and a table that answered by summing on demand
     /// would walk the list per row per placement.
-    fn rebuild(&mut self) {
-        let (extent, prefix) = (&self.extent, &mut self.prefix);
-        prefix.clear();
-        prefix.push(0.0);
+    fn reflow(&mut self) {
+        self.prefix.clear();
+        self.prefix.push(0.0);
         let mut at = 0.0;
-        for &each in extent {
-            at += each;
-            prefix.push(at);
+        for &extent in &self.extents {
+            at += extent.abs();
+            self.prefix.push(at);
         }
     }
 }
@@ -569,35 +620,34 @@ impl Rows {
 ///
 /// A zero box is what a table reads before its node is solved, and a row of no height would
 /// stack every row below it on the same line.
-fn measured_units(rect: windows_scene::Rect, unit: f32) -> Option<f32> {
+fn row_units(rect: Rect, unit: f32) -> Option<f32> {
     (unit > 0.0 && rect.y1 > rect.y0).then(|| (rect.y1 - rect.y0) / unit)
 }
 
-// ── virtualization ───────────────────────────────────────────────────────────────
+// ── the realization window ───────────────────────────────────────────────────────
 
 /// What a list needs to decide which rows exist.
 ///
-/// **Variable extents.** A row's own content decides how tall it is, so a realized row is
-/// what the solve measured and an unrealized one is [`ListSpec::estimate`]. Every extent is
-/// counted in [`ListSpec::row_h`], which is therefore the list's unit as well as its guess.
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// **Variable extents.** A row's own content decides how tall it is, so a realized row is what
+/// the solve measured and an unrealized one is [`ListSpec::estimate`]. Every extent is counted
+/// in [`ListSpec::row_h`], which is therefore the list's unit as well as its guess.
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub struct ListSpec {
     /// The row height, as the palette's — so a list is as dense as the user asked for.
     pub row_h: Metric,
     /// What a row the solve has not measured is assumed to be, in `row_h`.
     pub estimate: f32,
-    /// Rows realized beyond the viewport on each side. Two or three: enough that a row
-    /// exists before it is looked at, few enough that a fling does not realize a screen it
-    /// will never show.
+    /// Rows realized beyond the viewport on each side. Two or three: enough that a row exists
+    /// before it is looked at, few enough that a fling does not realize a screen it will never
+    /// show.
     pub overscan: usize,
 }
 
 /// Rows realized beyond the viewport on each side unless a list states otherwise.
-const OVERSCAN: usize = 3;
+pub const OVERSCAN: usize = 3;
 
 impl ListSpec {
-    /// Returns a list whose rows are one [`Metric::RowH`](crate::role::Metric) until they are
-    /// measured.
+    /// Returns a list whose rows are one `row_h` until they are measured.
     ///
     /// The height is a metric rather than a length, so the list is as dense as the user asked
     /// for and re-lowers with the type ramp.
@@ -630,82 +680,64 @@ impl ListSpec {
 
 /// How many points are sampled between where a fling started and where it lands.
 ///
-/// The corridor covers a glance mid-flight rather than a read, so the path is sampled and
-/// the rows realized for it do not scale with the distance flung.
+/// The corridor covers a glance mid-flight rather than a read, so the path is sampled and the
+/// rows realized for it do not scale with the distance flung.
 const CORRIDOR: usize = 2;
 
-/// How many runs a realized set holds: the live window, the destination, the corridor
-/// between them, and the pinned row.
+/// How many runs a realized set holds: the live window, the destination, the corridor points
+/// between them, and the pinned row. Sized so nothing a fling asks for is dropped.
 const MAX_RUNS: usize = 3 + CORRIDOR;
 
 /// Which rows are worth existing, as a bounded set of runs.
 ///
 /// Several runs rather than one range: the resting position is known the instant inertia
-/// begins, so the rows a fling lands on are realized before it arrives, and those are
-/// nowhere near the ones on screen. Bounded and `Copy`, so realization allocates nothing.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// begins, so the rows a fling lands on are realized before it arrives, and those are nowhere
+/// near the ones on screen. Bounded and `Copy`, so realization allocates nothing.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Realized {
-    runs: [(usize, usize); MAX_RUNS],
-    len: usize,
+    runs: [(u32, u32); MAX_RUNS],
+    n: u8,
 }
 
 impl Realized {
-    const EMPTY: Self = Self {
-        runs: [(0, 0); MAX_RUNS],
-        len: 0,
-    };
-
     /// Returns the runs, ascending and disjoint.
     pub fn runs(&self) -> impl Iterator<Item = Range<usize>> + '_ {
-        self.runs[..self.len].iter().map(|&(start, end)| start..end)
-    }
-
-    /// Returns how many rows the set realizes.
-    #[must_use]
-    pub fn rows(&self) -> usize {
-        self.runs[..self.len]
+        self.runs[..usize::from(self.n)]
             .iter()
-            .map(|&(start, end)| end - start)
-            .sum()
+            .map(|&(start, end)| start as usize..end as usize)
     }
 
-    /// Returns whether `index` falls in one of the runs.
-    #[must_use]
-    pub fn contains(&self, index: usize) -> bool {
-        self.runs[..self.len]
-            .iter()
-            .any(|&(start, end)| index >= start && index < end)
-    }
-
-    /// Appends a run, dropping an empty one and anything past `MAX_RUNS`.
+    /// Appends a run, dropping an empty one and anything past [`MAX_RUNS`].
     fn push(&mut self, run: Range<usize>) {
-        if run.is_empty() || self.len == MAX_RUNS {
+        if run.is_empty() || usize::from(self.n) == MAX_RUNS {
             return;
         }
-        self.runs[self.len] = (run.start, run.end);
-        self.len += 1;
+        self.runs[usize::from(self.n)] = (run.start as u32, run.end as u32);
+        self.n += 1;
     }
 
-    /// Sorts the runs by start and coalesces the overlaps. Insertion sort over at most
-    /// `MAX_RUNS` entries, in place.
-    fn merge(&mut self) {
-        for i in 1..self.len {
+    /// Sorts the runs by start and coalesces the overlaps.
+    ///
+    /// Insertion sort over at most [`MAX_RUNS`] entries, in place.
+    fn normalize(&mut self) {
+        let n = usize::from(self.n);
+        for i in 1..n {
             let mut j = i;
             while j > 0 && self.runs[j - 1].0 > self.runs[j].0 {
                 self.runs.swap(j - 1, j);
                 j -= 1;
             }
         }
-        let mut write = 0;
-        for read in 1..self.len {
-            if self.runs[read].0 <= self.runs[write].1 {
-                self.runs[write].1 = self.runs[write].1.max(self.runs[read].1);
+        let mut out = 0;
+        for i in 1..n {
+            if self.runs[i].0 <= self.runs[out].1 {
+                self.runs[out].1 = self.runs[out].1.max(self.runs[i].1);
             } else {
-                write += 1;
-                self.runs[write] = self.runs[read];
+                out += 1;
+                self.runs[out] = self.runs[i];
             }
         }
-        self.len = self.len.min(write + 1);
+        self.n = if n == 0 { 0 } else { out as u8 + 1 };
     }
 }
 
@@ -716,52 +748,84 @@ impl Realized {
 /// about positions past the end of the content. An empty list answers `0..0`.
 #[must_use]
 pub fn window(scroll_y: f32, viewport_h: f32, rows: &Rows, overscan: usize) -> Range<usize> {
-    let count = rows.len();
-    if count == 0 {
+    if rows.is_empty() {
         return 0..0;
     }
     // A position past the end answers the last row, which is what makes the overpan realize
-    // the end of the list rather than nothing; the two clamps below are what keep the run
-    // inside it.
+    // the end of the list rather than nothing; the two clamps are what keep the run inside it.
     let first = rows.at(scroll_y).saturating_sub(overscan);
-    let last = (rows.past(scroll_y + viewport_h.max(0.0)) + overscan).min(count);
+    let last = (rows.past(scroll_y + viewport_h.max(0.0)) + overscan).min(rows.len());
     first..last.max(first)
 }
 
 /// Returns the whole realized set: where the content is, where a fling is taking it, a fixed
 /// number of samples of the path between, and the row the list was told to keep.
 ///
-/// The corridor is sampled rather than swept, so a fling crossing three thousand rows
-/// realizes two windows and two overscan bands however far it travels. Allocates nothing.
+/// The corridor is sampled rather than swept, so a fling crossing three thousand rows realizes
+/// two windows and two overscan bands however far it travels. Allocates nothing.
 #[must_use]
-pub fn realize(
-    offset: f32,
-    target: Option<f32>,
-    viewport_h: f32,
-    pinned: Option<usize>,
-    rows: &Rows,
-    spec: &ListSpec,
-) -> Realized {
-    let mut out = Realized::EMPTY;
-    out.push(window(offset, viewport_h, rows, spec.overscan));
-    if let Some(target) = target {
-        for step in 1..=CORRIDOR {
-            let at = offset + (target - offset) * (step as f32) / ((CORRIDOR + 1) as f32);
+pub fn realize(rows: &Rows, at: Pos, overscan: usize) -> Realized {
+    // The tracker reports the content's position and the rows are placed in the band group's
+    // own space, so every position asked about is pulled back by where that group starts.
+    let live = at.offset - at.band_y;
+    let mut out = Realized::default();
+    out.push(window(live, at.viewport, rows, overscan));
+    if let Some(rest) = at.target() {
+        let rest = rest - at.band_y;
+        for sample in 1..=CORRIDOR {
+            let point = live + (rest - live) * sample as f32 / (CORRIDOR + 1) as f32;
             // Zero height, so a sample is the overscan band around a point rather than a
             // second viewport's worth of rows nobody will look at.
-            out.push(window(at, 0.0, rows, spec.overscan));
+            out.push(window(point, 0.0, rows, overscan));
         }
-        out.push(window(target, viewport_h, rows, spec.overscan));
+        out.push(window(rest, at.viewport, rows, overscan));
     }
-    if let Some(pinned) = pinned.filter(|&at| at < rows.len()) {
-        out.push(pinned..pinned + 1);
+    if let Some(index) = at.pin.and_then(|key| rows.index_of(key)) {
+        out.push(index..index + 1);
     }
-    out.merge();
+    out.normalize();
     out
 }
 
-/// Returns a scrolling container driving `state`, for a [`list`] and whatever else the
-/// content carries.
+// ── the containers ───────────────────────────────────────────────────────────────
+
+/// What a scroll container is declared with.
+///
+/// The state travels with the reveal policy so that a list and the mount reporting into it
+/// share one [`ListState`]; a second handle would be a second answer to where the content is.
+/// Ordinary containers hold no application state; their position stays in the scene-side
+/// shadow shared with input hit testing.
+#[derive(Copy, Clone, Debug)]
+pub struct ScrollDecl {
+    pub reveal: Reveal,
+    pub state: Option<ListState>,
+}
+
+/// Returns a scrolling container over `children`, with the default reveal policy.
+///
+/// The children go into a content group of their own, because the viewport must not move: it
+/// is what clips, and an offset on it would take the clip with it.
+pub fn scroll<'a>(ui: &'a mut Ui<'_>, children: impl FnOnce(&mut Ui<'_>)) -> Element<'a> {
+    scroll_with(ui, Reveal::default(), children)
+}
+
+/// Returns a scrolling container with an explicit thumb reveal policy.
+pub fn scroll_with<'a>(
+    ui: &'a mut Ui<'_>,
+    reveal: Reveal,
+    children: impl FnOnce(&mut Ui<'_>),
+) -> Element<'a> {
+    ui.scroll(
+        ScrollDecl {
+            reveal,
+            state: None,
+        },
+        children,
+    )
+}
+
+/// Returns a scrolling container driving `state`, for a [`list`] and whatever else the content
+/// carries.
 ///
 /// The band group is one child among several, so a leading inset, a trailing command and the
 /// figures drawn over the rows stay ordinary flow content of one scroller.
@@ -788,11 +852,11 @@ pub fn scroll_list<'a>(
 /// rather than one contiguous span.
 ///
 /// `keys` names every row, in order, under the application's own identity; it is what the
-/// list's length and every row's place come from. `items` supplies the data for the runs it
-/// is handed, **in ascending index order**; an index it does not supply is not realized, and
-/// the space the table gives that row stays open. Rows are reconciled by the same keyed
-/// `each` as any other list, so a row surviving a move of the window keeps its node, its
-/// owner and everything scoped to it.
+/// list's length and every row's place come from. `items` supplies the data for the runs it is
+/// handed, **in ascending index order**; an index it does not supply is not realized, and the
+/// space the table gives that row stays open. Rows are reconciled by the same keyed `each` as
+/// any other list, so a row surviving a move of the window keeps its node, its owner and
+/// everything scoped to it.
 ///
 /// Each realized row's box is measured and written back into the table, which corrects the
 /// group's height progressively. The tracker's position is never written from here: a
@@ -805,140 +869,324 @@ pub fn list<'a, T: 'static, K: 'static>(
     items: impl Fn(&Realized, &mut Vec<(usize, T)>) + 'static,
     view: impl Fn(&mut Ui<'_>, &T) -> Node<K> + 'static,
 ) -> Element<'a> {
-    let rows = state.rows;
     let spec = Memo::new(spec);
-    let row_metric = Memo::new(move || spec.get().row_h);
-    // The band group's own boxes, which is how a row's measured height comes back. One table
-    // and one signal, so a row appearing wakes the measurement and a solve that moved nothing
-    // wakes neither it nor anything derived from the extents.
+    // The band group's own boxes: one table and one signal, so a row appearing wakes the
+    // measurement and a solve that moved nothing wakes neither it nor anything derived from it.
     let boxes = anchors();
     // Where the band group sits inside the content, so the window is resolved in the group's
     // own space rather than the scroller's. A leading inset is ordinary flow content above it.
-    let lead = probe();
+    let band = probe();
 
-    // The list's length and order. Read untracked and written only on a difference, so the
-    // extents this effect owns cannot wake it.
+    // The list's shape. The scratch buffer is held across runs, so re-keying allocates nothing
+    // once the list has been its longest.
     let named = RefCell::new(Vec::<u64>::new());
     Effect::new(move || {
         let estimate = spec.get().estimate;
         let mut next = named.borrow_mut();
         next.clear();
         keys(&mut next);
-        if crate::signal::untracked(|| rows.with(|held| held.stale(&next))) {
-            rows.update(|held| held.sync(&next, estimate));
+        if crate::signal::untracked(|| state.with_rows(|rows| rows.differs(&next))) {
+            state.rows.update(|rows| rows.take(&next, estimate));
         }
     });
 
-    // Every realized row's measured height, at the scale the group was solved at, and how far
-    // the group itself sits below the top of the content.
+    // The measurement coming back, gated: the write is what wakes every reader of the extents.
     Effect::new(move || {
-        state.lead.set(lead.get().local.y);
-        let metric = row_metric.get();
-        let moved = boxes.with(|table| {
-            table.scope.is_some_and(|scope| {
-                let unit = crate::role::metric(metric, scope);
-                crate::signal::untracked(|| rows.with(|held| held.differs(table, unit)))
+        state.banded(band.get().local.y);
+        let row_h = spec.get().row_h;
+        let needed = boxes.with(|table| {
+            table.published().is_some_and(|scope| {
+                let unit = metric(row_h, scope);
+                crate::signal::untracked(|| state.with_rows(|rows| rows.needs(table, unit)))
             })
         });
-        if moved {
+        if needed {
             boxes.with(|table| {
-                let unit = crate::role::metric(metric, table.scope.expect("a measured table"));
-                rows.update(|held| held.absorb(table, unit));
+                let unit = metric(row_h, table.scope());
+                state.rows.update(|rows| rows.write(table, unit));
             });
         }
     });
 
     let realized = Memo::new(move || {
-        let spec = spec.get();
-        let above = state.lead.get();
-        rows.with(|held| {
-            realize(
-                state.offset() - above,
-                state.target().map(|at| at - above),
-                state.viewport(),
-                state.pinned.get().and_then(|key| held.index_of(key)),
-                held,
-                &spec,
-            )
-        })
+        let at = state.pos();
+        state.with_rows(|rows| realize(rows, at, spec.get().overscan))
     });
+
     let supplied = RefCell::new(Vec::<(usize, T)>::new());
-    ui.node(Preset::Bare)
-        .no_shrink()
+    ui.node(Preset::Layer)
         .anchors_origin(boxes)
-        .probed(lead)
+        .probed(band)
         .layout_from(move |layout| {
-            layout.height = Some(Len::Times(row_metric.get(), state.extent()));
+            layout.height = Len::times(spec.get().row_h, state.extent());
         })
         .children(move |ui| {
             ui.each(
                 move |out: &mut Vec<(u64, T)>| {
-                    let realized = realized.get();
                     let mut supplied = supplied.borrow_mut();
                     supplied.clear();
-                    items(&realized, &mut supplied);
-                    rows.with(|held| {
-                        for (index, item) in supplied.drain(..) {
-                            if let Some(key) = held.key(index) {
-                                out.push((key, item));
-                            }
-                        }
+                    realized.with(|set| items(set, &mut supplied));
+                    state.with_rows(|rows| {
+                        out.extend(
+                            supplied
+                                .drain(..)
+                                .filter_map(|(index, item)| Some((rows.key(index)?, item))),
+                        );
                     });
                 },
                 |(key, _)| key,
                 move |ui, (key, item)| {
                     let key = *key;
                     let node = view(ui, item);
-                    ui.effect(move |ui| {
-                        let (metric, at) = (row_metric.get(), rows.with(|held| {
-                            held.index_of(key).map_or(0.0, |index| held.units(index))
-                        }));
-                        if let Some(row) = ui.edit(node) {
-                            row.anchored(boxes, key).layout(move |layout| {
-                                layout.position = Some(super::Position::Band {
-                                    at: Len::Times(metric, at),
-                                });
+                    if let Some(row) = ui.edit(node) {
+                        // Read inside the closure, so a measurement above this row moves it
+                        // without the list being rebuilt.
+                        row.anchored(boxes, key).layout_from(move |layout| {
+                            let at = state.with_rows(|rows| {
+                                rows.index_of(key)
+                                    .map_or(0.0, |index| rows.offset_units(index))
                             });
-                        }
-                    });
+                            layout.position = Position::Band {
+                                at: Len::times(spec.get().row_h, at),
+                            };
+                        });
+                    }
                 },
             );
         })
 }
 
-// ── the front thread's half ──────────────────────────────────────────────────────
+// ── the two halves of a container ────────────────────────────────────────────────
 
-/// One scroll container, as the app half needs it. Held by the host beside the mount that
-/// owns the tracker, so a container unmounting takes its row with it.
+/// One scroll container, as the app half needs it.
+///
+/// Held by the host beside the mount that owns the tracker, so a container unmounting takes its
+/// row with it.
 pub(crate) struct ScrollRow {
-    pub tracker: windows_scene::TrackerId<windows_scene::Observed>,
-    pub viewport: NodeId,
-    pub content: NodeId,
-    pub thumb: Option<SpriteId>,
-    /// The strip the thumb travels in, which is the static geometry a grab lands on.
-    pub rail: Option<GroupId>,
-    /// The viewport's own control, which is what a hover names.
-    pub control: Option<ControlId>,
-    /// The rail's, which is what a grab names. Minted only where there is a thumb.
-    pub grab: Option<ControlId>,
-    pub reveal: Reveal,
-    pub state: Option<ListState>,
-    /// What was last published, so a solve that moved nothing emits nothing.
+    /// What crosses to the thread routing a contact over this surface.
+    pub front: ScrollFront,
+    /// What was last published with it: a solve that moved nothing emits nothing, and
+    /// [`ThumbGeom::UNSENT`] is what makes the first publication unconditional.
     pub last: ThumbGeom,
-    /// Whether the half that moves the thumb has been told this container exists.
-    pub front_added: bool,
+    /// The viewport node, whose solved size is the view extent.
+    pub node: NodeId,
+    /// The group the tracker's position is bound onto, whose solved height is the extent.
+    pub content: NodeId,
+    /// The strip the thumb travels in, which is the static geometry a grab lands on.
+    pub rail: NodeId,
+    pub thumb: SpriteId,
+    pub reveal: Reveal,
+    /// Whether the deferred tracker creation has run.
+    pub created: bool,
+    /// Present only for a virtualized list; an ordinary container keeps no application state.
+    pub state: Option<ListState>,
 }
 
-// ── the table the thumb is moved from ────────────────────────────────────────────
+impl ScrollRow {
+    /// Emits whatever this container's solve changed: its arrival, and its thumb geometry.
+    ///
+    /// The add is emitted before the geometry gate, so a container whose content fits is in the
+    /// table too: its thumb still has a reveal, and a row that never arrived would leave every
+    /// hover over that surface acting on nothing.
+    pub fn publish(&mut self, geom: ThumbGeom, out: &mut Vec<ScrollOp>) {
+        if self.last.max_scroll.is_nan() {
+            out.push(ScrollOp::Add {
+                front: self.front,
+                thumb: (self.reveal != Reveal::Never).then_some(self.thumb),
+                reveal: self.reveal,
+                observe: self.state.is_some(),
+            });
+        }
+        if geom != self.last {
+            self.last = geom;
+            out.push(ScrollOp::Thumb {
+                viewport: self.front.viewport,
+                geom,
+            });
+        }
+    }
+}
+
+impl Ui<'_> {
+    /// Mints the viewport, its content group and its scroll chrome, and runs `children` inside
+    /// the content group.
+    ///
+    /// The children go into a content group of their own, because the viewport must not move: it
+    /// is what clips, and an offset on it would take the clip with it.
+    pub fn scroll(&mut self, decl: ScrollDecl, children: impl FnOnce(&mut Ui<'_>)) -> Element<'_> {
+        let mut content = NodeId::NONE;
+        let mut viewport = self
+            .node(Preset::Scroll)
+            .children(|ui| content = ui.group(Preset::Stack, children).node_id());
+        let node = viewport.node_id();
+        let host = viewport.host();
+        let scope = host.scope_of(node);
+        // Minted after the content, because child order is paint order: a bar declared before
+        // the rows would be drawn under whatever the list paints over them.
+        let (rail, thumb) = crate::build::mount::mount_scroll_chrome(host, node);
+        let hover = host.mint_control(ControlRow::blank(node, scope));
+        let grab = host.mint_control(ControlRow::blank(rail, scope));
+        // The surface itself is a target so a hover can reveal its bar and a wheel notch the
+        // tracker did not take reaches it. Its own box is the whole of it, so it is not
+        // inflated: a control sitting near its edge would otherwise share the point.
+        host.hit(
+            node,
+            Some(HitDecl {
+                flags: HitFlags::INTERACTIVE.union(HitFlags::WHEEL),
+                id: hover,
+                touch_inflate: Some(0.0),
+            }),
+        );
+        host.gestures.push((grab, grab_decl()));
+        let front = ScrollFront {
+            viewport: node,
+            tracker: host.tracker_id(),
+            hover,
+            grab,
+        };
+        let at = host.scrolls.place(ScrollRow {
+            front,
+            last: ThumbGeom::UNSENT,
+            node,
+            content,
+            rail,
+            thumb,
+            reveal: decl.reveal,
+            created: false,
+            state: decl.state,
+        });
+        host.set_scroll_row(node, at);
+        viewport
+    }
+}
+
+impl Host {
+    /// Publishes every scroll container's solve: its tracker, its thumb, and its rail's target.
+    ///
+    /// Two deferral gates, both contracts rather than optimisations. **A viewport with no area
+    /// has not been laid out**, and a `VisualInteractionSource` takes its hit region from the
+    /// viewport's size at the moment it is created: created at mount it hit-tests nothing,
+    /// reports success, and the surface silently ignores every wheel notch for the life of the
+    /// window. **The rail is a hit target only while there is something to scroll**; left on, it
+    /// takes every press on the right edge of a surface that does not scroll, and a button
+    /// sitting there cannot be clicked.
+    pub(crate) fn publish_scrolls(&mut self) {
+        for at in 0..self.scrolls.slots() {
+            let Some(row) = self.scrolls.get(at) else {
+                continue;
+            };
+            let (node, content) = (row.node, row.content);
+            let view = self.tree.c.geom[node.index()].size;
+            if view.x <= 0.0 || view.y <= 0.0 {
+                continue;
+            }
+            let geom = thumb_geom(view.y, self.tree.c.geom[content.index()].size.y);
+            self.publish_scroll(at, geom, view);
+        }
+    }
+
+    /// Brings container `at` up to the geometry its solve implies.
+    fn publish_scroll(&mut self, at: u32, geom: ThumbGeom, view: Vector2) {
+        let Some(row) = self.scrolls.get(at) else {
+            return;
+        };
+        let (front, content, rail, thumb) = (row.front, row.content, row.rail, row.thumb);
+        let (reveal, state, created, moved) =
+            (row.reveal, row.state, row.created, row.last != geom);
+        if !created {
+            self.create_tracker(front.tracker, GroupId(front.viewport), Axes::VERTICAL);
+            self.bind(
+                content,
+                Prop::OffsetY,
+                track(front.tracker, Affine::CONTENT),
+            );
+        }
+        // The thumb's map is a function of the extents, so it is re-bound whenever they move.
+        if !created || moved {
+            self.bind(thumb.0, Prop::OffsetY, track(front.tracker, geom.affine()));
+        }
+        self.tracker_bounds(
+            front.tracker,
+            Vector2 { x: 0.0, y: 0.0 },
+            Vector2 {
+                x: 0.0,
+                y: geom.max_scroll,
+            },
+        );
+        let shown = reveal != Reveal::Never && geom.overflow();
+        self.visual_rect(thumb, geom.offset(view.x), geom.size());
+        self.hide(thumb.0, !shown);
+        self.hit(rail, shown.then(|| grab_hit(front.grab)));
+        if let Some(state) = state {
+            state.resized(view.y);
+            if let Some(to) = state.take_reveal(view.y) {
+                self.scroll_ops.push(ScrollOp::Reveal {
+                    viewport: front.viewport,
+                    to: Vector2 { x: 0.0, y: to },
+                });
+            }
+        }
+        let Self {
+            scrolls,
+            scroll_ops,
+            ..
+        } = self;
+        if let Some(row) = scrolls.get_mut(at) {
+            row.created = true;
+            row.publish(geom, scroll_ops);
+        }
+    }
+
+    /// Runs `f` against the container whose tracker `tracker` names.
+    ///
+    /// A linear scan rather than a map: a window holds a handful of scroll surfaces, and this is
+    /// walked from every tracker report of every fling.
+    pub(crate) fn scroll_by_tracker(
+        &mut self,
+        tracker: Id<TRACKER>,
+        f: impl FnOnce(&mut ScrollRow),
+    ) {
+        if let Some((_, row)) = self
+            .scrolls
+            .iter_mut()
+            .find(|(_, row)| row.front.tracker.id() == tracker)
+        {
+            f(row);
+        }
+    }
+}
+
+/// Returns the binding that drives one channel from `tracker` through `affine`.
+///
+/// One channel and never a composite: `Bind::Track` names a single property, and a binding
+/// aimed at `Prop::Offset` is refused.
+fn track(tracker: TrackerId<Observed>, affine: Affine) -> Bind {
+    Bind::Track {
+        tracker: tracker.erased(),
+        axis: TrackerAxis::PositionY,
+        affine,
+    }
+}
 
 /// One scroll container, as the half that moves its thumb holds it.
-struct ScrollLive {
-    front: ScrollFront,
-    /// Where the app half asked the content to go, until the next tick asks the compositor.
-    to: Option<f32>,
-    /// Where the content stood when the current thumb grab began.
-    grabbed_at: Option<f32>,
-    /// What the thumb's opacity was last retargeted to, so an unchanged reason emits nothing.
+struct Live {
+    of: ScrollFront,
+    /// The thumb's node, absent where the container declared no bar at all.
+    thumb: Option<SpriteId>,
+    reveal: Reveal,
+    /// Whether this container's tracker reports are owed to the app thread.
+    observe: bool,
+    /// The geometry a grab maps through, as the app half last published it.
+    last: ThumbGeom,
+    /// Where the app half asked the content to go, `NaN` until the next tick asks the
+    /// compositor.
+    requested: f32,
+    /// Where the content stood when the current thumb grab began, `NaN` when none is held.
+    grab_from: f32,
+    /// Whether the thumb was last retargeted to shown, so an unchanged reason emits nothing.
+    ///
+    /// `StartAnimation` resets the property's velocity, so a retarget per pointer sample would
+    /// pin the opacity instead of ramping it.
     shown: bool,
 }
 
@@ -948,149 +1196,168 @@ struct ScrollLive {
 /// cost a scan of a handful of rows and no hop.
 #[derive(Default)]
 pub(crate) struct ScrollTable {
-    rows: Vec<ScrollLive>,
+    rows: Vec<Live>,
+    /// The word each live tracker publishes its reported position into, listed from the scene.
+    shadows: Vec<(NodeId, Arc<AtomicU64>)>,
+    /// Whether a container has arrived or left since the shadows were listed.
+    relist: bool,
 }
 
 impl ScrollTable {
-    pub(crate) fn reveal_field(
-        &mut self,
-        request: crate::text_input::Reveal,
-        front: &mut Front<'_>,
-    ) -> Result<()> {
-        let Some(entry) = front.scene.hits().entry(request.id).copied() else {
-            return Ok(());
-        };
-        let Some(row) = self
-            .rows
-            .iter()
-            .find(|row| row.front.viewport == entry.scroll_src)
-        else {
-            return Ok(());
-        };
-        let Some(viewport) = front
-            .scene
-            .hits()
-            .entries()
-            .iter()
-            .find(|h| Some(h.id) == row.front.control)
-        else {
-            return Ok(());
-        };
-        let top = viewport.y0;
-        let bottom = viewport.y1;
-        let bottom = request
-            .occlusion
-            .filter(|r| r.x0 < entry.x1 && entry.x0 < r.x1)
-            .map_or(bottom, |r| bottom.min(r.y0));
-        let Some(shadow) = front.scene.tracker_shadow(row.front.tracker) else {
-            return Ok(());
-        };
-        let (x, y) = unpack_offset(shadow.load(Ordering::Acquire));
-        let delta = if entry.y1 - y > bottom {
-            entry.y1 - y - bottom
-        } else if entry.y0 - y < top {
-            entry.y0 - y - top
-        } else {
-            0.0
-        };
-        if delta != 0.0 {
-            front.scene.request(
-                row.front.tracker,
-                TrackerRequest::To(Vector2 {
-                    x,
-                    y: (y + delta).max(0.0),
-                }),
-            )?;
-        }
-        Ok(())
-    }
-
     /// Applies one batch of container edits, in the order the app half emitted them.
     ///
-    /// A thumb declared [`Reveal::Always`] is opaque from its mount, so its row starts shown
-    /// and the first edge that would show it again emits nothing.
+    /// A thumb declared [`Reveal::Always`] is opaque from its mount, so its row starts shown and
+    /// the first edge that would show it again emits nothing.
     pub(crate) fn apply_ops(&mut self, ops: &mut Vec<ScrollOp>) {
         for op in ops.drain(..) {
             match op {
-                ScrollOp::Add(front) => {
-                    let shown = front.reveal == Reveal::Always;
-                    self.rows.push(ScrollLive {
-                        front,
-                        to: None,
-                        grabbed_at: None,
-                        shown,
+                ScrollOp::Add {
+                    front,
+                    thumb,
+                    reveal,
+                    observe,
+                } => {
+                    self.relist = true;
+                    self.rows.push(Live {
+                        of: front,
+                        thumb,
+                        reveal,
+                        observe,
+                        shown: reveal == Reveal::Always,
+                        last: ThumbGeom::UNSENT,
+                        requested: f32::NAN,
+                        grab_from: f32::NAN,
                     });
                 }
-                ScrollOp::Geom { id, geom } => {
-                    if let Some(row) = self.rows.iter_mut().find(|row| row.front.id == id) {
-                        row.front.last = geom;
-                    }
+                ScrollOp::Thumb { viewport, geom } => self.edit(viewport, |row| row.last = geom),
+                ScrollOp::Reveal { viewport, to } => {
+                    self.edit(viewport, |row| row.requested = to.y);
                 }
-                ScrollOp::To { id, y } => {
-                    if let Some(row) = self.rows.iter_mut().find(|row| row.front.id == id) {
-                        row.to = Some(y);
-                    }
+                ScrollOp::Drop { viewport } => {
+                    self.relist = true;
+                    self.rows.retain(|row| row.of.viewport != viewport);
                 }
-                ScrollOp::Drop(id) => self.rows.retain(|row| row.front.id != id),
             }
         }
     }
 
-    /// Only a scroll with application-owned state needs its tracker reports upstream.
-    /// Scene-side hit offsets, request completion and thumb reveal are already serviced.
+    /// Returns whether this container's tracker reports are owed to the app thread.
+    ///
+    /// Only a scroll with application-owned state needs them upstream. Scene-side hit offsets,
+    /// request completion and thumb reveal are already serviced, and an unknown tracker stays
+    /// available to every other consumer.
     pub(crate) fn app_observes(&self, event: &SceneEvent) -> bool {
         let tracker = match *event {
             SceneEvent::TrackerValues { tracker, .. }
             | SceneEvent::TrackerPhase { tracker, .. }
-            | SceneEvent::InertiaStarting { tracker, .. }
+            | SceneEvent::InertiaBegan { tracker, .. }
             | SceneEvent::RequestIgnored { tracker, .. } => tracker,
             _ => return true,
         };
         self.rows
             .iter()
-            .find(|row| row.front.tracker.id() == tracker)
-            .is_none_or(|row| row.front.observe)
+            .find(|row| row.of.tracker.id() == tracker.id())
+            .is_none_or(|row| row.observe)
     }
 
-    /// Returns how many containers the table holds.
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    /// Returns the first container's thumb geometry, which is what a grab maps through.
-    #[cfg(test)]
-    fn geom_of_first(&self) -> Option<ThumbGeom> {
-        self.rows.first().map(|row| row.front.last)
-    }
-
-    /// Runs `f` against the first container `pick` accepts.
+    /// Brings the field `request` names inside its scroll container, clear of whatever occludes
+    /// it.
     ///
-    /// A linear scan rather than a map: a screen has a handful of scroll surfaces, and this
-    /// is walked from every tracker report of every fling.
-    fn where_(&mut self, pick: impl Fn(&ScrollFront) -> bool, f: impl FnOnce(&mut ScrollLive)) {
-        if let Some(row) = self.rows.iter_mut().find(|row| pick(&row.front)) {
+    /// The container is named by the field's own hit entry rather than by a parent walk, because
+    /// the entry already carries the surface its rect resolves through.
+    ///
+    /// # Errors
+    ///
+    /// The compositor refused the tracker request.
+    pub(crate) fn reveal_field(
+        &mut self,
+        request: crate::text_input::Reveal,
+        front: &mut Front<'_>,
+    ) -> Result<()> {
+        let Some(field) = front.scene.hits().entry(request.id).copied() else {
+            return Ok(());
+        };
+        let Some(at) = self
+            .rows
+            .iter()
+            .position(|row| row.of.viewport == field.scroll_src)
+        else {
+            return Ok(());
+        };
+        let hover = self.rows[at].of.hover;
+        let Some(view) = front
+            .scene
+            .hits()
+            .entries()
+            .iter()
+            .find(|entry| entry.id == hover)
+            .copied()
+        else {
+            return Ok(());
+        };
+        let viewport = self.rows[at].of.viewport;
+        let Some(offset) = self.shadow(viewport, front) else {
+            return Ok(());
+        };
+        // A candidate window or panel over the field takes room off the bottom of the viewport,
+        // but only where it actually overlaps the field's own column.
+        let bottom = request
+            .occlusion
+            .filter(|r| r.x0 < field.x1 && field.x0 < r.x1)
+            .map_or(view.y1, |r| view.y1.min(r.y0));
+        let delta = if field.y1 - offset.y > bottom {
+            field.y1 - offset.y - bottom
+        } else if field.y0 - offset.y < view.y0 {
+            field.y0 - offset.y - view.y0
+        } else {
+            return Ok(());
+        };
+        let to = Vector2 {
+            x: offset.x,
+            y: (offset.y + delta).max(0.0),
+        };
+        front
+            .scene
+            .request(self.rows[at].of.tracker, TrackerRequest::To(to))
+            .map(|_| ())
+    }
+
+    /// Returns the offset the tracker bound to `viewport` last reported.
+    ///
+    /// The set of shadow words changes only when a tracker is created or dropped, so it is
+    /// listed on those edges and read as an atomic between them.
+    fn shadow(&mut self, viewport: NodeId, front: &Front<'_>) -> Option<Vector2> {
+        if self.relist {
+            front.scene.tracker_shadows(&mut self.shadows);
+            self.relist = false;
+        }
+        let word = self
+            .shadows
+            .iter()
+            .find(|(node, _)| *node == viewport)
+            .map(|(_, word)| word)?;
+        // acquire: pairs with the release store the scene makes when it records a reported
+        // position, so both halves of the word read here are that one report's.
+        let (x, y) = unpack_offset(word.load(Ordering::Acquire));
+        Some(Vector2 { x, y })
+    }
+
+    /// Runs `f` against the container `viewport` names.
+    ///
+    /// A linear scan rather than a map: a screen has a handful of scroll surfaces, and this is
+    /// walked from every tracker report of every fling.
+    fn edit(&mut self, viewport: NodeId, f: impl FnOnce(&mut Live)) {
+        if let Some(row) = self.rows.iter_mut().find(|row| row.of.viewport == viewport) {
             f(row);
         }
     }
-}
 
-impl ScrollRow {
-    /// Returns what the half that moves this container's thumb needs of it.
+    /// Returns the index of the first container `pick` accepts.
     ///
-    /// `id` is the row's own, which is the name every later edit to this container carries.
-    pub(crate) fn describe(&self, id: crate::build::ScrollId) -> ScrollFront {
-        ScrollFront {
-            viewport: self.viewport,
-            id,
-            tracker: self.tracker,
-            thumb: self.thumb,
-            control: self.control,
-            grab: self.grab,
-            reveal: self.reveal,
-            last: self.last,
-            observe: self.state.is_some(),
-        }
+    /// An index rather than a borrow, so a caller that also has to read a shadow word does not
+    /// hold this table borrowed across that read.
+    fn find(&self, pick: impl Fn(&Live) -> bool) -> Option<usize> {
+        self.rows.iter().position(|row| pick(row))
     }
 }
 
@@ -1104,40 +1371,41 @@ pub fn observe(events: &[SceneEvent]) {
     }
     Host::with(|host| {
         for event in events {
-            match *event {
-                SceneEvent::TrackerValues {
-                    tracker, position, ..
-                } => host.scroll_by_tracker(tracker, |row| {
-                    if let Some(state) = row.state {
-                        state.moved(position.y);
+            let tracker = match *event {
+                SceneEvent::TrackerValues { tracker, .. }
+                | SceneEvent::InertiaBegan { tracker, .. }
+                | SceneEvent::TrackerPhase { tracker, .. } => tracker,
+                _ => continue,
+            };
+            host.scroll_by_tracker(tracker.id(), |row| {
+                let Some(state) = row.state else { return };
+                // Read before the edit, because holding the extent needs the other signal and
+                // the edit closure already holds this one.
+                let span = state.with_rows(Rows::total_units);
+                state.edit(|at| match *event {
+                    SceneEvent::TrackerValues { position, .. } => at.offset = position.y,
+                    // The resting position with snap points applied, which is the destination
+                    // the content will actually reach.
+                    SceneEvent::InertiaBegan { rest, .. } => at.target = rest.y,
+                    // Returning to idle releases the held extent and clears the destination;
+                    // leaving idle holds the extent where it stands.
+                    SceneEvent::TrackerPhase {
+                        phase: TrackerPhase::Idle,
+                        ..
+                    } => {
+                        at.target = f32::NAN;
+                        at.held = 0.0;
                     }
-                }),
-                SceneEvent::InertiaStarting {
-                    tracker, modified, ..
-                } => host.scroll_by_tracker(tracker, |row| {
-                    if let Some(state) = row.state {
-                        state.flinging_to(modified.y);
-                    }
-                }),
-                SceneEvent::TrackerPhase { tracker, phase } => {
-                    host.scroll_by_tracker(tracker, |row| {
-                        if let Some(state) = row.state {
-                            if phase == windows_scene::Phase::Idle {
-                                state.settled();
-                            } else {
-                                state.interacting();
-                            }
-                        }
-                    });
-                }
-                _ => {}
-            }
+                    SceneEvent::TrackerPhase { .. } if at.held <= 0.0 => at.held = span,
+                    _ => {}
+                });
+            });
         }
     });
 }
 
-/// Applies a tick's events and reports to the compositor: a thumb's reveal, and a thumb
-/// being dragged.
+/// Applies a tick's events and reports to the compositor: a thumb's reveal, a redirected
+/// contact, and a thumb being dragged.
 ///
 /// Must run **after the apply**, so a retarget never names a node the patch was about to
 /// rebuild, and after the router's tick, so a grab resolves against the hit array this frame
@@ -1145,412 +1413,191 @@ pub fn observe(events: &[SceneEvent]) {
 ///
 /// # Errors
 ///
-/// The compositor refused a retarget or a tracker request. The first failure is returned;
-/// the rest of the tick still runs.
+/// The compositor refused a retarget or a tracker request. The first failure is kept and the
+/// rest of the tick still runs, so a refused retarget on one surface does not leave another's
+/// grab half-applied.
 pub(crate) fn front(
     events: &[SceneEvent],
     reports: &[Report],
     table: &mut ScrollTable,
     front: &mut Front<'_>,
 ) -> Result<()> {
-    if events.is_empty() && reports.is_empty() && table.rows.iter().all(|row| row.to.is_none()) {
+    if events.is_empty()
+        && reports.is_empty()
+        && table.rows.iter().all(|row| row.requested.is_nan())
+    {
         return Ok(());
     }
-    // The first failure is kept and the rest of the tick still runs: a refused retarget on
-    // one surface must not leave another's grab half-applied.
-    let mut failed: Option<windows_core::Error> = None;
-    // Taken before the events, so a reveal and a phase edge in one tick leave the content
-    // where the reveal asked rather than where it stood.
-    for row in &mut table.rows {
-        if let Some(y) = row.to.take() {
-            if let Err(error) = front
-                .scene
-                .request(row.front.tracker, TrackerRequest::To(Vector2 { x: 0.0, y }))
-                .map(|_| ())
-            {
-                failed.get_or_insert(error);
-            }
+    let mut failed = Ok(());
+    // Taken before the events, so a reveal and a phase edge in one tick leave the content where
+    // the reveal asked rather than where it stood.
+    for at in 0..table.rows.len() {
+        if table.rows[at].requested.is_nan() {
+            continue;
         }
+        let y = core::mem::replace(&mut table.rows[at].requested, f32::NAN);
+        let tracker = table.rows[at].of.tracker;
+        keep(&mut failed, request(front, tracker, y));
     }
     for event in events {
-        let (tracker, moving) = match *event {
-            SceneEvent::TrackerPhase { tracker, phase } => {
-                (tracker, phase != windows_scene::Phase::Idle)
-            }
-            _ => continue,
+        let SceneEvent::TrackerPhase { tracker, phase } = *event else {
+            continue;
         };
-        table.where_(
-            |row| row.tracker.id() == tracker,
-            |row| {
-                if let Err(error) = reveal(row, moving, front) {
-                    failed.get_or_insert(error);
-                }
-            },
-        );
+        if let Some(at) = table.find(|row| row.of.tracker.id() == tracker.id()) {
+            keep(
+                &mut failed,
+                reveal(&mut table.rows[at], phase != TrackerPhase::Idle, front),
+            );
+        }
     }
     for report in reports {
         match *report {
-            Report::Redirect { target, pointer } => table.where_(
-                |row| row.control == Some(target),
-                |row| {
-                    if let Err(error) = front
-                        .scene
-                        .redirect_manipulation(row.front.tracker, &pointer)
-                    {
-                        failed.get_or_insert(error);
-                    }
-                },
-            ),
-            Report::HoverChanged { from, to, .. } => {
-                for (id, over) in [(from, false), (to, true)] {
-                    let Some(id) = id else { continue };
-                    table.where_(
-                        |row| row.control == Some(id),
-                        |row| {
-                            if let Err(error) = reveal(row, over, front) {
-                                failed.get_or_insert(error);
-                            }
-                        },
+            // A touch contact over a scroll surface is handed to the tracker, which is what
+            // makes the pan compositor-side; the front thread sees no further samples of it.
+            Report::Redirect { target, pointer } => {
+                if let Some(at) = table.find(|row| row.of.hover == target) {
+                    let tracker = table.rows[at].of.tracker;
+                    keep(
+                        &mut failed,
+                        front.scene.redirect_manipulation(tracker, &pointer),
                     );
                 }
             }
-            Report::Dragged { target, update, .. } => table.where_(
-                |row| row.grab == Some(target),
-                |row| {
-                    if let Err(error) = drag(row, update.phase, update.delta.y, front) {
-                        failed.get_or_insert(error);
+            Report::HoverChanged { from, to, .. } => {
+                for (control, over) in [(from, false), (to, true)] {
+                    let Some(control) = control else { continue };
+                    if let Some(at) = table.find(|row| row.of.hover == control) {
+                        keep(&mut failed, reveal(&mut table.rows[at], over, front));
                     }
-                },
-            ),
-            // A released or cancelled grab forgets where it started, so the next one
-            // measures from where the content actually is.
+                }
+            }
+            Report::Dragged { target, update, .. } => {
+                keep(&mut failed, drag(table, target, update, front));
+            }
+            // A released or cancelled grab forgets where it started, so the next one measures
+            // from where the content actually is.
             Report::Released { target, .. } | Report::Canceled { target, .. } => {
-                table.where_(|row| row.grab == Some(target), |row| row.grabbed_at = None);
+                if let Some(at) = table.find(|row| row.of.grab == target) {
+                    table.rows[at].grab_from = f32::NAN;
+                }
             }
             _ => {}
         }
     }
-    failed.map_or(Ok(()), Err)
+    failed
 }
 
-/// Shows or conceals a thumb.
-///
-/// Only [`Reveal::OnDemand`] retargets, and only on an edge: `Always` is opaque from the
-/// mount and `Never` has no thumb, so neither reaches the compositor here.
-fn reveal(row: &mut ScrollLive, show: bool, front: &mut Front<'_>) -> Result<()> {
-    let Some(thumb) = row.front.thumb else {
+/// Shows or conceals a thumb, where the row is on an edge that moves one.
+fn reveal(row: &mut Live, show: bool, front: &mut Front<'_>) -> Result<()> {
+    let Some(thumb) = row.thumb else {
         return Ok(());
     };
-    // A grabbed thumb stays lit however the pointer wanders, and a moving one stays lit
-    // whatever the pointer is doing.
-    let show = show || row.grabbed_at.is_some();
-    if row.front.reveal != Reveal::OnDemand || show == row.shown {
+    let Some(bind) = reveal_bind(row, show) else {
         return Ok(());
+    };
+    front.scene.retarget(thumb.0, Prop::Opacity, bind, front.back)
+}
+
+/// Decides what a thumb's opacity channel is bound to, recording the edge it crosses.
+///
+/// Returns `None` off an edge, and for a thumb this half does not move: [`Reveal::Always`] is
+/// opaque from the mount and [`Reveal::Never`] has no thumb. `StartAnimation` resets the
+/// property's velocity, so a retarget per pointer sample would pin the opacity rather than ramp
+/// it.
+///
+/// A conceal states [`CONCEAL_MS`] as the fade's own delay, so the thumb holds its opacity for
+/// that long and then ramps down. A reason arriving inside the wait binds the same channel
+/// again, and starting an animation replaces the one on the property, so the pending fade is
+/// gone rather than queued behind it.
+fn reveal_bind(row: &mut Live, show: bool) -> Option<Bind> {
+    // A grabbed thumb stays lit however the pointer wanders, and a moving one stays lit whatever
+    // the pointer is doing.
+    let show = show || !row.grab_from.is_nan();
+    if row.reveal != Reveal::OnDemand || show == row.shown {
+        return None;
     }
     row.shown = show;
-    let (to, delay_ms) = if show { (1.0, 0) } else { (0.0, CONCEAL_MS) };
-    front.scene.retarget(
-        thumb.node(),
-        Prop::Opacity,
-        Bind::Animate(Anim::Spring {
-            to: Value::Scalar(to),
-            tuning: Tuning::Chrome,
-            delay_ms,
-        }),
-        front.back,
-        front.env,
-    )
+    Some(Bind::Animate(Anim::Spring {
+        to: Value::Scalar(if show { 1.0 } else { 0.0 }),
+        tuning: Tuning::Chrome,
+        delay_ms: if show { 0 } else { CONCEAL_MS },
+    }))
 }
 
 /// Drives the tracker from a thumb the pointer is dragging.
 ///
-/// The displacement is from the contact's origin, so the content position is resolved from
-/// where it stood when the grab began rather than accumulated — a dropped sample then costs
-/// nothing, where an accumulated one would drift for the rest of the drag.
+/// The displacement is from the contact's origin, so the content position is resolved from where
+/// it stood when the grab began rather than accumulated — a dropped sample then costs nothing,
+/// where an accumulated one would drift for the rest of the drag.
 ///
-/// The origin is read from the tracker's published word rather than from the container's
-/// signal, which is the app half's. A tracker with no word is one the compositor has not
-/// created, and it has nothing to be dragged from.
-fn drag(row: &mut ScrollLive, phase: DragPhase, dy: f32, front: &mut Front<'_>) -> Result<()> {
-    if phase == DragPhase::Undecided {
+/// The origin is read from the tracker's published word rather than from the container's signal,
+/// which is the app half's. A tracker with no word is one the compositor has not created, and it
+/// has nothing to be dragged from.
+fn drag(
+    table: &mut ScrollTable,
+    target: ControlId,
+    update: DragUpdate,
+    front: &mut Front<'_>,
+) -> Result<()> {
+    let Some(at) = table.find(|row| row.of.grab == target) else {
+        return Ok(());
+    };
+    if update.phase == Phase::Undecided {
         return Ok(());
     }
-    let from = if let Some(from) = row.grabbed_at {
-        from
-    } else {
-        let Some(shadow) = front.scene.tracker_shadow(row.front.tracker) else {
+    if table.rows[at].grab_from.is_nan() {
+        let viewport = table.rows[at].of.viewport;
+        let Some(offset) = table.shadow(viewport, front) else {
             return Ok(());
         };
-        // acquire: pairs with the release store the scene makes when it records a reported
-        // position, so both halves of the word read here are that one report's.
-        let (_, y) = unpack_offset(shadow.load(Ordering::Acquire));
-        *row.grabbed_at.insert(y)
-    };
-    let thumb_y = thumb_y_for_scroll(from, row.front.last) + dy;
-    let to = scroll_for_thumb_y(thumb_y, row.front.last);
+        table.rows[at].grab_from = offset.y;
+    }
+    let row = &table.rows[at];
+    let thumb_y = thumb_y_for_scroll(row.grab_from, row.last) + update.delta.y;
+    let to = scroll_for_thumb_y(thumb_y, row.last);
+    let tracker = row.of.tracker;
+    request(front, tracker, to)
+}
+
+/// Asks a container's tracker for an absolute content position.
+fn request(front: &mut Front<'_>, tracker: TrackerId<Observed>, y: f32) -> Result<()> {
     front
         .scene
-        .request(
-            row.front.tracker,
-            TrackerRequest::To(Vector2 { x: 0.0, y: to }),
-        )
+        .request(tracker, TrackerRequest::To(Vector2 { x: 0.0, y }))
         .map(|_| ())
 }
 
-/// Returns the rail's gesture declaration, so a pointer can grab the bar in it.
-///
-/// A hit entry and a drag, with no wash and no chrome row: the thumb's opacity is retargeted
-/// here, and a control the front table adopted would give that channel two owners.
-pub(crate) fn grab_decl() -> GestureDecl {
-    GestureDecl {
-        settings: GestureSettings::None,
-        drag: Some(DragDecl {
-            axes: DragAxes::Vertical,
-            // Below the default: a scrollbar is aimed at, so the grab should follow the
-            // first pixel rather than absorb six of them.
-            threshold: 1.0,
-            commit: Commit::Live,
-            ..DragDecl::default()
-        }),
-        ..GestureDecl::default()
-    }
-}
-
-/// Returns the rail's hit entry: interactive, unscrolled, and inflated for touch.
-pub(crate) fn grab_hit(id: ControlId) -> HitDecl {
-    HitDecl {
-        // Pinned: the rail lives inside the container it reports on and does not move with
-        // it, so its rect must not resolve through that container's offset.
-        flags: HitFlags::INTERACTIVE | HitFlags::UNSCROLLED,
-        id,
-        touch_inflate: Some(THUMB_GRAB),
+/// Keeps the first failure of a tick, so the rest of it still runs.
+fn keep(first: &mut Result<()>, result: Result<()>) {
+    if first.is_ok() {
+        *first = result;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::tests::fixture;
-    use crate::driver::testing::LayoutDriver;
-    use crate::layout::Len;
+    use crate::layout::Anchored;
 
-    #[test]
-    fn a_scroll_replaced_before_its_first_solve_never_creates_a_retired_tracker() {
-        let mut patch = fixture();
-        let mount = || LayoutDriver::create(|ui| {
-            scroll(ui, |ui| { ui.node(Preset::Bare).height(Len::Times(Metric::RowH, 200.0)); });
-        });
-        let retired = mount();
-        drop(retired);
-        let mut live = mount();
-        live.flush(&mut patch);
-        assert_eq!(patch.ops().iter().filter(|op| matches!(op,
-            windows_scene::Op::Tracker { op: windows_scene::TrackerOp::Create { .. }, .. }
-        )).count(), 1, "only the surviving viewport may create a tracker");
-    }
-
-    #[test]
-    fn only_virtual_lists_forward_tracker_reports_to_the_app() {
-        let mut patch = fixture();
-        let mut down = crate::seam::Down::default();
-        let mut table = ScrollTable::default();
-        let ordinary = LayoutDriver::create(|ui| {
-            scroll(ui, |ui| {
-                ui.node(Preset::Bare)
-                    .height(Len::Times(Metric::RowH, 200.0));
-            });
-        });
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        table.apply_ops(&mut down.scrolls);
-        let tracker = table.rows[0].front.tracker.id();
-        let events = [
-            SceneEvent::TrackerValues {
-                tracker,
-                position: Vector2 { x: 0.0, y: 100.0 },
-                scale: 1.0,
-            },
-            SceneEvent::TrackerPhase {
-                tracker,
-                phase: windows_scene::Phase::Idle,
-            },
-            SceneEvent::InertiaStarting {
-                tracker,
-                natural: Vector2::default(),
-                modified: Vector2::default(),
-                from_impulse: false,
-            },
-            SceneEvent::RequestIgnored {
-                tracker,
-                request: 1,
-            },
-        ];
-        assert!(events.iter().all(|e| !table.app_observes(e)));
-        assert!(table.app_observes(&SceneEvent::DeviceRebuilt));
-        drop(ordinary);
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        table.apply_ops(&mut down.scrolls);
-        assert!(
-            events.iter().all(|e| table.app_observes(e)),
-            "unknown trackers remain available to other consumers"
-        );
-        let _list = LayoutDriver::create(|ui| {
-            let state = list_state();
-            scroll_list(ui, state, move |ui| {
-                list(
-                    ui,
-                    state,
-                    || SPEC,
-                    |out| out.extend(0..100u64),
-                    |runs, items| {
-                        for run in runs.runs() {
-                            for i in run {
-                                items.push((i, i));
-                            }
-                        }
-                    },
-                    |ui, _| ui.node(Preset::Bare).id(),
-                );
-            });
-        });
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        table.apply_ops(&mut down.scrolls);
-        let tracker = table.rows[0].front.tracker.id();
-        let moved = SceneEvent::TrackerValues {
-            tracker,
-            position: Vector2 { x: 0.0, y: 400.0 },
-            scale: 1.0,
-        };
-        assert!(table.app_observes(&moved));
-        observe(&[moved]);
-        Host::with(|h| {
-            h.scroll_by_tracker(tracker, |row| {
-                assert_eq!(
-                    row.state
-                        .expect("virtualization owns scroll state")
-                        .offset
-                        .get(),
-                    400.0
-                );
-            })
-        });
-    }
-
-    /// A container reaches the table that moves its thumb once, and leaves it when it
-    /// unmounts.
-    ///
-    /// The add is emitted before the geometry gate, so a container whose content fits is in
-    /// the table too: its thumb still has a reveal, and a row that never arrived would leave
-    /// every hover over that surface acting on nothing.
-    #[test]
-    fn a_container_is_added_once_and_dropped_when_it_unmounts() {
-        let mut patch = fixture();
-        let mut down = crate::seam::Down::default();
-        let mut table = ScrollTable::default();
-
-        let held = LayoutDriver::create(|ui| {
-            scroll(ui, |ui| {
-                ui.node(Preset::Bare)
-                    .height(Len::Times(Metric::RowH, 200.0));
-            });
-        });
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        assert!(
-            down.scrolls
-                .iter()
-                .filter(|op| matches!(op, ScrollOp::Add(_)))
-                .count()
-                == 1,
-            "a container was added other than once"
-        );
-        table.apply_ops(&mut down.scrolls);
-        assert_eq!(table.len(), 1);
-
-        Host::flush(&mut patch);
-
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        table.apply_ops(&mut down.scrolls);
-        assert_eq!(table.len(), 1, "a settled container was added twice");
-
-        drop(held);
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        table.apply_ops(&mut down.scrolls);
-        assert_eq!(table.len(), 0, "the unmounted container kept its row");
-    }
-
-    /// A container whose extents moved emits the new thumb geometry, and the table takes it.
-    #[test]
-    fn a_moved_extent_emits_the_geometry_the_table_grabs_against() {
-        let mut patch = fixture();
-        let mut down = crate::seam::Down::default();
-        let mut table = ScrollTable::default();
-
-        let _held = LayoutDriver::create(|ui| {
-            scroll(ui, |ui| {
-                ui.node(Preset::Bare)
-                    .height(Len::Times(Metric::RowH, 200.0));
-            });
-        });
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        table.apply_ops(&mut down.scrolls);
-        let first = table.geom_of_first().expect("one container");
-        assert!(
-            first.overflow,
-            "4000 DIP of content in a window that is not"
-        );
-
-        Host::with(|h| h.set_window(Vector2 { x: 400.0, y: 200.0 }));
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        assert!(
-            down.scrolls
-                .iter()
-                .any(|op| matches!(op, ScrollOp::Geom { .. })),
-            "a shorter viewport moved no thumb geometry"
-        );
-        table.apply_ops(&mut down.scrolls);
-        assert_ne!(
-            table.geom_of_first().expect("one container"),
-            first,
-            "the table kept the geometry the old viewport gave it"
-        );
+    /// Returns the geometry for a viewport showing `content_h` of content.
+    fn geom(viewport_h: f32, content_h: f32) -> ThumbGeom {
+        thumb_geom(viewport_h, content_h)
     }
 
     /// A viewport bigger than its content has no thumb, no travel and nothing to scroll.
     #[test]
     fn content_that_fits_has_no_scrollbar() {
-        let g = thumb_geom(400.0, 200.0);
-        assert!(!g.overflow);
+        let g = geom(400.0, 200.0);
+        assert!(!g.overflow());
         assert_eq!((g.max_scroll, g.thumb_h, g.travel), (0.0, 0.0, 0.0));
     }
 
-    /// A very long document still gets a thumb big enough to grab, and its travel is
-    /// corrected for that floor rather than running past the end of the track.
+    /// A very long document still gets a thumb big enough to grab, and its travel is corrected
+    /// for that floor rather than running past the end of the track.
     #[test]
     fn a_long_document_keeps_a_grabbable_thumb_inside_its_track() {
-        let g = thumb_geom(400.0, 100_000.0);
-        assert!(g.overflow);
+        let g = geom(400.0, 100_000.0);
+        assert!(g.overflow());
         assert!((g.thumb_h - THUMB_MIN_H).abs() < 1.0e-3);
         let track = 400.0 - 2.0 * THUMB_MARGIN;
         assert!(g.travel >= 0.0 && g.thumb_h + g.travel <= track + 1.0e-3);
@@ -1560,7 +1607,7 @@ mod tests {
     /// start from the value the compositor is already rendering.
     #[test]
     fn the_thumb_maps_both_ways() {
-        let g = thumb_geom(400.0, 2000.0);
+        let g = geom(400.0, 2000.0);
         for step in 0..=10u8 {
             let scroll = g.max_scroll * f32::from(step) / 10.0;
             let back = scroll_for_thumb_y(thumb_y_for_scroll(scroll, g), g);
@@ -1568,18 +1615,48 @@ mod tests {
         }
     }
 
-    /// With nothing to scroll, a dragged thumb asks for nothing rather than dividing by its
-    /// own zero travel.
+    /// The affine the compositor evaluates agrees with the function a grab is resolved through
+    /// at every point of the travel.
+    #[test]
+    fn the_thumb_affine_is_the_map_a_grab_uses() {
+        let g = geom(400.0, 2000.0);
+        let affine = g.affine();
+        for step in 0..=10u8 {
+            let scroll = g.max_scroll * f32::from(step) / 10.0;
+            let bound = scroll * affine.m + affine.c;
+            assert!(
+                (bound - thumb_y_for_scroll(scroll, g)).abs() < 1.0e-3,
+                "{scroll}"
+            );
+        }
+        assert_eq!(g.size().x, THUMB_W);
+        assert_eq!(g.size().y, g.thumb_h);
+        assert_eq!(g.offset(300.0).y, THUMB_MARGIN);
+        assert_eq!(g.offset(300.0).x, 300.0 - THUMB_W - THUMB_MARGIN);
+    }
+
+    /// With nothing to scroll, a dragged thumb asks for nothing rather than dividing by its own
+    /// zero travel.
     #[test]
     fn a_thumb_with_no_travel_maps_to_the_top() {
-        let g = thumb_geom(400.0, 200.0);
+        let g = geom(400.0, 200.0);
         assert_eq!(thumb_y_for_scroll(50.0, g), THUMB_MARGIN);
         assert_eq!(scroll_for_thumb_y(300.0, g), 0.0);
+        assert_eq!(g.affine().m, 0.0);
+    }
+
+    /// An unsent geometry compares unequal to every real one, including itself, so the first
+    /// publication needs no flag of its own.
+    #[test]
+    fn an_unsent_geometry_matches_nothing() {
+        assert!(ThumbGeom::UNSENT != ThumbGeom::UNSENT);
+        assert!(ThumbGeom::UNSENT != geom(400.0, 2000.0));
+        assert!(ThumbGeom::UNSENT.max_scroll.is_nan());
     }
 
     /// Returns a hundred-row table, every row `extent` row heights tall and measured.
     fn uniform(extent: f32) -> Rows {
-        table(&(0..100).map(|_| extent).collect::<Vec<_>>())
+        table(&vec![extent; 100])
     }
 
     /// Returns a table of the extents given, in row heights, at a 20-DIP row.
@@ -1588,18 +1665,52 @@ mod tests {
             unit: 20.0,
             ..Rows::default()
         };
-        rows.sync(&(0..extents.len() as u64).collect::<Vec<_>>(), 1.0);
-        rows.extent.clear();
-        rows.extent.extend_from_slice(extents);
-        rows.measured.iter_mut().for_each(|at| *at = true);
-        rows.rebuild();
+        rows.take(&(0..extents.len() as u64).collect::<Vec<_>>(), 1.0);
+        rows.extents.clear();
+        rows.extents.extend_from_slice(extents);
+        rows.reflow();
         rows
+    }
+
+    /// Returns a measured anchor table naming one row.
+    fn measured(key: u64, top: f32, bottom: f32) -> Table {
+        let mut table = Table::default();
+        table.boxes.push(Anchored {
+            key,
+            rect: Rect {
+                x0: 0.0,
+                y0: top,
+                x1: 100.0,
+                y1: bottom,
+            },
+        });
+        table
+    }
+
+    /// Returns how many rows a set realizes.
+    fn realized_rows(set: &Realized) -> usize {
+        set.runs().map(|run| run.len()).sum()
+    }
+
+    /// Returns whether a set realizes `index`.
+    fn holds(set: &Realized, index: usize) -> bool {
+        set.runs().any(|run| run.contains(&index))
+    }
+
+    /// Returns a position at `offset` in a viewport of `viewport_h`.
+    fn at(offset: f32, viewport_h: f32) -> Pos {
+        Pos {
+            offset,
+            viewport: viewport_h,
+            target: f32::NAN,
+            ..Pos::default()
+        }
     }
 
     /// Offsets accumulate the extents ahead of each row, and the search inverts them.
     ///
-    /// Answered from the prefix table rather than by summing, so a list of mixed extents
-    /// costs one lookup per row and one search per position however long it is.
+    /// Answered from the prefix table rather than by summing, so a list of mixed extents costs
+    /// one lookup per row and one search per position however long it is.
     #[test]
     fn a_mixed_table_answers_both_directions_without_a_scan() {
         let rows = table(&[1.0, 3.0, 0.5, 2.0]);
@@ -1610,38 +1721,47 @@ mod tests {
         assert_eq!(rows.offset(3), 90.0);
         assert_eq!(rows.total(), 130.0);
         assert_eq!(rows.extent(1), 60.0);
-        // Each row's own band answers itself at both edges, and the boundary belongs to the
-        // row it opens.
-        for (index, y) in [(0, 0.0), (0, 19.0), (1, 20.0), (1, 79.0), (2, 80.0), (3, 90.0)] {
+        // Each row's own band answers itself at both edges, and the boundary belongs to the row
+        // it opens.
+        for (index, y) in [
+            (0, 0.0),
+            (0, 19.0),
+            (1, 20.0),
+            (1, 79.0),
+            (2, 80.0),
+            (3, 90.0),
+        ] {
             assert_eq!(rows.at(y), index, "position {y}");
         }
-        assert_eq!(rows.at(-50.0), 0, "an overpan above the list answers its first row");
+        assert_eq!(
+            rows.at(-50.0),
+            0,
+            "an overpan above the list answers its first row"
+        );
         assert_eq!(rows.at(400.0), 3, "an overpan below it answers its last");
     }
 
     /// A measurement replaces the estimate, moves every row below it, and stays taken.
     #[test]
     fn a_measurement_moves_the_rows_below_it_and_is_kept() {
-        let mut rows = table(&[1.0, 1.0, 1.0]);
-        rows.measured.iter_mut().for_each(|at| *at = false);
-        let mut measured = Table::default();
-        measured.boxes.push(crate::layout::Anchored {
-            key: 1,
-            rect: windows_scene::Rect::new(0.0, 20.0, 100.0, 80.0),
-        });
-        assert!(rows.differs(&measured, 20.0));
-        rows.absorb(&measured, 20.0);
-        assert!(!rows.differs(&measured, 20.0), "the measurement did not land");
+        let mut rows = Rows {
+            unit: 20.0,
+            ..Rows::default()
+        };
+        rows.take(&[0, 1, 2], 1.0);
+        let one = measured(1, 20.0, 80.0);
+        assert!(rows.needs(&one, 20.0));
+        rows.write(&one, 20.0);
+        assert!(!rows.needs(&one, 20.0), "the measurement did not land");
         assert!(rows.is_measured(1) && !rows.is_measured(0));
-        assert_eq!(rows.offset(2), 80.0, "the row below kept the estimate's offset");
+        assert_eq!(
+            rows.offset(2),
+            80.0,
+            "the row below kept the estimate's offset"
+        );
         assert_eq!(rows.total(), 100.0);
         // A key the table reports and the list does not hold is not an index into it.
-        let mut stray = Table::default();
-        stray.boxes.push(crate::layout::Anchored {
-            key: 99,
-            rect: windows_scene::Rect::new(0.0, 0.0, 100.0, 40.0),
-        });
-        assert!(!rows.differs(&stray, 20.0));
+        assert!(!rows.needs(&measured(99, 0.0, 40.0), 20.0));
     }
 
     /// A row that survives a reorder carries its measurement to its new place, and a row that
@@ -1649,9 +1769,12 @@ mod tests {
     #[test]
     fn a_reorder_carries_each_measurement_with_its_row() {
         let mut rows = table(&[1.0, 3.0]);
-        rows.sync(&[1, 7, 0], 2.0);
+        rows.take(&[1, 7, 0], 2.0);
         assert!(rows.is_measured(0) && rows.is_measured(2));
-        assert!(!rows.is_measured(1), "a row that was not in the list was measured");
+        assert!(
+            !rows.is_measured(1),
+            "a row that was not in the list was measured"
+        );
         assert_eq!(rows.extent(0), 60.0, "the tall row lost its measurement");
         assert_eq!(rows.extent(1), 40.0, "the new row is not the estimate");
         assert_eq!(rows.extent(2), 20.0);
@@ -1664,8 +1787,8 @@ mod tests {
         overscan: 2,
     };
 
-    /// The window covers the viewport, plus the overscan on each side, and never runs past
-    /// the ends.
+    /// The window covers the viewport, plus the overscan on each side, and never runs past the
+    /// ends.
     #[test]
     fn the_realization_window_covers_the_viewport_and_is_clamped_at_both_ends() {
         let rows = uniform(1.0);
@@ -1689,8 +1812,11 @@ mod tests {
         extents[3] = 5.0;
         let rows = table(&extents);
         // A viewport of 100 DIPs opening at the tall row shows that row and one more.
-        let over = window(60.0, 100.0, &rows, 0);
-        assert_eq!(over, 3..4, "the open row did not take the viewport");
+        assert_eq!(
+            window(60.0, 100.0, &rows, 0),
+            3..4,
+            "the open row did not take the viewport"
+        );
         // The same viewport above it shows four.
         assert_eq!(window(0.0, 100.0, &rows, 0), 0..4);
         // And below it, where the rows are shut again, five.
@@ -1699,9 +1825,9 @@ mod tests {
 
     /// A tracker overpans past the end of the content, and the window stays inside the list.
     ///
-    /// The overpan is the bounce, so this position is reached by ordinary use. A window
-    /// running past the last row underflows a row count: a debug panic, and in release a
-    /// placement far past the end of the list.
+    /// The overpan is the bounce, so this position is reached by ordinary use. A window running
+    /// past the last row underflows a row count: a debug panic, and in release a placement far
+    /// past the end of the list.
     #[test]
     fn an_overpanned_window_stays_inside_the_list() {
         let rows = uniform(1.0);
@@ -1715,70 +1841,408 @@ mod tests {
     fn a_degenerate_list_realizes_nothing() {
         let empty = Rows::default();
         assert!(window(0.0, 100.0, &empty, 2).is_empty());
-        assert_eq!(realize(0.0, None, 100.0, None, &empty, &SPEC).rows(), 0);
+        assert_eq!(realized_rows(&realize(&empty, at(0.0, 100.0), 2)), 0);
         let unsolved = Rows {
             unit: 0.0,
             ..table(&[1.0; 10])
         };
-        assert_eq!(unsolved.at(500.0), 0, "an unmeasured scale answers the first row");
+        assert_eq!(
+            unsolved.at(500.0),
+            0,
+            "an unmeasured scale answers the first row"
+        );
     }
 
     /// At rest the realized set is exactly the live window: one run, no corridor, nothing
     /// realized ahead of a fling that is not happening.
     #[test]
     fn a_resting_list_realizes_one_run() {
-        let at_rest = realize(400.0, None, 100.0, None, &uniform(1.0), &SPEC);
-        assert_eq!(at_rest.runs().count(), 1);
-        assert_eq!(at_rest.runs().next().unwrap(), 18..27);
+        let set = realize(&uniform(1.0), at(400.0, 100.0), SPEC.overscan);
+        assert_eq!(set.runs().count(), 1);
+        assert_eq!(set.runs().next().expect("one run"), 18..27);
     }
 
-    /// A fling realizes where it lands as well as where it is, and the two are disjoint,
-    /// which is why the set is not one range.
+    /// A fling realizes where it lands as well as where it is, and the two are disjoint, which
+    /// is why the set is not one range.
     #[test]
     fn a_long_fling_realizes_its_destination_and_a_bounded_corridor() {
-        let flung = realize(0.0, Some(1900.0), 100.0, None, &uniform(1.0), &SPEC);
-        assert!(flung.contains(0), "where the content still is");
-        assert!(flung.contains(99), "where it is going");
-        assert!(!flung.contains(50), "and not the whole path between");
+        let flung = realize(
+            &uniform(1.0),
+            Pos {
+                target: 1900.0,
+                ..at(0.0, 100.0)
+            },
+            SPEC.overscan,
+        );
+        assert!(holds(&flung, 0), "where the content still is");
+        assert!(holds(&flung, 99), "where it is going");
+        assert!(!holds(&flung, 50), "and not the whole path between");
         assert!(flung.runs().count() > 1);
         // Two windows and two bands, and nothing that scales with the distance flung.
-        assert!(flung.rows() <= 4 * (100 / 20 + 2 * SPEC.overscan + 2));
+        assert!(realized_rows(&flung) <= 4 * (100 / 20 + 2 * SPEC.overscan + 2));
     }
 
     /// A short fling's destination overlaps the live window, and the two coalesce rather than
     /// realizing the same rows twice.
     #[test]
     fn a_short_fling_coalesces_into_one_run() {
-        let nudged = realize(400.0, Some(440.0), 100.0, None, &uniform(1.0), &SPEC);
+        let nudged = realize(
+            &uniform(1.0),
+            Pos {
+                target: 440.0,
+                ..at(400.0, 100.0)
+            },
+            SPEC.overscan,
+        );
         assert_eq!(nudged.runs().count(), 1);
-        let run = nudged.runs().next().unwrap();
-        assert_eq!(run, 18..29);
+        assert_eq!(nudged.runs().next().expect("one run"), 18..29);
     }
 
     /// A pinned row is realized wherever the content stands, and is its own run.
     ///
-    /// What keeps a focused row on the tree: an unrealized row has no node, so it has
-    /// nothing for the focus order to land on and no ring to draw.
+    /// What keeps a focused row on the tree: an unrealized row has no node, so it has nothing
+    /// for the focus order to land on and no ring to draw.
     #[test]
     fn a_pinned_row_is_realized_from_anywhere() {
-        let pinned = realize(1900.0, None, 100.0, Some(2), &uniform(1.0), &SPEC);
-        assert!(pinned.contains(2), "the pinned row was left unrealized");
-        assert!(pinned.contains(99), "the live window was dropped for it");
+        let pinned = realize(
+            &uniform(1.0),
+            Pos {
+                pin: Some(2),
+                ..at(1900.0, 100.0)
+            },
+            SPEC.overscan,
+        );
+        assert!(holds(&pinned, 2), "the pinned row was left unrealized");
+        assert!(holds(&pinned, 99), "the live window was dropped for it");
         assert_eq!(pinned.runs().count(), 2);
-        let past = realize(0.0, None, 100.0, Some(500), &uniform(1.0), &SPEC);
-        assert_eq!(past.runs().count(), 1, "a pin past the end realized a row that is not there");
+        let past = realize(
+            &uniform(1.0),
+            Pos {
+                pin: Some(500),
+                ..at(0.0, 100.0)
+            },
+            SPEC.overscan,
+        );
+        assert_eq!(
+            past.runs().count(),
+            1,
+            "a pin past the end realized a row that is not there"
+        );
     }
 
     /// The runs come out ascending and disjoint however they went in, because the fill walks
     /// them in order and a supplied item is matched by a single forward scan.
     #[test]
     fn the_runs_are_ascending_and_disjoint() {
-        let flung = realize(1900.0, Some(0.0), 100.0, Some(50), &uniform(1.0), &SPEC);
+        let flung = realize(
+            &uniform(1.0),
+            Pos {
+                target: 0.0,
+                pin: Some(50),
+                ..at(1900.0, 100.0)
+            },
+            SPEC.overscan,
+        );
         let mut last = 0;
         for run in flung.runs() {
             assert!(run.start >= last, "{run:?} after {last}");
             assert!(run.end > run.start);
             last = run.end;
         }
+    }
+
+    /// The band group's own offset is subtracted before the window is resolved, so a list under
+    /// a heading realizes the rows the viewport is actually over.
+    #[test]
+    fn the_band_offset_moves_the_window_with_the_group() {
+        let rows = uniform(1.0);
+        let banded = realize(
+            &rows,
+            Pos {
+                band_y: 400.0,
+                ..at(400.0, 100.0)
+            },
+            SPEC.overscan,
+        );
+        assert_eq!(
+            banded.runs().next().expect("one run"),
+            window(0.0, 100.0, &rows, SPEC.overscan),
+            "the group's own offset was not taken off the reported position"
+        );
+    }
+
+    /// A reveal asks for the nearest position that brings the row inside the viewport, and asks
+    /// for nothing where the row is already in it.
+    #[test]
+    fn a_reveal_moves_the_content_only_when_the_row_is_out_of_view() {
+        let state = list_state();
+        state.rows.update(|rows| {
+            rows.unit = 20.0;
+            rows.take(&(0..100).collect::<Vec<_>>(), 1.0);
+        });
+        state.edit(|at| at.offset = 400.0);
+
+        state.reveal(50);
+        assert_eq!(
+            state.take_reveal(100.0),
+            Some(920.0),
+            "a row below the viewport comes to its bottom edge"
+        );
+        state.reveal(5);
+        assert_eq!(
+            state.take_reveal(100.0),
+            Some(100.0),
+            "a row above it comes to the top edge"
+        );
+        state.reveal(21);
+        assert_eq!(
+            state.take_reveal(100.0),
+            None,
+            "a visible row moves nothing"
+        );
+        assert_eq!(state.take_reveal(100.0), None, "the request was not taken");
+        state.reveal(1_000);
+        assert_eq!(
+            state.take_reveal(100.0),
+            None,
+            "a row that has left the list moved the content"
+        );
+    }
+
+    /// The extent a list is laid out at climbs while a manipulation is live and never steps
+    /// back under a moving finger.
+    #[test]
+    fn a_held_extent_never_shortens_under_an_interaction() {
+        let state = list_state();
+        state.rows.update(|rows| {
+            rows.unit = 20.0;
+            rows.take(&(0..10).collect::<Vec<_>>(), 1.0);
+        });
+        assert_eq!(state.extent(), 10.0);
+        state.edit(|at| at.held = 10.0);
+        state
+            .rows
+            .update(|rows| rows.take(&(0..4).collect::<Vec<_>>(), 1.0));
+        assert_eq!(
+            state.extent(),
+            10.0,
+            "the content shortened mid-interaction"
+        );
+        state.edit(|at| at.held = 0.0);
+        assert_eq!(state.extent(), 4.0, "the hold outlived the interaction");
+    }
+
+    // ── the two halves of a container ────────────────────────────────────────────
+
+    /// Returns a container's app-side row, with `observe` deciding whether its tracker's
+    /// reports are owed upstream.
+    fn row(index: u32, observed: bool) -> ScrollRow {
+        let node = NodeId::raw(index, 1);
+        ScrollRow {
+            front: ScrollFront {
+                viewport: node,
+                tracker: TrackerId::new(Id::raw(index, 1)),
+                hover: ControlId::raw(index, 1),
+                grab: ControlId::raw(index + 100, 1),
+            },
+            last: ThumbGeom::UNSENT,
+            node,
+            content: NodeId::raw(index + 200, 1),
+            rail: NodeId::raw(index + 300, 1),
+            thumb: SpriteId(NodeId::raw(index + 100, 1)),
+            reveal: Reveal::OnDemand,
+            created: true,
+            state: observed.then(list_state),
+        }
+    }
+
+    /// A container reaches the table that moves its thumb once, and leaves it when it unmounts.
+    ///
+    /// The add is emitted before the geometry gate, so a container whose content fits is in the
+    /// table too: its thumb still has a reveal, and a row that never arrived would leave every
+    /// hover over that surface acting on nothing.
+    #[test]
+    fn a_container_is_added_once_and_dropped_when_it_unmounts() {
+        let mut held = row(1, false);
+        let mut table = ScrollTable::default();
+        let mut ops = Vec::new();
+
+        held.publish(geom(400.0, 200.0), &mut ops);
+        assert_eq!(
+            ops.len(),
+            2,
+            "the arrival and its geometry did not both cross"
+        );
+        assert!(
+            matches!(ops[0], ScrollOp::Add { .. }),
+            "the add was not first"
+        );
+        table.apply_ops(&mut ops);
+        assert_eq!(table.rows.len(), 1);
+        assert!(ops.is_empty(), "the batch was not drained");
+
+        held.publish(geom(400.0, 200.0), &mut ops);
+        assert!(ops.is_empty(), "a settled container emitted an op");
+        table.apply_ops(&mut ops);
+        assert_eq!(table.rows.len(), 1, "a settled container was added twice");
+
+        held.publish(geom(200.0, 4000.0), &mut ops);
+        assert_eq!(
+            ops.len(),
+            1,
+            "a moved extent emitted more than its geometry"
+        );
+        table.apply_ops(&mut ops);
+        assert_eq!(
+            table.rows[0].last,
+            geom(200.0, 4000.0),
+            "the table kept the geometry the old viewport gave it"
+        );
+
+        ops.push(ScrollOp::Drop {
+            viewport: held.front.viewport,
+        });
+        table.apply_ops(&mut ops);
+        assert!(
+            table.rows.is_empty(),
+            "the unmounted container kept its row"
+        );
+    }
+
+    /// Only a scroll with application-owned state needs its tracker's reports upstream.
+    ///
+    /// Scene-side hit offsets, request completion and thumb reveal are already serviced, and an
+    /// unknown tracker stays available to every other consumer.
+    #[test]
+    fn only_virtual_lists_forward_tracker_reports_to_the_app() {
+        let mut table = ScrollTable::default();
+        let mut ops = Vec::new();
+        row(1, false).publish(geom(200.0, 4000.0), &mut ops);
+        table.apply_ops(&mut ops);
+        let quiet = table.rows[0].of.tracker.id();
+        let unknown = TrackerId::<Observed>::new(Id::raw(9, 1)).id();
+
+        let events = |tracker| {
+            [
+                SceneEvent::TrackerValues {
+                    tracker: TrackerId::new(tracker),
+                    position: Vector2 { x: 0.0, y: 100.0 },
+                    scale: 1.0,
+                },
+                SceneEvent::TrackerPhase {
+                    tracker: TrackerId::new(tracker),
+                    phase: TrackerPhase::Idle,
+                },
+                SceneEvent::InertiaBegan {
+                    tracker: TrackerId::new(tracker),
+                    rest: Vector2 { x: 0.0, y: 0.0 },
+                    from_wheel: false,
+                },
+                SceneEvent::RequestIgnored {
+                    tracker: TrackerId::new(tracker),
+                    request: 1,
+                },
+            ]
+        };
+        assert!(events(quiet).iter().all(|e| !table.app_observes(e)));
+        assert!(
+            events(unknown).iter().all(|e| table.app_observes(e)),
+            "an unknown tracker was withheld from its other consumers"
+        );
+        assert!(table.app_observes(&SceneEvent::DeviceRebuilt));
+
+        let mut ops = Vec::new();
+        let mut virtualized = row(2, true);
+        virtualized.publish(geom(200.0, 4000.0), &mut ops);
+        table.apply_ops(&mut ops);
+        let watched = table.rows[1].of.tracker.id();
+        assert!(events(watched).iter().all(|e| table.app_observes(e)));
+    }
+
+    /// A thumb declared `Always` is opaque from its mount, so the first edge that would show it
+    /// again emits nothing.
+    #[test]
+    fn an_always_shown_thumb_starts_shown() {
+        let mut table = ScrollTable::default();
+        let mut ops = Vec::new();
+        let mut always = row(1, false);
+        always.reveal = Reveal::Always;
+        always.publish(geom(200.0, 4000.0), &mut ops);
+        table.apply_ops(&mut ops);
+        assert!(table.rows[0].shown);
+
+        let mut on_demand = row(2, false);
+        on_demand.publish(geom(200.0, 4000.0), &mut ops);
+        table.apply_ops(&mut ops);
+        assert!(!table.rows[1].shown, "an on-demand thumb started shown");
+    }
+
+    /// The reason to show a thumb ending does not take the thumb with it: the fade carries the
+    /// hold, and a reason arriving inside the hold binds the channel again, which replaces the
+    /// fade rather than letting it run.
+    #[test]
+    fn a_concealed_thumb_holds_before_it_fades_and_a_new_reason_replaces_the_fade() {
+        let mut table = ScrollTable::default();
+        let mut ops = Vec::new();
+        let mut held = row(1, false);
+        held.publish(geom(200.0, 4000.0), &mut ops);
+        table.apply_ops(&mut ops);
+        let live = &mut table.rows[0];
+
+        assert_eq!(
+            reveal_bind(live, true),
+            Some(Bind::Animate(Anim::Spring {
+                to: Value::Scalar(1.0),
+                tuning: Tuning::Chrome,
+                delay_ms: 0,
+            })),
+            "a thumb was not lit the moment its reason arrived"
+        );
+        assert_eq!(
+            reveal_bind(live, false),
+            Some(Bind::Animate(Anim::Spring {
+                to: Value::Scalar(0.0),
+                tuning: Tuning::Chrome,
+                delay_ms: CONCEAL_MS,
+            })),
+            "the fade carried no hold, so the thumb left with its reason"
+        );
+        assert_eq!(
+            reveal_bind(live, false),
+            None,
+            "a second conceal restarted the hold"
+        );
+        assert_eq!(
+            reveal_bind(live, true),
+            Some(Bind::Animate(Anim::Spring {
+                to: Value::Scalar(1.0),
+                tuning: Tuning::Chrome,
+                delay_ms: 0,
+            })),
+            "a reason inside the hold did not replace the pending fade"
+        );
+    }
+
+    /// A grab outlives the pointer leaving the thumb, so the reason it holds is not the hover's.
+    #[test]
+    fn a_grabbed_thumb_states_no_fade_however_the_pointer_wanders() {
+        let mut table = ScrollTable::default();
+        let mut ops = Vec::new();
+        let mut held = row(1, false);
+        held.publish(geom(200.0, 4000.0), &mut ops);
+        table.apply_ops(&mut ops);
+        let live = &mut table.rows[0];
+
+        _ = reveal_bind(live, true);
+        live.grab_from = 0.0;
+        assert_eq!(reveal_bind(live, false), None, "a grabbed thumb faded");
+        live.grab_from = f32::NAN;
+        assert!(
+            matches!(
+                reveal_bind(live, false),
+                Some(Bind::Animate(Anim::Spring { delay_ms: CONCEAL_MS, .. }))
+            ),
+            "a released grab did not leave the thumb on its hold"
+        );
     }
 }

@@ -1,155 +1,333 @@
 //! Borrowed parent-first authoring. Constructors write retained records immediately.
-use super::host::MountRow;
-use super::style::{Declaration, Recipe};
-use super::theme::{Appearance, PaintSource};
-use super::theme::{PaintMask, Part};
-use super::{Any, Host, Mount, Path};
-use crate::layout::{Layout, Len, Preset};
-use crate::role::{Role, Scope, Text};
+//!
+//! A constructor mints the node, links it under the current parent and returns an `Element`
+//! borrowing the context; chained setters edit columns in place. There is no temporary tree,
+//! no child collector and no per-element runtime object.
+
+use super::host::Host;
+use super::mount::Mount;
+use super::tree;
+use crate::layout::{Align, Anchors, Layout, Len, Preset, Probe, Templates, Track, WidthClass};
+use crate::role::{Scope, ScopedToken};
 use crate::signal::{Effect, Signal};
-use crate::widget::{Flow, TextSource, TextStyle};
+use crate::structure::{Branch, Keyed, Step};
 use core::marker::PhantomData;
-use windows_scene::{GroupId, NodeId, Prop, SpriteId, Value};
+use windows_numerics::Vector2;
+use windows_scene::{ControlId, GeomId, GroupId, NodeId, PathVerb, Prop, Value};
 
-#[derive(Copy, Clone, Debug)]
-pub(super) enum Target {
-    Group(GroupId),
-    Sprite(SpriteId),
-}
-impl Target {
-    pub(super) fn id(self) -> NodeId {
-        match self {
-            Self::Group(id) => id.node(),
-            Self::Sprite(id) => id.node(),
-        }
-    }
+/// Opaque retained identity.
+///
+/// The node generation is checked on every edit, so a handle held across an unmount reads
+/// back absence rather than whatever now occupies the slot.
+pub struct Node<K = super::Any> {
+    pub(crate) id: NodeId,
+    kind: PhantomData<fn() -> K>,
 }
 
-/// Opaque retained identity. Both the node generation and runtime lifetime are checked on edit.
-pub struct Node<K = Any> {
-    pub(super) target: Target,
-    pub(super) runtime: u64,
-    pub(super) owner: Option<windows_scene::ControlId>,
-    pub(super) hover_scope: Option<windows_scene::ControlId>,
-    pub(super) kind: PhantomData<fn() -> K>,
-}
 impl<K> Copy for Node<K> {}
+
 impl<K> Clone for Node<K> {
     fn clone(&self) -> Self {
         *self
     }
 }
+
+// A fixture names what it built by handle and asks the arena about it by id.
+#[cfg(test)]
+impl<K> From<Node<K>> for NodeId {
+    fn from(node: Node<K>) -> Self {
+        node.id
+    }
+}
+
 impl<K> core::fmt::Debug for Node<K> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        self.target.fmt(f)
+    fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.id.fmt(out)
     }
 }
 
 /// A short-lived writer borrowing the runtime. Keep `id()` when later edits are needed.
-pub struct Element<'a, K = Any> {
-    pub(super) host: &'a mut Host,
-    pub(super) members: Option<&'a mut Members>,
-    pub(super) node: Node<K>,
-}
-
-#[derive(Default)]
-pub(super) struct Members {
-    first: NodeId,
-    parent: Option<GroupId>,
-    roots: Vec<NodeId>,
-}
-impl Members {
-    fn push(&mut self, host: &mut Host, id: NodeId) {
-        if self.first.is_none() {
-            self.first = id;
-        }
-        host.mounts.place(id, MountRow::new());
-    }
+pub struct Element<'a, K = super::Any> {
+    pub(crate) ui: Ui<'a>,
+    pub(crate) node: NodeId,
+    kind: PhantomData<fn() -> K>,
 }
 
 /// The authoring and update context. Construction is available only in creation transactions.
 pub struct Ui<'a> {
-    pub(super) host: &'a mut Host,
-    pub(super) members: &'a mut Members,
-    pub(super) parent: Option<GroupId>,
-    pub(super) after: Option<NodeId>,
-    pub(super) scope: Scope,
-    pub(super) owner: Option<windows_scene::ControlId>,
-    pub(super) hover_scope: Option<windows_scene::ControlId>,
+    pub(crate) host: &'a mut Host,
+    /// The roots this transaction owns, which the retirement walk reads. Distinct from layout
+    /// ancestry, since a keyed result may own several siblings and an overlay a detached root.
+    pub(crate) members: &'a mut Vec<NodeId>,
+    pub(crate) parent: NodeId,
+    /// The sibling the next mint is ordered above. Carried rather than re-derived, because
+    /// the links carry no last-child pointer and finding one is a walk.
+    pub(crate) after: Option<NodeId>,
+    pub(crate) scope: u32,
+    /// The nearest enclosing control, which a part attaches itself to.
+    pub(crate) control: ControlId,
+    /// Whether a node minted here is one of this transaction's roots.
+    pub(crate) root: bool,
 }
 
-impl Ui<'_> {
+impl<'a> Ui<'a> {
+    /// Runs `create` against a fresh transaction under `parent`, above `after`.
+    ///
+    /// Takes a whole `Scope` and interns it, which is what a fixture holds; production mounts
+    /// through [`mount_interned`](Self::mount_interned), whose caller already has the index.
+    #[cfg(test)]
     pub(crate) fn mount_at(
-        parent: GroupId,
+        parent: NodeId,
         after: Option<NodeId>,
         scope: Scope,
-        owner: Option<windows_scene::ControlId>,
-        create: impl FnOnce(&mut Ui<'_>),
-    ) -> Mount {
-        Self::mount_scoped(parent, after, scope, owner, None, create)
-    }
-
-    fn mount_scoped(
-        parent: GroupId,
-        after: Option<NodeId>,
-        scope: Scope,
-        owner: Option<windows_scene::ControlId>,
-        hover_scope: Option<windows_scene::ControlId>,
+        control: ControlId,
         create: impl FnOnce(&mut Ui<'_>),
     ) -> Mount {
         Host::with(|host| {
-            let mut members = Members {
-                roots: host.root_pool.pop().unwrap_or_default(),
-                parent: Some(parent),
-                ..Default::default()
-            };
-            let scope = scope.in_theme(host.root_scope);
-            create(&mut Ui {
-                host,
-                members: &mut members,
-                parent: Some(parent),
-                after,
-                scope,
-                owner,
-                hover_scope,
-            });
-            Mount::new(members.roots, host.identity)
+            let root = host.root_scope();
+            let scope = host.intern(scope.in_theme(root));
+            Self::transact(host, parent, after, scope, control, create)
         })
     }
 
-    /// Retains keyed results and moves only roots outside the surviving LIS.
+    /// The same, against a scope this host has already interned.
+    pub(crate) fn mount_interned(
+        parent: NodeId,
+        after: Option<NodeId>,
+        scope: u32,
+        control: ControlId,
+        create: impl FnOnce(&mut Ui<'_>),
+    ) -> Mount {
+        Host::with(|host| Self::transact(host, parent, after, scope, control, create))
+    }
+
+    fn transact(
+        host: &mut Host,
+        parent: NodeId,
+        after: Option<NodeId>,
+        scope: u32,
+        control: ControlId,
+        create: impl FnOnce(&mut Ui<'_>),
+    ) -> Mount {
+        // Taken from the pool a retired mount returns its list to, so a warm mount of a
+        // screen already built once allocates nothing.
+        let mut members = host.take_roots();
+        create(&mut Ui { host, members: &mut members, parent, after, scope, control, root: true });
+        Mount::new(members)
+    }
+
+    /// Runs `create` against the window root, which outlives the transaction.
+    pub(crate) fn mount_root(create: impl FnOnce(&mut Ui<'_>)) -> Mount {
+        Host::with(|host| {
+            let (root, scope) = (host.root(), 0);
+            let mut members = host.take_roots();
+            create(&mut Ui {
+                host,
+                members: &mut members,
+                parent: root,
+                after: None,
+                scope,
+                control: ControlId::NONE,
+                root: false,
+            });
+            members.clear();
+            members.push(root);
+            Mount::rooted(members)
+        })
+    }
+
+    /// Returns the lexical design scope; width-dependent values resolve during solving.
+    pub fn scope(&self) -> Scope {
+        self.host.scope_at(self.scope)
+    }
+
+    pub fn window_size(&self) -> crate::signal::Cell<Vector2> {
+        self.host.window
+    }
+
+    /// Mints a node under the current parent and returns a writer for it.
+    ///
+    /// Allocates the parent immediately; chained declarations precede `children`.
+    pub fn node(&mut self, preset: Preset) -> Element<'_> {
+        let id = self.mint(preset, false);
+        self.element(id)
+    }
+
+    /// Mints a painted node under the current parent.
+    pub fn sprite(&mut self, preset: Preset) -> Element<'_> {
+        let id = self.mint(preset, true);
+        self.element(id)
+    }
+
+    fn mint(&mut self, preset: Preset, sprite: bool) -> NodeId {
+        let parent = GroupId(self.parent);
+        let id = if sprite {
+            self.host.sprite(parent, self.after).0
+        } else {
+            self.host.group(parent, self.after).0
+        };
+        self.host.tree.c.scope[id.index()] = self.scope;
+        self.host.tree.c.layout[id.index()] = Layout::of(preset);
+        self.host.tree.adopt_layout_bits(id);
+        self.after = Some(id);
+        if self.root {
+            self.members.push(id);
+        }
+        id
+    }
+
+    pub(crate) fn element<K>(&mut self, node: NodeId) -> Element<'_, K> {
+        Element {
+            ui: Ui {
+                host: &mut *self.host,
+                members: &mut *self.members,
+                parent: self.parent,
+                after: self.after,
+                scope: self.scope,
+                control: self.control,
+                root: self.root,
+            },
+            node,
+            kind: PhantomData,
+        }
+    }
+
+    pub fn group(&mut self, preset: Preset, create: impl FnOnce(&mut Ui<'_>)) -> Element<'_> {
+        self.node(preset).children(create)
+    }
+
+    pub fn row(&mut self, create: impl FnOnce(&mut Ui<'_>)) -> Element<'_> {
+        self.group(Preset::Row, create)
+    }
+
+    pub fn stack(&mut self, create: impl FnOnce(&mut Ui<'_>)) -> Element<'_> {
+        self.group(Preset::Stack, create)
+    }
+
+    pub fn grid(&mut self, create: impl FnOnce(&mut Ui<'_>)) -> Element<'_> {
+        self.group(Preset::Grid, create)
+    }
+
+    pub fn layer(&mut self, create: impl FnOnce(&mut Ui<'_>)) -> Element<'_> {
+        self.group(Preset::Layer, create)
+    }
+
+    /// Declares a single painted path. Its geometry remains a retained scene resource.
+    pub fn path(&mut self, geometry: GeomId) -> Element<'_, super::Path> {
+        let id = self.mint(Preset::Figure, true);
+        // Recorded rather than sent: the paint declaration that follows emits the mask, with
+        // the stroke only it knows.
+        self.host.appearances.set_shape(id, geometry);
+        self.element(id)
+    }
+
+    /// Declares a presentation region: one sprite painting a buffer the present thread draws.
+    ///
+    /// The node is an ordinary element in every other respect: it takes a size from its
+    /// container, it can be placed in a grid, and chrome may sit over it. Nothing may sit under
+    /// it: a region that lets the ground show through its own box is composed every frame
+    /// instead of flipping.
+    ///
+    /// `queue` is the presentation queue this region asks for. [`windows_present::Queue::Solo`]
+    /// is for the one surface whose plane the layout protects; everything else shares one named
+    /// queue, so a second per-frame surface degrades its own company and never that one.
+    /// `build` runs on the present thread with that thread's `Gpu`.
+    ///
+    /// The node carries a hit entry, so a contact resolves to the region through the one hit
+    /// array like any control. Which part of it the contact landed on is resolved by
+    /// [`crate::present::pick`] after the region has won.
+    pub fn region(
+        &mut self,
+        queue: windows_present::Queue,
+        live: &crate::present::Live,
+        build: impl FnOnce(&windows_present::Gpu, crate::present::Theme) -> windows_core::Result<Box<dyn windows_present::Frame>>
+            + Send
+            + 'static,
+    ) -> Element<'_, super::Region> {
+        let node = self.mint(crate::present::PRESET, true);
+        let scope = self.host.scope_at(self.scope);
+        let sink = self.host.region();
+        let control = self
+            .host
+            .mint_control(super::control::ControlRow::blank(node, scope));
+        self.host.hit(
+            node,
+            Some(windows_scene::HitDecl {
+                flags: windows_scene::HitFlags::INTERACTIVE,
+                id: control,
+                touch_inflate: None,
+            }),
+        );
+        let at = self.host.regions.place(crate::present::RegionRow {
+            node,
+            sink,
+            control,
+            queue,
+            live: live.clone(),
+            theme: std::sync::Arc::new(crate::present::Published::new(scope)),
+            build: Some(Box::new(build)),
+            extent: None,
+        });
+        self.host.set_region_row(node, at);
+        self.host.declare_part(
+            node,
+            super::theme::Part::Ink,
+            super::theme::PaintSource::Region(sink),
+            super::theme::PaintMask::Region(sink),
+            1.0,
+        );
+        self.element(node)
+    }
+
+    /// Returns absence for a retired generation.
+    pub fn edit<K>(&mut self, node: Node<K>) -> Option<Element<'_, K>> {
+        if self.host.tree.is_live(node.id) {
+            Some(self.element(node.id))
+        } else {
+            None
+        }
+    }
+
+    /// Mints the hidden node the results of a structural combinator are ordered above.
+    ///
+    /// A `Layer` because it is the container with no opinion, and hidden because it takes no
+    /// space: what it carries is a position in its parent's child list.
+    fn anchor(&mut self) -> NodeId {
+        let id = self.mint(Preset::Layer, false);
+        self.host.tree.set_flag(id, tree::HIDDEN, true);
+        id
+    }
+
+    /// Retains keyed results and moves only roots outside the surviving order.
     pub fn each<T: 'static, K: Eq + core::hash::Hash + Clone + 'static>(
         &mut self,
         fill: impl Fn(&mut Vec<T>) + 'static,
         key: impl Fn(&T) -> &K + 'static,
         create: impl Fn(&mut Ui<'_>, &T) + 'static,
     ) {
-        let parent = self
-            .parent
-            .expect("structure requires a creation transaction");
-        let anchor = self
-            .group(Preset::Bare, |_| {})
-            .layout(|l| l.hidden = Some(true))
-            .id()
-            .target
-            .id();
-        let (scope, owner, hover_scope) = (self.scope, self.owner, self.hover_scope);
-        let mut list = crate::structure::Keyed::<K, Mount>::new();
-        let mut next = Vec::new();
-        self.host.binding(anchor, move || {
-            next.clear();
-            fill(&mut next);
+        let anchor = self.anchor();
+        let (parent, scope, control) = (self.parent, self.scope, self.control);
+        let mut list = Keyed::<K, Mount>::new();
+        let mut items = Vec::new();
+        self.host.binding(move || {
+            items.clear();
+            fill(&mut items);
             let mut after = Some(anchor);
             list.reconcile(
-                &next,
+                &items,
                 &key,
-                |_, item| {
-                    Self::mount_scoped(parent, Some(anchor), scope, owner, hover_scope, |ui| {
-                        create(ui, item)
+                |item| {
+                    Ui::mount_interned(parent, Some(anchor), scope, control, |ui| {
+                        create(ui, item);
                     })
                 },
-                |mount, _, step, _| {
-                    after = mount.place(parent, after, step != crate::structure::Step::Keep);
+                |mount, step| {
+                    // A survivor already in the right place is a rebind and nothing
+                    // structural, so only the moves reach the splice.
+                    if step != Step::Keep {
+                        Host::with(|host| mount.place(host, parent, after));
+                    }
+                    after = mount.last().or(after);
                 },
             );
         });
@@ -164,12 +342,9 @@ impl Ui<'_> {
             if condition.read() {
                 create(self);
             }
-        } else {
-            self.branch(
-                move || condition.read().then_some(()),
-                move |ui, _| create(ui),
-            );
+            return;
         }
+        self.switch_on(move || condition.read().then_some(()), move |ui, ()| create(ui));
     }
 
     pub fn switch<K: PartialEq + 'static>(
@@ -177,591 +352,424 @@ impl Ui<'_> {
         key: impl Fn() -> K + 'static,
         create: impl Fn(&mut Ui<'_>, &K) + 'static,
     ) {
-        self.branch(move || Some(key()), create);
+        self.switch_on(move || Some(key()), create);
     }
 
-    fn branch<K: PartialEq + 'static>(
+    fn switch_on<K: PartialEq + 'static>(
         &mut self,
         key: impl Fn() -> Option<K> + 'static,
         create: impl Fn(&mut Ui<'_>, &K) + 'static,
     ) {
-        let parent = self
-            .parent
-            .expect("structure requires a creation transaction");
-        let anchor = self
-            .group(Preset::Bare, |_| {})
-            .layout(|l| l.hidden = Some(true))
-            .id()
-            .target
-            .id();
-        let (scope, owner, hover_scope) = (self.scope, self.owner, self.hover_scope);
-        let mut branch = crate::structure::Branch::<K, Mount>::new();
-        self.host.binding(anchor, move || {
+        let anchor = self.anchor();
+        let (parent, scope, control) = (self.parent, self.scope, self.control);
+        let mut branch = Branch::<K, Mount>::new();
+        self.host.binding(move || {
             branch.set(key(), |key| {
-                Self::mount_scoped(parent, Some(anchor), scope, owner, hover_scope, |ui| {
-                    create(ui, key)
-                })
+                let mount = Ui::mount_interned(parent, Some(anchor), scope, control, |ui| {
+                    create(ui, key);
+                });
+                Host::with(|host| mount.place(host, parent, Some(anchor)));
+                mount
             });
         });
     }
 
-    pub(crate) fn mount_root(create: impl FnOnce(&mut Ui<'_>)) -> Mount {
-        Host::with(|host| {
-            let root = host.model.root();
-            let mut members = Members::default();
-            members.roots = host.root_pool.pop().unwrap_or_default();
-            members.roots.push(root.node());
-            members.push(host, root.node());
-            let scope = host.root_scope;
-            create(&mut Ui {
-                host,
-                members: &mut members,
-                parent: Some(root),
-                after: None,
-                scope,
-                owner: None,
-                hover_scope: None,
+    /// Updates several retained handles through the same deferred signal graph.
+    ///
+    /// Deferred until the creation borrow ends, like every UI binding, and it creates no
+    /// structure: creation belongs to explicit transactions.
+    pub fn effect(&mut self, mut update: impl FnMut(&mut Ui<'_>) + 'static) -> Effect {
+        let (parent, scope, control) = (self.parent, self.scope, self.control);
+        self.host.binding(move || {
+            Host::with(|host| {
+                let mut members = Vec::new();
+                update(&mut Ui {
+                    host,
+                    members: &mut members,
+                    parent,
+                    after: None,
+                    scope,
+                    control,
+                    root: false,
+                });
+                debug_assert!(members.is_empty(), "an update transaction created structure");
             });
-            Mount::new(members.roots, host.identity)
         })
     }
 
-    /// Returns the lexical design scope; width-dependent values resolve during solving.
-    pub fn scope(&self) -> Scope {
-        self.scope
+    /// Installs one writer for `value`, or writes it once where it is constant.
+    pub(crate) fn bind<T, M>(
+        &mut self,
+        value: impl Signal<T, M> + 'static,
+        mut write: impl FnMut(&mut Host, T) + 'static,
+    ) where
+        T: Copy + PartialEq + 'static,
+    {
+        if value.is_constant() {
+            let held = value.read();
+            write(self.host, held);
+            return;
+        }
+        let mut last: Option<T> = None;
+        self.host.binding(move || {
+            let next = value.read();
+            if last.replace(next) != Some(next) {
+                Host::with(|host| write(host, next));
+            }
+        });
     }
 
-    pub fn geometry(&mut self, verbs: &[windows_scene::PathVerb]) -> windows_scene::GeomId {
-        let id = self.host.model.geometry(verbs);
-        crate::signal::Owner::retain(super::geometry::Lease(id, self.host.identity));
+    pub fn geometry(&mut self, verbs: &[PathVerb]) -> GeomId {
+        let id = self.host.geometry(verbs);
+        crate::signal::Owner::retain(super::geometry::Lease(id));
         id
     }
 
+    pub fn set_geometry(&mut self, id: GeomId, verbs: &[PathVerb]) {
+        self.host.set_geometry(id, verbs);
+    }
+
+    pub fn ramp(&mut self, stops: &[super::Stop], spread: windows_scene::Spread) -> windows_scene::RampId {
+        let id = self.host.ramp(stops, spread);
+        crate::signal::Owner::retain(super::geometry::Lease(id));
+        id
+    }
+
+    /// Re-resolves retained appearance and typography without recreating content.
+    pub fn set_theme(&mut self, root: Scope, backdrop: windows_scene::BackdropSpec) {
+        self.host.set_theme(root, backdrop);
+    }
+
+    // ── drawing in the geometry phase ───────────────────────────────────────────────
+
+    /// Mints `N` retained geometries and fills them in the geometry phase from `source`.
+    ///
+    /// The geometry phase runs after the flush has published every box, so `fill` reads the
+    /// box this batch solved and its verbs reach the same scene patch. It may not write
+    /// layout, structure or application state. Each path has its own buffer, reserved once at
+    /// `caps` and reused, and the set is re-emitted when the source box or a tracked read
+    /// inside `fill` moves.
+    pub(crate) fn geometries<const N: usize>(
+        &mut self,
+        source: super::geometry::Source,
+        caps: [usize; N],
+        fill: impl FnMut(&super::geometry::Inputs<'_>, &mut [Vec<PathVerb>; N]) + 'static,
+    ) -> [GeomId; N] {
+        self.geometries_on(self.parent, source, caps, fill)
+    }
+
+    /// Mints `N` geometries filled from the box of the container being built into, for figures
+    /// stacked inside it that have to agree on one extent.
+    pub fn own_geometries<const N: usize>(
+        &mut self,
+        caps: [usize; N],
+        fill: impl FnMut(&super::geometry::Inputs<'_>, &mut [Vec<PathVerb>; N]) + 'static,
+    ) -> [GeomId; N] {
+        self.geometries(super::geometry::Source::Own(self.parent), caps, fill)
+    }
+
+    fn geometries_on<const N: usize>(
+        &mut self,
+        node: NodeId,
+        source: super::geometry::Source,
+        caps: [usize; N],
+        fill: impl FnMut(&super::geometry::Inputs<'_>, &mut [Vec<PathVerb>; N]) + 'static,
+    ) -> [GeomId; N] {
+        let ids = core::array::from_fn(|_| self.geometry(&[]));
+        self.host.add_geometry_job(node, source, ids, caps, fill);
+        ids
+    }
+
+    /// Declares one painted path filled from its own solved box.
     pub fn path_with(
         &mut self,
-        capacity: usize,
-        mut draw: impl FnMut(&mut Vec<windows_scene::PathVerb>, windows_numerics::Vector2, Scope)
-        + 'static,
-    ) -> Element<'_, Path> {
-        let geometry = self.geometry(&[]);
-        let element = self.path(geometry);
-        let mut verbs = Vec::with_capacity(capacity);
-        super::geometry::install(
-            element.host,
-            element.node.target.id(),
-            Box::new(move |size, scope| {
-                verbs.clear();
-                crate::signal::read_only(|| draw(&mut verbs, size, scope));
-                super::set_geometry(geometry, &verbs);
-            }),
-        );
-        element
-    }
-
-    /// Returns absence for a retired generation or a handle from another runtime.
-    pub fn edit<K>(&mut self, node: Node<K>) -> Option<Element<'_, K>> {
-        (node.runtime == self.host.identity && self.host.mounts.get(node.target.id()).is_some())
-            .then_some(Element {
-                host: self.host,
-                members: None,
-                node,
-            })
-    }
-
-    pub(super) fn create<K>(&mut self, preset: Preset, sprite: bool) -> Node<K> {
-        let parent = self
-            .parent
-            .expect("structure requires a creation transaction");
-        let target = if sprite {
-            Target::Sprite(self.host.model.sprite(parent, self.after))
-        } else {
-            Target::Group(self.host.model.group(parent, self.after))
-        };
-        let id = target.id();
-        if self.members.parent == Some(parent) {
-            self.members.roots.push(id);
-        }
-        self.after = Some(id);
-        self.members.push(self.host, id);
-        let recipe = Recipe {
-            preset,
-            scope: self.scope,
-            layout: Declaration::default(),
-            pending: None,
-        };
-        self.host.styles.place(id, recipe);
-        self.host.mark_style(id, self.scope.width);
-        // The class this node's declaration is lowered at is the one its *builder* was in,
-        // and a responsive container reclasses its subtree only when its own class moves. A
-        // node mounted after the container settled would otherwise keep the builder's class
-        // for the rest of its life, so the solve's answer is compared against this one.
-        self.host.fresh.push((id, self.scope.width));
-        Node {
-            target,
-            runtime: self.host.identity,
-            owner: self.owner,
-            hover_scope: self.hover_scope,
-            kind: PhantomData,
-        }
-    }
-
-    /// Allocates the parent immediately. Chained declarations precede `children`.
-    pub fn node(&mut self, preset: Preset) -> Element<'_> {
-        let node = self.create(preset, false);
-        Element {
-            host: self.host,
-            members: Some(self.members),
-            node,
-        }
-    }
-
-    pub fn group(&mut self, preset: Preset, children: impl FnOnce(&mut Ui<'_>)) -> Element<'_> {
-        self.node(preset).children(children)
-    }
-
-    pub fn row(&mut self, children: impl FnOnce(&mut Ui<'_>)) -> Element<'_> {
-        self.group(Preset::Row, children)
-    }
-    pub fn stack(&mut self, children: impl FnOnce(&mut Ui<'_>)) -> Element<'_> {
-        self.group(Preset::Stack, children)
-    }
-    pub fn grid(&mut self, children: impl FnOnce(&mut Ui<'_>)) -> Element<'_> {
-        self.group(Preset::Grid, children)
-    }
-
-    pub fn scroll(
-        &mut self,
-        declaration: crate::layout::ScrollDecl,
-        children: impl FnOnce(&mut Ui<'_>),
-    ) -> Element<'_> {
-        self.scroll_content(declaration, |ui| ui.stack(children).no_shrink().id())
-    }
-    pub(crate) fn scroll_content<K>(
-        &mut self,
-        declaration: crate::layout::ScrollDecl,
-        create: impl FnOnce(&mut Ui<'_>) -> Node<K>,
-    ) -> Element<'_> {
-        let node = self.create(Preset::Scroll, false);
-        let Target::Group(viewport) = node.target else {
-            unreachable!()
-        };
-        let control = self.host.direct_control(
-            viewport.node(),
-            self.scope,
-            crate::widget::UiaRole::None,
-            windows_scene::HitFlags::SCROLL
-                | windows_scene::HitFlags::INTERACTIVE
-                | windows_scene::HitFlags::WHEEL,
-        );
-        self.host
-            .controls
-            .get_mut(control)
-            .unwrap()
-            .front
-            .hover_scope = self.hover_scope;
-        let mut content_ui = Ui {
-            host: self.host,
-            members: self.members,
-            parent: Some(viewport),
-            after: None,
-            scope: self.scope,
-            owner: self.owner,
-            hover_scope: self.hover_scope,
-        };
-        let content = create(&mut content_ui);
-        super::mount::install_scroll(
-            self.host,
-            viewport,
-            content.target.id(),
-            declaration,
-            self.scope,
-            viewport.node(),
-        );
-        Element {
-            host: self.host,
-            members: Some(self.members),
-            node,
-        }
-    }
-
-    pub fn region(
-        &mut self,
-        queue: windows_present::Queue,
-        live: &crate::present::Live,
-        build: impl FnOnce(
-            &windows_present::Gpu,
-            crate::present::Theme,
-        ) -> windows_core::Result<Box<dyn windows_present::Frame>>
-        + Send
-        + 'static,
-    ) -> Element<'_, super::Region> {
-        let sink = self.host.model.region();
-        let node = self.create(crate::present::PRESET, true);
-        let Target::Sprite(sprite) = node.target else {
-            unreachable!()
-        };
-        let control = self.host.direct_control(
-            sprite.node(),
-            self.scope,
-            crate::widget::UiaRole::Graph,
-            windows_scene::HitFlags::INTERACTIVE | windows_scene::HitFlags::GESTURE,
-        );
-        self.host
-            .controls
-            .get_mut(control)
-            .unwrap()
-            .front
-            .hover_scope = self.hover_scope;
-        let appearance = Appearance {
-            id: sprite,
-            mask: PaintMask::Box { radius: None },
-            source: PaintSource::Region(sink),
-            strength: 1.0,
-            part: Part::Static,
-            geom: None,
-            scope: self.scope,
-            surface: None,
-            halo: None,
-            next: NodeId::NONE,
-            wash: false,
-        };
-        appearance.publish(self.host, true);
-        self.host.appearances.place(sprite.node(), appearance);
-        self.host.own_appearance(sprite, sprite.node());
-        self.host.regions.place(
-            sprite.node(),
-            crate::present::RegionRow {
-                theme: std::sync::Arc::new(crate::present::Published::new(self.scope)),
-                sink,
-                key: crate::present::key_of(sink),
-                queue,
-                live: live.clone(),
-                control: Some(control),
-                build: Some(Box::new(build)),
-                extent: None,
-            },
-        );
-        Element {
-            host: self.host,
-            members: Some(self.members),
-            node,
-        }
-    }
-
-    /// Creates a run from an immutable typography recipe, without an intermediate text seed.
-    pub fn text(&mut self, style: TextStyle, source: impl Into<TextSource>) -> Element<'_> {
-        self.text_owned(self.owner, style, source)
-    }
-
-    pub(crate) fn text_owned(
-        &mut self,
-        owner: Option<windows_scene::ControlId>,
-        style: TextStyle,
-        source: impl Into<TextSource>,
-    ) -> Element<'_> {
-        let source = source.into();
-        let mut node = self.create(Preset::Text, style.flow == Flow::Line && !style.vertical);
-        node.owner = owner;
-        let (sprite, group) = match node.target {
-            Target::Sprite(id) => (id, None),
-            Target::Group(id) => (SpriteId::default(), Some(id)),
-        };
-        let ink = owner
-            .and_then(|id| self.host.chrome(id))
-            .map(|chrome| Role::Text(chrome.in_state(crate::widget::ModelState::Rest).text))
-            .or(style.ink);
-        if group.is_none() {
-            let appearance = Appearance {
-                id: sprite,
-                mask: PaintMask::Bare,
-                source: owner.filter(|id| self.host.chrome(*id).is_some()).map_or(
-                    PaintSource::Role(ink.unwrap_or(Role::Text(Text::Primary))),
-                    PaintSource::Owner,
-                ),
-                part: Part::Label,
-                strength: 1.0,
-                geom: None,
-                scope: self.scope,
-                surface: None,
-                halo: None,
-                next: NodeId::NONE,
-                wash: false,
-            };
-            appearance.publish(self.host, true);
-            self.host.appearances.place(sprite.node(), appearance);
-            self.host.own_appearance(sprite, node.target.id());
-        }
-        let key = super::text::install(
-            self.host,
-            node.target.id(),
-            super::text::Mint {
-                text: super::text::Source::Static(""),
-                ramp: style.typography,
-                flow: style.flow,
-                caps: style.caps,
-                vertical: style.vertical,
-                scope: self.scope,
-                ink,
-                sprite,
-                group,
-            },
-            source,
-        );
-        if let Some(owner) = owner {
-            let control = self.host.controls.get_mut(owner).unwrap();
-            if control.text.is_none() {
-                control.text = Some(key);
-                self.host.uia_restale();
-            }
-        } else {
-            let id = self.host.direct_control(
-                node.target.id(),
-                self.scope,
-                crate::widget::UiaRole::Text,
-                windows_scene::HitFlags::UIA,
-            );
-            let control = self.host.controls.get_mut(id).unwrap();
-            control.text = Some(key);
-            control.front.hover_scope = self.hover_scope;
-        }
-        Element {
-            host: self.host,
-            members: Some(self.members),
-            node,
-        }
-    }
-
-    /// Declares a single painted path. Its geometry remains a retained scene resource.
-    pub fn path(&mut self, geometry: windows_scene::GeomId) -> Element<'_, Path> {
-        let node = self.create(Preset::Bare, true);
-        let Target::Sprite(id) = node.target else {
-            unreachable!()
-        };
-        let appearance = Appearance {
+        cap: usize,
+        mut fill: impl FnMut(&super::geometry::Inputs<'_>, &mut Vec<PathVerb>) + 'static,
+    ) -> Element<'_, super::Path> {
+        let id = self.mint(Preset::Figure, true);
+        let [geom] = self.geometries_on(
             id,
-            mask: PaintMask::Shape { stroke: None },
-            source: PaintSource::Role(Role::Text(Text::Primary)),
-            part: Part::Static,
-            strength: 1.0,
-            geom: Some(geometry),
-            scope: self.scope,
-            surface: None,
-            halo: None,
-            next: NodeId::NONE,
-            wash: false,
-        };
-        appearance.publish(self.host, true);
-        self.host.appearances.place(id.node(), appearance);
-        self.host.own_appearance(id, id.node());
-        Element {
-            host: self.host,
-            members: Some(self.members),
-            node,
-        }
+            super::geometry::Source::Own(id),
+            [cap],
+            move |inputs, [out]| fill(inputs, out),
+        );
+        self.host.appearances.set_shape(id, geom);
+        self.element(id)
     }
 
-    pub fn plate(&mut self, radius: impl Into<Len>, role: Role, strength: f32) -> Element<'_> {
-        let node = self.create(Preset::Bare, true);
-        let Target::Sprite(id) = node.target else {
-            unreachable!()
-        };
-        let appearance = Appearance {
-            id,
-            mask: PaintMask::Box {
-                radius: Some(radius.into()),
-            },
-            source: PaintSource::Role(role),
-            strength,
-            part: Part::Fill,
-            geom: None,
-            scope: self.scope,
-            surface: None,
-            halo: None,
-            next: NodeId::NONE,
-            wash: false,
-        };
-        appearance.publish(self.host, true);
-        self.host.appearances.place(id.node(), appearance);
-        self.host.own_appearance(id, id.node());
-        Element {
-            host: self.host,
-            members: Some(self.members),
-            node,
-        }
+    /// Mints one retained geometry filled from any probe's box.
+    ///
+    /// The probe need not be this node's own: the box a set of figures has to agree with is
+    /// often a container none of them belongs to.
+    pub fn local_geometry(
+        &mut self,
+        bounds: Probe,
+        cap: usize,
+        mut fill: impl FnMut(&super::geometry::Inputs<'_>, &mut Vec<PathVerb>) + 'static,
+    ) -> GeomId {
+        let [id] = self.geometries(
+            super::geometry::Source::Probe(bounds),
+            [cap],
+            move |inputs, [out]| fill(inputs, out),
+        );
+        id
     }
 
-    /// Updates several retained handles through the same deferred signal graph.
-    pub fn effect(&mut self, mut update: impl FnMut(&mut Ui<'_>) + 'static) -> Effect {
-        let owner = if self.members.first.is_none() {
-            self.parent
-                .map_or(self.host.model.root().node(), GroupId::node)
-        } else {
-            self.members.first
-        };
-        let scope = self.scope;
-        self.host.binding(owner, move || {
-            Host::with(|host| {
-                let scope = scope.in_theme(host.root_scope);
-                update(&mut Ui {
-                    host,
-                    members: &mut Members::default(),
-                    parent: None,
-                    after: None,
-                    scope,
-                    owner: None,
-                    hover_scope: None,
-                });
-            })
-        })
+    /// The keyed-set half: the same phase, the same buffers and the same equality cutoff,
+    /// over a whole anchor table rather than one box.
+    pub fn anchored_geometries<const N: usize>(
+        &mut self,
+        anchors: Anchors,
+        caps: [usize; N],
+        fill: impl FnMut(&super::geometry::Inputs<'_>, &mut [Vec<PathVerb>; N]) + 'static,
+    ) -> [GeomId; N] {
+        self.geometries(super::geometry::Source::Anchors(anchors), caps, fill)
     }
 }
 
-impl<K> Element<'_, K> {
+impl<'a, K> Element<'a, K> {
+    /// Returns this element under another kind marker; the node is the same.
+    pub(crate) fn retype<T>(self) -> Element<'a, T> {
+        Element { ui: self.ui, node: self.node, kind: PhantomData }
+    }
+
     pub fn id(self) -> Node<K> {
+        Node { id: self.node, kind: PhantomData }
+    }
+
+    pub(crate) fn node_id(&self) -> NodeId {
         self.node
     }
 
+    pub(crate) fn host(&mut self) -> &mut Host {
+        self.ui.host
+    }
+
+    /// Runs the body synchronously with this parent's declared scope and control ownership.
+    pub fn children(self, create: impl FnOnce(&mut Ui<'_>)) -> Self {
+        let node = self.node;
+        let scope = self.ui.host.tree.c.scope[node.index()];
+        let control = self.ui.control;
+        // The parent's own list, not one of this container's: `root` is false here, so
+        // nothing is pushed into it and a container costs no storage of its own.
+        create(&mut Ui {
+            host: &mut *self.ui.host,
+            members: &mut *self.ui.members,
+            parent: node,
+            after: None,
+            scope,
+            control,
+            root: false,
+        });
+        self
+    }
+
+    pub fn row(self, create: impl FnOnce(&mut Ui<'_>)) -> Self {
+        self.preset(Preset::Row).children(create)
+    }
+
+    pub fn stack(self, create: impl FnOnce(&mut Ui<'_>)) -> Self {
+        self.preset(Preset::Stack).children(create)
+    }
+
+    pub fn grid(self, create: impl FnOnce(&mut Ui<'_>)) -> Self {
+        self.preset(Preset::Grid).children(create)
+    }
+
+    pub fn layer(self, create: impl FnOnce(&mut Ui<'_>)) -> Self {
+        self.preset(Preset::Layer).children(create)
+    }
+
+    fn preset(self, preset: Preset) -> Self {
+        let node = self.node;
+        // The arrangement alone: everything else stated on this element so far stands, and an
+        // alignment still at the old preset's default follows the new one.
+        self.ui.host.tree.author(node, |l| {
+            let (was, now) = (Layout::of(l.preset), Layout::of(preset));
+            if l.align == was.align {
+                l.align = now.align;
+            }
+            if l.justify == was.justify {
+                l.justify = now.justify;
+            }
+            l.preset = preset;
+        });
+        self.ui.host.tree.adopt_layout_bits(node);
+        self
+    }
+
+    /// Edits the authored layout and marks the node. The path every layout setter takes.
     pub fn layout(self, write: impl FnOnce(&mut Layout)) -> Self {
-        let id = self.node.target.id();
-        let class = self.host.model.solved(id).class;
-        let recipe = self
-            .host
-            .styles
-            .get_mut(id)
-            .expect("a live element owns its declaration");
-        write(&mut recipe.layout.base);
-        self.host.mark_style(id, class);
+        self.author(write)
+    }
+
+    pub(crate) fn author(self, write: impl FnOnce(&mut Layout)) -> Self {
+        self.ui.host.tree.author(self.node, write);
         self
     }
 
-    pub fn layout_when(
-        self,
-        class: crate::role::WidthClass,
-        write: impl FnOnce(&mut Layout),
-    ) -> Self {
-        let id = self.node.target.id();
-        let active = self.host.model.solved(id).class;
-        write(self.host.styles.at(id, class));
-        self.host.mark_style(id, active);
+    pub(crate) fn flag(self, bit: tree::Bits, on: bool) -> Self {
+        self.ui.host.tree.set_flag(self.node, bit, on);
         self
     }
 
-    pub fn responsive(self, bounds: [f32; 2]) -> Self {
-        let Target::Group(group) = self.node.target else {
-            panic!("a responsive scope requires a container")
-        };
-        self.host
-            .model
-            .responsive(group, windows_scene::Bounds(bounds));
-        self
+    // ── extent ──────────────────────────────────────────────────────────────────────
+
+    pub fn width(self, v: impl Into<Len>) -> Self {
+        self.author(|l| l.width = v.into())
     }
 
-    pub fn width(self, value: impl Into<Len>) -> Self {
-        self.layout(|l| l.width = Some(value.into()))
+    pub fn height(self, v: impl Into<Len>) -> Self {
+        self.author(|l| l.height = v.into())
     }
-    pub fn height(self, value: impl Into<Len>) -> Self {
-        self.layout(|l| l.height = Some(value.into()))
+
+    pub fn size(self, v: impl Into<Len> + Copy) -> Self {
+        self.author(|l| (l.width, l.height) = (v.into(), v.into()))
     }
-    pub fn gap(self, value: impl Into<Len>) -> Self {
-        self.layout(|l| l.gap = Some(value.into()))
+
+    pub fn min_width(self, v: impl Into<Len>) -> Self {
+        self.author(|l| l.min_width = v.into())
     }
-    pub fn padding(self, value: impl Into<Len>) -> Self {
-        self.layout(|l| l.padding = Some([value.into(); 2]))
+
+    pub fn min_height(self, v: impl Into<Len>) -> Self {
+        self.author(|l| l.min_height = v.into())
     }
+
+    pub fn max_width(self, v: impl Into<Len>) -> Self {
+        self.author(|l| l.max_width = v.into())
+    }
+
+    pub fn max_height(self, v: impl Into<Len>) -> Self {
+        self.author(|l| l.max_height = v.into())
+    }
+
+    pub fn aspect(self, ratio: f32) -> Self {
+        self.author(|l| l.aspect = ratio)
+    }
+
+    /// Takes a share of the surplus, weighted. Zero by default, so growing is stated.
     pub fn grow(self) -> Self {
-        self.layout(|l| l.grow = Some(1.0))
+        self.grow_by(1.0)
     }
 
-    pub fn opacity<M>(self, value: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(
-            Prop::Opacity,
-            crate::widget::Motion::Chrome,
-            value,
-            Value::Scalar,
-        )
+    pub fn grow_by(self, weight: f32) -> Self {
+        self.author(|l| l.grow = weight)
     }
 
-    pub(crate) fn channel<T: Copy + 'static, M>(
-        self,
-        prop: Prop,
-        motion: crate::widget::Motion,
-        value: impl Signal<T, M> + 'static,
-        map: impl Fn(T) -> Value + 'static,
-    ) -> Self {
-        let node = self.node.target.id();
-        assert!(
-            prop != Prop::Opacity
-                || self
-                    .node
-                    .hover_scope
-                    .and_then(|id| self.host.controls.get(id))
-                    .is_none_or(|row| row.front.reveal != node),
-            "an interaction reveal owns its opacity"
-        );
-        if let Some(owner) = self.node.owner.and_then(|id| self.host.controls.get(id)) {
-            assert!(
-                !owner
-                    .front
-                    .scalar_parts
-                    .iter()
-                    .flatten()
-                    .any(|(id, part)| *id == node && part.property() == prop),
-                "a scalar part owns its driven property"
-            );
-        }
-        if value.is_constant() {
-            self.host.set_channel(node, node, prop, map(value.read()));
-        } else {
-            self.host
-                .bind_channel(node, node, prop, motion, move || map(value.read()));
-        }
-        self
+    // ── spacing and alignment ───────────────────────────────────────────────────────
+
+    pub fn gap(self, v: impl Into<Len>) -> Self {
+        self.author(|l| l.gap = v.into())
     }
 
-    pub fn layout_from(self, write: impl Fn(&mut Layout) + 'static) -> Self {
-        let node = self.node.target.id();
-        self.host
-            .bind_to(node, super::binding::Destination::Layout, move || {
-                Host::with(|host| {
-                    let class = host.model.solved(node).class;
-                    if let Some(recipe) = host.styles.get_mut(node) {
-                        write(&mut recipe.layout.base);
-                        host.mark_style(node, class);
-                    }
-                })
-            });
-        self
+    pub fn padding(self, v: impl Into<Len> + Copy) -> Self {
+        self.author(|l| l.padding = [v.into(), v.into()])
     }
 
-    pub fn min_width(self, value: impl Into<Len>) -> Self {
-        self.layout(|l| l.min_width = Some(value.into()))
-    }
-    pub fn min_height(self, value: impl Into<Len>) -> Self {
-        self.layout(|l| l.min_height = Some(value.into()))
-    }
-    pub fn max_width(self, value: impl Into<Len>) -> Self {
-        self.layout(|l| l.max_width = Some(value.into()))
-    }
-    pub fn no_shrink(self) -> Self {
-        self.layout(|l| l.shrink = Some(0.0))
-    }
     pub fn padding_xy(self, x: impl Into<Len>, y: impl Into<Len>) -> Self {
-        self.layout(|l| l.padding = Some([x.into(), y.into()]))
+        self.author(|l| l.padding = [x.into(), y.into()])
     }
-    pub fn align(self, align: crate::layout::Align) -> Self {
-        self.layout(|l| l.align = Some(align))
+
+    pub fn align(self, align: Align) -> Self {
+        self.author(|l| l.align = align)
     }
-    pub fn justify(self, align: crate::layout::Align) -> Self {
-        self.layout(|l| l.justify = Some(align))
+
+    pub fn justify(self, align: Align) -> Self {
+        self.author(|l| l.justify = align)
     }
+
+    pub fn align_self(self, align: Align) -> Self {
+        self.author(|l| l.align_self = align)
+    }
+
+    // ── placement ───────────────────────────────────────────────────────────────────
+
+    pub fn at(self, row: u16, column: u16) -> Self {
+        self.span(row, column, 1, 1)
+    }
+
+    pub fn span(self, row: u16, col: u16, row_span: u16, col_span: u16) -> Self {
+        self.author(|l| {
+            l.position = crate::layout::Position::Cell { row, col, row_span, col_span };
+        })
+    }
+
+    /// Places this node at a normalized point of its parent, aligned by its own size.
+    ///
+    /// `x` and `y` are fractions of the parent's box; `align` says where the node's own
+    /// measured extent sits against that point on each axis. Out of flow: it takes no track
+    /// and no space from its siblings.
+    pub fn anchor(self, x: f32, y: f32, align: [Align; 2]) -> Self {
+        self.author(|l| l.position = crate::layout::Position::Anchor { at: [x, y, x, y], align })
+    }
+
+    /// Spans this node over its parent's whole box, out of flow: an underlay or an overlay
+    /// of a container whose other children keep their flow.
     pub fn cover(self) -> Self {
-        self.layout(|l| l.position = Some(crate::layout::Position::Absolute([Len::Zero; 4])))
+        self.author(|l| {
+            l.position =
+                crate::layout::Position::Anchor { at: [0.0, 0.0, 1.0, 1.0], align: [Align::Stretch; 2] };
+        })
     }
+
+    pub fn cols(self, tracks: impl IntoIterator<Item = Track>) -> Self {
+        self.author(|l| l.set_cols(tracks))
+    }
+
+    pub fn rows(self, tracks: impl IntoIterator<Item = Track>) -> Self {
+        self.author(|l| l.set_rows(tracks))
+    }
+
+    /// Takes the column ladder the scope resolves `token` to, so a class-dependent column
+    /// count is one registered table rather than a variant row per class.
+    pub fn cols_by(self, token: &'static ScopedToken<&'static [Track]>) -> Self {
+        self.author(|l| l.set_cols_by(token))
+    }
+
+    pub fn rows_by(self, token: &'static ScopedToken<&'static [Track]>) -> Self {
+        self.author(|l| l.set_rows_by(token))
+    }
+
+    // ── response and visibility ─────────────────────────────────────────────────────
+
+    /// Classifies this container from its own solved inline width, with the hysteresis band.
+    pub fn responsive(self, bounds: [f32; 2]) -> Self {
+        self.author(|l| l.bounds = bounds).flag(tree::RESPONSIVE, true)
+    }
+
+    /// Lays this row out as a stack at or below `class`, which is the one structural response
+    /// a container states about itself.
+    pub fn stack_below(self, class: WidthClass) -> Self {
+        self.author(|l| l.stack_below = class)
+    }
+
     pub fn clip(self) -> Self {
-        self.layout(|l| l.clip = Some(true))
+        self.flag(tree::CLIP, true)
     }
-    pub fn probed(self, probe: crate::layout::Probe) -> Self {
-        self.host.probes.place(self.node.target.id(), probe.cell());
+
+    /// Announces a change to this element's content to a listening client.
+    ///
+    /// `assertive` interrupts whatever the client is reading; otherwise the announcement waits
+    /// until it is idle. Declared on the element and not on a control, because the thing that
+    /// changes is the text inside a region rather than a control's own value.
+    pub fn live_region(self, assertive: bool) -> Self {
+        let live = if assertive { tree::LIVE_ASSERTIVE } else { tree::LIVE_POLITE };
+        self.ui.host.tree.set_live(self.node, live);
+        self
+    }
+
+    /// Keeps the node and its drafts and takes no space. A binding, so revealing is a setter
+    /// and not a remount.
+    pub fn hide_if<M>(mut self, value: impl Signal<bool, M> + 'static) -> Self {
+        let node = self.node;
+        self.ui.bind(value, move |host, on| host.tree.set_flag(node, tree::HIDDEN, on));
+        self
+    }
+
+    // ── probes and anchor sets ──────────────────────────────────────────────────────
+
+    pub fn probed(self, probe: Probe) -> Self {
+        self.ui.host.set_probe(self.node, probe);
         self
     }
 
@@ -769,672 +777,85 @@ impl<K> Element<'_, K> {
     ///
     /// One origin per set. Its own solved size and scope ride the same table, so a consumer
     /// drawing over the set needs no second probe to rebase what it reads.
-    pub fn anchors_origin(self, anchors: crate::layout::Anchors) -> Self {
-        self.host
-            .anchor_origins
-            .place(self.node.target.id(), anchors.cell());
+    pub fn anchors_origin(self, anchors: Anchors) -> Self {
+        self.ui.host.set_anchor_origin(self.node, anchors);
         self
     }
 
     /// Reports this node's solved box into `anchors` under `key`.
     ///
     /// `key` is the application's own identity for what the node stands for, so a node
-    /// recycled onto another subject reports under the subject's key rather than the
-    /// node's. The attachment leaves the set when the node unmounts.
-    pub fn anchored(self, anchors: crate::layout::Anchors, key: u64) -> Self {
-        let node = self.node.target.id();
-        let set = anchors.id();
-        let members = &mut self.host.anchor_members;
-        match members
-            .iter_mut()
-            .find(|(owner, at, _)| *owner == set && *at == node)
-        {
-            Some(entry) => entry.2 = key,
-            None => members.push((set, node, key)),
-        }
+    /// recycled onto another subject reports under the subject's key rather than the node's.
+    pub fn anchored(self, anchors: Anchors, key: u64) -> Self {
+        self.ui.host.attach_anchor(self.node, anchors, key);
         self
-    }
-    /// Places this node at a normalized point of its parent, aligned by its own size.
-    ///
-    /// `x` and `y` are fractions of the parent's box. `align` says where the node's own
-    /// measured extent sits against that point on each axis:
-    /// [`Center`](crate::layout::Align::Center) centres it,
-    /// [`Start`](crate::layout::Align::Start) hangs it after the point and
-    /// [`End`](crate::layout::Align::End) ends it there. The size the alignment consumes is
-    /// the one the solve measured, so the node needs no stated extent and no containing cell.
-    ///
-    /// Out of flow, like every other anchored placement: the node takes no track and no
-    /// space from its siblings, and the parent is its containing block.
-    pub fn anchor(self, x: f32, y: f32, align: [crate::layout::Align; 2]) -> Self {
-        self.layout(|l| {
-            l.position = Some(crate::layout::Position::Anchor {
-                at: [x, y, x, y],
-                align,
-            })
-        })
     }
 
-    /// Stretches this node across a normalized `[x0, y0, x1, y1]` region of its parent.
-    ///
-    /// The rect form of [`anchor`](Self::anchor): both edges of each axis are pinned, so
-    /// the node takes the region's extent rather than its own.
-    pub fn anchor_rect(self, at: [f32; 4]) -> Self {
-        self.layout(|l| {
-            l.position = Some(crate::layout::Position::Anchor {
-                at,
-                align: [crate::layout::Align::Stretch; 2],
-            })
-        })
+    /// Writes this node's computed layout on every call, reusing its track buffers.
+    pub fn layout_from(self, write: impl Fn(&mut Layout) + 'static) -> Self {
+        let node = self.node;
+        self.ui
+            .host
+            .binding(move || Host::with(|host| host.tree.author(node, &write)));
+        self
     }
 
-    pub fn at(self, row: u16, column: u16) -> Self {
-        self.layout(|l| {
-            l.position = Some(crate::layout::Position::Grid {
-                row,
-                column,
-                row_span: 1,
-                column_span: 1,
-            })
-        })
-    }
-    pub fn rotation<M>(self, value: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(
-            Prop::RotationAngle,
-            crate::widget::Motion::Chrome,
-            value,
-            Value::Scalar,
-        )
-    }
+    // ── channels ────────────────────────────────────────────────────────────────────
 
-    pub fn pivot_relative(self, fraction: windows_numerics::Vector2) -> Self {
-        let node = self.node.target.id();
-        self.host.relative_pivot(node, fraction);
-        self
-    }
-}
-
-impl Ui<'_> {
-    /// Re-resolves retained appearance and typography without recreating content.
-    pub fn set_theme(&mut self, root: Scope, backdrop: windows_scene::BackdropSpec) {
-        self.host.set_theme(root, backdrop);
-    }
-
-    pub fn window_size(&self) -> crate::signal::Cell<windows_numerics::Vector2> {
-        self.host.window_size
-    }
-    pub fn set_geometry(&mut self, id: windows_scene::GeomId, verbs: &[windows_scene::PathVerb]) {
-        self.host.model.set_geometry(id, verbs);
-    }
-    pub fn ramp(
-        &mut self,
-        stops: &[super::Stop],
-        spread: windows_scene::Spread,
-    ) -> windows_scene::RampId {
-        super::mount::resolve_stops(stops, self.host.root_scope, &mut self.host.ramp_stops);
-        let id = self.host.model.ramp(&self.host.ramp_stops, spread);
-        let mut held = self.host.ramp_pool.pop().unwrap_or_default();
-        held.extend_from_slice(stops);
-        self.host.ramps.place(id, (held, spread));
-        crate::signal::Owner::retain(super::geometry::RampLease(super::geometry::Lease(
-            id,
-            self.host.identity,
-        )));
-        id
-    }
-    /// Draws one path from a probed box, in the geometry phase.
-    ///
-    /// The geometry phase runs after the flush has published every probe, so `fill` reads
-    /// the box **this** batch solved and its verbs reach the same scene patch. It may not
-    /// write layout, structure or application state; the phase guard holds reads open and
-    /// blocks writes.
-    pub fn local_geometry(
-        &mut self,
-        bounds: crate::layout::Probe,
-        capacity: usize,
-        mut fill: impl FnMut(&mut Vec<windows_scene::PathVerb>, windows_numerics::Vector2, Scope)
-        + 'static,
-    ) -> windows_scene::GeomId {
-        self.local_geometries(bounds, [capacity], move |[verbs], size, scope| {
-            fill(verbs, size, scope)
-        })[0]
-    }
-    /// Draws several paths from one probed box, in the geometry phase.
-    ///
-    /// `bounds` is any probe, not this node's own: the box a set of figures has to agree
-    /// with is often a container none of them belongs to. Each path has its own buffer,
-    /// reserved once at `capacities` and reused, and the whole set is re-emitted when the
-    /// box or a tracked read inside `fill` moves. See [`local_geometry`](Self::local_geometry)
-    /// for the phase's contract.
-    pub fn local_geometries<const N: usize>(
-        &mut self,
-        bounds: crate::layout::Probe,
-        capacities: [usize; N],
-        mut fill: impl FnMut(&mut [Vec<windows_scene::PathVerb>; N], windows_numerics::Vector2, Scope)
-        + 'static,
-    ) -> [windows_scene::GeomId; N] {
-        let ids = capacities.map(|_| self.geometry(&[]));
-        let local = crate::signal::Memo::new(move || {
-            let p = bounds.get();
-            p.scope.map(|scope| (p.size, scope))
-        });
-        let mut paths = capacities.map(Vec::with_capacity);
-        let runtime = self.host.identity;
-        Effect::geometry(move || {
-            if Host::try_with(|host| host.identity == runtime) != Some(true) {
-                return;
-            }
-            let Some((size, scope)) = local.get() else {
-                return;
-            };
-            paths.iter_mut().for_each(Vec::clear);
-            crate::signal::read_only(|| fill(&mut paths, size, scope));
-            for (id, verbs) in ids.into_iter().zip(&paths) {
-                super::set_geometry(id, verbs);
-            }
-        });
-        ids
-    }
-    /// Draws from one container's keyed anchor table, in the geometry phase.
-    ///
-    /// The [`Anchors`](crate::layout::Anchors) half of
-    /// [`local_geometries`](Self::local_geometries): the same phase, the same buffers and
-    /// the same equality cutoff, over a whole keyed set rather than one box. The table
-    /// carries the origin's size and scope, so `fill` needs no other argument.
-    pub fn anchored_geometries<const N: usize>(
-        &mut self,
-        anchors: crate::layout::Anchors,
-        capacities: [usize; N],
-        mut fill: impl FnMut(&mut [Vec<windows_scene::PathVerb>; N], &crate::layout::Table)
-        + 'static,
-    ) -> [windows_scene::GeomId; N] {
-        let ids = capacities.map(|_| self.geometry(&[]));
-        let mut paths = capacities.map(Vec::with_capacity);
-        let runtime = self.host.identity;
-        Effect::geometry(move || {
-            if Host::try_with(|host| host.identity == runtime) != Some(true) {
-                return;
-            }
-            paths.iter_mut().for_each(Vec::clear);
-            anchors.with(|table| {
-                crate::signal::read_only(|| fill(&mut paths, table));
-            });
-            for (id, verbs) in ids.into_iter().zip(&paths) {
-                super::set_geometry(id, verbs);
-            }
-        });
-        ids
-    }
-    pub fn paths_with<const N: usize, K>(
-        &mut self,
-        capacities: [usize; N],
-        mut fill: impl FnMut(&mut [Vec<windows_scene::PathVerb>; N], windows_numerics::Vector2, Scope)
-        + 'static,
-        create: impl FnOnce(&mut Ui<'_>, [windows_scene::GeomId; N]) -> Node<K>,
-    ) -> Element<'_, K> {
-        let ids = capacities.map(|_| self.geometry(&[]));
-        let mut paths = capacities.map(Vec::with_capacity);
-        let node = create(self, ids);
-        super::geometry::install(
-            self.host,
-            node.target.id(),
-            Box::new(move |size, scope| {
-                paths.iter_mut().for_each(Vec::clear);
-                crate::signal::read_only(|| fill(&mut paths, size, scope));
-                for (id, verbs) in ids.into_iter().zip(&paths) {
-                    super::set_geometry(id, verbs);
-                }
-            }),
-        );
-        self.edit(node).unwrap()
-    }
-}
-impl<K> Element<'_, K> {
-    /// Runs the body synchronously with this parent's declared scope and control ownership.
-    pub fn children(mut self, create: impl FnOnce(&mut Ui<'_>)) -> Self {
-        let Target::Group(group) = self.node.target else {
-            panic!("children require a container")
-        };
-        let scope = self.host.styles.get(group.node()).unwrap().scope;
-        let control = self.host.mounts.get(group.node()).unwrap().control;
-        let hover_scope = control
-            .filter(|id| self.host.controls.get(*id).unwrap().front.hover_scope == Some(*id))
-            .or(self.node.hover_scope);
-        let after = self.host.model.last_child(group.node());
-        create(&mut Ui {
-            host: self.host,
-            members: self
-                .members
-                .as_deref_mut()
-                .expect("construction requires a creation transaction"),
-            parent: Some(group),
-            after,
-            scope,
-            owner: control.or(self.node.owner),
-            hover_scope,
-        });
-        self
-    }
-    pub fn row(self, create: impl FnOnce(&mut Ui<'_>)) -> Self {
-        self.layout(|l| l.flow = Some(Preset::Row)).children(create)
-    }
-    pub fn stack(self, create: impl FnOnce(&mut Ui<'_>)) -> Self {
-        self.layout(|l| l.flow = Some(Preset::Stack))
-            .children(create)
-    }
-    pub fn grid(self, create: impl FnOnce(&mut Ui<'_>)) -> Self {
-        self.layout(|l| l.flow = Some(Preset::Grid))
-            .children(create)
-    }
-    pub fn wrap(self, create: impl FnOnce(&mut Ui<'_>)) -> Self {
-        self.layout(|l| l.flow = Some(Preset::Wrap))
-            .children(create)
-    }
-    pub fn tiles(self, min: impl Into<Len>, create: impl FnOnce(&mut Ui<'_>)) -> Self {
-        self.layout(|l| {
-            l.flow = Some(Preset::Tiles);
-            l.tile_min = Some(min.into());
-        })
-        .children(create)
-    }
-    pub fn cols(self, tracks: impl IntoIterator<Item = crate::layout::Track>) -> Self {
-        self.layout(|l| {
-            let out = l.columns();
-            out.clear();
-            out.extend(tracks);
-        })
-    }
-    pub fn rows(self, tracks: impl IntoIterator<Item = crate::layout::Track>) -> Self {
-        self.layout(|l| {
-            let out = l.rows();
-            out.clear();
-            out.extend(tracks);
-        })
-    }
-    pub fn span(self, row: u16, column: u16, row_span: u16, column_span: u16) -> Self {
-        self.layout(|l| {
-            l.position = Some(crate::layout::Position::Grid {
-                row,
-                column,
-                row_span,
-                column_span,
-            })
-        })
-    }
-    pub fn align_self(self, value: crate::layout::Align) -> Self {
-        self.layout(|l| l.align_self = Some(value))
-    }
-    pub fn max_height(self, value: impl Into<Len>) -> Self {
-        self.layout(|l| l.max_height = Some(value.into()))
-    }
-    pub fn stack_when(self, class: crate::role::WidthClass) -> Self {
-        self.layout_when(class, |l| l.flow = Some(Preset::Stack))
-    }
-    pub fn cols_when(
-        self,
-        class: crate::role::WidthClass,
-        tracks: impl IntoIterator<Item = crate::layout::Track>,
-    ) -> Self {
-        self.layout_when(class, |l| {
-            let out = l.columns();
-            out.clear();
-            out.extend(tracks);
-        })
-    }
-    pub fn width_when(self, class: crate::role::WidthClass, value: impl Into<Len>) -> Self {
-        self.layout_when(class, |l| l.width = Some(value.into()))
-    }
-    pub fn min_width_when(self, class: crate::role::WidthClass, value: impl Into<Len>) -> Self {
-        self.layout_when(class, |l| l.min_width = Some(value.into()))
-    }
-    pub fn max_width_when(self, class: crate::role::WidthClass, value: impl Into<Len>) -> Self {
-        self.layout_when(class, |l| l.max_width = Some(value.into()))
-    }
-    pub fn hide_when(self, class: crate::role::WidthClass) -> Self {
-        self.layout_when(class, |l| l.hidden = Some(true))
-    }
-    pub fn hide_below(mut self, class: crate::role::WidthClass) -> Self {
-        for at in [
-            crate::role::WidthClass::Narrow,
-            crate::role::WidthClass::Medium,
-            crate::role::WidthClass::Wide,
-        ] {
-            if at < class {
-                self = self.hide_when(at);
-            }
-        }
-        self
-    }
-    pub fn float_when(self, class: crate::role::WidthClass, edge: crate::layout::Edge) -> Self {
-        self.layout_when(class, |l| {
-            l.position = Some(crate::layout::Position::Edge(edge))
-        })
-    }
-    pub fn float_below(
-        mut self,
-        class: crate::role::WidthClass,
-        edge: crate::layout::Edge,
-    ) -> Self {
-        for at in [
-            crate::role::WidthClass::Narrow,
-            crate::role::WidthClass::Medium,
-            crate::role::WidthClass::Wide,
-        ] {
-            if at < class {
-                self = self.float_when(at, edge);
-            }
-        }
-        self
-    }
-    pub fn pinned(self, insets: [Len; 4]) -> Self {
-        self.layout(|l| l.position = Some(crate::layout::Position::Absolute(insets)))
-    }
-    pub fn hide_if<M>(self, value: impl Signal<bool, M> + 'static) -> Self {
-        if value.is_constant() {
-            self.host
-                .replace_binding(self.node.target.id(), super::binding::Destination::Hidden);
-            self.layout(|l| l.hidden = Some(value.read()))
-        } else {
-            let node = self.node.target.id();
-            self.host
-                .bind_to(node, super::binding::Destination::Hidden, move || {
-                    let hidden = value.read();
-                    Host::with(|h| {
-                        let class = h.model.solved(node).class;
-                        let recipe = h.styles.get_mut(node).unwrap();
-                        recipe.layout.base.hidden = Some(hidden);
-                        h.mark_style(node, class);
-                    });
-                });
-            self
-        }
-    }
-    pub fn pivot<M>(self, value: impl Signal<windows_numerics::Vector2, M> + 'static) -> Self {
-        self.channel(
-            Prop::Center,
-            crate::widget::Motion::Chrome,
-            value,
-            Value::Vec2,
-        )
-    }
-}
-
-impl<K> Element<'_, K> {
-    fn decorate(self, mask: PaintMask, source: PaintSource, part: Part, strength: f32) -> Self {
-        let node = self.node.target.id();
-        let scope = self.host.styles.get(node).unwrap().scope;
-        let id = match self.node.target {
-            Target::Sprite(id) => id,
-            Target::Group(group) => self.host.model.visual(group, None),
-        };
-        let existing = self.host.appearances.get(id.node()).copied();
-        if matches!(self.node.target, Target::Group(_)) {
-            self.host.model.visual_insets(id, [0.0; 4]);
-        }
-        let appearance = Appearance {
-            id,
-            mask,
-            source,
-            part,
-            strength,
-            geom: existing.and_then(|a| a.geom),
-            scope,
-            surface: None,
-            halo: existing.and_then(|a| a.halo),
-            next: existing.map_or(NodeId::NONE, |a| a.next),
-            wash: false,
-        };
-        appearance.publish(self.host, true);
-        self.host.appearances.place(id.node(), appearance);
-        if existing.is_none() {
-            self.host.own_appearance(id, node);
-        }
-        if let Some(owner) = self.node.owner {
-            self.host.control_part(owner, part, id);
-        }
-        self
-    }
-    pub fn plate(self, radius: impl Into<Len>, role: Role, strength: f32) -> Self {
-        self.decorate(
-            PaintMask::Box {
-                radius: Some(radius.into()),
-            },
-            PaintSource::Role(role),
-            Part::Fill,
-            strength,
-        )
-    }
-    pub fn outline(self, radius: crate::role::Metric, role: Role, width: impl Into<Len>) -> Self {
-        self.decorate(
-            PaintMask::Border {
-                radius,
-                width: width.into(),
-            },
-            PaintSource::Role(role),
-            Part::Border,
-            1.0,
-        )
-    }
-    pub fn washed(self, id: windows_scene::RampId, radius: crate::role::Metric) -> Self {
-        self.decorate(
-            PaintMask::Box {
-                radius: Some(radius.into()),
-            },
-            PaintSource::Gradient(id),
-            Part::Fill,
-            1.0,
-        )
-    }
-    pub fn elevate(self, elevation: crate::role::Elevation) -> Self {
-        let node = self.node.target.id();
-        let recipe = self.host.styles.get_mut(node).unwrap();
-        recipe.scope = recipe.scope.elevate(elevation);
-        let scope = recipe.scope;
-        self.host.mark_style(node, scope.width);
-        let mut paint = self.host.mounts.get(node).unwrap().paints;
-        while let Some(row) = self.host.appearances.get_mut(paint) {
-            row.scope = scope;
-            let row = *row;
-            paint = row.next;
-            row.publish(self.host, true);
-        }
-        self
-    }
-    pub fn appearance(self, chrome: crate::widget::Chrome) -> Self {
-        let Target::Group(group) = self.node.target else {
-            panic!("chrome requires a surface")
-        };
-        self.host.declare_surface(group, chrome);
-        self
-    }
-    pub fn ghost(self) -> Self {
-        self.appearance(crate::widget::Chrome::new(
-            crate::widget::roles::BUTTON[crate::widget::roles::GHOST as usize],
-            crate::role::Metric::Radius,
-        ))
-    }
-    pub fn accent(self) -> Self {
-        self.appearance(crate::widget::Chrome::new(
-            crate::widget::roles::BUTTON[crate::widget::roles::ACCENT as usize],
-            crate::role::Metric::Radius,
-        ))
-    }
-    pub fn accent_subtle(self) -> Self {
-        self.appearance(crate::widget::Chrome::new(
-            crate::widget::roles::BUTTON[crate::widget::roles::ACCENT_SUBTLE as usize],
-            crate::role::Metric::Radius,
-        ))
-    }
-    fn halo_style(self, halo: super::theme::HaloStyle) -> Self {
-        match self.node.target {
-            Target::Group(group) => self.host.surface_halo(group, halo),
-            Target::Sprite(sprite) => {
-                if let Some(paint) = self.host.appearances.get_mut(sprite.node()) {
-                    paint.halo = Some((
-                        halo,
-                        if paint.part == Part::Fill {
-                            crate::role::Silhouette::Area
-                        } else {
-                            crate::role::Silhouette::Ink
-                        },
-                    ));
-                    let paint = *paint;
-                    paint.publish(self.host, false);
-                }
-            }
-        }
-        self
-    }
-    pub fn shadowed(self, edge: crate::layout::Edge) -> Self {
-        self.host
-            .replace_binding(self.node.target.id(), super::binding::Destination::Halo);
-        self.halo_style(super::theme::HaloStyle::Shadow(edge))
-    }
-    pub fn halo<M>(self, role: impl Signal<Role, M> + 'static) -> Self
+    /// Installs one retained writer per destination; a constant snaps and equal values stop
+    /// here rather than reaching the wire.
+    pub(crate) fn channel<T, M>(self, prop: Prop, value: impl Signal<T, M> + 'static) -> Self
     where
-        K: 'static,
+        T: Copy + Into<Value> + PartialEq + 'static,
     {
-        if role.is_constant() {
-            self.host
-                .replace_binding(self.node.target.id(), super::binding::Destination::Halo);
-            self.halo_style(super::theme::HaloStyle::Glow(role.read()))
-        } else {
-            let node = self.node;
-            self.host.bind_to(
-                node.target.id(),
-                super::binding::Destination::Halo,
-                move || {
-                    let role = role.read();
-                    Host::with(|host| {
-                        Element {
-                            host,
-                            members: None,
-                            node,
-                        }
-                        .halo_style(super::theme::HaloStyle::Glow(role));
-                    });
-                },
-            );
-            self
-        }
+        self.ui.host.install_channel(self.node, prop, value);
+        self
     }
-    pub fn halo_lit<M>(self, value: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(
-            Prop::ShadowOpacity,
-            crate::widget::Motion::Chrome,
-            value,
-            Value::Scalar,
-        )
+
+    pub fn opacity<M>(self, value: impl Signal<f32, M> + 'static) -> Self {
+        self.channel(Prop::Opacity, value)
     }
-}
-impl Element<'_, Path> {
-    pub fn fill(self, role: crate::role::DataRole) -> Self {
-        self.decorate(
-            PaintMask::Shape { stroke: None },
-            PaintSource::Role(Role::Data(role)),
-            Part::Fill,
-            1.0,
-        )
+
+    pub fn rotation<M>(self, value: impl Signal<f32, M> + 'static) -> Self {
+        self.channel(Prop::RotationAngle, value)
     }
-    pub fn stroke(self, role: impl Into<Role>, width: impl Into<Len>) -> Self {
-        self.decorate(
-            PaintMask::Shape {
-                stroke: Some(width.into()),
-            },
-            PaintSource::Role(role.into()),
-            Part::Border,
-            1.0,
-        )
-    }
-    pub fn fill_ramp(self, id: windows_scene::RampId) -> Self {
-        self.decorate(
-            PaintMask::Shape { stroke: None },
-            PaintSource::Gradient(id),
-            Part::Fill,
-            1.0,
-        )
-    }
-    pub fn stroke_ramp(self, id: windows_scene::RampId, width: impl Into<Len>) -> Self {
-        self.decorate(
-            PaintMask::Shape {
-                stroke: Some(width.into()),
-            },
-            PaintSource::Gradient(id),
-            Part::Border,
-            1.0,
-        )
-    }
-    pub fn ink(self) -> Self {
-        self.ink_paint(None)
-    }
-    pub fn ink_stroke(self, width: impl Into<Len>) -> Self {
-        self.ink_paint(Some(width.into()))
-    }
-    fn ink_paint(self, stroke: Option<Len>) -> Self {
-        let source = self
-            .node
-            .owner
-            .filter(|id| self.host.chrome(*id).is_some())
-            .map_or(
-                PaintSource::Role(Role::Text(Text::Primary)),
-                PaintSource::Owner,
-            );
-        self.decorate(PaintMask::Shape { stroke }, source, Part::Label, 1.0)
-    }
-    pub fn line(self, role: crate::role::Stroke) -> Self {
-        self.stroke(Role::Stroke(role), crate::role::Metric::HairlineW)
-    }
-    pub fn line_stroke(self, role: crate::role::Stroke, width: impl Into<Len>) -> Self {
-        self.stroke(Role::Stroke(role), width)
-    }
+
     pub fn trim<M>(self, value: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(
-            Prop::TrimEnd,
-            crate::widget::Motion::Chrome,
-            value,
-            Value::Scalar,
-        )
+        self.channel(Prop::TrimEnd, value)
     }
+
     pub fn stroke_width<M>(self, value: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(
-            Prop::StrokeThickness,
-            crate::widget::Motion::Snap,
-            value,
-            Value::Scalar,
-        )
+        self.channel(Prop::StrokeThickness, value)
     }
-    pub(crate) fn slider_trail(
-        self,
-        origin: f32,
-        ramp: Option<windows_scene::RampId>,
-        width: impl Into<Len>,
-    ) -> Self {
-        let source = ramp.map_or(
-            PaintSource::Role(Role::Fill(crate::role::Fill::Accent)),
-            PaintSource::Gradient,
-        );
-        self.decorate(
-            PaintMask::Shape {
-                stroke: Some(width.into()),
-            },
-            source,
-            Part::Trail { origin },
-            1.0,
-        )
+
+    pub fn pivot<M>(self, value: impl Signal<Vector2, M> + 'static) -> Self {
+        self.channel(Prop::Center, value)
     }
+
+    /// Sets the pivot as a fraction of this node's own solved box, resolved at publication.
+    pub fn pivot_relative(self, fraction: Vector2) -> Self {
+        self.ui.host.set_relative_pivot(self.node, fraction);
+        self
+    }
+
 }
 
 impl Element<'_, super::Region> {
+    /// Rounds the region's own corners.
+    ///
+    /// The mask is this side's, not the renderer's: the buffer is a rectangle and the
+    /// compositor is what clips it, so a region on a card takes the card's radius without the
+    /// renderer knowing what shape it is drawing into.
     pub(crate) fn region_radius(self, radius: Len) -> Self {
-        let paint = self
-            .host
-            .appearances
-            .get_mut(self.node.target.id())
-            .unwrap();
-        paint.mask = PaintMask::Box {
-            radius: Some(radius.into()),
-        };
-        let paint = *paint;
-        paint.publish(self.host, true);
+        let node = self.node;
+        let sink = self.ui.host.region_sink(node);
+        self.ui.host.declare_part(
+            node,
+            super::theme::Part::Ink,
+            super::theme::PaintSource::Region(sink),
+            super::theme::PaintMask::Box { radius },
+            1.0,
+        );
         self
     }
 }

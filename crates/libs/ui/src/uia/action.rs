@@ -9,7 +9,8 @@
 //! request-for-service the pointer stack posts. An invoke runs the widget's own front-side
 //! handler, publishes its pixels and queues its intent, exactly as a tap does.
 
-use std::sync::Mutex;
+use crate::text_input::Selection;
+use std::sync::{Mutex, PoisonError};
 use windows_scene::ControlId;
 
 /// One queued request. `Copy`: every variant is an id and a scalar.
@@ -26,27 +27,66 @@ pub enum Action {
     Reveal(ControlId),
 }
 
-/// The pending actions. A mutex and a `Vec`, because a client action arrives at human rate.
-#[derive(Debug, Default)]
-pub struct Queue(Mutex<Vec<Action>>);
+/// One queued editing request. Variable-length, which is why it is not on [`Action`].
+#[derive(Debug)]
+pub(crate) enum TextAction {
+    Replace(ControlId, u64, Vec<u16>),
+    Select(ControlId, u64, Selection),
+}
 
-impl Queue {
+/// Decides whether a newly queued row replaces one already queued.
+pub(crate) trait Supersedes {
+    /// Returns whether `self` stands in place of `queued`, which is dropped when it does.
+    ///
+    /// # Contract
+    ///
+    /// `self` must carry everything `queued` would have conveyed. A row that names a
+    /// position answers `true` for an earlier row naming the same control, because the
+    /// later position is where the control is; a row that names an edit answers `false`,
+    /// because two edits are two changes and neither states the other.
+    fn supersedes(&self, queued: &Self) -> bool;
+}
+
+impl Supersedes for Action {
+    fn supersedes(&self, queued: &Self) -> bool {
+        matches!(
+            (self, queued),
+            (Self::SetValue(id, _), Self::SetValue(held, _)) if id == held
+        )
+    }
+}
+
+impl Supersedes for TextAction {
+    fn supersedes(&self, queued: &Self) -> bool {
+        matches!(
+            (self, queued),
+            (Self::Select(id, ..), Self::Select(held, ..)) if id == held
+        )
+    }
+}
+
+/// The pending requests. A mutex and a `Vec`, because a client action arrives at human rate.
+#[derive(Debug)]
+pub(crate) struct Queue<T>(Mutex<Vec<T>>);
+
+impl<T> Default for Queue<T> {
+    fn default() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+}
+
+impl<T: Supersedes> Queue<T> {
     /// Records `action` and returns whether the queue was empty before it, which is the one
     /// moment the front thread has to be woken.
     ///
-    /// A `SetValue` replaces a queued `SetValue` for the same control instead of being
-    /// appended, and returns `false`.
-    pub fn push(&self, action: Action) -> bool {
-        let mut queue = self.0.lock().unwrap_or_else(|e| e.into_inner());
+    /// An action that supersedes a queued one replaces it in place and returns `false`: a
+    /// client dragging a slider sends one `SetValue` per step and only the last states
+    /// where the slider is.
+    pub fn push(&self, action: T) -> bool {
+        let mut queue = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let first = queue.is_empty();
-        // A client dragging a slider sends one `SetValue` per step and only the last states
-        // where the slider is, so a repeat replaces the queued one in place.
-        if let Action::SetValue(id, _) = action
-            && let Some(last) = queue
-                .iter_mut()
-                .rfind(|queued| matches!(queued, Action::SetValue(queued, _) if *queued == id))
-        {
-            *last = action;
+        if let Some(held) = queue.iter_mut().rfind(|held| action.supersedes(held)) {
+            *held = action;
             return false;
         }
         queue.push(action);
@@ -54,8 +94,8 @@ impl Queue {
     }
 
     /// Moves everything queued into `out`, keeping the queue's allocation.
-    pub fn drain(&self, out: &mut Vec<Action>) {
-        let mut queue = self.0.lock().unwrap_or_else(|e| e.into_inner());
+    pub fn drain(&self, out: &mut Vec<T>) {
+        let mut queue = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         out.append(&mut queue);
     }
 }
@@ -67,7 +107,7 @@ mod tests {
     /// Mints `count` ids through the id authority. An id is generational, so a value not
     /// minted here is not one the stack can produce.
     fn ids(count: usize) -> Vec<ControlId> {
-        let mut authority = windows_scene::Ids::<windows_scene::Control>::new();
+        let mut authority = windows_scene::Ids::<{ windows_scene::CONTROL }>::default();
         (0..count).map(|_| authority.mint()).collect()
     }
 
@@ -103,11 +143,21 @@ mod tests {
             "one entry per control, holding its latest value"
         );
     }
-}
 
-/// Variable-length editing requests have their own queue; numeric actions remain Copy.
-#[derive(Debug)]
-pub(crate) enum TextAction {
-    Replace(ControlId, u64, Vec<u16>),
-    Select(ControlId, u64, crate::text_input::Selection),
+    /// Two edits are two changes, so the queue keeps both; two selections name one caret,
+    /// so the later one stands.
+    #[test]
+    fn an_edit_accumulates_and_a_selection_supersedes() {
+        let id = ids(1);
+        let queue = Queue::default();
+        queue.push(TextAction::Replace(id[0], 1, vec![b'a' as u16]));
+        queue.push(TextAction::Replace(id[0], 2, vec![b'b' as u16]));
+        queue.push(TextAction::Select(id[0], 2, Selection::at(0)));
+        queue.push(TextAction::Select(id[0], 2, Selection::at(1)));
+
+        let mut out = Vec::new();
+        queue.drain(&mut out);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[2], TextAction::Select(_, _, s) if s.caret == 1));
+    }
 }

@@ -49,6 +49,16 @@ impl Visual {
     pub fn as_container(&self) -> Option<ContainerVisual> {
         self.0.cast().ok().map(ContainerVisual::new)
     }
+
+    /// Returns this visual as a [`SpriteVisual`], or `None` if it is not one.
+    ///
+    /// The counterpart of [`as_container`](Visual::as_container), for the two slots only a
+    /// sprite carries: its brush and its shadow. A retained tree holding one pointer per
+    /// node takes the narrow view here, at the call site that needs it, rather than storing
+    /// the same object twice.
+    pub fn as_sprite(&self) -> Option<SpriteVisual> {
+        self.0.cast().ok().map(SpriteVisual::new)
+    }
 }
 
 impl SpriteVisual {

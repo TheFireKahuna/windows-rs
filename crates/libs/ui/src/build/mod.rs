@@ -1,26 +1,40 @@
 //! Parent-first declarations write directly into retained records.
-mod binding;
-mod control;
-pub use control::Scalar;
-mod ui;
-pub use ui::{Element, Node, Ui};
-pub struct Any;
-pub struct Path;
-pub struct Region;
-pub struct Field;
+
+pub(crate) mod binding;
+pub(crate) mod control;
 pub(crate) mod field;
-mod geometry;
-mod host;
-mod mount;
-mod style;
+pub(crate) mod geometry;
+pub(crate) mod hits;
+pub(crate) mod host;
+pub(crate) mod mount;
+#[cfg(test)]
+pub(crate) mod rig;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod text;
-mod theme;
+pub(crate) mod theme;
+pub(crate) mod tree;
+pub(crate) mod ui;
+
+/// An element with no further vocabulary of its own.
+pub struct Any;
+/// An element whose shape is a retained path.
+pub struct Path;
+/// An element whose paint is a presentation region.
+pub struct Region;
+/// An element whose text the input stack edits.
+pub struct Field;
+
+pub use control::Scalar;
+pub use mount::{Stop, root_scope, set_geometry, set_ramp};
+pub use ui::{Element, Node, Ui};
+
+pub(crate) use host::{Entrance, Placement};
+pub(crate) use mount::Mount;
+
+// The driver's own tests drive the host directly, so it is public under the test-support
+// feature and crate-private otherwise.
 #[cfg(any(test, feature = "test-support"))]
 pub use host::Host;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) use host::Host;
-pub(crate) use host::{Placement, ScrollId};
-pub(crate) use mount::Mount;
-pub use mount::{Stop, root_scope, set_geometry, set_ramp};

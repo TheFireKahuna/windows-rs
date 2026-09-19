@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use windows_color::{DisplayCapability, OutputTransform};
-use windows_scene::{ControlId, Env, HitEntry, HitFlags, HitTable, Ids, NO_ENTRY, NodeId};
+use windows_scene::{CONTROL, ControlId, Env, HitEntry, HitFlags, HitTable, Ids, NO_ENTRY, NodeId};
 use windows_ui::Result;
 use windows_ui::gesture::{DragDecl, GestureDecl, Recognised};
 use windows_ui::input::{Doorbell, Report, Router};
@@ -85,11 +85,11 @@ fn main() -> Result<()> {
     // The hit array, built by hand: this example has no scene, and the router reads the array
     // whatever produced it.
     let mut hits = HitTable::default();
-    hits.replace(&targets());
+    hits.replace(&targets(), &target_index());
 
     for (index, (name, ..)) in TARGETS.iter().enumerate() {
         let decl = match *name {
-            "drag" => GestureDecl::default().with_drag(DragDecl::reorder()),
+            "drag" => GestureDecl::default().with_drag(DragDecl::default()),
             "wheel" => GestureDecl::slider(false),
             _ => GestureDecl::default(),
         };
@@ -100,8 +100,7 @@ fn main() -> Result<()> {
     println!(
         "dial: {}",
         match router.attach_rotary(&window) {
-            Ok(true) => "attached",
-            Ok(false) => "none attached",
+            Ok(()) => "attached",
             Err(_) => "refused",
         }
     );
@@ -223,7 +222,7 @@ fn main() -> Result<()> {
 
     println!("\n── what the run did ──");
     println!("{:#?}", router.census());
-    println!("measured unit: {:?}", router.measured_unit());
+    println!("measured factor: {}", router.measured_factor());
     println!("doorbell: {:?}", bell.health());
     println!("pacer: {:?}", pacer.health());
     // Ticks may exceed display frames, because a press asks to be serviced at once; hover
@@ -299,12 +298,23 @@ fn targets() -> Vec<HitEntry> {
 /// than written out. Minting densely from a fresh authority puts the nth target at slot
 /// n + 1, because slot zero is reserved so that `NONE` names no control.
 fn target_id(index: usize) -> ControlId {
-    let mut ids = Ids::<windows_scene::Control>::new();
+    let mut ids = Ids::<CONTROL>::default();
     let mut id = ids.mint();
     for _ in 0..index {
         id = ids.mint();
     }
     id
+}
+
+/// Returns the id index [`HitTable::replace`] binary-searches, mapping each target's control
+/// id to its row in the entry array.
+///
+/// Ascending by construction: an [`Id`](windows_scene::Id) orders on its slot, and the targets
+/// occupy slots 1 to 4 in the order they are listed.
+fn target_index() -> Vec<(ControlId, u32)> {
+    (0..TARGETS.len())
+        .map(|at| (target_id(at), at as u32))
+        .collect()
 }
 
 fn label(id: Option<ControlId>) -> &'static str {

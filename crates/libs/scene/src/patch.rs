@@ -1,77 +1,70 @@
 //! The `Send` seam: `Copy` ops over typed side-buffers. **App half.**
 //!
-//! [`Op`] and [`SinkPatch`] are asserted `Send` at compile time. A generated COM interface
-//! holds a raw pointer and declares no `Send`, so no composition object can reach the app
-//! thread through a patch.
-//!
-//! Every variable-length payload travels as a [`Span`] into a typed side-buffer, one buffer
-//! per payload kind, and the applier bounds-checks the span where it reads it back.
+//! Every variable-length payload rides a typed side-buffer, so pooling is one `Vec` per
+//! payload kind rather than one per op, and the applier's bounds check happens once where it
+//! reads the span back.
 
-use crate::env::Env;
-use crate::hit_build::HitEntry;
+use crate::hit_entry::HitEntry;
 use crate::sink::*;
 use windows_color::Radiance;
-use windows_text::{GlyphSeg, SegBuffers};
 
-pub use windows_text::Span;
+/// Addresses an `(offset, count)` window into one of a [`SinkPatch`]'s side-buffers.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub struct Span {
+    pub off: u32,
+    pub len: u32,
+}
 
-/// Where a new node attaches.
+/// Where a root attaches.
 ///
-/// The two parentless cases are separate variants: the front half seats a window root and a
-/// detached root differently, and a single `NodeId::NONE` standing for both would name
-/// neither.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+/// The window band holds content and the overlay band holds slot roots and the ghosts an
+/// exit leaves behind, so an overlay sits above content by its position in the tree rather
+/// than by an ordering every caller has to keep.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Attach {
-    /// An ordinary child of another node.
     Node(NodeId),
-    /// The window's own container, which the front half owns. The model names what goes
-    /// into the container and never the container itself.
     Window,
-    /// A slot root: a flyout, popup, tooltip or ghost. Placed in absolute window
-    /// DIPs by its own solve, scanned at the tail of the hit array, and above every
-    /// window-attached node in z-order.
-    Detached,
+    Overlay,
 }
 
 impl Attach {
-    /// Returns the parent node, or `None` for [`Attach::Window`] and [`Attach::Detached`].
+    /// The parent node, or `None` for the two band attachments.
     #[must_use]
     pub const fn node(self) -> Option<NodeId> {
         match self {
             Self::Node(id) => Some(id),
-            Self::Window | Self::Detached => None,
+            Self::Window | Self::Overlay => None,
         }
     }
 }
 
-/// One instruction to the front half.
+/// One instruction to the scene half.
 ///
-/// `Copy` throughout: no `Rc`, no COM interface and no closure can appear in a variant.
-/// Event handlers stay in the app thread's own maps and cross as declarations the front
-/// thread consults rather than holds.
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// `after`, not `index`: a visual collection offers insert-at-bottom, insert-above and
+/// remove and no insert-at-index, so the wire speaks the platform's vocabulary and the
+/// applier is a direct call with no translation. There is no reorder op, because the keyed
+/// structure diff upstream already computes the minimal moves.
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub enum Op {
-    /// Mints a node and attaches it. `after` names the sibling to sit above, or `None` for
-    /// the bottom of the collection: a visual collection offers insert-at-bottom,
-    /// insert-above and remove, and no insert-at-index.
     New {
         id: NodeId,
         kind: NodeKind,
         parent: Attach,
         after: Option<NodeId>,
     },
-    /// Reparents or reorders one node. The keyed structure diff upstream computes the
-    /// minimal set of moves, and this op carries one of them.
     Move {
         id: NodeId,
-        parent: NodeId,
+        parent: Attach,
         after: Option<NodeId>,
     },
-    /// Destroys a node and its subtree, releasing every resource on the way down. A
-    /// subtree removal is one op, and a partial destroy is not expressible.
+    /// Cascades to the subtree, so a partial destroy is unrepresentable. `origin` and
+    /// `bounds` are the solved rect and clip chain the app already holds, which is what an
+    /// exit's ghost is mounted and sized from.
     Drop {
         id: NodeId,
         exit: Exit,
+        origin: Point,
+        bounds: Option<[f32; 4]>,
     },
     Mask {
         id: SpriteId,
@@ -80,21 +73,10 @@ pub enum Op {
     Paint {
         id: SpriteId,
         paint: Paint,
-    },
-    /// Declares the halo a sprite casts, or removes it with `None`.
-    ///
-    /// Its own op rather than a field of [`Paint`](Op::Paint): a halo is cast by whatever
-    /// the sprite paints and says nothing about what that is, so re-tinting a halo must not
-    /// re-declare — and therefore re-realize — the brush chain under it.
-    Halo {
-        id: SpriteId,
         halo: Option<Halo>,
     },
-    /// Bounds what a node's subtree may draw inside.
-    ///
-    /// Addressed to a [`NodeId`] because groups clip and a group carries no mask or paint.
-    /// The clip's kind selects which object is minted — a rectangle clip and a geometric
-    /// clip are different objects — and the sides and radii are channels of that object.
+    /// Addressed to a node because groups clip and have no mask or paint to carry it, and
+    /// its own op because a clip's *kind* identifies rather than animates.
     Clip {
         id: NodeId,
         clip: Clip,
@@ -109,255 +91,232 @@ pub enum Op {
         op: ResOp,
     },
     Tracker {
-        id: crate::id::Id<Tracker>,
+        id: TrackerId<()>,
         op: TrackerOp,
     },
-    /// Replaces the whole hit table. Issued when layout changed and at no other time, so
-    /// this is not a per-frame path.
+    /// Whole-table replace. `index` is `(ControlId, u32)` ordered by id, built app-side, so
+    /// the table's id lookup is an `extend_from_slice` and never a sort.
     Hits {
         entries: Span,
+        index: Span,
     },
-    /// Starts a timed reveal, reported back as
-    /// [`SceneEvent::DelayElapsed`](crate::SceneEvent::DelayElapsed).
-    ///
-    /// The wait is a compositor animation with `ms` of lead inside a scoped batch, and the
-    /// batch's completion is the report, so no thread holds a clock for it. Re-issuing a live
-    /// id restarts the wait.
+    /// Starts a timed reveal, or cancels the one registered under `id` with `None`.
     Delay {
         id: DelayId,
-        ms: u32,
-    },
-    /// Cancels a delay by dropping it. A cancelled delay never reports.
-    CancelDelay {
-        id: DelayId,
+        ms: Option<u32>,
     },
 }
 
-/// A pending patch: the ops, and the buffers their payloads live in.
-///
-/// The buffers are pooled: the front thread hands a drained patch back and the app thread
-/// refills it, so a forty-stop ramp or a four-hundred-entry hit table allocates nothing once
-/// the buffers have reached their working size.
-#[derive(Debug, Default)]
+/// One pass of app-thread decisions, as `Copy` ops over typed side-buffers.
+#[derive(Default)]
 pub struct SinkPatch {
-    pub(crate) ops: Vec<Op>,
-    pub(crate) verbs: Vec<PathVerb>,
-    pub(crate) stops: Vec<(f32, Radiance)>,
-    pub(crate) frames: Vec<(f32, Value, Easing)>,
-    pub(crate) dashes: Vec<f32>,
-    pub(crate) hits: Vec<HitEntry>,
-    /// Segments and the glyph data they span, in one type, so they are pooled and cleared
-    /// together: a segment resolved against a buffer it did not travel with is a span into
-    /// the wrong bytes. `windows-text` appends straight into this.
-    pub(crate) text: SegBuffers,
-    /// The environment this patch's geometry was solved under, or `None` before it has been
-    /// flushed.
-    ///
-    /// The applier compares it against the environment it is applying under, so geometry
-    /// snapped to a different pixel grid than the one in force is visible. A mismatch is
-    /// counted as [`Census::env_mismatches`](crate::Census::env_mismatches) and not refused.
-    pub(crate) env: Option<Env>,
+    /// The environment this patch's geometry was solved under, where the emitter states one.
+    pub env: Option<Env>,
+    ops: Vec<Op>,
+    verbs: Vec<PathVerb>,
+    stops: Vec<(u16, Radiance)>,
+    frames: Vec<(f32, Value, Easing)>,
+    floats: Vec<f32>,
+    segs: Vec<GlyphSeg>,
+    glyphs: Vec<u16>,
+    hits: Vec<HitEntry>,
+    index: Vec<(ControlId, u32)>,
 }
 
-/// Fails to compile if a patch or an op ever gains a field that is not `Send`.
+/// The whole proof that no composition object crossed the seam: a generated interface holds
+/// a raw pointer and `windows-core` declares no `Send` for any of them.
 const _: () = {
     const fn assert_send<T: Send>() {}
-    assert_send::<SinkPatch>();
     assert_send::<Op>();
+    assert_send::<SinkPatch>();
 };
 
+/// One appender and one span reader per side-buffer, so the arithmetic is written once.
+macro_rules! buffers {
+    ($($push:ident, $read:ident, $field:ident: $ty:ty;)*) => { $(
+        impl SinkPatch {
+            pub fn $push(&mut self, items: &[$ty]) -> Span {
+                let off = self.$field.len() as u32;
+                self.$field.extend_from_slice(items);
+                Span { off, len: items.len() as u32 }
+            }
+
+            /// The items `span` covers, or `&[]` where it runs past the buffer. One bounds
+            /// check, at the seam: a mismatched pair presents as a missing payload rather
+            /// than a panic inside a draw call.
+            #[must_use]
+            #[allow(
+                clippy::should_implement_trait,
+                reason = "the hit index's reader is named for the buffer it reads, as every                           other reader here is; it takes a span and is not an indexing operator"
+            )]
+            pub fn $read(&self, span: Span) -> &[$ty] {
+                let (off, len) = (span.off as usize, span.len as usize);
+                self.$field.get(off..off + len).unwrap_or_default()
+            }
+        }
+    )* };
+}
+
+buffers! {
+    push_verbs, verbs, verbs: PathVerb;
+    push_stops, stops, stops: (u16, Radiance);
+    push_frames, frames, frames: (f32, Value, Easing);
+    push_floats, floats, floats: f32;
+    push_segs, segs, segs: GlyphSeg;
+    push_glyphs, glyphs, glyphs: u16;
+    push_hits, hits, hits: HitEntry;
+    push_index, index, index: (ControlId, u32);
+}
+
 impl SinkPatch {
-    /// Returns an empty patch that has allocated nothing.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn push(&mut self, op: Op) {
+        self.ops.push(op);
     }
 
-    /// Empties every buffer and keeps its allocation.
-    pub fn clear(&mut self) {
-        // The environment goes with the contents: a drained patch has been applied, and
-        // nothing has been solved into a pooled one yet.
-        self.env = None;
-        self.ops.clear();
-        self.verbs.clear();
-        self.stops.clear();
-        self.frames.clear();
-        self.dashes.clear();
-        self.hits.clear();
-        self.text.clear();
-    }
-
-    /// Returns whether the patch instructs the front half to do anything.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
-    }
-
-    /// Returns the number of ops the patch carries.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.ops.len()
-    }
-
-    /// Returns the ops, in the order they must be applied.
     #[must_use]
     pub fn ops(&self) -> &[Op] {
         &self.ops
     }
 
-    /// Returns the environment this patch's geometry was solved under, or `None` before it
-    /// has been flushed.
     #[must_use]
-    pub fn env(&self) -> Option<Env> {
-        self.env
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
     }
 
-    /// Returns the glyph buffers, for a producer appending a shaped run into them.
+    /// The whole glyph buffer. A run's segments address it absolutely, so the applier hands
+    /// the pool to the rasterizer and each segment's span cuts its own window out of it.
+    #[must_use]
+    pub fn glyph_pool(&self) -> &[u16] {
+        &self.glyphs
+    }
+
+    /// The whole float buffer, which a run's advances and offsets address absolutely.
+    #[must_use]
+    pub fn float_pool(&self) -> &[f32] {
+        &self.floats
+    }
+
+    /// The hit array's own buffer, to build into rather than copy into.
     ///
-    /// `ShapedRun::segments` appends here and returns the span naming what it wrote, so a
-    /// run reaches the patch without an intermediate copy.
-    pub fn text(&mut self) -> &mut SegBuffers {
-        &mut self.text
-    }
-
-    // ── appending payloads ────────────────────────────────────────────────────────
-    //
-    // Each returns the span naming what it appended, so a caller builds the payload and
-    // the op that reads it in one expression.
-
-    pub(crate) fn push_op(&mut self, op: Op) {
-        self.ops.push(op);
-    }
-
-    pub(crate) fn push_verbs(&mut self, verbs: &[PathVerb]) -> Span {
-        Self::extend(&mut self.verbs, verbs)
-    }
-
-    pub(crate) fn push_stops(&mut self, stops: &[(f32, Radiance)]) -> Span {
-        Self::extend(&mut self.stops, stops)
-    }
-
-    pub(crate) fn push_frames(&mut self, frames: &[(f32, Value, Easing)]) -> Span {
-        Self::extend(&mut self.frames, frames)
-    }
-
-    pub(crate) fn push_dashes(&mut self, dashes: &[f32]) -> Span {
-        Self::extend(&mut self.dashes, dashes)
-    }
-
-    pub(crate) fn push_segs(&mut self, segs: &[GlyphSeg]) -> Span {
-        Self::extend(&mut self.text.segs, segs)
-    }
-
-    /// Returns the hit table's buffer, for a producer writing entries straight into it.
-    pub(crate) fn hits_mut(&mut self) -> &mut Vec<HitEntry> {
+    /// The table is replaced whole and one [`Op::Hits`] carries it, so a builder clears this
+    /// and refills it, then names the whole of it through [`hits_span`](Self::hits_span). A
+    /// second builder in one patch would overwrite the first.
+    pub fn hits_mut(&mut self) -> &mut Vec<HitEntry> {
         &mut self.hits
     }
 
-    /// Returns the number of entries the hit table holds.
+    /// The id index's own buffer, built alongside [`hits_mut`](Self::hits_mut) and ordered
+    /// by id on the way out.
+    pub fn index_mut(&mut self) -> &mut Vec<(ControlId, u32)> {
+        &mut self.index
+    }
+
+    /// The span covering everything [`hits_mut`](Self::hits_mut) holds.
     #[must_use]
-    pub fn hits_len(&self) -> usize {
-        self.hits.len()
+    pub fn hits_span(&self) -> Span {
+        Span {
+            off: 0,
+            len: self.hits.len() as u32,
+        }
     }
 
-    /// Returns the whole hit table, in z-order.
+    /// The span covering everything [`index_mut`](Self::index_mut) holds.
     #[must_use]
-    pub fn hit_entries(&self) -> &[HitEntry] {
-        &self.hits
+    pub fn index_span(&self) -> Span {
+        Span {
+            off: 0,
+            len: self.index.len() as u32,
+        }
     }
 
-    fn extend<T: Copy>(buffer: &mut Vec<T>, items: &[T]) -> Span {
-        let off = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
-        buffer.extend_from_slice(items);
-        Span::new(off, u32::try_from(items.len()).unwrap_or(u32::MAX))
-    }
-
-    // ── reading them back, on the far side ────────────────────────────────────────
-
-    pub(crate) fn verbs(&self, span: Span) -> &[PathVerb] {
-        span.of(&self.verbs)
-    }
-
-    pub(crate) fn stops(&self, span: Span) -> &[(f32, Radiance)] {
-        span.of(&self.stops)
-    }
-
-    pub(crate) fn frames(&self, span: Span) -> &[(f32, Value, Easing)] {
-        span.of(&self.frames)
-    }
-
-    pub(crate) fn dashes(&self, span: Span) -> &[f32] {
-        span.of(&self.dashes)
-    }
-
-    pub(crate) fn segs(&self, span: Span) -> &[GlyphSeg] {
-        span.of(&self.text.segs)
-    }
-
-    pub(crate) fn hits(&self, span: Span) -> &[HitEntry] {
-        span.of(&self.hits)
-    }
-
-    pub(crate) fn glyphs(&self) -> &SegBuffers {
-        &self.text
+    /// Clears every buffer and keeps every allocation, which is what makes a 40-stop ramp or
+    /// a 400-entry hit table cost nothing after warm-up.
+    pub fn clear(&mut self) {
+        self.env = None;
+        self.ops.clear();
+        self.verbs.clear();
+        self.stops.clear();
+        self.frames.clear();
+        self.floats.clear();
+        self.segs.clear();
+        self.glyphs.clear();
+        self.hits.clear();
+        self.index.clear();
     }
 }
 
-/// A pool of drained patches, so the two threads swap buffers rather than allocate them.
-///
-/// One patch is in flight at a time: the front thread hands a patch back as soon as it has
-/// applied it.
-#[derive(Debug, Default)]
+/// Returns drained patches to the app thread so neither side allocates per frame.
+#[derive(Default)]
 pub struct PatchPool(Vec<SinkPatch>);
 
 impl PatchPool {
-    /// Returns a drained patch, from the pool or freshly allocated.
     pub fn take(&mut self) -> SinkPatch {
         self.0.pop().unwrap_or_default()
     }
 
-    /// Takes a patch back, drains it, and holds it for reuse.
     pub fn give(&mut self, mut patch: SinkPatch) {
         patch.clear();
-        // Two is the working set: one patch being filled and one being applied.
-        if self.0.len() < 2 {
-            self.0.push(patch);
-        }
+        self.0.push(patch);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_numerics::Vector2;
 
     #[test]
     fn a_span_reads_back_exactly_what_was_appended() {
-        let mut patch = SinkPatch::new();
-        let first = patch.push_dashes(&[1.0, 2.0]);
-        let second = patch.push_dashes(&[3.0]);
-        assert_eq!(patch.dashes(first), &[1.0, 2.0]);
-        assert_eq!(patch.dashes(second), &[3.0]);
+        let mut patch = SinkPatch::default();
+        let first = patch.push_floats(&[1.0, 2.0]);
+        let second = patch.push_floats(&[3.0]);
+        assert_eq!(patch.floats(first), &[1.0, 2.0]);
+        assert_eq!(patch.floats(second), &[3.0]);
+        assert_eq!(patch.floats(Span { off: 0, len: 9 }), &[] as &[f32]);
     }
 
     #[test]
-    fn clearing_keeps_the_allocations() {
-        let mut patch = SinkPatch::new();
-        patch.push_dashes(&[1.0; 64]);
-        let capacity = patch.dashes.capacity();
+    fn clearing_keeps_the_allocations_the_next_pass_writes_into() {
+        let mut patch = SinkPatch::default();
+        patch.push_verbs(&[PathVerb::Line(Vector2 { x: 1.0, y: 1.0 })]);
+        patch.push(Op::Delay {
+            id: DelayId::FIRST,
+            ms: Some(4),
+        });
+        patch.env = Some(Env::new(
+            96.0,
+            windows_color::OutputTransform::for_display(
+                windows_color::DisplayCapability::Sdr,
+                203.0,
+            ),
+        ));
         patch.clear();
-        assert!(patch.dashes.is_empty());
-        assert_eq!(patch.dashes.capacity(), capacity);
+        assert!(patch.is_empty());
+        assert!(patch.env.is_none());
+        assert_eq!(patch.verbs(Span { off: 0, len: 1 }), &[] as &[PathVerb]);
     }
 
     #[test]
-    fn a_pooled_patch_comes_back_empty() {
+    fn the_pool_hands_back_a_cleared_patch() {
         let mut pool = PatchPool::default();
         let mut patch = pool.take();
-        patch.push_op(Op::Drop {
-            id: NodeId::NONE,
-            exit: Exit::None,
+        patch.push(Op::Delay {
+            id: DelayId::FIRST,
+            ms: None,
         });
         pool.give(patch);
-        assert!(pool.take().is_empty());
+        let reused = pool.take();
+        assert!(reused.is_empty());
+    }
+
+    #[test]
+    fn the_hit_buffers_are_built_in_place_and_named_whole() {
+        let mut patch = SinkPatch::default();
+        patch.hits_mut().clear();
+        patch.index_mut().clear();
+        assert_eq!(patch.hits_span(), Span { off: 0, len: 0 });
+        patch.index_mut().push((ControlId::FIRST, 0));
+        assert_eq!(patch.index_span(), Span { off: 0, len: 1 });
+        assert_eq!(patch.index(patch.index_span()), &[(ControlId::FIRST, 0)]);
     }
 }

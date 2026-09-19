@@ -1,5 +1,5 @@
-//! The pointer stack: pointer, keyboard and dial messages in, resolved [`Report`]s out on
-//! the frame clock.
+//! The pointer stack: pointer, keyboard and dial messages in, resolved [`Report`]s out on the
+//! frame clock.
 //!
 //! ```text
 //!  front thread — WndProc                     front thread — service tick
@@ -17,32 +17,23 @@
 //!
 //! The split rests on four properties of pointer input:
 //!
-//! * A pointer message signals that samples are available; it does not carry them. The
-//!   samples live in a system-side history ring addressed by pointer id, so a consumer that
-//!   reads the ring once per frame keeps the intermediate samples legacy coalescing
-//!   discards.
-//! * Hover is a per-frame quantity and a manipulation is an integrated one. A hover state
-//!   between two presents is not observable, so hover resolves once per frame; every sample
-//!   of a manipulation contributes, so all of them are consumed. The split is at the
-//!   consumption point, not at the message.
-//! * A discrete transition is neither. A press, a release, a cancel, a wheel notch and a
-//!   keystroke ask to be serviced on the next pump iteration by posting the pacer's own
-//!   message, because waiting for the display would add a frame of latency to each. Motion
-//!   waits for the frame clock, because motion is per-frame.
-//! * Resolving a contact costs a walk proportional to the node count, which the flat hit
-//!   array in [`HitTable`] bounds.
+//! * A pointer message signals that samples are available; it does not carry them.
+//! * Hover is a per-frame quantity and a manipulation is an integrated one. The split is at
+//!   the consumption point, not at the message.
+//! * A discrete transition is neither: it asks to be serviced on the next pump iteration,
+//!   because waiting for the display would add a frame of latency to each.
+//! * Resolving a contact costs a walk proportional to the node count, which the flat hit array
+//!   in [`HitTable`] bounds.
 //!
-//! A tick is not a frame. Ticks are bounded by the frame clock *plus* the discrete input
-//! rate, so anything genuinely per-frame is gated on
-//! [`Wake::frames`](windows_window::Wake::frames) rather than on the tick. A driven run
-//! measured 145 ticks against 134 display frames and 45 hover resolutions.
+//! A tick is not a frame. Ticks are bounded by the frame clock *plus* the discrete input rate,
+//! so anything genuinely per-frame is gated on [`Wake::frames`](windows_window::Wake::frames)
+//! rather than on the tick.
 //!
 //! # There is no legacy mouse path
 //!
 //! `DefWindowProc` promotes pointer input into legacy mouse messages, so every pointer arm
-//! that carries a contact is handled and none falls through. Neither binding filter
-//! generates `WM_MOUSEMOVE`, its relatives or `TrackMouseEvent`, so a legacy arm does not
-//! compile.
+//! that carries a contact is handled and none falls through. Neither binding filter generates
+//! `WM_MOUSEMOVE`, its relatives or `TrackMouseEvent`, so a legacy arm does not compile.
 //!
 //! # The environment is stated, never held
 //!
@@ -51,35 +42,30 @@
 //! window moves to another display, and every contact then resolves against the wrong pixel
 //! grid.
 
-mod capability;
 mod coords;
 mod doorbell;
-mod dynamic;
 mod focus;
-mod inertia;
-mod sample;
-mod scroll;
-mod service;
+mod platform;
 
-pub use capability::{Capability, Devices, Interaction};
-pub use coords::{Coords, PointerSpace, Unit};
+pub use coords::{Coords, Pen, PointerSpace, Sample, client_origin};
 pub use doorbell::{
     Doorbell, DoorbellHealth, EventKind, InputEvent, KeyEvent, KeyKind, Mods, PointerEvent,
     PointerFlags, PointerType,
 };
-pub use dynamic::Late;
-pub use focus::{FocusRing, FocusScope, Move, ScopeId};
-pub use inertia::Inertia;
-pub use sample::{Pen, Reader, Sample};
-pub use service::Service;
+pub use focus::{FocusRing, Move, ScopeId};
+pub use platform::{Capability, Inertia, Late, Service};
 
 use crate::bindings::*;
-use crate::gesture::{DragUpdate, Events, GestureDecl, Recognised, RecognizerPool};
+use crate::gesture::{
+    Contacts, DragUpdate, Events, Feed, Flags, Recognised, SLOTS, pivot_of, scroll_ancestor,
+    scroll_offer,
+};
 use crate::rotary::{Rotary, Rotation};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 use windows_core::Result;
-use windows_scene::{ControlId, Env, HitFlags, HitTable, Point, ShadowOffsets};
+use windows_scene::{ContactKind, ControlId, Env, Hit, HitFlags, HitTable, Point};
+use windows_window::{Tick, Wake, Window};
 
 /// How many coalesced entries one service reads back.
 ///
@@ -87,13 +73,12 @@ use windows_scene::{ControlId, Env, HitFlags, HitTable, Point, ShadowOffsets};
 /// frames of a 1 kHz digitizer. A deeper batch means the pump never reached the frames that
 /// produced it.
 const HISTORY_MAX: usize = 128;
-use windows_window::{Tick, Wake, Window};
 
 /// Reports one outcome of a tick, published in the order it happened.
 ///
 /// Every variant is resolved on the front thread, and the layer above turns a report into
-/// pixels before it turns it into an [`Intent`](crate::gesture::Intent). An intent therefore
-/// exists only after the visual it belongs to, and can never be the cause of one.
+/// pixels before it turns it into an intent. An intent therefore exists only after the visual
+/// it belongs to, and can never be the cause of one.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Report {
     /// Offers a touch press to its nearest scrolling ancestor. Scene-thread only.
@@ -102,15 +87,15 @@ pub enum Report {
         pointer: windows_scene::ManipulationPointer,
     },
     /// A hover boundary was crossed. One tick can publish several, in the order the pointer
-    /// crossed them: a fast flick over a toolbar publishes every crossing on the path, and
-    /// the layer that owns the chrome decides which of them light anything.
+    /// crossed them: a fast flick over a toolbar publishes every crossing on the path, and the
+    /// layer that owns the chrome decides which of them light anything.
     HoverChanged {
         from: Option<ControlId>,
         to: Option<ControlId>,
         /// Where the crossing happened, in client DIPs.
         at: Point,
-        /// The performance-counter value the sample was stamped with, or zero where it
-        /// carried none. A dwell is measured against this rather than against a tick count.
+        /// The performance-counter value the sample was stamped with, or zero where it carried
+        /// none. A dwell is measured against this rather than against a tick count.
         qpc: u64,
     },
     FocusChanged {
@@ -121,13 +106,13 @@ pub enum Report {
         target: ControlId,
         contact: u32,
         /// The contact as it was at the message, not as it is now. Its `raw` is the point the
-        /// target was chosen from, and it carries the pen's pressure and tilt and the
-        /// measured contact patch.
+        /// target was chosen from, and it carries the pen's pressure and tilt and the measured
+        /// contact patch.
         sample: Sample,
         buttons: u32,
     },
-    /// A bound contact moved. Carries the pen's pressure, tilt and twist, which a
-    /// recogniser's own events do not: those carry a position alone.
+    /// A bound contact moved. Carries the pen's pressure, tilt and twist, which a recogniser's
+    /// own events do not: those carry a position alone.
     Moved {
         target: ControlId,
         contact: u32,
@@ -158,8 +143,8 @@ pub enum Report {
         update: DragUpdate,
     },
     /// A wheel notch over a target that is not a scroll surface. A scroll container's wheel
-    /// does not reach here: `PointerWheelConfig` routes it to that container's tracker on
-    /// the compositor side, with no front-thread work.
+    /// does not reach here: `PointerWheelConfig` routes it to that container's tracker on the
+    /// compositor side, with no front-thread work.
     Wheel {
         target: Option<ControlId>,
         at: Point,
@@ -191,7 +176,7 @@ pub enum Report {
         target: Option<ControlId>,
         pressed: bool,
     },
-    /// Every contact was taken away — a lost capture, or the window losing focus.
+    /// Every contact was taken away — the window lost focus.
     CaptureLost,
 }
 
@@ -211,9 +196,7 @@ pub struct InputCensus {
     ///
     /// One means the platform never coalesced: the pump kept up and each service saw a single
     /// sample. Greater than one means the pump fell behind and the batch carries samples a
-    /// point-sampling consumer would have dropped. `SendInput` does not outrun a healthy
-    /// pump, so injected input rarely raises it; a 1 kHz mouse against a loaded front thread
-    /// does.
+    /// point-sampling consumer would have dropped.
     pub deepest_batch: u32,
     /// Hit tests run to resolve a discrete transition. Bounded by human input rate.
     pub discrete_hits: u64,
@@ -229,54 +212,41 @@ pub struct InputCensus {
 
 /// Drains a [`Doorbell`] on the frame clock and publishes the resulting [`Report`]s.
 ///
-/// Runs on the front thread: it owns recognisers, which are non-agile, and it resolves
-/// through the retained tree's hit array.
+/// Runs on the front thread: it owns recognisers, which are non-agile, and it resolves through
+/// the retained tree's hit array.
 pub struct Router {
     bell: Rc<Doorbell>,
-    hwnd: HWND,
-    coords: Coords,
-    reader: Reader,
-    pool: RecognizerPool,
-    /// A clone of the pool's queue, so draining it does not conflict with iterating the pool.
+    contacts: Contacts,
+    /// A clone of the contact table's queue, so draining it does not conflict with writing the
+    /// columns beside it.
     events: Events,
+    /// Which gestures each target accepts. Resolved on the front thread, so deciding whether a
+    /// gesture applies makes no call to the application thread.
+    decls: FxHashMap<ControlId, crate::gesture::GestureDecl>,
     focus: FocusRing,
-    /// Which gestures each target accepts. Resolved on the front thread, so deciding whether
-    /// a gesture applies makes no call to the application thread.
-    decls: FxHashMap<ControlId, GestureDecl>,
-    hover: Option<ControlId>,
-    /// Set when the hover answer may have changed without the pointer moving — a layout
-    /// change under a stationary cursor.
-    hover_stale: bool,
-    /// The environment the last tick ran under. Read only by the comparison that decides what
-    /// a change to the environment invalidated; it is never answered as the current scale.
-    env: Option<Env>,
+    capability: Capability,
+    inertia: Inertia,
     /// The window's dial. `None` means no radial controller is attached.
     rotary: Option<Rotary>,
-    rotations: Vec<Rotation>,
+    hover: Option<ControlId>,
     /// The mouse contact holding explicit Win32 capture. Touch routing is system-owned.
     capture: Option<u32>,
-    inertia: Inertia,
-    capability: Capability,
+    /// The environment the last tick ran under. Read only by the comparison that decides what
+    /// a change to the environment invalidated; never answered as the current scale.
+    env: Option<Env>,
+    /// Set when the hover answer may have changed without the pointer moving.
+    stale: bool,
+    /// Held while a gesture or a stale hover is live. The doorbell holds its own for the ring.
+    tick: Option<Tick>,
     wake: Wake,
-    /// Held while a gesture or inertia is live. The doorbell holds its own for the ring.
-    running: Option<Tick>,
-    /// The live scroll offset of every viewport, as the thread owning the trackers publishes
-    /// it. A hit test against the array copy this thread holds resolves scroll through these
-    /// rather than through offsets the table itself was told, which only the scene's own
-    /// table is.
-    shadows: ShadowOffsets,
+    census: InputCensus,
     // ── scratch, so a frame allocates nothing after the first ─────────────────────
-    moved: Vec<u32>,
-    recognised: Vec<Recognised>,
-    /// The ids the pool reports as inertial, copied out once per tick so the pump can hold
-    /// `&mut self` while it walks them.
-    inertial_ids: Vec<u32>,
-    /// The ids bound to one target, for the unmount that aborts them.
-    target_ids: Vec<u32>,
     /// The coalesced-history buffer, allocated once. `POINTER_INFO` is ~100 bytes, so this
     /// holds ~13 KB for the window's life and a contact's motion allocates nothing.
     history: Vec<POINTER_INFO>,
-    census: InputCensus,
+    moved: Vec<u32>,
+    recognised: Vec<Recognised>,
+    rotations: Vec<Rotation>,
 }
 
 impl Router {
@@ -288,48 +258,37 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns an error if `window` is closed, leaving no handle to resolve against.
+    /// `window` is closed, leaving no handle to resolve against.
     pub fn new(bell: &Rc<Doorbell>, window: &Window, wake: Wake) -> Result<Self> {
         if !window.is_open() {
             return Err(windows_core::Error::new(
-                windows_core::HRESULT(0x8007_0006u32 as i32),
+                windows_core::HRESULT(0x8007_0006_u32 as i32),
                 "the window is closed",
             ));
         }
-        let hwnd = window.hwnd();
-        let late = Late::resolve();
-        let pool = RecognizerPool::new();
-        // The queue every recogniser in the pool is wired to. Cloned so that draining it and
-        // iterating the pool do not borrow one field twice; the queue is an `Rc` inside, so
-        // both names refer to it.
-        let events = pool.events().clone();
         bell.pace(window, wake.clone());
+        let late = bell.late();
+        let contacts = Contacts::default();
         Ok(Self {
+            events: contacts.events().clone(),
+            contacts,
             bell: Rc::clone(bell),
-            hwnd,
-            coords: Coords::new(hwnd),
-            reader: Reader::new(late),
-            pool,
-            events,
-            focus: FocusRing::default(),
             decls: FxHashMap::default(),
-            hover: None,
-            hover_stale: false,
-            env: None,
-            rotary: None,
-            rotations: Vec::with_capacity(8),
-            capture: None,
-            inertia: Inertia::new(window, late),
+            focus: FocusRing::default(),
             capability: Capability::read(window, &late),
+            inertia: Inertia::new(window, late),
+            rotary: None,
+            hover: None,
+            capture: None,
+            env: None,
+            stale: false,
+            tick: None,
             wake,
-            running: None,
-            shadows: ShadowOffsets::default(),
-            moved: Vec::with_capacity(16),
-            recognised: Vec::with_capacity(32),
-            inertial_ids: Vec::with_capacity(8),
-            target_ids: Vec::with_capacity(8),
-            history: vec![POINTER_INFO::default(); HISTORY_MAX],
             census: InputCensus::default(),
+            history: vec![POINTER_INFO::default(); HISTORY_MAX],
+            moved: Vec::with_capacity(SLOTS),
+            recognised: Vec::with_capacity(32),
+            rotations: Vec::with_capacity(8),
         })
     }
 
@@ -346,93 +305,67 @@ impl Router {
         &self.census
     }
 
-    /// Attaches the window's radial controller.
-    ///
-    /// `Ok(true)` means the controller object exists, not that a dial is present:
-    /// `CreateForWindow` succeeds on a machine with no wheel attached and the object then
-    /// never raises anything, so a dial plugged in later needs no re-attach.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the interop factory refused the window.
-    pub fn attach_rotary(&mut self, window: &Window) -> Result<bool> {
-        match Rotary::new(window, self.bell.service()) {
-            Ok(rotary) => {
-                self.rotary = Some(rotary);
-                Ok(true)
-            }
-            // `CreateForWindow` answers this when no controller is available. Distinguished
-            // from a real refusal so a missing dial does not read as a broken one.
-            Err(error) if error.code() == windows_core::HRESULT(0x8007_0490u32 as i32) => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Returns `true` once a radial controller is attached.
+    /// Returns the factor the WinRT pointer statics were measured to answer in, which is
+    /// `1.0` while unmeasured and exactly `1.0` where the two spaces agreed.
     #[must_use]
-    pub const fn has_rotary(&self) -> bool {
-        self.rotary.is_some()
-    }
-
-    /// Returns the unit the WinRT pointer statics were measured to answer in.
-    #[must_use]
-    pub fn measured_unit(&self) -> Unit {
-        self.bell.space.unit()
+    pub fn measured_factor(&self) -> f32 {
+        self.bell.space().factor()
     }
 
     /// Returns the focus ring. Focus order is the hit array's, filtered to `INTERACTIVE`.
-    #[must_use]
-    pub const fn focus(&self) -> &FocusRing {
-        &self.focus
-    }
-
-    /// Returns the focus ring for mutation, as an overlay opens or closes a scope.
-    /// The scroll shadows every hit test on this thread resolves through. The owner of the
-    /// array copy installs the current set here whenever a tracker is created or dropped.
-    pub fn shadows_mut(&mut self) -> &mut ShadowOffsets {
-        &mut self.shadows
-    }
-
-    /// The scroll shadows, for a hit test made outside the router against the same array.
-    pub fn shadows(&self) -> &ShadowOffsets {
-        &self.shadows
-    }
-
     pub const fn focus_mut(&mut self) -> &mut FocusRing {
         &mut self.focus
     }
 
+    /// Attaches the window's radial controller.
+    ///
+    /// `CreateForWindow` succeeds on a machine with no dial attached and the object then never
+    /// raises anything, so a dial plugged in later needs no re-attach.
+    ///
+    /// # Errors
+    ///
+    /// The interop factory refused the window, or an event registration failed.
+    pub fn attach_rotary(&mut self, window: &Window) -> Result<()> {
+        self.rotary = Some(Rotary::new(window, self.bell.service())?);
+        Ok(())
+    }
+
     /// Records which gestures `target` accepts. Called as the widget mounts.
-    pub fn declare(&mut self, target: ControlId, decl: GestureDecl) {
+    pub fn declare(&mut self, target: ControlId, decl: crate::gesture::GestureDecl) {
         self.decls.insert(target, decl);
     }
 
-    /// Drops `target`'s declaration, on unmount. Any contact still bound to it aborts,
-    /// because a gesture whose target has gone cannot commit anything.
+    /// Drops `target`'s declaration, on unmount.
+    ///
+    /// Any contact still bound to it aborts, because a gesture whose target has gone cannot
+    /// commit anything, and the abort releases any explicit mouse capture that contact held.
     pub fn forget(&mut self, target: ControlId) {
         self.decls.remove(&target);
-        let mut ids = core::mem::take(&mut self.target_ids);
-        self.pool.bound_to(target, &mut ids);
-        for &id in &ids {
-            self.cancel_contact(id);
+        for id in self.contacts.ids() {
+            if id != 0
+                && self
+                    .contacts
+                    .bound(id)
+                    .is_some_and(|(held, _)| held == target)
+            {
+                self.drop_contact(id);
+            }
         }
-        ids.clear();
-        self.target_ids = ids;
-        self.focus.clear_tab_index(target);
+        self.focus.forget(target);
     }
 
     /// Marks the hover answer stale, for a layout change under a stationary pointer.
     ///
-    /// Costs one hit test on the next tick and nothing at idle. Content that moves under a
-    /// resting pointer changes its hover only through this call.
+    /// Costs one hit test on the next tick and nothing at idle.
     pub fn invalidate_hover(&mut self) {
-        self.hover_stale = true;
+        self.stale = true;
+        self.tick.get_or_insert_with(|| self.wake.tick());
     }
 
     /// Stops content inertia at the system's request.
     ///
-    /// No message arm reaches this: `WM_STOPINERTIA` is absent from the SDK the bindings are
-    /// generated from, so there is no constant to match on. [`Inertia`] drives it instead.
+    /// No message arm reaches this: neither inertia message number is in the generated
+    /// bindings, so there is no constant to match on.
     pub fn stop_inertia(&mut self) {
         self.bell.stop_inertia();
     }
@@ -446,296 +379,133 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns an error propagated from a platform pointer or recogniser call. Whatever was
-    /// resolved before it is already in `out`.
+    /// A platform pointer or recogniser call refused. Whatever was resolved before it is
+    /// already in `out`.
     pub fn tick(&mut self, hits: &HitTable, env: Env, out: &mut Vec<Report>) -> Result<()> {
+        // Re-opened before the drain, so a transition arriving during it asks again rather
+        // than being swallowed. A gate re-opened after the drain stays shut over that window,
+        // and the symptom is input that silently stops.
+        self.bell.service().begin();
         self.census.ticks += 1;
-        self.sync(env);
-        // Re-opened before the drain, so a transition arriving during it asks for another
-        // service rather than being swallowed. A gate re-opened after the drain stays shut
-        // over that window, and the symptom is input that silently stops.
-        self.bell.begin();
-        self.drain(hits, env, out)?;
-        let hover_moved = self.feed(hits, env, out)?;
-        self.resolve_hover(hits, env, out, hover_moved);
-        self.rotate(hits, env, out);
-        self.pump(out)?;
+        self.retarget(env);
+        while let Some(event) = self.bell.pop() {
+            match event {
+                InputEvent::Pointer(event) => self.pointer(&event, hits, env, out)?,
+                InputEvent::Key(event) => self.key(event, hits, out),
+            }
+        }
+        let hovering_moved = self.feed(hits, env, out)?;
+        self.resolve_hover(hits, env, out, hovering_moved);
+        self.rotate(hits, out);
+        self.pump(hits, out)?;
         self.settle();
         Ok(())
     }
 
     /// Brings the router up to date with `env` and keeps it as the next tick's watermark.
     ///
-    /// Any change to the environment makes the hover answer stale. The doorbell calibrates
-    /// the recogniser's space at capture time, before a transition enters the ring.
-    fn sync(&mut self, env: Env) {
+    /// Any change to the environment makes the hover answer stale. A scale change additionally
+    /// discards the measured recogniser factor, which was never derived from the scale and has
+    /// no arithmetic that carries it to a new one.
+    fn retarget(&mut self, env: Env) {
         let Some(last) = self.env.replace(env) else {
             return;
         };
         if last == env {
             return;
         }
-        self.hover_stale = true;
+        if last.scale() != env.scale() {
+            self.bell.space().forget();
+            if let Some(rotary) = self.rotary.as_ref() {
+                rotary.rescale(env.scale());
+            }
+        }
+        self.stale = true;
+    }
+
+    /// Takes or drops the frame request covering everything this tick left running.
+    fn settle(&mut self) {
+        if self.contacts.live() > 0 || self.stale {
+            self.tick.get_or_insert_with(|| self.wake.tick());
+        } else {
+            self.tick = None;
+            self.bell.settle();
+        }
+        // A window whose content is moving must say so, or a touchpad tap lands on whatever
+        // was moving under it. A refusal is retried by the next tick, so the result is not
+        // acted on here.
+        _ = self.inertia.set(self.contacts.any_inertial());
     }
 
     // ── 1. the ring, in order ─────────────────────────────────────────────────────
 
-    fn drain(&mut self, hits: &HitTable, env: Env, out: &mut Vec<Report>) -> Result<()> {
-        while let Some(event) = self.bell.pop() {
-            match event {
-                InputEvent::Pointer(event) => self.pointer(event, hits, env, out)?,
-                InputEvent::Key(event) => self.key(event, hits, out),
+    fn pointer(
+        &mut self,
+        p: &PointerEvent,
+        hits: &HitTable,
+        env: Env,
+        out: &mut Vec<Report>,
+    ) -> Result<()> {
+        match p.kind {
+            EventKind::Down => return self.press(p, hits, env, out),
+            EventKind::Up => return self.up(p, hits, env, out),
+            EventKind::Wheel => return self.wheel(p, hits, env, out),
+            EventKind::Cancel => {
+                // A window-level capture change names no pointer, so it ends whatever held the
+                // explicit capture and nothing where none did.
+                let contact = if p.id == 0 { self.capture } else { Some(p.id) };
+                if let Some(id) = contact {
+                    self.abort(id, out);
+                }
+            }
+            EventKind::CaptureLost => {
+                self.contacts.release_all(true);
+                self.capture = None;
+                out.push(Report::CaptureLost);
+                let from = self.focus.current();
+                if self.focus.focus(None) {
+                    out.push(Report::FocusChanged { from, to: None });
+                }
+            }
+            EventKind::Button => {
+                if let Some((target, _)) = self.contacts.bound(p.id) {
+                    out.push(Report::Buttons {
+                        target,
+                        contact: p.id,
+                        buttons: p.buttons,
+                    });
+                }
             }
         }
         Ok(())
     }
 
-    fn pointer(
-        &mut self,
-        event: PointerEvent,
-        hits: &HitTable,
-        env: Env,
-        out: &mut Vec<Report>,
-    ) -> Result<()> {
-        match event.kind {
-            EventKind::Down => self.down(event, hits, env, out),
-            EventKind::Button => {
-                if let Some(bound) = self.pool.get(event.id) {
-                    out.push(Report::Buttons {
-                        target: bound.target,
-                        contact: event.id,
-                        buttons: event.buttons,
-                    });
-                }
-                Ok(())
-            }
-            EventKind::Up => self.up(event, env, out),
-            EventKind::Cancel => {
-                self.abort(event.id, out);
-                Ok(())
-            }
-            // Releasing capture on an up posts this message back, so a loss with nothing
-            // bound is ignored: treating it as a cancel would abort the gesture that had
-            // just completed normally.
-            EventKind::Deactivated => {
-                self.pool.release_all(true);
-                self.capture = None;
-                self.events.clear();
-                out.push(Report::CaptureLost);
-                if let Some((from, to)) = self.focus.focus(None) {
-                    out.push(Report::FocusChanged { from, to });
-                }
-                Ok(())
-            }
-            EventKind::CaptureLost if event.id != 0 => {
-                self.abort(event.id, out);
-                Ok(())
-            }
-            EventKind::CaptureLost => {
-                if let Some(id) = self.capture {
-                    self.abort(id, out);
-                }
-                Ok(())
-            }
-            EventKind::Wheel => self.wheel(event, hits, env, out),
-        }
-    }
-
-    fn down(
-        &mut self,
-        event: PointerEvent,
-        hits: &HitTable,
-        env: Env,
-        out: &mut Vec<Report>,
-    ) -> Result<()> {
-        // Built from the point the doorbell recorded at the message, not from wherever the
-        // contact has since moved to.
-        let pressed = self.reader.at_transition(&event, &self.coords, env);
-        let at = pressed.raw;
-        self.census.discrete_hits += 1;
-        let Some(hit) = hits.hit_with(at, event.ptype.contact(), &self.shadows) else {
-            // A press on nothing still takes focus away, so clicking the background dismisses
-            // a text caret.
-            if let Some((from, to)) = self.focus.focus(None) {
-                out.push(Report::FocusChanged { from, to });
-            }
-            return Ok(());
-        };
-
-        // An overlay's blocker consumes the press outright. Nothing under it is pressed, no
-        // focus moves, and the overlay's owner decides what closing means.
-        if hit.flags.contains(HitFlags::BLOCKER) {
-            out.push(Report::Dismiss {
-                blocker: hit.id,
-                scope: self.focus.innermost().map(|(id, _)| id),
-            });
-            return Ok(());
-        }
-
-        if let Some((from, to)) = self.focus.focus(Some(hit.id)) {
-            out.push(Report::FocusChanged { from, to });
-        }
-
-        out.push(Report::Pressed {
-            target: hit.id,
-            contact: event.id,
-            sample: pressed,
-            buttons: event.buttons,
-        });
-
-        // A contact the digitizer is not confident about is a palm. It is still tracked — its
-        // up has to be accounted for — but nothing is fed to a recogniser, so it can never
-        // start a gesture.
-        let rejected = event.ptype == PointerType::Touch && !event.flags.confident();
-        if rejected {
-            self.census.rejected += 1;
-        }
-
-        // A contact is bound whatever its target declared: a declaration says which gestures
-        // a press can become, not whether the press happened. Skipping the bind for a target
-        // that declared nothing would leave it with a press and no release, which latches its
-        // press wash, holds its pool slot for the life of the window, and loses the tap,
-        // because a tap is a press and a release on one control.
-        let decl = self.decls.get(&hit.id).copied().unwrap_or_default();
-        // Offer ordinary content touches to the nearest scroll ancestor. Keep the local
-        // recogniser until capture is actually lost: a tap may never become a manipulation.
-        let scroll = (event.ptype == PointerType::Touch && !rejected)
-            .then(|| scroll::touch(hits, hit, decl))
-            .flatten();
-        // A contact routes to its down-window for its life. Mouse is the one device that can
-        // leave the window without lifting, so capture is what keeps it routed here.
-        if event.ptype == PointerType::Mouse {
-            self.capture = Some(event.id);
-            // SAFETY: `SetCapture` takes the window handle by value and writes through no
-            // pointer; a handle whose window has been destroyed fails the call rather than
-            // being dereferenced.
-            unsafe {
-                _ = SetCapture(self.hwnd);
-            }
-        }
-
-        let started = (|| {
-            self.pool
-                .bind(event.id, event.ptype, hit.id, decl, at, rejected)?;
-            if let Some(bound) = self.pool.get_mut(event.id) {
-                bound.scroll_touch = scroll.is_some();
-            }
-            self.census.bindings += 1;
-            if !rejected {
-                let point = event.point()?;
-                if let Some(bound) = self.pool.get(event.id) {
-                    bound.recognizer().down(point)?;
-                }
-                self.collect(event.id, out);
-            }
-            if let Some(target) = scroll
-                && let Some(pointer) = event.manipulation.as_ref()
-            {
-                out.push(Report::Redirect {
-                    target,
-                    pointer: *pointer.as_ref().map_err(Clone::clone)?,
-                });
-            }
-            Ok(())
-        })();
-        if started.is_err() {
-            out.push(Report::Canceled {
-                target: hit.id,
-                contact: event.id,
-            });
-            self.cancel_contact(event.id);
-        }
-        started
-    }
-
-    fn up(&mut self, event: PointerEvent, env: Env, out: &mut Vec<Report>) -> Result<()> {
-        let at = self.coords.client(env, event.id, event.x_px, event.y_px);
-        if self.capture == Some(event.id) {
-            self.capture = None;
-            if event.ptype == PointerType::Mouse {
-                // SAFETY: `ReleaseCapture` takes no argument and writes through no pointer.
-                unsafe {
-                    _ = ReleaseCapture();
-                }
-            }
-        }
-        let Some(bound) = self.pool.get(event.id) else {
-            self.bell.release(event.id);
-            return Ok(());
-        };
-        let (target, rejected, scroll_touch) = (bound.target, bound.rejected, bound.scroll_touch);
-        // Ordinary releases are unconditional. Scrollable touch content waits for the
-        // recogniser's tap decision, then clears its press through release or cancellation.
-        if rejected {
-            out.push(Report::Canceled {
+    /// Returns the one report a contact's end produces.
+    ///
+    /// A release carries where it happened; an abort carries nothing, because a canceled
+    /// contact restores the pre-drag value and commits none.
+    fn ended(target: ControlId, contact: u32, at: Option<Point>) -> Report {
+        match at {
+            Some(at) => Report::Released {
                 target,
-                contact: event.id,
-            });
-        } else if !scroll_touch {
-            out.push(Report::Released {
-                target,
-                contact: event.id,
+                contact,
                 at,
-            });
+            },
+            None => Report::Canceled { target, contact },
         }
-        let fed = if rejected {
-            Ok(())
-        } else {
-            event.point().and_then(|point| {
-                self.pool
-                    .get(event.id)
-                    .map_or(Ok(()), |bound| bound.recognizer().up(point))
-            })
-        };
-        self.collect(event.id, out);
-        // A quick swipe may finish before the compositor takes capture. Only an actual
-        // recogniser tap can invoke the child control in that case.
-        if scroll_touch {
-            out.push(
-                if self.pool.get(event.id).is_some_and(|bound| bound.tapped) {
-                    Report::Released {
-                        target,
-                        contact: event.id,
-                        at,
-                    }
-                } else {
-                    Report::Canceled {
-                        target,
-                        contact: event.id,
-                    }
-                },
-            );
-        }
-        // Inertia keeps the binding alive: the contact is gone but its motion is not, and the
-        // recogniser running that motion is the one being pumped.
-        let inertial = self
-            .pool
-            .get(event.id)
-            .is_some_and(|bound| bound.recognizer().is_inertial());
-        self.pool.set_inertial(event.id, inertial);
-        if !inertial {
-            self.pool.release(event.id, false);
-        }
-        self.bell.release(event.id);
-        // Returned last, so a refused sample reaches the caller only after the contact has
-        // been fully ended rather than leaving this stack still holding it.
-        fed
     }
 
-    /// Aborts the contact bound to `id`: the recogniser completes and nothing is committed.
+    /// Ends the contact bound to `id` without committing anything, reporting it once.
     fn abort(&mut self, id: u32, out: &mut Vec<Report>) {
-        if let Some(bound) = self.pool.get(id) {
-            out.push(Report::Canceled {
-                target: bound.target,
-                contact: id,
-            });
+        if let Some((target, _)) = self.contacts.bound(id) {
+            out.push(Self::ended(target, id, None));
         }
-        self.cancel_contact(id);
+        self.drop_contact(id);
     }
 
-    /// The same teardown for an OS cancellation, an unmounted target, or a failed handoff.
-    fn cancel_contact(&mut self, id: u32) {
-        self.pool.release(id, true);
+    /// The same teardown for an OS cancellation, an unmounted target, or a failed press.
+    fn drop_contact(&mut self, id: u32) {
+        self.contacts.release(id, true);
         self.census.aborts += 1;
         if self.capture == Some(id) {
             self.capture = None;
@@ -747,40 +517,217 @@ impl Router {
         self.bell.release(id);
     }
 
-    fn wheel(
+    fn press(
         &mut self,
-        event: PointerEvent,
+        p: &PointerEvent,
         hits: &HitTable,
         env: Env,
         out: &mut Vec<Report>,
     ) -> Result<()> {
-        let at = self.coords.client(env, event.id, event.x_px, event.y_px);
+        // Built from the point the doorbell recorded at the message, not from wherever the
+        // contact has since moved to.
+        let sample = self.bell.coords().at_transition(p, env);
         self.census.discrete_hits += 1;
-        let hit = hits.hit_with(at, event.ptype.contact(), &self.shadows);
+        let Some(hit) = hits.hit(sample.raw, sample.kind()) else {
+            // A press on nothing still takes focus away, so clicking the background dismisses
+            // a text caret.
+            let from = self.focus.current();
+            if self.focus.focus(None) {
+                out.push(Report::FocusChanged { from, to: None });
+            }
+            return Ok(());
+        };
+        // An overlay's blocker consumes the press outright. Nothing under it is pressed, no
+        // focus moves, and the overlay's owner decides what closing means.
+        if hit.flags.contains(HitFlags::BLOCKER) {
+            out.push(Report::Dismiss {
+                blocker: hit.id,
+                scope: self.focus.innermost(),
+            });
+            return Ok(());
+        }
+        let from = self.focus.current();
+        if self.focus.focus(Some(hit.id)) {
+            out.push(Report::FocusChanged {
+                from,
+                to: Some(hit.id),
+            });
+        }
+        out.push(Report::Pressed {
+            target: hit.id,
+            contact: p.id,
+            sample,
+            buttons: p.buttons,
+        });
+        // A contact the digitizer is not confident about is a palm. It is still tracked — its
+        // up has to be accounted for — but nothing is fed to a recogniser, so it can never
+        // start a gesture.
+        let rejected = p.ptype == PointerType::Touch && !p.flags.confident();
+        if rejected {
+            self.census.rejected += 1;
+        }
+        // A contact routes to its down-window for its life. Mouse is the one device that can
+        // leave the window without lifting, and the call is what makes the window own the
+        // cursor: a window that does not pays a hit test and a cursor resolution on every
+        // sample rather than two resynchronisations.
+        if p.ptype == PointerType::Mouse {
+            self.capture = Some(p.id);
+            // SAFETY: `SetCapture` takes the window handle by value and writes through no
+            // pointer; a handle whose window has been destroyed fails the call rather than
+            // being dereferenced.
+            unsafe {
+                _ = SetCapture(self.bell.coords().hwnd());
+            }
+        }
+        match self.start(p, hit, hits, sample.raw, rejected, out) {
+            Ok(()) => Ok(()),
+            // A press that was reported and could not be started still ends, and ends once.
+            Err(error) => {
+                out.push(Self::ended(hit.id, p.id, None));
+                self.drop_contact(p.id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Binds the contact, feeds its recogniser the down, and offers a touch press to the
+    /// nearest scroll container.
+    ///
+    /// # Errors
+    ///
+    /// No slot was free, the platform refused to configure a recogniser, or the down sample
+    /// the doorbell retained could not be taken or fed.
+    fn start(
+        &mut self,
+        p: &PointerEvent,
+        hit: Hit,
+        hits: &HitTable,
+        origin: Point,
+        rejected: bool,
+        out: &mut Vec<Report>,
+    ) -> Result<()> {
+        // A contact is bound whatever its target declared: a declaration says which gestures a
+        // press can become, not whether the press happened. Skipping the bind for a target
+        // that declared nothing would leave it with a press and no release, which latches its
+        // press wash, holds its slot for the life of the window, and loses the tap, because a
+        // tap is a press and a release on one control.
+        let decl = self.decls.get(&hit.id).copied().unwrap_or_default();
+        // Ordinary content touches are offered to the nearest scroll ancestor. The local
+        // recogniser stays until capture is actually lost: a tap may never become a
+        // manipulation.
+        let scroll = (p.ptype == PointerType::Touch && !rejected)
+            .then(|| scroll_offer(hits, hit, decl))
+            .flatten();
+        self.contacts
+            .bind(p.id, hit.id, decl, p.ptype.is_touchpad(), origin, rejected)?;
+        self.contacts
+            .set(p.id, Flags::SCROLL_TOUCH, scroll.is_some());
+        // Stated at the down and not first at the manipulation, so the rotation the platform
+        // reports covers the whole gesture rather than starting one update late.
+        self.restate_pivot(p.id, hit.id, hits);
+        self.census.bindings += 1;
+        if !rejected && let Some(point) = p.point() {
+            self.contacts.feed(p.id, Feed::Down(point?))?;
+            self.collect(p.id, hits, out);
+        }
+        if let Some(target) = scroll
+            && let Some(pointer) = p.manipulation()
+        {
+            out.push(Report::Redirect {
+                target,
+                pointer: pointer?,
+            });
+        }
+        Ok(())
+    }
+
+    fn up(&mut self, p: &PointerEvent, hits: &HitTable, env: Env, out: &mut Vec<Report>) -> Result<()> {
+        let at = self.bell.coords().client(env, p.id, p.x_px, p.y_px);
+        if self.capture == Some(p.id) {
+            // Releasing capture posts `WM_CAPTURECHANGED` back at us; clearing the owner first
+            // is what keeps that from ending a gesture that has just completed.
+            self.capture = None;
+            if p.ptype == PointerType::Mouse {
+                // SAFETY: `ReleaseCapture` takes no argument and writes through no pointer.
+                unsafe {
+                    _ = ReleaseCapture();
+                }
+            }
+        }
+        let Some((target, _)) = self.contacts.bound(p.id) else {
+            self.bell.release(p.id);
+            return Ok(());
+        };
+        let flags = self.contacts.flags(p.id);
+        let released = !flags.has(Flags::REJECTED);
+        // Ordinary releases are unconditional. Scrollable touch content waits for the
+        // recogniser's tap decision below, so that it ends exactly once either way.
+        if !flags.has(Flags::SCROLL_TOUCH) {
+            out.push(Self::ended(target, p.id, released.then_some(at)));
+        }
+        let fed = match p.point() {
+            Some(point) if released => {
+                point.and_then(|point| self.contacts.feed(p.id, Feed::Up(point)))
+            }
+            _ => Ok(()),
+        };
+        self.collect(p.id, hits, out);
+        // A quick swipe may finish before the compositor takes capture. Only an actual
+        // recogniser tap can invoke the child control in that case.
+        if flags.has(Flags::SCROLL_TOUCH) {
+            let tapped = self.contacts.flags(p.id).has(Flags::TAPPED);
+            out.push(Self::ended(target, p.id, tapped.then_some(at)));
+        }
+        // Inertia keeps the binding alive: the contact is gone but its motion is not, and the
+        // recogniser running that motion is the one being pumped.
+        let inertial = self.contacts.still_inertial(p.id);
+        self.contacts.set(p.id, Flags::INERTIAL, inertial);
+        if !inertial {
+            self.contacts.release(p.id, false);
+        }
+        self.bell.release(p.id);
+        // Returned last, so a refused sample reaches the caller only after the contact has
+        // been fully ended rather than leaving this stack still holding it.
+        fed
+    }
+
+    fn wheel(
+        &mut self,
+        p: &PointerEvent,
+        hits: &HitTable,
+        env: Env,
+        out: &mut Vec<Report>,
+    ) -> Result<()> {
+        let at = self.bell.coords().client(env, p.id, p.x_px, p.y_px);
+        self.census.discrete_hits += 1;
+        let hit = hits.hit(at, p.ptype.contact());
         // A scroll surface's wheel belongs to its tracker: the source's `PointerWheelConfig`
         // takes it, and handling it front-side here would be a second scroll path.
         if hit.is_some_and(|hit| {
             (hit.flags.contains(HitFlags::SCROLL) || !hit.flags.contains(HitFlags::WHEEL))
-                && scroll::ancestor(hits, hit).is_some()
+                && scroll_ancestor(hits, hit).is_some()
         }) {
             return Ok(());
         }
         if let Some(hit) = hit
-            && let Some(bound) = self.pool.get(event.id)
-            && bound.target == hit.id
+            && self
+                .contacts
+                .bound(p.id)
+                .is_some_and(|(target, _)| target == hit.id)
+            && let Some(point) = p.point()
         {
-            let point = event.point()?;
-            bound
-                .recognizer()
-                .wheel(point, event.flags.buttons() & 2 != 0, false)?;
-            self.collect(event.id, out);
+            // A pointer wheel message packs the pointer id where the legacy one packs the
+            // modifier keys, so neither shift nor control is readable from the record.
+            self.contacts
+                .feed(p.id, Feed::Wheel(point?, false, false))?;
+            self.collect(p.id, hits, out);
             return Ok(());
         }
         out.push(Report::Wheel {
             target: hit.map(|hit| hit.id),
             at,
-            notches: event.wheel as f32 / WHEEL_DELTA as f32,
-            horizontal: event.horizontal,
+            notches: p.wheel as f32 / WHEEL_DELTA as f32,
+            horizontal: p.horizontal,
         });
         Ok(())
     }
@@ -791,22 +738,25 @@ impl Router {
         if event.kind == KeyKind::Down {
             match event.key as i32 {
                 VK_TAB => {
+                    let from = self.focus.current();
                     match self.focus.step(hits, !event.mods.shift) {
-                        Move::To { from, to } => {
-                            out.push(Report::FocusChanged { from, to: Some(to) });
-                        }
+                        Move::To => out.push(Report::FocusChanged {
+                            from,
+                            to: self.focus.current(),
+                        }),
                         // Off the end of a scope that does not trap: dismiss it and let the
                         // owner step again outside.
                         Move::Left => out.push(Report::Escape {
-                            scope: self.focus.innermost().map(|(id, _)| id),
+                            scope: self.focus.innermost(),
                         }),
-                        Move::Nowhere => {}
+                        Move::None => {}
                     }
                     return;
                 }
-                VK_ESCAPE if self.focus.depth() > 0 => {
+                // With no scope open, `Esc` is an ordinary key and reaches the focused control.
+                VK_ESCAPE if self.focus.innermost().is_some() => {
                     out.push(Report::Escape {
-                        scope: self.focus.innermost().map(|(id, _)| id),
+                        scope: self.focus.innermost(),
                     });
                     return;
                 }
@@ -825,62 +775,57 @@ impl Router {
     ///
     /// Returns whether the hovering pointer was among them, which decides whether hover is
     /// resolved this tick.
-    fn feed(&mut self, _hits: &HitTable, env: Env, out: &mut Vec<Report>) -> Result<bool> {
-        let mut moved = core::mem::take(&mut self.moved);
-        self.bell.take_moved(&mut moved);
+    ///
+    /// # Errors
+    ///
+    /// The platform refused a batch, or a recogniser refused the samples in one.
+    fn feed(&mut self, hits: &HitTable, env: Env, out: &mut Vec<Report>) -> Result<bool> {
+        self.bell.moved_into(&mut self.moved);
         let hovering = self.bell.hovering();
-        let mut hover_moved = false;
-
-        for &id in &moved {
-            if Some(id) == hovering {
-                hover_moved = true;
+        let coords = self.bell.coords();
+        let mut hovering_moved = false;
+        for index in 0..self.moved.len() {
+            let id = self.moved[index];
+            if Some(id) == hovering && !self.bell.is_down(id) {
+                hovering_moved = true;
             }
-            let Some(bound) = self.pool.get(id) else {
+            let Some((target, _)) = self.contacts.bound(id) else {
                 continue;
             };
-            if bound.rejected {
+            if self.contacts.flags(id).has(Flags::REJECTED) {
                 continue;
             }
             // `ProcessMoveEvents` takes the intermediate points, so a drag consumes every
             // sample in the batch, in order, rather than the one a message happened to carry.
-            let batch = PointerPoint::GetIntermediatePointsTransformed(id, &self.bell.transform)?;
-            bound.recognizer().moves(&batch)?;
+            let batch = PointerPoint::GetIntermediatePointsTransformed(id, self.bell.transform())?;
+            self.contacts.feed(id, Feed::Moves(&batch))?;
 
             // The drag policy folds the whole batch into one report. The axis a two-axis drag
             // locks to is a threshold crossing on the path, so deciding it from the newest
-            // sample alone can lock to the wrong axis when an earlier sample crossed the
-            // other way. Displacement is a state, so the fold reports it once.
+            // sample alone can lock to the wrong axis when an earlier sample crossed the other
+            // way. Displacement is a state, so the fold reports it once.
             //
             // The predicted position is fed, not the raw one: continuous motion carries the
             // system's latency compensation.
-            let mut history = core::mem::take(&mut self.history);
-            let count = self.reader.batch(id, &mut history);
+            let count = coords.batch(id, &mut self.history);
             self.census.deepest_batch = self.census.deepest_batch.max(count as u32);
             let mut update: Option<DragUpdate> = None;
             let mut newest = None;
-            for info in &history[..count] {
-                let sample = self.reader.sample(info, &self.coords, env);
-                if let Some(bound) = self.pool.get_mut(id)
-                    && let Some(drag) = bound.drag.as_mut()
-                {
-                    let step = drag.update(sample.at);
-                    // `decided` is sticky across the fold: the tick that contains the
-                    // crossing is the tick that reports it, whichever sample crossed.
-                    update = Some(match update {
-                        Some(previous) => DragUpdate {
-                            decided: previous.decided || step.decided,
-                            ..step
-                        },
-                        None => step,
+            for entry in 0..count {
+                let sample = coords.sample(&self.history[entry], env);
+                if let Some(step) = self.contacts.drag(id, sample.at) {
+                    // `decided` is sticky across the fold: the tick that contains the crossing
+                    // is the tick that reports it, whichever sample crossed.
+                    update = Some(DragUpdate {
+                        decided: step.decided || update.is_some_and(|held| held.decided),
+                        ..step
                     });
                 }
                 newest = Some(sample);
             }
-            self.history = history;
-
-            if let (Some(update), Some(bound)) = (update, self.pool.get(id)) {
+            if let Some(update) = update {
                 out.push(Report::Dragged {
-                    target: bound.target,
+                    target,
                     contact: id,
                     update,
                 });
@@ -888,54 +833,56 @@ impl Router {
             // Pressure, tilt, twist and the contact patch reach a gesture sink here and
             // nowhere else: a manipulation's own events carry a position alone. They are
             // state, so the newest reading is the whole answer.
-            if let (Some(sample), Some(bound)) = (newest, self.pool.get(id)) {
+            if let Some(sample) = newest {
                 out.push(Report::Moved {
-                    target: bound.target,
+                    target,
                     contact: id,
                     sample,
                 });
             }
-            self.collect(id, out);
+            self.collect(id, hits, out);
         }
+        Ok(hovering_moved)
+    }
 
-        moved.clear();
-        self.moved = moved;
-        Ok(hover_moved)
+    /// States the pivot contact `id` rotates about, resolved from `target`'s entry.
+    ///
+    /// A refusal leaves the recogniser on its last pivot, which is the previous frame's
+    /// centre: the next update states it again, so a refused call costs one frame of drift
+    /// rather than a gesture.
+    fn restate_pivot(&self, id: u32, target: ControlId, hits: &HitTable) {
+        let Some((_, decl)) = self.contacts.bound(id) else {
+            return;
+        };
+        _ = self.contacts.restate_pivot(id, pivot_of(hits, target, decl));
     }
 
     /// Drains the events the recogniser raised for `id` and appends them to `out`.
     ///
-    /// Called immediately after each feed: the platform raises these synchronously from
-    /// inside `ProcessDownEvent` and its siblings, so the binding is the one just fed and no
-    /// event has to carry its own routing.
-    fn collect(&mut self, id: u32, out: &mut Vec<Report>) {
-        let mut recognised = core::mem::take(&mut self.recognised);
-        self.events.drain(&mut recognised);
-        let Some(bound) = self.pool.get_mut(id) else {
-            recognised.clear();
-            self.recognised = recognised;
+    /// Called immediately after each feed: the platform raises these synchronously from inside
+    /// `ProcessDownEvent` and its siblings, so the binding is the one just fed and no event
+    /// has to carry its own routing.
+    fn collect(&mut self, id: u32, hits: &HitTable, out: &mut Vec<Report>) {
+        self.events.drain(&mut self.recognised);
+        let Some((target, _)) = self.contacts.bound(id) else {
+            self.recognised.clear();
             return;
         };
-        let target = bound.target;
-        // Applied after the loop: the pool's index writer needs the pool, and `bound` borrows
-        // it for the length of the walk.
+        // Applied after the walk, because a completion and a start can both be in one batch
+        // and the last one is what the contact is left in.
         let mut inertial = None;
-        for event in recognised.drain(..) {
+        for index in 0..self.recognised.len() {
+            let event = self.recognised[index];
             match event {
-                Recognised::Tapped { .. } => bound.tapped = true,
-                Recognised::ManipulationStarted { .. } => bound.manipulating = true,
-                Recognised::ManipulationUpdated { .. } => {
-                    // Restated per update rather than set once at down: the platform requires
-                    // both pivot values to stay current through the interaction.
-                    if let Some(pivot) = bound.decl.pivot {
-                        _ = bound.recognizer().pivot(pivot);
-                    }
+                Recognised::Tapped { .. } => self.contacts.set(id, Flags::TAPPED, true),
+                // Restated per update rather than set once at down: the platform requires both
+                // pivot values to stay current through the interaction, and the control the
+                // contact is on moves under it whenever its viewport scrolls.
+                Recognised::ManipulationStarted { .. } | Recognised::ManipulationUpdated { .. } => {
+                    self.restate_pivot(id, target, hits);
                 }
                 Recognised::InertiaStarting { .. } => inertial = Some(true),
-                Recognised::ManipulationCompleted { .. } => {
-                    bound.manipulating = false;
-                    inertial = Some(false);
-                }
+                Recognised::ManipulationCompleted { .. } => inertial = Some(false),
                 _ => {}
             }
             self.census.gestures += 1;
@@ -945,10 +892,10 @@ impl Router {
                 event,
             });
         }
+        self.recognised.clear();
         if let Some(on) = inertial {
-            self.pool.set_inertial(id, on);
+            self.contacts.set(id, Flags::INERTIAL, on);
         }
-        self.recognised = recognised;
     }
 
     // ── 3. one hover resolution ───────────────────────────────────────────────────
@@ -957,26 +904,21 @@ impl Router {
     /// tick.
     ///
     /// Runs only when the hovering pointer moved or the layout changed under it, and never
-    /// while a contact is down.
+    /// while a contact is down: a contact owns the pointer while it is down, so hover chrome
+    /// must not chase a drag.
     ///
-    /// Hover is the accumulated result of enter and leave events, which are boundary
-    /// crossings on a path. A path that crosses a target between two samples has a real enter
-    /// and a real leave that point-sampling cannot see, and once dropped here they cannot be
-    /// recovered above. So the batch is walked and every crossing published; whether a
-    /// three-millisecond traversal lights anything is decided by the layer that owns the
-    /// chrome.
-    ///
-    /// The cost is one history read in place of one current read, plus a memo-bounded scan of
-    /// the flat hit array per entry.
+    /// Hover is the accumulated result of enter and leave events, which are boundary crossings
+    /// on a path. A path that crosses a target between two samples has a real enter and a real
+    /// leave that point-sampling cannot see, and once dropped here they cannot be recovered
+    /// above. So the batch is walked and every crossing published.
     ///
     /// Each target is chosen from the sample's raw position rather than its predicted one, so
     /// an extrapolated point cannot select the wrong target. Nothing here constructs a
     /// `PointerPoint`, so this per-frame path allocates nothing.
     fn resolve_hover(&mut self, hits: &HitTable, env: Env, out: &mut Vec<Report>, moved: bool) {
-        // A contact owns the pointer while it is down: hover chrome must not chase a drag.
-        // The pool covers bound contacts; `is_down` covers a contact already handed to a
+        // The contact table covers a bound contact; `is_down` covers one already handed to a
         // scroll surface's tracker.
-        if self.pool.live() > 0 {
+        if self.contacts.live() > 0 {
             return;
         }
         if self.bell.hovering().is_some_and(|id| self.bell.is_down(id)) {
@@ -984,45 +926,43 @@ impl Router {
         }
         let Some(id) = self.bell.hovering() else {
             if let Some(from) = self.hover.take() {
+                self.census.hover_changes += 1;
                 out.push(Report::HoverChanged {
                     from: Some(from),
                     to: None,
                     at: Point { x: 0.0, y: 0.0 },
                     qpc: 0,
                 });
-                self.census.hover_changes += 1;
             }
-            self.hover_stale = false;
+            self.stale = false;
             return;
         };
-        if !moved && !self.hover_stale && self.hover.is_some() {
+        if !moved && !self.stale && self.hover.is_some() {
             return;
         }
-        self.hover_stale = false;
-
-        let mut history = core::mem::take(&mut self.history);
-        let count = self.reader.batch(id, &mut history);
+        self.stale = false;
+        let coords = self.bell.coords();
+        let count = coords.batch(id, &mut self.history);
         self.census.deepest_batch = self.census.deepest_batch.max(count as u32);
-        for entry in &history[..count] {
-            let sample = self.reader.sample(entry, &self.coords, env);
+        for entry in 0..count {
+            let sample = coords.sample(&self.history[entry], env);
             self.cross(hits, &sample, out);
         }
-        // A pointer whose history has aged out still has a current position, so an empty
-        // batch falls back to the newest sample rather than dropping the hover for this tick.
+        // A pointer whose history has aged out still has a current position, so an empty batch
+        // falls back to the newest sample rather than dropping the hover for this tick.
         if count == 0
-            && let Some(sample) = self.reader.newest(id, &self.coords, env)
+            && let Some(sample) = coords.newest(id, env)
         {
             self.cross(hits, &sample, out);
         }
-        self.history = history;
     }
 
-    /// Resolves one sample against the hit array, publishing a [`Report::HoverChanged`] when
-    /// the target differs from the current hover.
+    /// Resolves one sample against the hit array, publishing a crossing where the target
+    /// differs from the current hover.
     fn cross(&mut self, hits: &HitTable, sample: &Sample, out: &mut Vec<Report>) {
         self.census.hover_hits += 1;
         let to = hits
-            .hit_with(sample.raw, sample.kind(), &self.shadows)
+            .hit(sample.raw, sample.kind())
             .map(|hit| hit.id);
         if to == self.hover {
             return;
@@ -1038,64 +978,50 @@ impl Router {
         });
     }
 
+    // ── 4. the dial ───────────────────────────────────────────────────────────────
+
     /// Drains the dial's rotations and publishes them.
     ///
     /// A dial contact routes through the same hit array a finger does: an on-screen dial
     /// resting over a knob targets that knob, and a dial with no screen contact targets
-    /// whatever has focus. The rotary path is therefore not a second routing authority — it
-    /// resolves through the same array and falls back to the same focus ring.
-    fn rotate(&mut self, hits: &HitTable, _env: Env, out: &mut Vec<Report>) {
+    /// whatever has focus. The rotary path is therefore not a second routing authority.
+    fn rotate(&mut self, hits: &HitTable, out: &mut Vec<Report>) {
         let Some(rotary) = self.rotary.as_ref() else {
             return;
         };
-        let mut rotations = core::mem::take(&mut self.rotations);
-        rotary.events().drain(&mut rotations);
-
-        for rotation in rotations.drain(..) {
-            let (target, contact) = match rotation {
-                Rotation::Turned { contact, .. }
-                | Rotation::Button { contact, .. }
-                | Rotation::Clicked { contact } => (contact, contact),
-                Rotation::Contact { at } => (at, at),
-                // Acquiring and losing the controller reports the device arriving and
-                // leaving; nothing is targeted by it.
-                Rotation::Control { .. } => continue,
+        rotary.drain(&mut self.rotations);
+        for index in 0..self.rotations.len() {
+            let rotation = self.rotations[index];
+            let target = match rotation {
+                Rotation::Turned { at: Some(at), .. } | Rotation::Clicked { at: Some(at) } => hits
+                    .hit(at, ContactKind::Touch)
+                    .map(|hit| hit.id),
+                _ => self.focus.current(),
             };
-            let target = match target {
-                Some(at) => hits
-                    .hit_with(at, windows_scene::ContactKind::Touch, &self.shadows)
-                    .map(|h| h.id),
-                None => self.focus.current(),
-            };
-            _ = contact;
-
             match rotation {
                 Rotation::Turned { degrees, .. } => {
-                    // The step is the target's declared resolution, so a knob whose detents
-                    // are two units apart moves by two per click and the haptics match.
                     let decl = target
                         .and_then(|id| self.decls.get(&id))
-                        .and_then(|d| d.rotary);
+                        .and_then(|decl| decl.rotary);
+                    // Restated per target rather than once at attach: the dial is one device
+                    // serving every knob on the screen, and the resolution is the step the
+                    // user feels as well as the one they get.
+                    if let Some(decl) = decl {
+                        _ = rotary.tune(&decl);
+                    }
                     let steps = match decl {
                         Some(decl) if decl.resolution_degrees.abs() > f64::EPSILON => {
                             degrees / decl.resolution_degrees
                         }
                         _ => 0.0,
                     };
-                    if let Some(decl) = decl {
-                        // Restated per target rather than once at attach: the dial is one
-                        // device serving every knob on the screen.
-                        _ = rotary.tune(&decl);
-                    }
                     out.push(Report::Rotary {
                         target,
                         degrees,
                         steps,
                     });
                 }
-                Rotation::Button { pressed, .. } => {
-                    out.push(Report::RotaryButton { target, pressed });
-                }
+                Rotation::Button { pressed } => out.push(Report::RotaryButton { target, pressed }),
                 Rotation::Clicked { .. } => {
                     out.push(Report::RotaryButton {
                         target,
@@ -1106,72 +1032,44 @@ impl Router {
                         pressed: false,
                     });
                 }
-                Rotation::Contact { .. } | Rotation::Control { .. } => {}
             }
         }
-
-        rotations.clear();
-        self.rotations = rotations;
+        self.rotations.clear();
     }
 
-    // ── 4. inertia, on the same clock as everything else ──────────────────────────
+    // ── 5. inertia, on the same clock as everything else ──────────────────────────
 
-    fn pump(&mut self, out: &mut Vec<Report>) -> Result<()> {
-        let mut ids = core::mem::take(&mut self.inertial_ids);
+    /// Advances inertia one frame on every contact still in it, releasing the ones that
+    /// stopped.
+    ///
+    /// # Errors
+    ///
+    /// A recogniser refused to advance its inertia.
+    fn pump(&mut self, hits: &HitTable, out: &mut Vec<Report>) -> Result<()> {
         if self.bell.take_stop_inertia() {
             // A system stop request ends every running motion without committing what it was
             // on its way to.
-            self.pool.inertial_into(&mut ids);
-            for &id in &ids {
-                self.pool.release(id, true);
-                self.census.aborts += 1;
+            for id in self.contacts.ids() {
+                if id != 0 && self.contacts.flags(id).has(Flags::INERTIAL) {
+                    self.contacts.release(id, true);
+                    self.census.aborts += 1;
+                }
             }
+            return Ok(());
         }
-
-        self.pool.inertial_into(&mut ids);
-        let mut fed = Ok(());
-        for &id in &ids {
-            if let Some(bound) = self.pool.get(id)
-                && let Err(error) = bound.recognizer().inertia()
-            {
-                fed = Err(error);
-                break;
+        for id in self.contacts.ids() {
+            if id == 0 || !self.contacts.flags(id).has(Flags::INERTIAL) {
+                continue;
             }
-            self.collect(id, out);
+            self.contacts.feed(id, Feed::Inertia)?;
+            self.collect(id, hits, out);
             // A recogniser whose inertia has run out has nothing left to pump; the contact
             // behind it lifted earlier.
-            let done = self
-                .pool
-                .get(id)
-                .is_some_and(|bound| !bound.recognizer().is_inertial());
-            if done {
-                self.pool.release(id, false);
+            if !self.contacts.still_inertial(id) {
+                self.contacts.release(id, false);
             }
         }
-        // Returned after the scratch is back, so a refused sample does not cost the buffer.
-        ids.clear();
-        self.inertial_ids = ids;
-        fed
-    }
-
-    // ── 5. requesting the next tick ───────────────────────────────────────────────
-
-    fn settle(&mut self) {
-        let busy = self.pool.live() > 0;
-        if busy {
-            if self.running.is_none() {
-                self.running = Some(self.wake.tick());
-            }
-        } else {
-            self.running = None;
-        }
-        if self.bell.idle() {
-            self.bell.settle();
-        }
-        // A window whose content is moving must say so, or a touchpad tap lands on whatever
-        // was moving under it. A refusal is retried by the next tick, so the result is not
-        // acted on here.
-        _ = self.inertia.set(self.pool.any_inertial());
+        Ok(())
     }
 }
 
@@ -1179,7 +1077,7 @@ impl core::fmt::Debug for Router {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Router")
             .field("census", &self.census)
-            .field("unit", &self.measured_unit())
+            .field("factor", &self.measured_factor())
             .field("hover", &self.hover)
             .field("capture", &self.capture)
             .field("inertia", &self.inertia)

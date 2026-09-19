@@ -1,22 +1,70 @@
-//! The front thread's half of a control: what a [`Report`] does to pixels, before anything
-//! is queued to the application.
+//! The front thread's half of a control: what a [`Report`] does to pixels, before anything is
+//! queued to the application.
 //!
-//! No intent causes a visual: the pixels move front-side in the tick that saw the event, and
-//! the [`Intent`] the application receives is emitted afterwards.
+//! No intent causes a visual: the pixels move front-side in the tick that saw the event, and the
+//! [`Intent`] the application receives is emitted afterwards.
 //!
 //! The path is index arithmetic — a rect test the router already did, an array index, and one
 //! retarget. It performs no hash lookup, no allocation, no role resolve and no hop to the app
-//! thread. Wash opacities are resolved at mount, on the app thread, and carried here as
-//! numbers, because realizing a colour cell mid-hover would create a surface on the
-//! interaction path.
+//! thread.
+//!
+//! Interaction state is held per window, not per control. The pointer and the keyboard are each
+//! one physical thing, so a second hovered control cannot exist to carry a bit.
 
-use super::{Interaction, Range, TURN_SPAN, detent_delta, fraction_of, offset_of};
-use crate::gesture::{DragPhase, DragUpdate};
-use crate::input::Report;
+use super::roles::{ScalarPart, TURN_SWEEP, fraction_of};
+use crate::gesture::{DragUpdate, Phase, Recognised};
+use crate::input::{KeyKind, Report};
+use crate::uia::Action;
+use windows_numerics::Vector2;
+use windows_present::SubId;
 use windows_scene::{
-    Anim, Backends, Bind, Control, ControlId, Env, NodeId, Prop, Result, Scene, Slots, SpriteId,
-    Tuning, Value,
+    Affine, Anim, Backends, Bind, CONTROL, ControlId, Env, HitFlags, NodeId, Point, Prop, Result,
+    Scene, Slots, SpriteId, Tuning, Value,
 };
+
+/// What an arrow, `Home` or `End` does to a scalar's fraction, in steps of its own quantum.
+///
+/// The end stops are infinite rather than a second shape: the clamp in [`Controls::put`] turns
+/// them into the ends.
+const KEYS: [(u16, f32); 6] = [
+    (0x25, -1.0),
+    (0x28, -1.0),
+    (0x26, 1.0),
+    (0x27, 1.0),
+    (0x24, f32::NEG_INFINITY),
+    (0x23, f32::INFINITY),
+];
+
+/// What a control is, as bits: everything a report needs about it that is not a number or an id.
+pub mod flag {
+    /// Scope edges emit application hover intents.
+    pub const OBSERVES: u8 = 1 << 0;
+    /// The application declared a handler for a two-axis drag here.
+    ///
+    /// A flag and not the handler: the handler is application code and stays on the app thread.
+    /// This side needs only to know whether a drag is worth raising, and whether a release ends
+    /// one or is a tap.
+    pub const DRAGS: u8 = 1 << 1;
+    /// A pointer reads the value off its position along the control's own rect.
+    pub const SLIDE: u8 = 1 << 2;
+    /// A pointer turns the value: a rotation about the control's centre, or a dial detent.
+    pub const TURN: u8 = 1 << 3;
+    /// The value runs up the screen, which is against the coordinate it is read from.
+    pub const VERTICAL: u8 = 1 << 4;
+    /// Either way a pointer moves a value.
+    pub const VALUED: u8 = SLIDE | TURN;
+}
+
+/// How a value arrived, which decides both how its pixels move and what the application is told.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum How {
+    /// The pointer is carrying the motion.
+    Carried,
+    /// The value jumped on its own and springs to where it landed.
+    Sprung,
+    /// The gesture ended here, so the application is told to commit.
+    Settled,
+}
 
 /// The front half's write side: the scene, the backends, and the display environment.
 ///
@@ -29,75 +77,97 @@ pub struct Front<'a> {
 }
 
 impl Front<'_> {
-    fn retarget(&mut self, node: NodeId, prop: Prop, bind: Bind) -> Result<()> {
-        self.scene.retarget(node, prop, bind, self.back, self.env)
+    /// Springs `prop` to `to`.
+    ///
+    /// One of the shared spring templates, so a state change allocates nothing, and the motion
+    /// plays to completion on the compositor with no further frames on any thread of ours. A
+    /// retarget mid-ramp continues from where the spring had reached.
+    fn spring(&mut self, node: NodeId, prop: Prop, to: Value) -> Result<()> {
+        let bind = Bind::Animate(Anim::Spring {
+            to,
+            tuning: Tuning::Chrome,
+            delay_ms: 0,
+        });
+        self.scene.retarget(node, prop, bind, self.back)
+    }
+
+    /// Springs a scalar channel, or writes it plainly where the value is already being carried.
+    ///
+    /// Two platform facts decide which. `StartAnimation` resets the property's velocity, so a
+    /// spring retargeted on every pointer-move pins the property instead of moving it. And an
+    /// implicit natural-motion animation never receives its target value automatically, so a
+    /// sprung first write on a freshly mounted part runs to zero rather than to the value: a mount
+    /// pins its start by arriving as [`How::Carried`].
+    fn scalar(&mut self, node: NodeId, prop: Prop, to: f32, how: How) -> Result<()> {
+        if how == How::Carried {
+            let bind = Bind::Set(Value::Scalar(to));
+            self.scene.retarget(node, prop, bind, self.back)
+        } else {
+            self.spring(node, prop, Value::Scalar(to))
+        }
     }
 }
 
-/// One control, as the front thread needs it.
+/// One control's chrome. Every control has one.
 ///
-/// Every field is a number or an id. Roles, colours and closures stay on the app thread,
-/// which is the side that can resolve and call them.
-#[derive(Copy, Clone, Debug, Default)]
+/// Every field is a number or an id. Roles, colours and closures stay on the app thread, which is
+/// the side that can resolve and call them: the two alphas are resolved at mount, because
+/// realizing a colour cell mid-hover would create a surface on the interaction path.
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ChromeRow {
-    pub id: ControlId,
-    /// Nearest interaction scope, inherited through mounted children.
-    pub hover_scope: Option<ControlId>,
-    /// The scope's retained reveal target, or `NONE` when none is declared.
+    /// The sprite whose opacity hover and press ride, or a `NONE` node for a control with no wash.
+    /// Written by every hover and press report; read as the only pixel an ordinary state change
+    /// moves.
+    pub wash: SpriteId,
+    /// The nearest interaction scope's retained reveal target, or `NONE`. Written by hover, press
+    /// and focus through the scope; read as the opacity that fades.
     pub reveal: NodeId,
-    /// Whether scope edges also emit application hover intents.
-    pub observes_hover: bool,
-    /// The sprite whose opacity hover and press ride. `None` for a control with no wash.
-    pub wash: Option<SpriteId>,
-    /// Resolved wash opacities.
+    /// Nearest interaction scope, inherited through mounted children, or `NONE`.
+    pub scope: ControlId,
+    /// Resolved wash opacities: what a hover shows, and what a press shows over it.
     pub hover: f32,
     pub press: f32,
-    /// The node a value moves, the inset it rests at, and the travel the last solve measured
-    /// between those insets. Holding all three keeps the move to one multiply and one add,
-    /// and keeps the router from asking the app thread for geometry.
-    pub scalar_parts: [Option<(NodeId, super::ScalarPart)>; 4],
-    pub thumb: Option<NodeId>,
-    /// Retained value stroke and its normalized origin.
-    pub trail: Option<(NodeId, f32)>,
+    pub flags: u8,
+}
+
+impl Default for ChromeRow {
+    /// A control with nothing to light: no wash, no reveal, no scope, and no flag set.
+    fn default() -> Self {
+        Self {
+            wash: SpriteId(NodeId::NONE),
+            reveal: NodeId::NONE,
+            scope: ControlId::NONE,
+            hover: 0.0,
+            press: 0.0,
+            flags: 0,
+        }
+    }
+}
+
+/// A control's value half. Placed only where a value moves, which is a handful of the controls a
+/// screen carries, so the rest carry the chrome row alone.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct ValueRow {
+    /// Every node the value moves, and how each maps `0..=1`. A thumb, a value stroke and a
+    /// rotating needle are rows of this one array, so the router drives them in one loop and none
+    /// of them can disagree about which property carries the value.
+    pub parts: [(NodeId, ScalarPart); 4],
+    /// Bottom of the range and its width. A fraction becomes the number an intent carries with one
+    /// multiply and one add, so this side never holds the range the application authored.
+    pub min: f64,
+    pub span: f64,
+    /// The inset a value part rests at, and the travel the last solve measured beyond it.
     pub rest: f32,
     pub travel: f32,
-    /// What a pointer means here. `None` is a press and nothing else.
-    pub drive: Option<Interaction>,
-    /// Whether the application declared a handler for this control's two-axis drag.
-    ///
-    /// A flag and not the handler: the handler is application code and stays on the app
-    /// thread. This side needs only to know whether a drag on this control is worth raising,
-    /// and whether a release ends a drag or is a tap.
-    pub drags: bool,
-    /// Where this control's value stands, `0..=1`.
-    ///
-    /// Seeded by the mount and advanced here. A turned control has no absolute position on
-    /// the pointer — a drag reports displacement from its origin and a dial reports detents —
-    /// so its value accumulates on the front thread.
+    /// Where the value stands, `0..=1`. Seeded by the mount and advanced here: a turned control
+    /// has no absolute position on the pointer, so its value accumulates on this thread.
     pub fraction: f32,
-    /// Last application-authored fraction. Geometry-only updates repeat it, so adopting
-    /// new geometry can preserve a newer pointer value without swallowing an external edit.
-    pub source_fraction: f32,
+    /// The quantum the fraction snaps to, or zero for a continuous value. Pointer, keyboard,
+    /// automation and rotary updates all snap through it, so none of them can disagree.
+    pub step: f32,
+    /// The application's source revision. A changed one supersedes a gesture standing on this
+    /// control; a repeated one is a geometry-only update and preserves the pointer's fraction.
     pub revision: u64,
-}
-
-/// The hit target includes the half-thumb gutters; the value range does not.
-fn slider_value_at(along: f32, span: f32, travel: f32, range: Range) -> f64 {
-    let fraction = if travel > 0.0 {
-        fraction_of((along - (span - travel) * 0.5) / travel, range.vertical)
-    } else {
-        0.0
-    };
-    range.at(fraction)
-}
-
-impl ChromeRow {
-    fn adopted(self, previous: Option<Self>) -> Self {
-        let fraction = previous
-            .filter(|old| old.drive == self.drive && old.revision == self.revision)
-            .map_or(self.source_fraction, |old| old.fraction);
-        Self { fraction, ..self }
-    }
 }
 
 /// What the application is asked to do, raised after the pixels have already moved.
@@ -107,6 +177,21 @@ pub struct Intent {
     pub what: What,
 }
 
+impl Intent {
+    /// Returns the intent an activation key raises on the control that holds focus.
+    ///
+    /// `Enter` and `Right` on a menu row reach the focus scope rather than a control, so the
+    /// caller names the target and this states what reaching it means: the tap a pointer would
+    /// have raised, so a row opened from the keyboard runs the handler a click runs.
+    #[must_use]
+    pub const fn invoke_focused(target: ControlId) -> Self {
+        Self {
+            target,
+            what: What::Tapped,
+        }
+    }
+}
+
 /// What an [`Intent`] asks of the application.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum What {
@@ -114,97 +199,73 @@ pub enum What {
     Hovered(bool),
     /// A press and a release on the same control.
     Tapped,
-    /// A value while it is being moved.
+    /// A value while it is being moved, and the value it settled on when `commit`.
     Scalar {
         value: f64,
         revision: u64,
         commit: bool,
     },
-    /// The value it settled on. A canceled contact commits nothing.
-    Committed(f64),
     /// Capture was canceled; discard application preview state.
     Canceled(u64),
     /// A two-axis drag moved. Raised only for a control that declared a handler for one.
     Dragged(DragUpdate),
-    /// A two-axis drag ended. `Some` carries the last sample it reported, whose
-    /// displacement takes effect; `None` is a contact that was taken away, whose pre-drag
-    /// value stands.
+    /// A two-axis drag ended. `Some` carries the last sample it reported, whose displacement takes
+    /// effect; `None` is a contact that was taken away, whose pre-drag value stands.
     DragEnded(Option<DragUpdate>),
+    /// A contact finished on one pickable piece of a presented region's pixels.
+    ///
+    /// Raised by the present layer rather than by these tables: the part is resolved against
+    /// pixels the renderer drew, which no control row holds a rect for.
+    Part(SubId),
 }
 
-/// Returns the drag state a sample leaves behind: the control it is on, and whether the
-/// gesture has passed its threshold at any point.
-///
-/// `decided` is **sticky**. A drag that has locked an axis stays locked for the rest of the
-/// contact, so a release after it ends the drag rather than being a tap — and the phase of
-/// the last sample alone cannot answer that, because a locked drag reports zero displacement
-/// on the axis it does not own and can sample as though nothing moved.
-///
-/// Split out because it is the one decision on this path that touches no pixels: everything
-/// else here writes the scene, and a compositor is not available to a test.
-fn dragging_after(
-    held: Option<(ControlId, bool)>,
-    target: ControlId,
-    phase: DragPhase,
-) -> (ControlId, bool) {
-    let was = held.is_some_and(|(id, decided)| id == target && decided);
-    (target, was || phase != DragPhase::Undecided)
-}
-
-/// What a gesture reports to the application, whatever the gesture moves.
-///
-/// One enum rather than a handler per phase: a gesture is a sequence with exactly one end,
-/// and separate callbacks would let a caller register the moves and forget the release. A
-/// scalar's payload is its value; a declared two-axis drag's is the sample it reported.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum Gesturing<T> {
-    /// The gesture moved. A drag's update carries the phase, the displacement **projected
-    /// onto the locked axis**, and whether this sample is the one that decided that axis.
-    Moved(T),
-    /// The contact lifted: what it carries takes effect.
-    Committed(T),
-    /// The contact was taken away: nothing takes effect, and what stood before the gesture
-    /// stands.
-    Canceled,
-}
-
-/// The front thread's control table and the interaction state over it.
+/// The front thread's control tables and the interaction state over them.
 ///
 /// Dense and generational: a control's index is its slot for the life of its mount, and the
-/// generation turns a report about a control that has since unmounted into a miss rather than
-/// a write to whatever now occupies the slot.
+/// generation turns a report about a control that has since unmounted into a miss rather than a
+/// write to whatever now occupies the slot. Every singleton below is `ControlId::NONE` when it
+/// names nothing, so retiring a control is one comparison against each.
 #[derive(Default)]
 pub struct Controls {
-    canceled: Option<(ControlId, u64)>,
-
-    /// The store over the control id family the app thread mints. This side holds no `Ids`
+    /// The stores over the control id family the app thread mints. This side holds no `Ids`
     /// counter, so it can place a row but never mint an id.
-    rows: Slots<Control, ChromeRow>,
-    hovered: Option<ControlId>,
-    observed_hover: Option<ControlId>,
-    focused: Option<ControlId>,
-    revealed: [(ControlId, NodeId); 3],
-    pressed: Option<ControlId>,
-    /// The window's focus ring: one visual, sprung between controls. Focus is singular, so
-    /// the ring is per window rather than per control, and moving it between two controls is
-    /// a compositor animation.
-    ring: Option<NodeId>,
-    /// Whether the ring is showing. Keyboard focus shows it; a pointer interaction hides it.
-    ring_shown: bool,
+    chrome: Slots<CONTROL, ChromeRow>,
+    values: Slots<CONTROL, ValueRow>,
+    hovered: ControlId,
+    pressed: ControlId,
+    focused: ControlId,
+    /// The observed scope the application was last told about, so a crossing between two children
+    /// of one scope is not an edge.
+    observed: ControlId,
     /// The control being turned, and the fraction it stood at when the contact landed.
     ///
-    /// A turn is a displacement from the contact's origin, so each drag sample is applied to
-    /// this fraction rather than accumulated onto the last one — which would drift by the
-    /// samples the recogniser coalesced. A cancel restores the same fraction.
-    grabbed: Option<(ControlId, f32)>,
-    /// The control a declared two-axis drag is running on, whether it ever passed the
-    /// threshold, and the last sample it raised.
+    /// A turn is a displacement from the contact's origin, so each sample applies to this rather
+    /// than accumulating onto the last one, which would drift by the samples the recogniser
+    /// coalesced. A cancel restores it.
+    grabbed: ControlId,
+    grab_at: f32,
+    /// The control a declared two-axis drag runs on, the last sample it raised, and whether it
+    /// ever passed the threshold.
     ///
-    /// The flag is what separates a release that ends a drag from one that is a tap: below
-    /// the threshold a drag has no axis and no meaning, so a nudge while clicking is a click.
-    /// The sample is what the release carries, so a handler is not asked to remember the
-    /// displacement it was given one tick earlier.
-    dragged: Option<(ControlId, bool, DragUpdate)>,
+    /// `decided` is sticky. Below the threshold a drag has no axis and no meaning, so a nudge
+    /// while clicking is a click; once locked it stays locked, so a release ends the drag rather
+    /// than being a tap. The phase of the last sample alone cannot answer that, because a locked
+    /// drag reports zero displacement on the axis it does not own and can sample as though nothing
+    /// moved.
+    dragged: ControlId,
+    drag_last: Option<DragUpdate>,
+    decided: bool,
+    /// A gesture the app thread superseded by editing the value under it, raised on the next tick
+    /// because adoption has no intent buffer.
+    superseded: ControlId,
+    superseded_at: u64,
+    /// The scopes whose reveal targets are up, deduplicated in fixed storage.
+    revealed: [ControlId; 3],
+    /// The window's one focus ring, sprung between controls. Focus is singular, so the ring is per
+    /// window rather than per control, and the glide between two controls is a compositor
+    /// animation rather than a behaviour this crate runs.
+    ring: NodeId,
+    ring_shown: bool,
 }
 
 impl Controls {
@@ -214,274 +275,207 @@ impl Controls {
         Self::default()
     }
 
+    /// Records the window's focus ring visual, minted once by the window's owner.
+    pub fn set_ring(&mut self, ring: NodeId) {
+        self.ring = ring;
+    }
+
     /// Adopts the rows a mount produced or a solve corrected, as drained by the app thread
     /// alongside its patch.
-    /// `released` is the same patch's retirement list. Publication excludes those ids from
-    /// `rows`; adoption retires them before input can reach a destroyed visual.
     ///
-    /// A geometry-only update preserves the pointer's fraction. A changed source fraction
-    /// adopts the application's value, so another control or a document load reaches this
-    /// control through the same front-side writer as a pointer.
+    /// `released` is the same patch's retirement list. Publication excludes those ids; adoption
+    /// retires them before input can reach a destroyed visual.
     ///
-    /// A row whose travel moved is re-driven here. This table is the only writer of the
-    /// properties the router owns, so changed geometry reaches the pixels through this call
-    /// and no other.
+    /// A geometry-only update preserves the pointer's fraction. A changed revision adopts the
+    /// application's value and supersedes a gesture standing on it, so another control or a
+    /// document load reaches this control through the same front-side writer as a pointer.
+    ///
+    /// Geometry that moved is re-driven and re-bound here. These tables are the only writer of the
+    /// properties the router owns, so changed geometry reaches the pixels through this call and no
+    /// other.
     ///
     /// # Errors
     ///
     /// A retarget was refused by the compositor.
     pub fn adopt(
         &mut self,
-        rows: &[ChromeRow],
+        chrome: &[(ControlId, ChromeRow)],
+        values: &[(ControlId, ValueRow)],
         released: &[ControlId],
         front: &mut Front<'_>,
     ) -> Result<()> {
-        // Retirement is part of adoption, not an optional driver step. Late reports can
-        // never reach the visuals destroyed by this same patch.
+        // Retirement is part of adoption and not an optional driver step: a late report can never
+        // reach a visual this same patch destroyed.
         for &id in released {
             self.release(id);
         }
-        for &row in rows {
-            debug_assert!(
-                !released.contains(&row.id),
-                "a retired chrome row crossed the publication seam"
-            );
-            // `Slots` compares the generation, so a row for a control whose slot has since
-            // been recycled misses and is placed fresh.
-            let held = self.rows.get(row.id).copied();
-            let superseded =
-                held.is_some_and(|old| old.drive != row.drive || old.revision != row.revision);
-            if superseded && self.pressed == Some(row.id) {
-                self.canceled = Some((row.id, row.revision));
-                self.pressed = None;
-                self.grabbed = None;
-                self.dragged = None;
-                self.wash(row.id, front)?;
+        for &(id, row) in chrome {
+            debug_assert!(!released.contains(&id), "a retired row crossed publication");
+            self.chrome.place(id, row);
+            self.wash(id, front)?;
+        }
+        for &(id, mut row) in values {
+            let held = self.value(id);
+            if self.values.get(id).is_some() && held.revision == row.revision {
+                row.fraction = held.fraction;
+            } else if self.grabbed == id {
+                self.grabbed = ControlId::NONE;
+                (self.superseded, self.superseded_at) = (id, row.revision);
             }
-            let row = row.adopted(held);
-            if held.is_none_or(|old| {
-                (old.trail, old.thumb, old.rest, old.travel)
-                    != (row.trail, row.thumb, row.rest, row.travel)
-            }) {
-                if let (Some((trail, origin)), Some(source), Some(Interaction::Slide(range))) =
-                    (row.trail, row.thumb, row.drive)
-                {
-                    let m = if row.travel > 0.0 {
-                        1.0 / row.travel
-                    } else {
-                        0.0
-                    };
-                    for (prop, clamp) in [
-                        (Prop::TrimStart, [0.0, origin]),
-                        (Prop::TrimEnd, [origin, 1.0]),
-                    ] {
-                        front.retarget(
-                            trail,
-                            prop,
-                            Bind::FollowOffset {
-                                source,
-                                vertical: range.vertical,
-                                affine: windows_scene::Affine {
-                                    m,
-                                    c: -row.rest * m,
-                                },
-                                clamp,
-                            },
-                        )?;
-                    }
-                }
+            let moved = (held.rest, held.travel, held.parts) != (row.rest, row.travel, row.parts);
+            self.values.place(id, row);
+            if moved {
+                self.bind_trails(row, front)?;
             }
-            self.rows.place(row.id, row);
-            if held.is_none_or(|old| {
-                (
-                    old.rest,
-                    old.travel,
-                    old.fraction,
-                    old.thumb,
-                    old.scalar_parts,
-                    old.drive,
-                ) != (
-                    row.rest,
-                    row.travel,
-                    row.fraction,
-                    row.thumb,
-                    row.scalar_parts,
-                    row.drive,
-                )
-            }) {
-                self.drive(
-                    row.id,
-                    row.fraction,
-                    held.is_none_or(|old| old.fraction == row.fraction),
-                    front,
-                )?;
+            if moved || held.fraction != row.fraction {
+                self.drive(id, row.fraction, How::Carried, front)?;
             }
         }
-        self.refresh_reveals(front)
+        self.reveals(front)
+    }
+
+    /// Binds each value stroke's trim to its thumb's own animated offset, so the stroke follows
+    /// the spring on the compositor rather than through one write per frame.
+    fn bind_trails(&self, row: ValueRow, front: &mut Front<'_>) -> Result<()> {
+        let thumb = row.parts.iter().find_map(|(node, part)| match part {
+            ScalarPart::Thumb { vertical } => Some((*node, *vertical)),
+            _ => None,
+        });
+        for (node, part) in row.parts {
+            let (ScalarPart::Trail { from }, Some((source, vertical))) = (part, thumb) else {
+                continue;
+            };
+            let m = if row.travel > 0.0 {
+                1.0 / row.travel
+            } else {
+                0.0
+            };
+            let affine = Affine {
+                m,
+                c: -row.rest * m,
+            };
+            for (prop, clamp) in [(Prop::TrimStart, [0.0, from]), (Prop::TrimEnd, [from, 1.0])] {
+                let bind = Bind::FollowOffset {
+                    source,
+                    vertical,
+                    affine,
+                    clamp,
+                };
+                front.scene.retarget(node, prop, bind, front.back)?;
+            }
+        }
+        Ok(())
     }
 
     /// Forgets a control. Anything still pointing at it becomes a miss.
     pub fn release(&mut self, id: ControlId) {
-        self.rows.take(id);
-        if self.canceled.is_some_and(|(target, _)| target == id) {
-            self.canceled = None;
-        }
-        if self.hovered == Some(id) {
-            self.hovered = None;
-        }
-        if self.pressed == Some(id) {
-            self.pressed = None;
-        }
-        if self.observed_hover == Some(id) {
-            self.observed_hover = None;
-        }
-        if self.focused == Some(id) {
-            self.focused = None;
-        }
-        if self.grabbed.is_some_and(|(target, _)| target == id) {
-            self.grabbed = None;
-        }
-        if self.dragged.is_some_and(|(target, _, _)| target == id) {
-            self.dragged = None;
-        }
-    }
-
-    fn observe_hover(&mut self, target: Option<ControlId>, out: &mut Vec<Intent>) {
-        let next = target
-            .and_then(|id| self.rows.get(id)?.hover_scope)
-            .filter(|id| self.rows.get(*id).is_some_and(|row| row.observes_hover));
-        if self.observed_hover == next {
-            return;
-        }
-        for (target, value) in [(self.observed_hover, false), (next, true)] {
-            if let Some(target) = target {
-                out.push(Intent {
-                    target,
-                    what: What::Hovered(value),
-                });
-            }
-        }
-        self.observed_hover = next;
-    }
-
-    fn refresh_reveals(&mut self, front: &mut Front<'_>) -> Result<()> {
-        let mut next = [(ControlId::NONE, NodeId::NONE); 3];
-        for (index, target) in [self.hovered, self.pressed, self.focused]
-            .into_iter()
-            .enumerate()
+        self.chrome.take(id);
+        self.values.take(id);
+        for slot in [
+            &mut self.hovered,
+            &mut self.pressed,
+            &mut self.focused,
+            &mut self.observed,
+            &mut self.grabbed,
+            &mut self.dragged,
+            &mut self.superseded,
+        ]
+        .into_iter()
+        .chain(self.revealed.iter_mut())
         {
-            if let Some(scope) = target.and_then(|id| self.rows.get(id)?.hover_scope)
-                && let Some(row) = self.rows.get(scope)
-                && !row.reveal.is_none()
-                && !next.iter().any(|&(id, _)| id == scope)
-            {
-                next[index] = (scope, row.reveal);
+            if *slot == id {
+                *slot = ControlId::NONE;
             }
         }
-        for &(scope, node) in &self.revealed {
-            if !node.is_none()
-                && !next.contains(&(scope, node))
-                && self.rows.get(scope).is_some_and(|row| row.reveal == node)
-            {
-                front.retarget(node, Prop::Opacity, chrome(0.0))?;
-            }
-        }
-        for &(scope, node) in &next {
-            if !node.is_none() && !self.revealed.contains(&(scope, node)) {
-                front.retarget(node, Prop::Opacity, chrome(1.0))?;
-            }
-        }
-        self.revealed = next;
-        Ok(())
     }
 
-    /// Records the window's focus ring visual, minted once by the window's owner.
-    pub fn set_ring(&mut self, ring: NodeId) {
-        self.ring = Some(ring);
-    }
-
-    /// Applies one tick's reports: moves the pixels they move, and appends the intents they
-    /// raise to `out`.
+    /// Applies one tick's reports: moves the pixels they move, and appends the intents they raise
+    /// to `out`.
     ///
-    /// Per-frame path: `out` is appended to rather than replaced, so a caller holding one
-    /// buffer for the life of the window allocates nothing here.
+    /// Per-frame path: `out` is appended to rather than replaced, so a caller holding one buffer
+    /// for the life of the window allocates nothing here.
     ///
     /// # Errors
     ///
     /// A retarget was refused by the compositor.
-    pub(crate) fn automation(
-        &mut self,
-        actions: &[crate::uia::Action],
-        front: &mut Front<'_>,
-        out: &mut Vec<Intent>,
-    ) -> Result<()> {
-        use crate::uia::Action;
-        for &action in actions {
-            match action {
-                Action::SetValue(target, value) => {
-                    if let Some(Interaction::Slide(range) | Interaction::Turn(range)) =
-                        self.rows.get(target).and_then(|row| row.drive)
-                    {
-                        let value = range.at(range.fraction(value));
-                        self.drive(target, range.fraction(value), true, front)?;
-                        self.scalar_event(target, value, false, out);
-                        self.scalar_event(target, value, true, out);
-                    }
-                }
-                Action::Invoke(target)
-                | Action::Toggle(target)
-                | Action::Select(target)
-                | Action::Expand(target, _) => {
-                    if self.rows.get(target).is_some() {
-                        out.push(Intent {
-                            target,
-                            what: What::Tapped,
-                        });
-                    }
-                }
-                Action::Focus(_) | Action::Reveal(_) => {}
-            }
-        }
-        Ok(())
-    }
-
     pub fn tick(
         &mut self,
         reports: &[Report],
         front: &mut Front<'_>,
         out: &mut Vec<Intent>,
     ) -> Result<()> {
-        if let Some((target, revision)) = self.canceled.take() {
+        if !self.superseded.is_none() {
+            let target = core::mem::replace(&mut self.superseded, ControlId::NONE);
             out.push(Intent {
                 target,
-                what: What::Canceled(revision),
+                what: What::Canceled(self.superseded_at),
             });
         }
-        if let Some(target) = self.pressed.filter(|id| {
-            front
+        // A control that stopped being interactive under a live contact never sends a release.
+        let dropped = !self.pressed.is_none()
+            && front
                 .scene
                 .hits()
-                .entry(*id)
-                .is_none_or(|entry| !entry.flags.contains(windows_scene::HitFlags::INTERACTIVE))
-        }) {
-            self.one(&Report::Canceled { target, contact: 0 }, front, out)?;
+                .entry(self.pressed)
+                .is_none_or(|entry| !entry.flags.contains(HitFlags::INTERACTIVE));
+        if dropped {
+            self.end(self.pressed, None, front, out)?;
         }
         for report in reports {
             self.one(report, front, out)?;
         }
-        self.refresh_reveals(front)
+        self.reveals(front)
+    }
+
+    /// Applies the actions an automation client asked for.
+    ///
+    /// A set value lands on the same writer a pointer reaches, so clamping and snapping cannot
+    /// differ between them.
+    ///
+    /// # Errors
+    ///
+    /// A retarget was refused by the compositor.
+    pub(crate) fn automation(
+        &mut self,
+        actions: &[Action],
+        front: &mut Front<'_>,
+        out: &mut Vec<Intent>,
+    ) -> Result<()> {
+        for &action in actions {
+            match action {
+                Action::SetValue(target, value) => {
+                    let row = self.value(target);
+                    if row.span != 0.0 {
+                        self.settle(target, ((value - row.min) / row.span) as f32, front, out)?;
+                    }
+                }
+                Action::Invoke(target)
+                | Action::Toggle(target)
+                | Action::Select(target)
+                | Action::Expand(target, _)
+                    if self.chrome.get(target).is_some() =>
+                {
+                    out.push(Intent {
+                        target,
+                        what: What::Tapped,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Sets hover and press for a control the router never sees the pointer over.
     ///
     /// The window's own caption buttons, and nothing else: once `WM_NCHITTEST` names one, the
-    /// system owns its pointer stream, so no [`Report`] and no `Sample` exist for it. The two
-    /// fields a report would have set are written here directly, and the wash is derived by
-    /// the same path every other control's is.
+    /// system owns its pointer stream, so no [`Report`] and no sample exist for it. The two fields
+    /// a report would have set are written here directly, and the wash is derived by the same path
+    /// every other control's is.
     ///
-    /// Call this only when the window reports that the caption band's state moved, never per
-    /// tick: a stale `(None, None)` clears a hover the router has just lit. The pointer is
-    /// one physical thing, so this hover and the router's are never both live.
+    /// Call this only when the window reports that the caption band's state moved, never per tick:
+    /// a stale pair of nothings clears a hover the router has just lit. The pointer is one physical
+    /// thing, so this hover and the router's are never both live.
     ///
     /// # Errors
     ///
@@ -492,789 +486,414 @@ impl Controls {
         pressed: Option<ControlId>,
         front: &mut Front<'_>,
     ) -> Result<()> {
-        let (was_hover, was_pressed) = (self.hovered, self.pressed);
-        self.hovered = hover;
-        self.pressed = pressed;
-        for id in [was_hover, was_pressed, hover, pressed]
-            .into_iter()
-            .flatten()
-        {
+        let was = [self.hovered, self.pressed];
+        self.hovered = hover.unwrap_or(ControlId::NONE);
+        self.pressed = pressed.unwrap_or(ControlId::NONE);
+        for id in [was[0], was[1], self.hovered, self.pressed] {
             self.wash(id, front)?;
         }
-        self.refresh_reveals(front)
-    }
-
-    fn scalar_event(&self, target: ControlId, value: f64, commit: bool, out: &mut Vec<Intent>) {
-        if let Some(row) = self.rows.get(target) {
-            out.push(Intent {
-                target,
-                what: What::Scalar {
-                    value,
-                    revision: row.revision,
-                    commit,
-                },
-            });
-        }
+        self.reveals(front)
     }
 
     fn one(&mut self, report: &Report, front: &mut Front<'_>, out: &mut Vec<Intent>) -> Result<()> {
         match *report {
-            Report::Redirect { .. } => {}
-            // A single service can publish several of these, in the order the pointer
-            // crossed them. Each is applied; a sub-frame traversal is absorbed by the
-            // spring, which reaches about eight percent of its ramp before the next
-            // retarget replaces it.
+            // One tick can publish several, in the order the pointer crossed them. Each is
+            // applied; a sub-frame traversal is absorbed by the spring, which reaches about eight
+            // percent of its ramp before the next retarget replaces it.
             Report::HoverChanged { from, to, .. } => {
-                self.hovered = to.filter(|id| self.rows.get(*id).is_some());
-                self.observe_hover(to, out);
-                if let Some(from) = from {
-                    self.wash(from, front)?;
-                }
-                if let Some(to) = to {
-                    self.wash(to, front)?;
-                }
-            }
-            Report::Pressed { target, sample, .. } => {
-                self.focused = None;
-                if self.rows.get(target).is_none() {
-                    return Ok(());
-                }
-                self.pressed = Some(target);
-                // Where the value stood when the contact landed: a turn is measured from it.
-                self.grabbed = self.rows.get(target).map(|row| (target, row.fraction));
-                // A fresh contact starts undecided, whatever the last one ended as.
-                self.dragged = None;
-                self.hide_ring(front)?;
-                self.wash(target, front)?;
-                if let Some(Interaction::Slide(range)) = self.rows.get(target).and_then(|r| r.drive)
-                {
-                    let value = self.slide(target, sample.raw, range, false, front)?;
-                    self.scalar_event(target, value, false, out);
-                }
-            }
-            Report::Released { target, at, .. } => {
-                // Scroll rails belong to the scroll front and carry no chrome row. Their
-                // release must not become a menu choice or an application click.
-                if self.pressed != Some(target) || self.rows.get(target).is_none() {
-                    return Ok(());
-                }
-                self.pressed = None;
-                self.grabbed = None;
-                self.wash(target, front)?;
-                // A drag that passed the threshold ends here and is not also a tap: the two
-                // are the same contact, and raising both would run the click handler at the
-                // end of every reorder.
-                if let Some((_, decided, last)) =
-                    self.dragged.take().filter(|&(id, _, _)| id == target)
-                    && decided
-                {
-                    out.push(Intent {
-                        target,
-                        what: What::DragEnded(Some(last)),
-                    });
-                    return Ok(());
-                }
-                match self.rows.get(target).and_then(|row| row.drive) {
-                    // For a control that carries no value, a press and a release on it is a
-                    // tap whatever moved in between.
-                    None | Some(Interaction::Press) => out.push(Intent {
-                        target,
-                        what: What::Tapped,
-                    }),
-                    Some(Interaction::Slide(range)) => {
-                        let value = self.slide(target, at, range, false, front)?;
-                        self.scalar_event(target, value, true, out);
-                    }
-                    // The fraction this table accumulated during the turn, not the bottom
-                    // of the range.
-                    Some(Interaction::Turn(range)) => {
-                        let fraction = self.rows.get(target).map_or(0.0, |row| row.fraction);
-                        self.scalar_event(target, range.at(fraction), true, out);
-                    }
-                }
-            }
-            // A cancel is not a release: nothing is committed, the value returns to where it
-            // stood before the contact, and the wash is re-derived from this table's state.
-            Report::Canceled { target, .. } => {
-                if self.pressed != Some(target) {
-                    return Ok(());
-                }
-                self.pressed = None;
-                if let Some((grabbed, fraction)) = self.grabbed.take()
-                    && grabbed == target
-                {
-                    self.drive(target, fraction, false, front)?;
-                    if let Some(Interaction::Slide(range) | Interaction::Turn(range)) =
-                        self.rows.get(target).and_then(|row| row.drive)
-                    {
-                        self.scalar_event(target, range.at(fraction), false, out);
-                    }
-                }
-                out.push(Intent {
-                    target,
-                    what: What::Canceled(self.rows.get(target).map_or(0, |row| row.revision)),
-                });
-                if let Some((_, decided, _)) =
-                    self.dragged.take().filter(|&(id, _, _)| id == target)
-                    && decided
-                {
-                    out.push(Intent {
-                        target,
-                        what: What::DragEnded(None),
-                    });
-                }
-                self.wash(target, front)?;
-            }
-            // The thumb moves here, in this tick, before the number is queued.
-            Report::Moved { target, sample, .. } => {
-                if self.pressed != Some(target) {
-                    return Ok(());
-                }
-                if let Some(Interaction::Slide(range)) = self.rows.get(target).and_then(|r| r.drive)
-                {
-                    let value = self.slide(target, sample.raw, range, true, front)?;
-                    self.scalar_event(target, value, false, out);
-                }
-            }
-            // A knob is dragged rather than slid: the update carries displacement from the
-            // contact's origin, so it applies to the fraction held in `grabbed`.
-            Report::Dragged { target, update, .. } => {
-                // A control the application declared a drag handler for gets the update as
-                // it stands. Nothing here moves a pixel for it: what a two-axis drag displaces
-                // is the application's own subject — a row's position in a list, a scope over
-                // channels — which this table holds no geometry for.
-                if self.rows.get(target).is_some_and(|r| r.drags) {
-                    let held = self.dragged.map(|(id, decided, _)| (id, decided));
-                    let (id, decided) = dragging_after(held, target, update.phase);
-                    self.dragged = Some((id, decided, update));
-                    out.push(Intent {
-                        target,
-                        what: What::Dragged(update),
-                    });
-                }
-                if let Some(Interaction::Turn(range)) = self.rows.get(target).and_then(|r| r.drive)
-                {
-                    let Some((_, from)) = self.grabbed.filter(|&(id, _)| id == target) else {
-                        return Ok(());
-                    };
-                    // Upward is more, and the coordinate grows downward.
-                    let value =
-                        self.turn(target, from - update.delta.y / TURN_SPAN, range, front)?;
-                    self.scalar_event(target, value, false, out);
+                let was = from.unwrap_or(ControlId::NONE);
+                self.hovered = self.live(to);
+                self.observe(out);
+                for id in [was, self.hovered] {
+                    self.wash(id, front)?;
                 }
             }
             Report::FocusChanged { to, .. } => {
-                self.focused = to.filter(|id| self.rows.get(*id).is_some());
-                self.move_ring(to, front)?;
+                self.focused = self.live(to);
+                self.move_ring(front)?;
             }
-            // A dial reports detents, which are a delta: a step count applied as an
-            // absolute position would send one click to an end stop.
+            Report::Pressed { target, sample, .. } => {
+                if self.chrome.get(target).is_none() {
+                    return Ok(());
+                }
+                self.focused = ControlId::NONE;
+                self.pressed = target;
+                // Where the value stood when the contact landed: a turn is measured from it, and
+                // a cancel puts it back. A control carrying no value grabs nothing, so its
+                // canceled contact restores nothing and reports no number.
+                (self.grabbed, self.grab_at) = if self.flags(target) & flag::VALUED != 0 {
+                    (target, self.value(target).fraction)
+                } else {
+                    (ControlId::NONE, 0.0)
+                };
+                // A fresh contact starts undecided, whatever the last one ended as.
+                (self.dragged, self.decided, self.drag_last) = (ControlId::NONE, false, None);
+                self.hide_ring(front)?;
+                self.wash(target, front)?;
+                self.slide(target, sample.raw, How::Sprung, front, out)?;
+            }
+            // The thumb moves here, in this tick, before the number is queued.
+            Report::Moved { target, sample, .. } if self.pressed == target => {
+                self.slide(target, sample.raw, How::Carried, front, out)?;
+            }
+            // A turned control is a single-pointer rotation about its own centre, so its value
+            // arrives as the recogniser's cumulative rotation rather than as a displacement. The
+            // platform reports degrees, positive clockwise, and clockwise is more.
+            Report::Gesture {
+                target,
+                event: Recognised::ManipulationUpdated { cumulative, .. },
+                ..
+            } if self.flags(target) & flag::TURN != 0 && self.grabbed == target => {
+                let turned = cumulative.rotation.to_radians() / TURN_SWEEP;
+                self.put(target, self.grab_at + turned, How::Carried, front, out)?;
+            }
+            Report::Dragged { target, update, .. } if self.flags(target) & flag::DRAGS != 0 => {
+                // What a two-axis drag displaces is the application's own subject — a row's place
+                // in a list, a scope over channels — which these tables hold no geometry for, so
+                // nothing here moves a pixel for it.
+                self.decided =
+                    (self.dragged == target && self.decided) || update.phase != Phase::Undecided;
+                (self.dragged, self.drag_last) = (target, Some(update));
+                out.push(Intent {
+                    target,
+                    what: What::Dragged(update),
+                });
+            }
+            Report::Released { target, at, .. } => self.end(target, Some(at), front, out)?,
+            Report::Canceled { target, .. } => self.end(target, None, front, out)?,
+            // A dial reports detents, which are a delta: a step count applied as an absolute
+            // position would send one click to an end stop.
             Report::Rotary {
                 target: Some(target),
                 steps,
                 ..
-            } => {
-                if let Some(Interaction::Turn(range)) = self.rows.get(target).and_then(|r| r.drive)
-                {
-                    let from = self.rows.get(target).map_or(0.0, |row| row.fraction);
-                    let value =
-                        self.turn(target, from + detent_delta(range, steps), range, front)?;
-                    self.scalar_event(target, value, false, out);
-                    self.scalar_event(target, value, true, out);
-                }
+            } if self.flags(target) & flag::TURN != 0 => {
+                let row = self.value(target);
+                self.settle(target, row.fraction + steps as f32 * row.step, front, out)?;
             }
             Report::Key {
                 target: Some(target),
                 event,
-            } => {
-                if event.kind == crate::input::KeyKind::Down && !event.mods.ctrl && !event.mods.alt
-                {
-                    if let Some(Interaction::Slide(range) | Interaction::Turn(range)) =
-                        self.rows.get(target).and_then(|r| r.drive)
-                    {
-                        let from = self.rows.get(target).unwrap().fraction;
-                        let fraction = match event.key {
-                            0x25 | 0x28 => Some(from - detent_delta(range, 1.0)),
-                            0x26 | 0x27 => Some(from + detent_delta(range, 1.0)),
-                            0x24 => Some(0.0),
-                            0x23 => Some(1.0),
-                            _ => None,
-                        };
-                        if let Some(fraction) = fraction {
-                            let value = self.turn(target, fraction, range, front)?;
-                            self.scalar_event(target, value, false, out);
-                            self.scalar_event(target, value, true, out);
-                        }
-                    }
+            } if self.flags(target) & flag::VALUED != 0
+                && event.kind == KeyKind::Down
+                && !event.mods.ctrl
+                && !event.mods.alt =>
+            {
+                if let Some(&(_, steps)) = KEYS.iter().find(|(vk, _)| *vk == event.key) {
+                    let row = self.value(target);
+                    self.settle(target, row.fraction + steps * row.step, front, out)?;
                 }
             }
-            // Listed rather than matched with `_`, so a new `Report` variant fails to
-            // compile here. None of these moves a control's chrome: they belong to the
-            // overlay layer, the text stack and the recogniser.
-            Report::Rotary { target: None, .. }
-            | Report::RotaryButton { .. }
-            | Report::CaptureLost
+            // Listed rather than matched with a wildcard, so a new `Report` variant fails to
+            // compile here. None of these moves a control's chrome: they belong to the overlay
+            // layer, the text stack, the scroll front and the recogniser.
+            Report::Redirect { .. }
+            | Report::Moved { .. }
             | Report::Buttons { .. }
             | Report::Gesture { .. }
+            | Report::Dragged { .. }
             | Report::Wheel { .. }
-            | Report::Key { target: None, .. }
+            | Report::Key { .. }
             | Report::Escape { .. }
-            | Report::Dismiss { .. } => {}
+            | Report::Dismiss { .. }
+            | Report::Rotary { .. }
+            | Report::RotaryButton { .. }
+            | Report::CaptureLost => {}
         }
         Ok(())
     }
 
-    /// Returns the wash opacity `id` should be showing, derived from the state this table
-    /// holds rather than from the event that just arrived.
+    /// Ends the contact on `target`, at the point it lifted, or nowhere when it was taken away.
     ///
-    /// Because it is derived per control, one control can be hovered while another is
-    /// pressed — the state a drag passing under the pointer produces.
-    fn rest_alpha(&self, id: ControlId) -> f32 {
-        let Some(row) = self.rows.get(id) else {
-            return 0.0;
-        };
-        if self.pressed == Some(id) {
-            row.press
-        } else if self.hovered == Some(id) {
-            row.hover
-        } else {
-            0.0
+    /// A release and a cancel are the same unwind with two differences — a cancel puts the value
+    /// back where the contact found it and commits nothing — so they share the order in which the
+    /// press, the grab and the drag are let go, and the wash is re-derived once for both.
+    ///
+    /// A scroll rail belongs to the scroll front and carries no chrome row. Its release must not
+    /// become a menu choice or an application click.
+    fn end(
+        &mut self,
+        target: ControlId,
+        at: Option<Point>,
+        front: &mut Front<'_>,
+        out: &mut Vec<Intent>,
+    ) -> Result<()> {
+        if self.pressed != target || self.chrome.get(target).is_none() {
+            return Ok(());
         }
-    }
-
-    fn wash(&self, id: ControlId, front: &mut Front<'_>) -> Result<()> {
-        let Some(wash) = self.rows.get(id).and_then(|row| row.wash) else {
+        self.pressed = ControlId::NONE;
+        let grabbed = core::mem::replace(&mut self.grabbed, ControlId::NONE) == target;
+        let dragged = core::mem::replace(&mut self.dragged, ControlId::NONE) == target;
+        self.wash(target, front)?;
+        // A decided drag ends here and is not also a tap: the two are the same contact, and
+        // raising both would run the click handler at the end of every reorder. A canceled one
+        // ends the same way carrying nothing, which is the whole of what a drag handler is told.
+        if dragged && self.decided {
+            out.push(Intent {
+                target,
+                what: What::DragEnded(at.and(self.drag_last)),
+            });
+            return Ok(());
+        }
+        let Some(at) = at else {
+            if grabbed {
+                self.put(target, self.grab_at, How::Sprung, front, out)?;
+            }
+            out.push(Intent {
+                target,
+                what: What::Canceled(self.value(target).revision),
+            });
             return Ok(());
         };
-        // A spring: it plays to completion with no further front-thread frames, and a
-        // retarget mid-ramp continues from where it had reached.
-        front.retarget(wash.node(), Prop::Opacity, chrome(self.rest_alpha(id)))
+        match self.flags(target) & flag::VALUED {
+            // A control that carries no value: a press and a release on it is a tap whatever moved
+            // in between.
+            0 => out.push(Intent {
+                target,
+                what: What::Tapped,
+            }),
+            flag::SLIDE => self.slide(target, at, How::Settled, front, out)?,
+            // The fraction this table accumulated during the turn, not the range's floor.
+            _ => self.put(
+                target,
+                self.value(target).fraction,
+                How::Settled,
+                front,
+                out,
+            )?,
+        }
+        Ok(())
     }
 
-    /// Moves a control's part to `fraction` and records where it now stands.
-    ///
-    /// The one place a fraction becomes a property on this thread. A slide, a knob drag and
-    /// a dial detent all reach it, through [`offset_of`] and [`angle_of`], so none of them
-    /// can disagree about which property carries the value or which way it runs.
-    ///
-    /// A control with no thumb or no [`Interaction`] is left alone: its part follows the
-    /// application's own channel, whose writer is the app thread.
-    fn drive(
+    /// Moves a value that arrived as a discrete step — a detent, an arrow key, an automation set —
+    /// and reports it as moved and then settled, which is the whole of that gesture.
+    fn settle(
         &mut self,
         id: ControlId,
-        fraction: f32,
-        snap: bool,
+        to: f32,
         front: &mut Front<'_>,
+        out: &mut Vec<Intent>,
     ) -> Result<()> {
-        let Some(row) = self.rows.get_mut(id) else {
-            return Ok(());
-        };
-        row.fraction = fraction.clamp(0.0, 1.0);
-        let motion = |v| {
-            if snap {
-                Bind::Set(Value::Scalar(v))
-            } else {
-                chrome(v)
-            }
-        };
-        for (node, part) in row.scalar_parts.into_iter().flatten() {
-            front.retarget(node, part.property(), motion(part.at(row.fraction)))?;
-        }
-        let (fraction, thumb, rest, travel, drive) =
-            (row.fraction, row.thumb, row.rest, row.travel, row.drive);
-        let (Some(thumb), Some(drive)) = (thumb, drive) else {
-            return Ok(());
-        };
-        match drive {
-            // A press carries no value: a toggle's knob follows the application's own
-            // channel, so this table does not write it.
-            Interaction::Press => {
-                front.retarget(thumb, Prop::OffsetX, motion(rest + fraction * travel))
-            }
-            // A turned part rotates through the constant sweep; a slid one travels the
-            // extent the last solve measured for it.
-            Interaction::Turn(_) => Ok(()),
-            Interaction::Slide(range) => front.retarget(
-                thumb,
-                if range.vertical {
-                    Prop::OffsetY
-                } else {
-                    Prop::OffsetX
-                },
-                motion(rest + offset_of(fraction, travel, range.vertical)),
-            ),
-        }
+        self.put(id, to, How::Sprung, front, out)?;
+        self.put(id, to, How::Settled, front, out)
     }
 
-    /// Returns the value at the pointer's position along the control's own rect, having
-    /// moved the part to match.
+    /// Clamps and snaps `to`, moves every part that follows it, and reports the value it stands
+    /// for.
     ///
-    /// The rect is the hit-array entry the router already resolved through, looked up by id,
-    /// so nothing here measures or asks the app thread for geometry. Where the control has
-    /// no entry, the held fraction is returned and nothing moves.
+    /// The one path a fraction takes to become both a pixel and a number, so a pointer, a key, a
+    /// dial and an automation client cannot disagree about clamping, snapping, which property
+    /// carries the value or which way it runs.
+    fn put(
+        &mut self,
+        id: ControlId,
+        to: f32,
+        how: How,
+        front: &mut Front<'_>,
+        out: &mut Vec<Intent>,
+    ) -> Result<()> {
+        let row = self.value(id);
+        let to = to.clamp(0.0, 1.0);
+        let to = if row.step > 0.0 {
+            (to / row.step).round() * row.step
+        } else {
+            to
+        };
+        self.drive(id, to, how, front)?;
+        out.push(Intent {
+            target: id,
+            what: What::Scalar {
+                value: row.min + row.span * f64::from(to),
+                revision: row.revision,
+                commit: how == How::Settled,
+            },
+        });
+        Ok(())
+    }
+
+    /// Moves a slid control to the pointer's position along its own rect and reports the value.
+    ///
+    /// The rect is the hit-array entry the router already resolved through, looked up by id, so
+    /// nothing here measures or asks the app thread for geometry. Where the control has no entry
+    /// the held fraction stands and nothing moves.
     fn slide(
         &mut self,
         id: ControlId,
-        at: windows_scene::Point,
-        range: Range,
-        snap: bool,
+        at: Point,
+        how: How,
         front: &mut Front<'_>,
-    ) -> Result<f64> {
+        out: &mut Vec<Intent>,
+    ) -> Result<()> {
+        let flags = self.flags(id);
+        if flags & flag::SLIDE == 0 {
+            return Ok(());
+        }
+        let row = self.value(id);
+        let vertical = flags & flag::VERTICAL != 0;
         let Some(entry) = front.scene.hits().entry(id).copied() else {
-            return Ok(range.at(self.rows.get(id).map_or(0.0, |row| row.fraction)));
+            return self.put(id, row.fraction, how, front, out);
         };
-        let (along, span) = if range.vertical {
+        let (along, span) = if vertical {
             (at.y - entry.y0, entry.y1 - entry.y0)
         } else {
             (at.x - entry.x0, entry.x1 - entry.x0)
         };
-        let travel = self.rows.get(id).map_or(0.0, |row| {
-            if row.thumb.is_some() {
-                row.travel
-            } else {
-                span
-            }
-        });
-        let value = slider_value_at(along, span, travel, range);
-        self.drive(id, range.fraction(value), snap, front)?;
-        Ok(value)
+        // The hit target includes the half-thumb gutters; the value range does not. A control with
+        // no thumb has no gutters, so its travel is the whole span.
+        let travel = if row.travel > 0.0 { row.travel } else { span };
+        let over = ((along - (span - travel) * 0.5) / travel).clamp(0.0, 1.0);
+        self.put(id, fraction_of(over, vertical), how, front, out)
     }
 
-    /// Clamps `fraction`, moves the part, and returns the value, for a control whose input
-    /// is a delta: a knob drag or a dial detent.
-    fn turn(
+    /// Records `fraction` and moves every part of the control that follows it.
+    ///
+    /// A control with no parts is left alone: whatever it shows follows the application's own
+    /// channel, whose writer is the app thread.
+    fn drive(
         &mut self,
         id: ControlId,
         fraction: f32,
-        range: Range,
+        how: How,
         front: &mut Front<'_>,
-    ) -> Result<f64> {
-        let value = range.at(fraction);
-        self.drive(id, range.fraction(value), false, front)?;
-        Ok(value)
-    }
-
-    // ── the window's focus ring ───────────────────────────────────────────────────
-
-    fn move_ring(&mut self, to: Option<ControlId>, front: &mut Front<'_>) -> Result<()> {
-        let Some(ring) = self.ring else {
+    ) -> Result<()> {
+        let Some(row) = self.values.get_mut(id) else {
             return Ok(());
         };
-        let Some(entry) = to.and_then(|id| front.scene.hits().entry(id)).copied() else {
+        row.fraction = fraction;
+        let row = *row;
+        for (node, part) in row.parts {
+            for (prop, to) in part
+                .channels(fraction, row.rest, row.travel)
+                .into_iter()
+                .flatten()
+            {
+                front.scalar(node, prop, to, how)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Retargets `id`'s wash to the opacity this table's own state implies.
+    ///
+    /// Derived per control rather than from the event that arrived, so one control can be hovered
+    /// while another is pressed — the state a drag passing under the pointer produces.
+    fn wash(&self, id: ControlId, front: &mut Front<'_>) -> Result<()> {
+        let row = self.chrome_of(id);
+        if row.wash.0.is_none() {
+            return Ok(());
+        }
+        let to = if self.pressed == id {
+            row.press
+        } else if self.hovered == id {
+            row.hover
+        } else {
+            0.0
+        };
+        front.spring(row.wash.0, Prop::Opacity, Value::Scalar(to))
+    }
+
+    /// Raises scope entry and exit for the scopes that asked for them.
+    fn observe(&mut self, out: &mut Vec<Intent>) {
+        let scope = self.chrome_of(self.hovered).scope;
+        let next = if self.flags(scope) & flag::OBSERVES != 0 {
+            scope
+        } else {
+            ControlId::NONE
+        };
+        if next == self.observed {
+            return;
+        }
+        for (target, entered) in [(self.observed, false), (next, true)] {
+            if !target.is_none() {
+                out.push(Intent {
+                    target,
+                    what: What::Hovered(entered),
+                });
+            }
+        }
+        self.observed = next;
+    }
+
+    /// Fades the reveal target of every active scope, and only where that changed.
+    ///
+    /// Crossing two children of one scope leaves it active, so the fade is not restarted. The fade
+    /// is a spring rather than a two-keyframe hold, because step easing takes a segment's end
+    /// value immediately and would jump at the start of the hold rather than at its end.
+    fn reveals(&mut self, front: &mut Front<'_>) -> Result<()> {
+        let mut next = [ControlId::NONE; 3];
+        for (slot, source) in [self.hovered, self.pressed, self.focused]
+            .into_iter()
+            .enumerate()
+        {
+            let scope = self.chrome_of(source).scope;
+            if !self.chrome_of(scope).reveal.is_none() && !next.contains(&scope) {
+                next[slot] = scope;
+            }
+        }
+        for (these, others, to) in [(self.revealed, next, 0.0), (next, self.revealed, 1.0)] {
+            for id in these {
+                let node = self.chrome_of(id).reveal;
+                if !node.is_none() && !others.contains(&id) {
+                    front.spring(node, Prop::Opacity, Value::Scalar(to))?;
+                }
+            }
+        }
+        self.revealed = next;
+        Ok(())
+    }
+
+    /// Springs the window's one ring onto the focused control, or takes it down.
+    fn move_ring(&mut self, front: &mut Front<'_>) -> Result<()> {
+        let Some(entry) = front.scene.hits().entry(self.focused).copied() else {
             return self.hide_ring(front);
         };
-        let offset = windows_numerics::Vector2 {
+        if self.ring.is_none() {
+            return Ok(());
+        }
+        let at = Vector2 {
             x: entry.x0,
             y: entry.y0,
         };
-        let size = windows_numerics::Vector2 {
+        let size = Vector2 {
             x: entry.x1 - entry.x0,
             y: entry.y1 - entry.y0,
         };
-        // Sprung on offset and size, so the glide between two controls runs on the
-        // compositor and costs no further front-thread frames.
-        front.retarget(ring, Prop::Offset, spring(Value::Vec2(offset)))?;
-        front.retarget(ring, Prop::Size, spring(Value::Vec2(size)))?;
+        front.spring(self.ring, Prop::Offset, Value::Vec2(at))?;
+        front.spring(self.ring, Prop::Size, Value::Vec2(size))?;
         if !self.ring_shown {
             self.ring_shown = true;
-            front.retarget(ring, Prop::Opacity, chrome(1.0))?;
+            front.spring(self.ring, Prop::Opacity, Value::Scalar(1.0))?;
         }
         Ok(())
     }
 
     fn hide_ring(&mut self, front: &mut Front<'_>) -> Result<()> {
-        let Some(ring) = self.ring.filter(|_| self.ring_shown) else {
+        if self.ring.is_none() || !self.ring_shown {
             return Ok(());
-        };
+        }
         self.ring_shown = false;
-        front.retarget(ring, Prop::Opacity, chrome(0.0))
-    }
-}
-
-/// Returns the shared chrome spring bound to `to`, so starting a state transition allocates
-/// nothing.
-const fn spring(to: Value) -> Bind {
-    Bind::Animate(Anim::Spring {
-        to,
-        tuning: Tuning::Chrome,
-        delay_ms: 0,
-    })
-}
-
-const fn chrome(to: f32) -> Bind {
-    spring(Value::Scalar(to))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::gesture::Axis;
-
-    #[test]
-    fn unmount_retires_chrome_and_every_held_reference() {
-        use crate::build::{Host, tests::fixture};
-        let mut patch = fixture();
-        let held = crate::build::Ui::mount_at(
-            Host::with(|h| h.model().root()),
-            None,
-            crate::build::root_scope(),
-            None,
-            |ui| {
-                crate::widget::button(ui, "Gain");
-            },
-        );
-        let mut down = crate::seam::Down::default();
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        let row = down
-            .chrome
-            .iter()
-            .find(|row| row.wash.is_some())
-            .copied()
-            .unwrap();
-        let mut controls = Controls::new();
-        controls.rows.place(row.id, row);
-        controls.hovered = Some(row.id);
-        controls.observed_hover = Some(row.id);
-        controls.pressed = Some(row.id);
-        controls.grabbed = Some((row.id, 0.5));
-        controls.dragged = Some((row.id, true, undecided()));
-        down.clear();
-        drop(held);
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        assert!(down.released.contains(&row.id));
-        for &id in &down.released {
-            controls.release(id);
-        }
-        assert!(
-            controls.rows.get(row.id).is_none(),
-            "late reports cannot find a destroyed wash"
-        );
-        assert!(controls.hovered.is_none() && controls.observed_hover.is_none());
-        assert!(
-            controls.pressed.is_none() && controls.grabbed.is_none() && controls.dragged.is_none()
-        );
+        front.spring(self.ring, Prop::Opacity, Value::Scalar(0.0))
     }
 
-    #[test]
-    fn native_adoption_ignores_late_input_after_a_control_unmounts() -> Result<()> {
-        use crate::build::{Host, tests::fixture};
-        use windows_window::{Apartment, Window, ensure_dispatcher_queue};
-        ensure_dispatcher_queue(Apartment::Asta)?;
-        let _ = fixture();
-        let (env, scope) = Host::with(|h| (h.env, h.root_scope));
-        let mut model = windows_scene::Model::new(crate::layout::root());
-        model.set_window(windows_numerics::Vector2 { x: 800.0, y: 600.0 });
-        Host::install(model, env, scope);
-        let window = Window::new("control lifetime regression")
-            .size_dips(800.0, 600.0)
-            .create()?;
-        let back = Backends::new(
-            windows_composition::Compositor::new()?,
-            &windows_d2d::Gpu::for_window()?,
-            windows_text::FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"]),
-        )?;
-        Host::install_text(back.ladder().clone())?;
-        let mut scene = Scene::new_at(
-            window.handle(),
-            &back,
-            env,
-            windows_scene::BackdropSpec::default(),
-        )?;
-        let mut controls = Controls::new();
-        let mut down = crate::seam::Down::default();
-        let root = Host::with(|h| h.model().root());
-        let held = crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
-            crate::widget::button(ui, "Gain");
-        });
-        Host::flush(&mut down.patch);
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        let id = down
-            .chrome
-            .iter()
-            .find(|row| row.wash.is_some())
-            .unwrap()
-            .id;
-        scene.apply(&mut down.patch, &back, env)?;
-        let mut front = Front {
-            scene: &mut scene,
-            back: &back,
-            env,
-        };
-        controls.adopt(&down.chrome, &down.released, &mut front)?;
-        let mut intents = Vec::new();
-        controls.tick(
-            &[Report::HoverChanged {
-                from: None,
-                to: Some(id),
-                at: Default::default(),
-                qpc: 0,
-            }],
-            &mut front,
-            &mut intents,
-        )?;
-        down.clear();
-        drop(held);
-        let _replacement =
-            crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
-                crate::widget::button(ui, "replacement");
-            });
-        Host::flush(&mut down.patch);
-        Host::with(|h| {
-            h.fill(&mut down);
-        });
-        front.scene.apply(&mut down.patch, &back, env)?;
-        controls.adopt(&down.chrome, &down.released, &mut front)?;
-        intents.clear();
-        let replacement = down
-            .chrome
-            .iter()
-            .find(|row| row.wash.is_some())
-            .unwrap()
-            .id;
-        controls.pressed = Some(replacement);
-        controls.grabbed = Some((replacement, 0.5));
-        controls.dragged = Some((replacement, true, undecided()));
-        controls.tick(
-            &[
-                Report::HoverChanged {
-                    from: Some(id),
-                    to: None,
-                    at: Default::default(),
-                    qpc: 0,
-                },
-                Report::Canceled {
-                    target: id,
-                    contact: 1,
-                },
-                Report::Released {
-                    target: id,
-                    contact: 1,
-                    at: Default::default(),
-                },
-            ],
-            &mut front,
-            &mut intents,
-        )?;
-        controls.automation(&[crate::uia::Action::Invoke(id)], &mut front, &mut intents)?;
-        assert!(
-            intents.is_empty(),
-            "retired generations cannot move visuals or invoke callbacks"
-        );
-        assert!(controls.rows.get(id).is_none());
-        assert_eq!(controls.pressed, Some(replacement));
-        assert_eq!(controls.grabbed, Some((replacement, 0.5)));
-        assert_eq!(controls.dragged, Some((replacement, true, undecided())));
-        Ok(())
+    /// Returns `id` where it still has a row, and `NONE` otherwise.
+    fn live(&self, id: Option<ControlId>) -> ControlId {
+        id.filter(|id| self.chrome.get(*id).is_some())
+            .unwrap_or(ControlId::NONE)
     }
 
-    /// A drag sample that displaced nothing, for a held state a test sets up by hand.
-    fn undecided() -> DragUpdate {
-        DragUpdate {
-            phase: DragPhase::Undecided,
-            delta: windows_scene::Point::default(),
-            from: windows_scene::Point::default(),
-            at: windows_scene::Point::default(),
-            decided: false,
-        }
+    fn chrome_of(&self, id: ControlId) -> ChromeRow {
+        self.chrome.get(id).copied().unwrap_or_default()
     }
 
-    /// Two distinct control ids, minted rather than constructed: a slot and a generation are
-    /// the arena's to assign and this crate cannot spell one.
-    fn two() -> (ControlId, ControlId) {
-        let mut ids = windows_scene::Ids::<Control>::new();
-        (ids.mint(), ids.mint())
+    fn flags(&self, id: ControlId) -> u8 {
+        self.chrome_of(id).flags
     }
 
-    #[test]
-    fn semantic_hover_reports_scope_edges_and_ignores_child_crossings() {
-        let mut ids = windows_scene::Ids::<Control>::new();
-        let [scope, a, b, other, ordinary] = core::array::from_fn(|_| ids.mint());
-        let mut controls = Controls::default();
-        for (id, hover_scope) in [
-            (scope, Some(scope)),
-            (a, Some(scope)),
-            (b, Some(scope)),
-            (other, Some(other)),
-            (ordinary, None),
-        ] {
-            controls.rows.place(
-                id,
-                ChromeRow {
-                    id,
-                    hover_scope,
-                    observes_hover: id == scope || id == other,
-                    reveal: NodeId::NONE,
-                    wash: None,
-                    hover: 0.0,
-                    press: 0.0,
-                    scalar_parts: [None; 4],
-                    thumb: None,
-                    trail: None,
-                    rest: 0.0,
-                    travel: 0.0,
-                    drive: None,
-                    drags: false,
-                    fraction: 0.0,
-                    source_fraction: 0.0,
-                    revision: 0,
-                },
-            );
-        }
-        let mut out = Vec::with_capacity(2);
-        controls.observe_hover(Some(a), &mut out);
-        assert_eq!(
-            out,
-            [Intent {
-                target: scope,
-                what: What::Hovered(true)
-            }]
-        );
-        out.clear();
-        for _ in 0..1000 {
-            controls.observe_hover(Some(b), &mut out);
-            controls.observe_hover(Some(a), &mut out);
-        }
-        assert!(out.is_empty(), "child crossings must stay scene-side");
-        controls.release(a);
-        controls.observe_hover(Some(b), &mut out);
-        assert!(
-            out.is_empty(),
-            "replacing a hovered child preserves the scope"
-        );
-        controls.observe_hover(Some(other), &mut out);
-        assert_eq!(
-            out,
-            [
-                Intent {
-                    target: scope,
-                    what: What::Hovered(false)
-                },
-                Intent {
-                    target: other,
-                    what: What::Hovered(true)
-                }
-            ]
-        );
-        out.clear();
-        controls.observe_hover(Some(ordinary), &mut out);
-        assert_eq!(
-            out,
-            [Intent {
-                target: other,
-                what: What::Hovered(false)
-            }]
-        );
-        out.clear();
-        controls.observe_hover(None, &mut out);
-        controls.observe_hover(Some(ordinary), &mut out);
-        assert!(out.is_empty());
-        controls.observe_hover(Some(b), &mut out);
-        out.clear();
-        controls.release(scope);
-        controls.observe_hover(Some(b), &mut out);
-        assert!(
-            out.is_empty(),
-            "a released scope cannot receive another event"
-        );
-        assert_eq!(out.capacity(), 2);
-    }
-
-    #[test]
-    fn slider_pointer_maps_the_visible_rail_and_snaps_the_reported_value() {
-        let horizontal = Range::new(-24.0, 24.0).step(0.1);
-        assert_eq!(slider_value_at(13.0, 126.0, 100.0, horizontal), -24.0);
-        assert_eq!(slider_value_at(63.0, 126.0, 100.0, horizontal), 0.0);
-        assert_eq!(slider_value_at(113.0, 126.0, 100.0, horizontal), 24.0);
-        assert_eq!(slider_value_at(-20.0, 126.0, 100.0, horizontal), -24.0);
-        assert_eq!(slider_value_at(140.0, 126.0, 100.0, horizontal), 24.0);
-        assert!((slider_value_at(70.0, 126.0, 100.0, horizontal) - 3.4).abs() < 1e-10);
-        let vertical = Range {
-            vertical: true,
-            ..horizontal
-        };
-        assert_eq!(slider_value_at(13.0, 126.0, 100.0, vertical), 24.0);
-        assert_eq!(slider_value_at(113.0, 126.0, 100.0, vertical), -24.0);
-        assert!(slider_value_at(0.0, 0.0, 0.0, horizontal).is_finite());
-    }
-
-    #[test]
-    fn source_edits_and_geometry_updates_have_distinct_value_ownership() {
-        let (id, _) = two();
-        let source = ChromeRow {
-            hover_scope: None,
-            observes_hover: false,
-            reveal: NodeId::NONE,
-            id,
-            wash: None,
-            hover: 0.0,
-            press: 0.0,
-            scalar_parts: [None; 4],
-            thumb: None,
-            trail: None,
-            rest: 0.0,
-            travel: 100.0,
-            drive: Some(Interaction::Slide(Range::UNIT)),
-            drags: false,
-            fraction: 0.25,
-            source_fraction: 0.25,
-            revision: 0,
-        };
-        assert_eq!(source.adopted(None).fraction, 0.25);
-        let dragged = ChromeRow {
-            fraction: 0.75,
-            ..source
-        };
-        let resized = ChromeRow {
-            travel: 200.0,
-            ..source
-        }
-        .adopted(Some(dragged));
-        assert_eq!((resized.fraction, resized.travel), (0.75, 200.0));
-        let edited = ChromeRow {
-            source_fraction: 0.5,
-            revision: 1,
-            ..source
-        }
-        .adopted(Some(resized));
-        assert_eq!(edited.fraction, 0.5);
-    }
-
-    #[test]
-    fn a_drag_below_the_threshold_is_still_a_click() {
-        let (a, _) = two();
-        assert_eq!(dragging_after(None, a, DragPhase::Undecided), (a, false));
-    }
-
-    #[test]
-    fn a_decided_drag_stays_decided_through_the_rest_of_the_contact() {
-        let (a, _) = two();
-        let after = dragging_after(None, a, DragPhase::Locked(Axis::Vertical));
-        assert_eq!(after, (a, true));
-        // A locked drag reports zero on the axis it does not own, so a sample can look
-        // undecided; the lock is never revisited and neither is this.
-        assert_eq!(
-            dragging_after(Some(after), a, DragPhase::Undecided),
-            (a, true)
-        );
-    }
-
-    #[test]
-    fn a_contact_on_another_control_starts_undecided() {
-        let (a, b) = two();
-        let after = dragging_after(None, a, DragPhase::Locked(Axis::Horizontal));
-        assert_eq!(
-            dragging_after(Some(after), b, DragPhase::Undecided),
-            (b, false),
-            "one control's lock does not carry to the next"
-        );
+    /// Returns the value half of `id`, or an all-zero row for a control no value moves.
+    ///
+    /// A zero row has zero span, so a value read off it is the range floor and moves no part.
+    fn value(&self, id: ControlId) -> ValueRow {
+        self.values.get(id).copied().unwrap_or_default()
     }
 }
 

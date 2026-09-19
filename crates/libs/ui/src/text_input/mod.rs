@@ -3,18 +3,17 @@
 //! Only plain snapshots cross threads. TSF and the editable buffer stay on the window STA,
 //! and a geometry revision must match the buffer before it can answer a caret operation.
 
-mod clipboard;
-mod editor;
+mod doc;
 mod geometry;
-mod protocol;
-mod runtime;
-pub(crate) mod settings;
+mod input;
+mod session;
+mod store;
+pub(crate) mod system;
 mod touch;
-mod tsf;
-pub(crate) use runtime::TextInput;
 
-pub(crate) use editor::{Command, Editor};
 pub(crate) use geometry::{Cluster, Geometry};
+pub(crate) use input::TextInput;
+
 use std::sync::Arc;
 use windows_scene::ControlId;
 
@@ -52,6 +51,15 @@ pub(crate) struct Selection {
 impl Selection {
     pub fn range(self) -> core::ops::Range<u32> {
         self.anchor.min(self.caret)..self.anchor.max(self.caret)
+    }
+
+    /// Returns the collapsed, downstream selection at `caret`.
+    pub fn at(caret: u32) -> Self {
+        Self {
+            anchor: caret,
+            caret,
+            affinity: Affinity::Downstream,
+        }
     }
 }
 
@@ -93,5 +101,5 @@ pub(crate) struct Commit {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Reveal {
     pub id: ControlId,
-    pub occlusion: Option<windows_scene::Rect>,
+    pub occlusion: Option<crate::layout::Rect>,
 }

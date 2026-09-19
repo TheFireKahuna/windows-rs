@@ -1,50 +1,36 @@
-//! Queues and raises the automation events for what a tick changed.
+//! One queue of what a tick changed, folded, and raised at the end of the tick.
 //!
-//! A flush runs on the front thread at the end of the tick, after the publish, so the tree
-//! is consistent when a client reads it back and no raise re-enters a client's callback in
-//! the middle of an input handler.
+//! A flush runs on the front thread after the publish, so the snapshot is consistent when a
+//! client reads it back and no raise re-enters a client's callback in the middle of an input
+//! handler.
 //!
-//! A property raise is folded to one per element per property per tick, keeping the oldest
-//! previous value and the newest current one, so a drag reports one change spanning the
-//! whole burst rather than one per pointer sample.
+//! A row carries only where the value came *from*. Where it went is read from the snapshot at
+//! raise time, which is after every write this tick, so a burst of pointer samples folds by
+//! dropping every row after the first for that element and property: the one that survives
+//! reports the whole burst, from where it started to where it ended. Automation compares the
+//! two values, and a raise whose values are both empty describes a change from nothing to
+//! nothing and reaches no listener.
 
+use super::provider::{Shared, packed};
+use super::snapshot::{ColFlags, State, Tree};
+use super::variant;
+use crate::VARIANT;
 use crate::bindings::{
-    IRawElementProviderSimple, StructureChangeType_ChildrenBulkAdded,
-    UIA_AutomationFocusChangedEventId, UIA_ExpandCollapseExpandCollapseStatePropertyId,
-    UIA_Invoke_InvokedEventId, UIA_LiveRegionChangedEventId, UIA_MenuClosedEventId,
-    UIA_MenuOpenedEventId, UIA_RangeValueValuePropertyId, UIA_SelectionItemIsSelectedPropertyId,
-    UIA_ToggleToggleStatePropertyId, UIA_ToolTipOpenedEventId, UiaClientsAreListening,
-    UiaRaiseAutomationEvent, UiaRaiseAutomationPropertyChangedEvent, UiaRaiseStructureChangedEvent,
-    VARIANT,
+    StructureChangeType_ChildrenBulkAdded, UIA_AutomationFocusChangedEventId,
+    UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_Invoke_InvokedEventId,
+    UIA_LiveRegionChangedEventId, UIA_MenuClosedEventId, UIA_MenuOpenedEventId,
+    UIA_RangeValueValuePropertyId, UIA_SelectionItemIsSelectedPropertyId,
+    UIA_Text_TextChangedEventId, UIA_Text_TextSelectionChangedEventId,
+    UIA_ToggleToggleStatePropertyId, UIA_ToolTipOpenedEventId, UIA_ValueValuePropertyId,
+    UiaClientsAreListening, UiaRaiseAutomationEvent, UiaRaiseAutomationPropertyChangedEvent,
+    UiaRaiseStructureChangedEvent,
 };
+use std::sync::Arc;
 use windows_core::Interface;
 use windows_scene::ControlId;
 
-/// One event a tick has to raise.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum Raise {
-    /// The tree was replaced. One event for the whole change, not one per element.
-    Structure,
-    Focus(ControlId),
-    Invoked(ControlId),
-    /// A property change, carrying both the previous and the current value.
-    ///
-    /// Automation compares the two: a raise whose values are both empty describes a
-    /// change from nothing to nothing and reaches no listener.
-    Property {
-        id: ControlId,
-        what: Property,
-        from: Val,
-        to: Val,
-    },
-    Live(ControlId),
-    MenuOpened(ControlId),
-    MenuClosed(ControlId),
-    TooltipOpened(ControlId),
-}
-
-/// A property this stack raises changes for, and the type it is reported as.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// What a row reports as the property that changed.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Property {
     /// `RangeValue.Value`, as a double.
     Range,
@@ -54,72 +40,121 @@ pub enum Property {
     Selected,
     /// `ExpandCollapse.ExpandCollapseState`, as the enumeration's integer.
     Expanded,
+    /// `Value.Value`, as the string an editable document now holds.
+    Text,
 }
 
-impl Property {
-    /// Returns the automation property id this property is raised under.
-    #[must_use]
-    pub const fn id(self) -> i32 {
-        match self {
-            Self::Range => UIA_RangeValueValuePropertyId,
-            Self::Toggle => UIA_ToggleToggleStatePropertyId,
-            Self::Selected => UIA_SelectionItemIsSelectedPropertyId,
-            Self::Expanded => UIA_ExpandCollapseExpandCollapseStatePropertyId,
-        }
+/// One event a tick has to raise.
+///
+/// A plain event names an element and an automation event id. A property change names the
+/// property and what it changed **from**; what it changed to is read at raise time, which is
+/// after every write this tick.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Raise {
+    /// The tree was replaced. One event for the whole change, not one per element.
+    Structure,
+    Event(ControlId, i32),
+    Property(ControlId, Property, Val),
+}
+
+impl Raise {
+    pub const fn focus(id: ControlId) -> Self {
+        Self::Event(id, UIA_AutomationFocusChangedEventId)
+    }
+    pub const fn invoked(id: ControlId) -> Self {
+        Self::Event(id, UIA_Invoke_InvokedEventId)
+    }
+    pub const fn live(id: ControlId) -> Self {
+        Self::Event(id, UIA_LiveRegionChangedEventId)
+    }
+    pub const fn menu_opened(id: ControlId) -> Self {
+        Self::Event(id, UIA_MenuOpenedEventId)
+    }
+    pub const fn menu_closed(id: ControlId) -> Self {
+        Self::Event(id, UIA_MenuClosedEventId)
+    }
+    pub const fn tooltip_opened(id: ControlId) -> Self {
+        Self::Event(id, UIA_ToolTipOpenedEventId)
+    }
+    pub const fn selection_changed(id: ControlId) -> Self {
+        Self::Event(id, UIA_Text_TextSelectionChangedEventId)
+    }
+    pub const fn text_changed(id: ControlId) -> Self {
+        Self::Event(id, UIA_Text_TextChangedEventId)
     }
 
-    /// Returns `on` in the variant type this property is reported as.
-    #[must_use]
-    pub const fn of(self, on: bool) -> Val {
-        match self {
-            Self::Selected => Val::Bool(on),
-            // `ToggleState` and `ExpandCollapseState` are both off at 0 and on at 1.
-            _ => Val::Int(on as i32),
+    /// Returns what this row folds on: the element, the property where it is a property
+    /// change, and the event id where it is a plain event.
+    fn key(&self) -> (ControlId, Option<Property>, i32) {
+        match *self {
+            Self::Structure => (ControlId::NONE, None, 0),
+            Self::Event(id, event) => (id, None, event),
+            Self::Property(id, what, _) => (id, Some(what), 0),
         }
     }
 }
 
-/// A property's value, in the variant type automation expects for it.
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// A value in the variant type automation expects for its property.
+#[derive(Clone, PartialEq, Debug)]
 pub enum Val {
+    Empty,
     Number(f64),
     Int(i32),
     Bool(bool),
+    /// UTF-16 already, because that is what the snapshot holds and what a `BSTR` takes.
+    Text(Arc<[u16]>),
 }
 
 impl Val {
-    fn variant(self) -> VARIANT {
-        match self {
-            Self::Number(v) => super::variant::r8(v),
-            Self::Int(v) => super::variant::i4(v),
-            Self::Bool(v) => super::variant::bool(v),
+    fn variant(&self) -> VARIANT {
+        match *self {
+            Self::Empty => variant::empty(),
+            Self::Number(v) => variant::r8(v),
+            Self::Int(v) => variant::i4(v),
+            Self::Bool(v) => variant::bool(v),
+            Self::Text(ref v) => variant::wide(v),
         }
+    }
+}
+
+/// Returns what `what` now reads as on the element at `at`.
+fn now(what: Property, tree: &Tree, id: ControlId, at: u16) -> Val {
+    let state = tree.state(at);
+    match what {
+        Property::Range => tree.value(at).map_or(Val::Empty, Val::Number),
+        Property::Toggle => Val::Int(i32::from(state.has(State::TOGGLED))),
+        Property::Selected => Val::Bool(state.has(State::SELECTED)),
+        Property::Expanded => Val::Int(i32::from(state.has(State::EXPANDED))),
+        Property::Text => tree
+            .field(id)
+            .map_or(Val::Empty, |field| Val::Text(Arc::clone(&field.text))),
+    }
+}
+
+/// Returns the automation property id `what` is raised under.
+const fn property_id(what: Property) -> i32 {
+    match what {
+        Property::Range => UIA_RangeValueValuePropertyId,
+        Property::Toggle => UIA_ToggleToggleStatePropertyId,
+        Property::Selected => UIA_SelectionItemIsSelectedPropertyId,
+        Property::Expanded => UIA_ExpandCollapseExpandCollapseStatePropertyId,
+        Property::Text => UIA_ValueValuePropertyId,
     }
 }
 
 /// The events queued for the current tick.
 ///
-/// Bounded by the number of elements that changed in that tick. The allocation is kept
-/// across ticks, so a steady drag allocates nothing.
-#[derive(Debug, Default)]
+/// Bounded by the number of elements that changed in it. The allocation is kept across ticks,
+/// so a steady drag allocates nothing.
+#[derive(Default)]
 pub struct Pending(Vec<Raise>);
 
 impl Pending {
-    /// Records `raise`, folding it into a queued event that names the same element.
-    ///
-    /// A property change merges into the queued change for that element and property,
-    /// keeping the queued previous value and taking the new current one. Any other event
-    /// is recorded once and a duplicate is dropped.
+    /// Records `raise`, dropping it where the queue already names the same element and the
+    /// same property or event.
     pub fn push(&mut self, raise: Raise) {
-        if let Raise::Property { id, what, to, .. } = raise {
-            // The burst becomes one change: from where it started to where it ended.
-            if let Some(Raise::Property { to: last, .. }) = self.0.iter_mut().find(|queued| {
-                matches!(queued, Raise::Property { id: a, what: b, .. } if *a == id && *b == what)
-            }) {
-                *last = to;
-                return;
-            }
-        } else if self.0.contains(&raise) {
+        let key = raise.key();
+        if self.0.iter().any(|queued| queued.key() == key) {
             return;
         }
         self.0.push(raise);
@@ -130,81 +165,67 @@ impl Pending {
         self.0.is_empty()
     }
 
-    /// Moves everything queued into `out` without raising it.
+    /// Raises every queued event against the current snapshot, then empties the queue.
     ///
-    /// Appends rather than handing the buffer over, as [`flush`](Self::flush) drains
-    /// rather than replacing it, so the set keeps its allocation across ticks.
+    /// An element that has unmounted since its row was recorded resolves to nothing and is
+    /// skipped rather than failing the flush. Nothing is raised when no client is
+    /// [`listening`], and the queue is emptied either way.
+    pub fn flush(&mut self, shared: &Arc<Shared>, tree: &Tree) {
+        if listening() {
+            for raise in self.0.drain(..) {
+                one(&raise, shared, tree);
+            }
+        }
+        self.0.clear();
+    }
+
+    /// Moves the queued rows into `out` without raising them.
     #[cfg(test)]
     pub fn take(&mut self, out: &mut Vec<Raise>) {
         out.append(&mut self.0);
     }
+}
 
-    /// Raises every queued event, then empties the set.
-    ///
-    /// `provider` resolves an element to the object a client holds. An element that has
-    /// unmounted since the event was recorded resolves to `None` and is skipped rather
-    /// than failing the flush. Nothing is raised when no client is [`listening`], and the
-    /// set is emptied either way.
-    pub fn flush(&mut self, provider: impl Fn(ControlId) -> Option<IRawElementProviderSimple>) {
-        if self.0.is_empty() {
-            return;
-        }
-        if !listening() {
-            self.0.clear();
-            return;
-        }
-        for raise in self.0.drain(..) {
-            let (id, event) = match raise {
-                Raise::Structure => {
-                    // Raised on the fragment root as a bulk change: the array is replaced
-                    // wholesale, so there is no per-element diff to describe.
-                    let Some(root) = provider(ControlId::NONE) else {
-                        continue;
-                    };
-                    // SAFETY: `root` is a provider object alive for the call, and a null
-                    // runtime id of length zero names the root itself, which is the form a
-                    // bulk change takes.
-                    unsafe {
-                        _ = UiaRaiseStructureChangedEvent(
-                            root.as_raw(),
-                            StructureChangeType_ChildrenBulkAdded,
-                            core::ptr::null_mut(),
-                            0,
-                        );
-                    }
-                    continue;
-                }
-                Raise::Property { id, what, from, to } => {
-                    let Some(element) = provider(id) else {
-                        continue;
-                    };
-                    // SAFETY: `element` is a provider object alive for the call, and both
-                    // variants carry the type this property is reported as. Each holds a
-                    // scalar, so neither owns an allocation the callee would release.
-                    unsafe {
-                        _ = UiaRaiseAutomationPropertyChangedEvent(
-                            element.as_raw(),
-                            what.id(),
-                            from.variant(),
-                            to.variant(),
-                        );
-                    }
-                    continue;
-                }
-                Raise::Focus(id) => (id, UIA_AutomationFocusChangedEventId),
-                Raise::Invoked(id) => (id, UIA_Invoke_InvokedEventId),
-                Raise::Live(id) => (id, UIA_LiveRegionChangedEventId),
-                Raise::MenuOpened(id) => (id, UIA_MenuOpenedEventId),
-                Raise::MenuClosed(id) => (id, UIA_MenuClosedEventId),
-                Raise::TooltipOpened(id) => (id, UIA_ToolTipOpenedEventId),
+/// Raises one queued row.
+fn one(raise: &Raise, shared: &Arc<Shared>, tree: &Tree) {
+    let (id, _, event) = raise.key();
+    let Some(provider) = super::provider::provider_for(shared, id) else {
+        return;
+    };
+    match *raise {
+        // Raised on the fragment root as a bulk change: the table is replaced wholesale, so
+        // there is no per-element diff to describe. A null runtime id of length zero names the
+        // root itself, which is the form a bulk change takes.
+        //
+        // SAFETY: `provider` is a provider object alive for the call, and the null runtime id
+        // is the documented argument for a change that names no one element.
+        Raise::Structure => unsafe {
+            _ = UiaRaiseStructureChangedEvent(
+                provider.as_raw(),
+                StructureChangeType_ChildrenBulkAdded,
+                core::ptr::null_mut(),
+                0,
+            );
+        },
+        // SAFETY: `provider` is a provider object alive for the call, and `event` is one of
+        // the event id constants the constructors above write.
+        Raise::Event(..) => unsafe {
+            _ = UiaRaiseAutomationEvent(provider.as_raw(), event);
+        },
+        Raise::Property(_, what, ref was) => {
+            let Some(at) = tree.index_of(id) else {
+                return;
             };
-            let Some(element) = provider(id) else {
-                continue;
-            };
-            // SAFETY: `element` is a provider object alive for the call, and `event` is one
-            // of the event id constants above.
+            // SAFETY: `provider` is alive for the call, both variants carry the type this
+            // property is reported as, and each owns whatever allocation it holds until the
+            // call returns, which is where they are dropped.
             unsafe {
-                _ = UiaRaiseAutomationEvent(element.as_raw(), event);
+                _ = UiaRaiseAutomationPropertyChangedEvent(
+                    provider.as_raw(),
+                    property_id(what),
+                    was.variant(),
+                    now(what, tree, id, at).variant(),
+                );
             }
         }
     }
@@ -212,8 +233,8 @@ impl Pending {
 
 /// Returns whether a raised event could reach a client.
 ///
-/// A hint rather than a guarantee: it answers `true` on a desktop with no client attached,
-/// so it gates only the cost of raising and nothing structural.
+/// A hint rather than a guarantee: it answers `true` on a desktop with no client attached, so
+/// it gates only the cost of raising and nothing structural.
 #[must_use]
 pub fn listening() -> bool {
     // SAFETY: the call takes no arguments, reads no caller state, and is callable from any
@@ -221,62 +242,16 @@ pub fn listening() -> bool {
     unsafe { UiaClientsAreListening().as_bool() }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Returns whether the element at `at` is a live region, and so owes an announcement.
+#[must_use]
+pub fn is_live(tree: &Tree, at: u16) -> bool {
+    tree.at(at).is_some_and(|entry| {
+        entry.flags.has(ColFlags::LIVE_POLITE) || entry.flags.has(ColFlags::LIVE_ASSERTIVE)
+    })
+}
 
-    /// Mints `count` ids through the id authority. An id is generational, so a value not
-    /// minted here is not one the stack can produce.
-    fn ids(count: usize) -> Vec<ControlId> {
-        let mut authority = windows_scene::Ids::<windows_scene::Control>::new();
-        (0..count).map(|_| authority.mint()).collect()
-    }
-
-    fn moved(id: ControlId, from: f64, to: f64) -> Raise {
-        Raise::Property {
-            id,
-            what: Property::Range,
-            from: Val::Number(from),
-            to: Val::Number(to),
-        }
-    }
-
-    #[test]
-    fn a_drag_raises_one_change_spanning_the_whole_burst() {
-        let id = ids(2);
-        let mut pending = Pending::default();
-        for step in 0..64 {
-            pending.push(moved(id[0], f64::from(step), f64::from(step) + 1.0));
-        }
-        pending.push(moved(id[1], 0.0, 9.0));
-
-        assert_eq!(pending.0.len(), 2, "one per element per property");
-        assert_eq!(
-            pending.0[0],
-            moved(id[0], 0.0, 64.0),
-            "from where the burst started to where it ended, not the last sample's pair"
-        );
-    }
-
-    #[test]
-    fn two_properties_of_one_element_do_not_fold_together() {
-        let id = ids(1);
-        let mut pending = Pending::default();
-        pending.push(moved(id[0], 0.0, 1.0));
-        pending.push(Raise::Property {
-            id: id[0],
-            what: Property::Toggle,
-            from: Val::Int(0),
-            to: Val::Int(1),
-        });
-        assert_eq!(pending.0.len(), 2);
-    }
-
-    #[test]
-    fn one_structure_event_describes_a_whole_republish() {
-        let mut pending = Pending::default();
-        pending.push(Raise::Structure);
-        pending.push(Raise::Structure);
-        assert_eq!(pending.0.len(), 1);
-    }
+/// Returns the focused control as a packed id, or `u64::MAX` where nothing holds focus.
+#[must_use]
+pub fn packed_focus(id: Option<ControlId>) -> u64 {
+    id.map_or(u64::MAX, packed)
 }

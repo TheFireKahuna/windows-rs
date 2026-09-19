@@ -35,11 +35,12 @@ pub mod text_input;
 #[deny(unsafe_code)]
 pub mod widget;
 
-// The window's three commands: minimize, maximize and close. Two functions over the hit
-// array and the control table the layers above already own, so an application declares a
-// title bar rather than implementing one.
+// The window's three commands: minimize, maximize and close. Two functions over the hit array
+// and the control table the layers above already own, so an application declares a title bar
+// rather than implementing one. An application names a command through `Element::caption`; the
+// two answers here are the driver's.
 #[deny(unsafe_code)]
-pub mod caption;
+pub(crate) mod caption;
 
 // Start-up and the frame: the ordered tick and the six process-wide installs. An
 // application takes one of each, and the order within the tick is a correctness rule at

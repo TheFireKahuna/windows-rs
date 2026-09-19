@@ -2,8 +2,8 @@
 //!
 //! Focus order is the hit array's order, filtered to `INTERACTIVE`, with `tab_index` as an
 //! explicit override. The pointer, the wheel, keyboard focus order, the window's caption hit
-//! test and automation's element-from-point all resolve through that one z-ordered flat
-//! array, so no second ordering is maintained beside it.
+//! test and automation's element-from-point all resolve through that one z-ordered flat array,
+//! so no second ordering is maintained beside it.
 //!
 //! Scopes nest. An open overlay opens one, so `Tab` cycles within it and closing it restores
 //! focus to whatever invoked it; `Esc` is delivered to the innermost scope before any control
@@ -14,7 +14,6 @@
 //! closed or moved, and [`FocusRing::apply`] is the one place they land, which is what lets
 //! the two halves run on separate threads.
 
-use super::Report;
 use crate::seam::FocusOp;
 use rustc_hash::FxHashMap;
 use windows_scene::{ControlId, HitFlags, HitTable};
@@ -23,30 +22,45 @@ use windows_scene::{ControlId, HitFlags, HitTable};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScopeId(pub u32);
 
-/// Describes a focus scope at the moment an overlay opens it.
+/// One open scope: where its subtree begins, whether `Tab` may leave it, and what focus
+/// returns to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct FocusScope {
-    /// Wraps `Tab` at the ends of the scope instead of letting it leave. A modal popup sets
-    /// this; a flyout leaves it clear, so tabbing past its last item dismisses it.
-    pub trap: bool,
-    /// The control focus returns to when the scope closes. `None` leaves focus cleared, so
-    /// the next keystroke reaches the window rather than a control.
-    pub restore_to: Option<ControlId>,
+struct Scope {
+    id: ScopeId,
+    /// Wraps `Tab` at the ends instead of letting it leave. A modal popup sets this; a flyout
+    /// leaves it clear, so tabbing past its last item dismisses it.
+    trap: bool,
+    /// `None` leaves focus cleared, so the next keystroke reaches the window rather than a
+    /// control.
+    restore_to: Option<ControlId>,
     /// The scope's first entry in the hit array: its blocker for a light-dismissing overlay,
     /// or its root otherwise. Everything at or after it in the array is inside the scope.
-    pub from: ControlId,
+    from: ControlId,
+}
+
+/// What a focus step did.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Move {
+    /// Focus moved.
+    To,
+    /// The step ran off the end of a scope that does not trap. The caller dismisses that scope
+    /// and steps again outside it.
+    Left,
+    /// Nothing focusable, or focus was already where the step would put it.
+    #[default]
+    None,
 }
 
 /// Holds the focused control and the stack of scopes that bound navigation.
 #[derive(Debug, Default)]
 pub struct FocusRing {
     current: Option<ControlId>,
-    scopes: Vec<(ScopeId, FocusScope)>,
-    /// Explicit tab positions, keyed by control. Empty for every screen that does not
-    /// override the hit array's order.
+    scopes: Vec<Scope>,
+    /// Explicit tab positions, keyed by control. Empty for every screen that does not override
+    /// the hit array's order.
     order: FxHashMap<ControlId, i32>,
-    /// Candidate buffer reused across navigations, so moving focus allocates nothing after
-    /// the first move.
+    /// Candidate buffer reused across navigations, so moving focus allocates nothing after the
+    /// first move.
     scratch: Vec<(i32, ControlId)>,
 }
 
@@ -57,20 +71,16 @@ impl FocusRing {
         self.current
     }
 
-    /// Focuses `next` directly, as a press does.
-    ///
-    /// Returns the control that lost focus alongside the one that took it, so a caller
-    /// repaints both in one pass. `None` means `next` already had focus and nothing changed.
-    pub fn focus(
-        &mut self,
-        next: Option<ControlId>,
-    ) -> Option<(Option<ControlId>, Option<ControlId>)> {
-        if self.current == next {
-            return None;
-        }
-        let previous = self.current;
-        self.current = next;
-        Some((previous, next))
+    /// Returns the innermost open scope, which `Esc` is delivered to before any control.
+    #[must_use]
+    pub fn innermost(&self) -> Option<ScopeId> {
+        self.scopes.last().map(|scope| scope.id)
+    }
+
+    /// Returns how many scopes are open.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.scopes.len()
     }
 
     /// Gives `id` an explicit position in the focus order.
@@ -83,94 +93,67 @@ impl FocusRing {
 
     /// Drops `id`'s explicit position, returning it to the hit array's order. Called on
     /// unmount.
-    pub fn clear_tab_index(&mut self, id: ControlId) {
+    pub fn forget(&mut self, id: ControlId) {
         self.order.remove(&id);
     }
 
-    /// Opens the scope named `id`. Everything at or after `scope.from` in the hit array is
-    /// inside it.
+    /// Focuses `next` directly, as a press does.
     ///
-    /// The name is minted by the half that opens the overlay, which is not this one: an op
-    /// naming its scope can be emitted, queued and applied without a reply.
-    pub(crate) fn push_scope_as(&mut self, id: ScopeId, scope: FocusScope) {
-        self.scopes.push((id, scope));
+    /// Returns whether focus moved, so a caller repaints the ring only when it did.
+    pub fn focus(&mut self, next: Option<ControlId>) -> bool {
+        let moved = self.current != next;
+        self.current = next;
+        moved
     }
 
-    /// Applies the focus edits the app half emitted, in the order it emitted them.
+    /// Applies the focus edits the app half emitted, in the order it emitted them, and returns
+    /// whether any of them moved focus.
     ///
-    /// Appends the [`Report::FocusChanged`] each edit produced to `out`, so the ring visual
-    /// repaints both the control that lost focus and the one that took it.
-    pub(crate) fn apply(&mut self, ops: &[FocusOp], hits: &HitTable, out: &mut Vec<Report>) {
+    /// Every op changes exactly one datum, so one read before the loop and one comparison
+    /// after it reports all five.
+    pub(crate) fn apply(&mut self, ops: &[FocusOp], hits: &HitTable) -> bool {
+        let before = self.current;
         for op in ops {
             match *op {
-                FocusOp::PushScope {
-                    scope,
+                FocusOp::Push {
+                    id,
                     trap,
                     from,
                     restore_to,
-                } => self.push_scope_as(
-                    scope,
-                    FocusScope {
-                        trap,
-                        // An overlay anchored to a control names that control. One anchored
-                        // to a point or to the window names none, and what it interrupted is
-                        // known only here.
-                        restore_to: restore_to.or(self.current),
-                        from,
-                    },
-                ),
-                FocusOp::PopScope(scope) => {
-                    let previous = self.current;
-                    let open = self.scopes.iter().any(|(id, _)| *id == scope);
-                    _ = self.pop_scope(scope);
-                    if open && previous != self.current {
-                        out.push(Report::FocusChanged {
-                            from: previous,
-                            to: self.current,
-                        });
-                    }
-                }
+                } => self.scopes.push(Scope {
+                    id,
+                    trap,
+                    // An overlay anchored to a control names that control. One anchored to a
+                    // point or to the window names none, and what it interrupted is known
+                    // only here.
+                    restore_to: restore_to.or(self.current),
+                    // A scope naming no entry collects nothing, which is the same fail-closed
+                    // answer as one whose entry has left the array: `ControlId::NONE` is never
+                    // an entry's id.
+                    from: from.unwrap_or(ControlId::NONE),
+                }),
+                FocusOp::Pop(scope) => self.pop(scope),
                 FocusOp::Focus(next) => {
-                    if let Some((from, to)) = self.focus(next) {
-                        out.push(Report::FocusChanged { from, to });
-                    }
+                    self.focus(next);
                 }
-                FocusOp::Step { forward } => Self::report(self.step(hits, forward), out),
-                FocusOp::StepToEnd { last } => Self::report(self.step_to_end(hits, last), out),
+                FocusOp::Step { forward } => {
+                    self.step(hits, forward);
+                }
+                FocusOp::End { last } => self.enter(hits, last),
             }
         }
+        before != self.current
     }
 
-    /// Appends the report a step produced, where it moved focus at all.
-    fn report(moved: Move, out: &mut Vec<Report>) {
-        if let Move::To { from, to } = moved {
-            out.push(Report::FocusChanged { from, to: Some(to) });
-        }
-    }
-
-    /// Closes the scope `id` and moves focus to its `restore_to`.
-    ///
-    /// Returns the control focus was moved to, which the caller repaints in the same pass
-    /// that closed the overlay. `None` when `id` names no open scope.
-    pub fn pop_scope(&mut self, id: ScopeId) -> Option<ControlId> {
-        let at = self.scopes.iter().position(|(scope, _)| *scope == id)?;
+    /// Closes the scope `id` and moves focus to its `restore_to`. Does nothing where `id`
+    /// names no open scope.
+    pub fn pop(&mut self, id: ScopeId) {
+        let Some(at) = self.scopes.iter().position(|scope| scope.id == id) else {
+            return;
+        };
         // Truncating takes the nested scopes with it: closing an overlay closes its submenus.
-        let restore = self.scopes[at].1.restore_to;
+        self.current = self.scopes[at].restore_to;
         self.scopes.truncate(at);
-        self.current = restore;
-        restore
-    }
-
-    /// Returns the innermost open scope, which `Esc` is delivered to before any control.
-    #[must_use]
-    pub fn innermost(&self) -> Option<(ScopeId, FocusScope)> {
-        self.scopes.last().copied()
-    }
-
-    /// Returns the number of open scopes.
-    #[must_use]
-    pub fn depth(&self) -> usize {
-        self.scopes.len()
     }
 
     /// Moves focus one step through the order, forwards when `forward` is set.
@@ -180,62 +163,48 @@ impl FocusRing {
     /// caller answers by dismissing that scope and stepping again outside it.
     pub fn step(&mut self, hits: &HitTable, forward: bool) -> Move {
         self.collect(hits);
-        if self.scratch.is_empty() {
-            return Move::Nowhere;
-        }
+        let Some(last) = self.scratch.len().checked_sub(1) else {
+            return Move::None;
+        };
         let at = self
             .current
-            .and_then(|id| self.scratch.iter().position(|(_, entry)| *entry == id));
-        let last = self.scratch.len() - 1;
+            .and_then(|id| self.scratch.iter().position(|(_, e)| *e == id));
         let next = match (at, forward) {
-            // Nothing focused: enter at whichever end the step came from.
             (None, true) => 0,
             (None, false) => last,
-            (Some(at), true) if at == last => {
-                if self.innermost().is_some_and(|(_, scope)| !scope.trap) {
-                    return Move::Left;
-                }
-                0
-            }
-            (Some(0), false) => {
-                if self.innermost().is_some_and(|(_, scope)| !scope.trap) {
-                    return Move::Left;
-                }
-                last
-            }
-            (Some(at), true) => at + 1,
-            (Some(at), false) => at - 1,
+            (Some(at), true) if at < last => at + 1,
+            (Some(at), false) if at > 0 => at - 1,
+            // Off the end: a trapping scope wraps, a flyout lets go.
+            _ if !self.scopes.last().is_some_and(|scope| scope.trap) => return Move::Left,
+            (_, true) => 0,
+            (_, false) => last,
         };
-        self.land(self.scratch[next].1)
+        let id = self.scratch[next].1;
+        if self.focus(Some(id)) {
+            Move::To
+        } else {
+            Move::None
+        }
     }
 
     /// Moves focus to the last control of the innermost scope when `last` is set, and to the
     /// first otherwise. Drives `Home` and `End`.
-    pub fn step_to_end(&mut self, hits: &HitTable, last: bool) -> Move {
+    pub fn enter(&mut self, hits: &HitTable, last: bool) {
         self.collect(hits);
-        let Some(&(_, id)) = (if last {
+        let end = if last {
             self.scratch.last()
         } else {
             self.scratch.first()
-        }) else {
-            return Move::Nowhere;
         };
-        self.land(id)
-    }
-
-    /// Focuses the candidate a step chose and reports what that did. Landing where focus
-    /// already was is [`Move::Nowhere`], so no caller repaints a ring that did not move.
-    fn land(&mut self, id: ControlId) -> Move {
-        match self.focus(Some(id)) {
-            Some((from, _)) => Move::To { from, to: id },
-            None => Move::Nowhere,
+        if let Some(&(_, id)) = end {
+            self.focus(Some(id));
         }
     }
 
     /// Fills `scratch` with the innermost scope's focusable controls, in focus order.
     ///
-    /// Explicit indices sort first and among themselves; everything else keeps the hit
-    /// array's own order, which is the reading order layout produced. The sort is stable,
+    /// Explicit indices above zero sort first and among themselves; everything else keeps the
+    /// hit array's own order, which is the reading order layout produced. The sort is stable,
     /// which is what preserves that order.
     fn collect(&mut self, hits: &HitTable) {
         self.scratch.clear();
@@ -245,10 +214,10 @@ impl FocusRing {
         // A scope whose entry is absent from the array has no subtree in it either: it has
         // closed, or it has not been flushed yet. Both mean nothing is in scope, so this
         // leaves the candidates empty rather than falling back to the head of the array —
-        // that fallback widens a stale scope to the whole window and lets `Tab` walk out of
-        // a modal, which nothing downstream would report.
+        // that fallback widens a stale scope to the whole window and lets `Tab` walk out of a
+        // modal.
         let start = match self.scopes.last() {
-            Some((_, scope)) => match entries.iter().position(|entry| entry.id == scope.from) {
+            Some(scope) => match entries.iter().position(|entry| entry.id == scope.from) {
                 Some(at) => at,
                 None => return,
             },
@@ -256,55 +225,29 @@ impl FocusRing {
         };
         for entry in &entries[start..] {
             // A blocker routes a press rather than holding focus, and an entry that is not
-            // interactive — a scroll viewport carrying no control of its own — is not a
-            // focus stop either.
-            if !entry.flags.contains(HitFlags::INTERACTIVE)
-                || entry.flags.contains(HitFlags::BLOCKER)
+            // interactive — a scroll viewport carrying no control of its own — is not a focus
+            // stop.
+            if entry.flags.contains(HitFlags::INTERACTIVE)
+                && !entry.flags.contains(HitFlags::BLOCKER)
             {
-                continue;
+                let index = self.order.get(&entry.id).copied().unwrap_or(0);
+                self.scratch.push((index, entry.id));
             }
-            let index = self.order.get(&entry.id).copied().unwrap_or(0);
-            self.scratch.push((index, entry.id));
         }
-        // Positive indices first, in their own order; everything unstated after, in the hit
-        // array's.
         self.scratch
             .sort_by_key(|(index, _)| if *index > 0 { (0, *index) } else { (1, 0) });
     }
 }
 
-/// Reports what a focus step did.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Move {
-    /// Focus moved from `from` to `to`.
-    To {
-        from: Option<ControlId>,
-        to: ControlId,
-    },
-    /// The step ran off the end of a scope that does not trap. The caller dismisses that
-    /// scope and steps again outside it.
-    Left,
-    /// Nothing focusable, or focus was already where the step would put it.
-    Nowhere,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_scene::{HitEntry, Ids, NO_ENTRY, NodeId};
+    use windows_scene::{HitEntry, NO_ENTRY, NodeId};
 
-    /// Returns the `n`th id a fresh [`Ids`] mints.
-    ///
-    /// A `ControlId` is a generational index with no public constructor, so it can only come
-    /// from an [`Ids`]. Minting densely from a fresh one is deterministic, which makes this
-    /// stable across calls and distinct per `n` without any shared state.
+    /// Returns the id at row `n` of the first generation, which is what an authority mints
+    /// `n`th.
     fn cid(n: u32) -> ControlId {
-        let mut ids = Ids::<windows_scene::Control>::new();
-        let mut id = ids.mint();
-        for _ in 1..n {
-            id = ids.mint();
-        }
-        id
+        ControlId::raw(n, 1)
     }
 
     fn entry(id: u32, flags: HitFlags) -> HitEntry {
@@ -323,60 +266,64 @@ mod tests {
     }
 
     fn table(ids: &[u32]) -> HitTable {
-        let mut table = HitTable::default();
         let entries: Vec<HitEntry> = ids
             .iter()
             .map(|id| entry(*id, HitFlags::INTERACTIVE))
             .collect();
-        table.replace(&entries);
+        table_of(&entries)
+    }
+
+    /// Returns a table over `entries`, with the id index the array ships beside them.
+    fn table_of(entries: &[HitEntry]) -> HitTable {
+        let mut table = HitTable::default();
+        let mut index: Vec<(ControlId, u32)> = entries
+            .iter()
+            .enumerate()
+            .map(|(at, entry)| (entry.id, at as u32))
+            .collect();
+        index.sort_unstable_by_key(|&(id, _)| id);
+        table.replace(entries, &index);
         table
+    }
+
+    /// Opens a scope beginning at `from`, as an overlay's blocker does.
+    fn push(ring: &mut FocusRing, scope: u32, trap: bool, restore_to: Option<ControlId>) {
+        ring.scopes.push(Scope {
+            id: ScopeId(scope),
+            trap,
+            restore_to,
+            from: cid(9),
+        });
     }
 
     #[test]
     fn focus_order_is_the_hit_arrays_order() {
         let hits = table(&[1, 2, 3]);
         let mut ring = FocusRing::default();
-        assert_eq!(
-            ring.step(&hits, true),
-            Move::To {
-                from: None,
-                to: cid(1)
-            }
-        );
-        assert_eq!(
-            ring.step(&hits, true),
-            Move::To {
-                from: Some(cid(1)),
-                to: cid(2)
-            }
-        );
-        assert_eq!(
-            ring.step(&hits, false),
-            Move::To {
-                from: Some(cid(2)),
-                to: cid(1)
-            }
-        );
+        assert_eq!(ring.step(&hits, true), Move::To);
+        assert_eq!(ring.current(), Some(cid(1)));
+        assert_eq!(ring.step(&hits, true), Move::To);
+        assert_eq!(ring.current(), Some(cid(2)));
+        assert_eq!(ring.step(&hits, false), Move::To);
+        assert_eq!(ring.current(), Some(cid(1)));
     }
 
     #[test]
     fn a_scope_whose_entry_has_gone_bounds_navigation_to_nothing() {
-        // A scope is named by its own first entry. If that entry is absent from the array,
-        // its subtree is absent too — the scope closed, or it has not been flushed yet — so
+        // A scope is named by its own first entry. If that entry is absent from the array, its
+        // subtree is absent too — the scope closed, or it has not been flushed yet — so
         // navigation is bounded to nothing. Resolving to the head of the array instead would
         // widen a stale scope to the whole window and let `Tab` walk out of a modal.
         let hits = table(&[1, 2, 3]);
         let mut ring = FocusRing::default();
-        ring.push_scope_as(
-            ScopeId(1),
-            FocusScope {
-                trap: true,
-                restore_to: None,
-                from: cid(99),
-            },
-        );
-        assert_eq!(ring.step(&hits, true), Move::Nowhere);
-        assert_eq!(ring.step_to_end(&hits, false), Move::Nowhere);
+        ring.scopes.push(Scope {
+            id: ScopeId(1),
+            trap: true,
+            restore_to: None,
+            from: cid(99),
+        });
+        assert_eq!(ring.step(&hits, true), Move::None);
+        ring.enter(&hits, false);
         assert_eq!(ring.current(), None, "and nothing was focused on the way");
     }
 
@@ -385,27 +332,21 @@ mod tests {
         let hits = table(&[1, 2, 3]);
         let mut ring = FocusRing::default();
         ring.set_tab_index(cid(3), 1);
-        assert_eq!(
-            ring.step(&hits, true),
-            Move::To {
-                from: None,
-                to: cid(3)
-            }
-        );
+        assert_eq!(ring.step(&hits, true), Move::To);
+        assert_eq!(ring.current(), Some(cid(3)));
         // …and the rest keep the array's own order behind it.
-        assert_eq!(
-            ring.step(&hits, true),
-            Move::To {
-                from: Some(cid(3)),
-                to: cid(1)
-            }
-        );
+        assert_eq!(ring.step(&hits, true), Move::To);
+        assert_eq!(ring.current(), Some(cid(1)));
+        // Unmounting the control returns it to the array's order.
+        ring.forget(cid(3));
+        ring.focus(None);
+        assert_eq!(ring.step(&hits, true), Move::To);
+        assert_eq!(ring.current(), Some(cid(1)));
     }
 
     #[test]
     fn a_trapping_scope_wraps_and_a_flyout_lets_go() {
-        let mut hits = HitTable::default();
-        hits.replace(&[
+        let hits = table_of(&[
             entry(1, HitFlags::INTERACTIVE),
             entry(9, HitFlags::INTERACTIVE | HitFlags::BLOCKER),
             entry(10, HitFlags::INTERACTIVE),
@@ -413,31 +354,21 @@ mod tests {
         ]);
 
         let mut popup = FocusRing::default();
-        popup.push_scope_as(
-            ScopeId(1),
-            FocusScope {
-                trap: true,
-                restore_to: Some(cid(1)),
-                from: cid(9),
-            },
-        );
+        push(&mut popup, 1, true, Some(cid(1)));
         // The blocker is not a focus stop, so the scope is exactly its two items.
-        assert!(matches!(popup.step(&hits, true), Move::To { to, .. } if to == cid(10)));
-        assert!(matches!(popup.step(&hits, true), Move::To { to, .. } if to == cid(11)));
-        assert!(
-            matches!(popup.step(&hits, true), Move::To { to, .. } if to == cid(10)),
+        assert_eq!(popup.step(&hits, true), Move::To);
+        assert_eq!(popup.current(), Some(cid(10)));
+        assert_eq!(popup.step(&hits, true), Move::To);
+        assert_eq!(popup.current(), Some(cid(11)));
+        assert_eq!(popup.step(&hits, true), Move::To);
+        assert_eq!(
+            popup.current(),
+            Some(cid(10)),
             "a trapping scope let focus out"
         );
 
         let mut flyout = FocusRing::default();
-        flyout.push_scope_as(
-            ScopeId(1),
-            FocusScope {
-                trap: false,
-                restore_to: Some(cid(1)),
-                from: cid(9),
-            },
-        );
+        push(&mut flyout, 1, false, Some(cid(1)));
         _ = flyout.step(&hits, true);
         _ = flyout.step(&hits, true);
         assert_eq!(
@@ -445,49 +376,49 @@ mod tests {
             Move::Left,
             "tabbing past the last item should dismiss a flyout rather than wrap"
         );
+        // Backwards off the front is the same answer, from the one guard.
+        flyout.focus(Some(cid(10)));
+        assert_eq!(flyout.step(&hits, false), Move::Left);
     }
 
     #[test]
     fn closing_a_scope_restores_focus_to_the_invoker() {
         let mut ring = FocusRing::default();
-        _ = ring.focus(Some(cid(1)));
-        let scope = ScopeId(1);
-        ring.push_scope_as(
-            scope,
-            FocusScope {
-                trap: true,
-                restore_to: Some(cid(1)),
-                from: cid(9),
-            },
-        );
-        _ = ring.focus(Some(cid(10)));
-        assert_eq!(ring.pop_scope(scope), Some(cid(1)));
+        ring.focus(Some(cid(1)));
+        push(&mut ring, 1, true, Some(cid(1)));
+        ring.focus(Some(cid(10)));
+        ring.pop(ScopeId(1));
         assert_eq!(ring.current(), Some(cid(1)));
-        assert_eq!(ring.depth(), 0);
+        assert_eq!(ring.innermost(), None);
     }
 
     #[test]
     fn closing_a_scope_takes_everything_nested_inside_it() {
         let mut ring = FocusRing::default();
-        let outer = ScopeId(1);
-        ring.push_scope_as(
-            outer,
-            FocusScope {
-                trap: false,
-                restore_to: Some(cid(1)),
-                from: cid(9),
-            },
+        push(&mut ring, 1, false, Some(cid(1)));
+        push(&mut ring, 2, false, Some(cid(10)));
+        assert_eq!(ring.innermost(), Some(ScopeId(2)));
+        ring.pop(ScopeId(1));
+        assert_eq!(ring.current(), Some(cid(1)));
+        assert_eq!(
+            ring.innermost(),
+            None,
+            "a submenu outlived the menu that owned it"
         );
-        ring.push_scope_as(
-            ScopeId(2),
-            FocusScope {
-                trap: false,
-                restore_to: Some(cid(10)),
-                from: cid(20),
-            },
-        );
-        assert_eq!(ring.depth(), 2);
-        assert_eq!(ring.pop_scope(outer), Some(cid(1)));
-        assert_eq!(ring.depth(), 0, "a submenu outlived the menu that owned it");
+    }
+
+    #[test]
+    fn apply_reports_a_move_once_for_the_whole_batch() {
+        let hits = table(&[1, 2, 3]);
+        let mut ring = FocusRing::default();
+        assert!(ring.apply(&[FocusOp::Step { forward: true }], &hits));
+        assert_eq!(ring.current(), Some(cid(1)));
+        // Two ops that cancel out leave focus where it was, so nothing is repainted.
+        assert!(!ring.apply(
+            &[FocusOp::Focus(Some(cid(2))), FocusOp::Focus(Some(cid(1)))],
+            &hits
+        ));
+        assert!(ring.apply(&[FocusOp::End { last: true }], &hits));
+        assert_eq!(ring.current(), Some(cid(3)));
     }
 }

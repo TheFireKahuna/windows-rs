@@ -258,6 +258,10 @@ Windows.UI.Composition.IVector3NaturalMotionAnimation::{put_InitialVelocity}
 Windows.UI.Composition.ISpringScalarNaturalMotionAnimation::{put_DampingRatio, put_Period}
 Windows.UI.Composition.ISpringVector2NaturalMotionAnimation::{put_DampingRatio, put_Period}
 Windows.UI.Composition.ISpringVector3NaturalMotionAnimation::{put_DampingRatio, put_Period}
+// A spring that waits before it runs. `DelayBehavior` stays at its default, which sets the
+// initial value before the wait; with `put_InitialValue` absent that value is the property's
+// own, so the channel holds where it stands for the delay and then springs.
+Windows.UI.Composition.INaturalMotionAnimation::{put_DelayTime}
 Windows.UI.Composition.ICompositor4::{CreateSpringScalarAnimation, CreateSpringVector2Animation, CreateSpringVector3Animation}
 
 // Clips: an inset rectangle applied to a visual's subtree. Its insets are animatable,

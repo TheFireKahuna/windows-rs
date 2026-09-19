@@ -14,11 +14,12 @@ use core::marker::PhantomData;
 ///
 /// The value is reachable through [`Deref`](core::ops::Deref) and
 /// [`DerefMut`](core::ops::DerefMut), and the wrapper is the same size as `T`.
+#[derive(Debug)]
 pub struct FrontHandle<T> {
     inner: T,
-    /// A raw pointer is neither `Send` nor `Sync`, and `PhantomData` of one carries that
-    /// without carrying a pointer.
-    _not_send: PhantomData<*const ()>,
+    /// A raw pointer is neither `Send` nor `Sync`, and `PhantomData` of one carries that without
+    /// carrying a pointer.
+    _front: PhantomData<*const ()>,
 }
 
 impl<T> FrontHandle<T> {
@@ -26,12 +27,12 @@ impl<T> FrontHandle<T> {
     pub const fn new(inner: T) -> Self {
         Self {
             inner,
-            _not_send: PhantomData,
+            _front: PhantomData,
         }
     }
 
-    /// Returns the wrapped value, releasing the claim. The handle is not `Send`, so this runs
-    /// on the thread that made the claim.
+    /// Returns the wrapped value, releasing the claim. The handle is not `Send`, so this runs on
+    /// the thread that made the claim.
     pub fn into_inner(self) -> T {
         self.inner
     }
@@ -50,12 +51,6 @@ impl<T> core::ops::DerefMut for FrontHandle<T> {
     }
 }
 
-impl<T: core::fmt::Debug> core::fmt::Debug for FrontHandle<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_tuple("FrontHandle").field(&self.inner).finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,7 +62,7 @@ mod tests {
     /// working.
     #[test]
     fn a_front_handle_is_neither_send_nor_sync() {
-        fn is_send<T: Send>() -> bool {
+        const fn is_send<T: Send>() -> bool {
             true
         }
         // `u32` is `Send`; wrapping it takes that away.

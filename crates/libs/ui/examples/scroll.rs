@@ -274,9 +274,9 @@ impl Palette for Reference {
 
     fn shadow(&self, _scope: Scope) -> windows_ui::role::Shadow {
         windows_ui::role::Shadow {
-            blur: 18.0,
+            sigma: 18.0,
             offset: 14.0,
-            tint: Radiance::new(0.0, 0.0, 0.0, 0.45),
+            light: Radiance::new(0.0, 0.0, 0.0, 0.45),
         }
     }
 
@@ -325,7 +325,7 @@ impl Palette for Reference {
         }
     }
 
-    fn content_peak_nits(&self, _gamut: &windows_color::Gamut) -> f32 {
+    fn content_peak_nits(&self, _gamut: &windows_color::Gamut, _scope: Scope) -> f32 {
         290.0
     }
 }

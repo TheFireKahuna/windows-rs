@@ -26,7 +26,7 @@ impl Drop for Retained {
 struct Recorder {
     removed: Vec<char>,
     built: Vec<char>,
-    steps: Vec<(char, Step, Option<usize>)>,
+    steps: Vec<(char, Step)>,
 }
 
 impl Recorder {
@@ -40,11 +40,11 @@ impl Recorder {
         list.reconcile(
             &items,
             |item| item,
-            move |key, _| {
-                built.borrow_mut().built.push(*key);
-                Retained(*key, Cell::new(0))
+            move |item| {
+                built.borrow_mut().built.push(*item);
+                Retained(*item, Cell::new(0))
             },
-            move |row, _, step, after| placed.borrow_mut().steps.push((row.0, step, after)),
+            move |row, step| placed.borrow_mut().steps.push((row.0, step)),
         );
         out.borrow_mut().removed = REMOVED.with(|log| core::mem::take(&mut *log.borrow_mut()));
         Rc::try_unwrap(out)
@@ -52,28 +52,28 @@ impl Recorder {
             .into_inner()
     }
 
-    fn moved(&self) -> Vec<char> {
+    fn keys(&self) -> Vec<char> {
+        self.steps.iter().map(|(key, _)| *key).collect()
+    }
+
+    fn of(&self, want: Step) -> Vec<char> {
         self.steps
             .iter()
-            .filter(|(_, step, _)| *step == Step::Move)
-            .map(|(key, _, _)| *key)
+            .filter(|(_, step)| *step == want)
+            .map(|(key, _)| *key)
             .collect()
+    }
+
+    fn moved(&self) -> Vec<char> {
+        self.of(Step::Move)
     }
 
     fn kept(&self) -> Vec<char> {
-        self.steps
-            .iter()
-            .filter(|(_, step, _)| *step == Step::Keep)
-            .map(|(key, _, _)| *key)
-            .collect()
+        self.of(Step::Keep)
     }
 
     fn inserted(&self) -> Vec<char> {
-        self.steps
-            .iter()
-            .filter(|(_, step, _)| *step == Step::Insert)
-            .map(|(key, _, _)| *key)
-            .collect()
+        self.of(Step::Insert)
     }
 }
 
@@ -128,7 +128,7 @@ fn a_reorder_moves_the_minimum() {
     let out = Recorder::run(&mut list, "eabcd");
     assert_eq!(out.moved(), vec!['e']);
     assert_eq!(out.kept(), vec!['a', 'b', 'c', 'd']);
-    assert_eq!(list.keys(), ['e', 'a', 'b', 'c', 'd']);
+    assert_eq!(out.keys(), vec!['e', 'a', 'b', 'c', 'd']);
 }
 
 #[test]
@@ -141,23 +141,13 @@ fn a_reversal_moves_all_but_one() {
 }
 
 #[test]
-fn a_survivor_is_placed_after_the_key_already_in_front_of_it() {
-    // Front to back, so the predecessor is already correct when a step is applied and the
-    // caller needs no operation other than "insert after this one".
-    let mut list = Keyed::new();
-    let out = Recorder::run(&mut list, "abc");
-    let afters: Vec<Option<usize>> = out.steps.iter().map(|(_, _, after)| *after).collect();
-    assert_eq!(afters, vec![None, Some(0), Some(1)]);
-}
-
-#[test]
 fn a_departing_row_is_told_before_anything_is_built() {
     let mut list = Keyed::new();
     Recorder::run(&mut list, "abc");
     let out = Recorder::run(&mut list, "axc");
     assert_eq!(out.removed, vec!['b']);
     assert_eq!(out.built, vec!['x']);
-    assert_eq!(list.len(), 3);
+    assert_eq!(out.keys(), vec!['a', 'x', 'c']);
 }
 
 #[test]
@@ -168,18 +158,18 @@ fn a_departing_row_disposes_its_scope_and_a_surviving_one_does_not() {
 
     let build = |cells: &Rc<RefCell<Vec<(char, Cell<i32>)>>>| {
         let cells = Rc::clone(cells);
-        move |key: &char, _: &char| {
+        move |item: &char| {
             // Created inside the row's own scope, so the row owns it.
-            cells.borrow_mut().push((*key, Cell::new(0_i32)));
+            cells.borrow_mut().push((*item, Cell::new(0_i32)));
         }
     };
 
     let items: Vec<char> = "abc".chars().collect();
-    list.reconcile(&items, |item| item, build(&cells), |_, _, _, _| {});
+    list.reconcile(&items, |item| item, build(&cells), |_, _| {});
     assert_eq!(live_nodes(), baseline + 3);
 
     let items: Vec<char> = "ac".chars().collect();
-    list.reconcile(&items, |item| item, build(&cells), |_, _, _, _| {});
+    list.reconcile(&items, |item| item, build(&cells), |_, _| {});
     assert_eq!(
         live_nodes(),
         baseline + 2,
@@ -194,7 +184,7 @@ fn a_departing_row_disposes_its_scope_and_a_surviving_one_does_not() {
         .collect();
     assert_eq!(live, vec!['a', 'c']);
 
-    list.clear();
+    drop(list);
     assert_eq!(live_nodes(), baseline);
 }
 
@@ -211,10 +201,10 @@ fn a_list_reconciled_from_inside_an_effect_does_not_grow_its_scope() {
             list.reconcile(
                 &items,
                 |item| item,
-                |_, _| {
+                |_| {
                     let _ = Cell::new(0_i32);
                 },
-                |_, _, _, _| {},
+                |_, _| {},
             );
         }
         assert_eq!(
@@ -222,7 +212,6 @@ fn a_list_reconciled_from_inside_an_effect_does_not_grow_its_scope() {
             baseline + 3,
             "only the live rows' cells remain"
         );
-        list.clear();
     });
     drop(owner);
     assert_eq!(live_nodes(), baseline);
@@ -283,4 +272,27 @@ impl Drop for Teardown {
         assert!(self.cell.alive());
         self.log.borrow_mut().push(format!("teardown {}", self.key));
     }
+}
+
+#[test]
+fn a_keyed_reconcile_allocates_nothing_after_the_first() {
+    // Two rounds warm both halves of the scratch: the first builds every row, and the second
+    // is the first with a survivor in every seat, which is what grows the subsequence buffers.
+    let rows: Vec<u32> = (0..64).collect();
+    let mut list: Keyed<u32> = Keyed::new();
+    list.reconcile(&rows, |item| item, |_| {}, |_, _| {});
+    list.reconcile(&rows, |item| item, |_| {}, |_, _| {});
+
+    let rotated: Vec<u32> = rows.iter().rev().copied().collect();
+    list.reconcile(&rotated, |item| item, |_| {}, |_, _| {});
+
+    let before = crate::counting::allocations();
+    for order in [&rows, &rotated] {
+        list.reconcile(order, |item| item, |_| {}, |_, _| {});
+    }
+    assert_eq!(
+        crate::counting::allocations() - before,
+        0,
+        "a reconcile of a settled key set allocated"
+    );
 }

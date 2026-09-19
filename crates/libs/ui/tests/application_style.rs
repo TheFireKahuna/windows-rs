@@ -63,5 +63,5 @@ impl role::Palette for NoBuiltins {
     fn emission(&self, _: role::Role, _: Scope) -> role::Emission { unreachable!() }
     fn typography(&self, _: TypeRole, _: Scope) -> FontSpec { unreachable!() }
     fn metric(&self, _: Metric, _: Scope) -> f32 { unreachable!() }
-    fn content_peak_nits(&self, _: &windows_color::Gamut) -> f32 { unreachable!() }
+    fn content_peak_nits(&self, _: &windows_color::Gamut, _: Scope) -> f32 { unreachable!() }
 }

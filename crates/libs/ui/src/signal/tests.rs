@@ -28,12 +28,11 @@ fn retained_resources_drop_in_order_outside_the_graph_borrow() {
     drop(owner);
     assert_eq!(count.get(), 2);
     assert_eq!(log.take(), ["second", "first"]);
-    assert!(graph::read_resource(resource.id).is_none());
+    assert!(graph::peek(resource.id).is_none());
+    // The slot is recycled here, so the generation check is all that separates the stale
+    // handle from its new occupant.
     let (replacement, _) = Owner::scope(|| Owner::retain(42));
-    assert!(
-        graph::read_resource(resource.id).is_none(),
-        "slot reuse revived a resource"
-    );
+    assert!(graph::peek(resource.id).is_none(), "slot reuse revived a resource");
     drop(replacement);
     drop(outer);
     assert_eq!(live_nodes(), before);
@@ -605,8 +604,10 @@ fn producer_completions_during_a_flush_belong_to_the_next_batch() {
     }
 }
 
+/// A staged write holds one wake until the drain that consumes it, and the drain releases it
+/// whether or not the write still has a cell to land in.
 #[test]
-fn releasing_the_last_staged_write_releases_the_ring() {
+fn a_drain_releases_the_wake_a_staged_write_raised() {
     let ring = Arc::new(crate::seam::Ring::new().expect("an event is available"));
     let _registration = arm_posts(Arc::clone(&ring));
 
@@ -617,32 +618,61 @@ fn releasing_the_last_staged_write_releases_the_ring() {
             .join()
             .expect("producer");
         assert!(ring.event().take(), "the staged write did not ring");
-        // Disposal drops the staged write, which is the graph's only pending one.
+        // Disposal reaches nothing in the staging table: the write stays pending against a
+        // generation the drain will reject.
         drop(owner);
         cell
     };
 
-    // Nothing is pending, so the next write is an empty-to-pending transition again and
-    // rings without a flush having run.
     let (_owner, fresh) = Owner::scope(|| Cell::new(0_u32));
     ring.arm();
     std::thread::spawn(move || fresh.post(2))
         .join()
         .expect("producer");
-    assert!(ring.event().take(), "a disposed write left the ring held");
+    assert!(!ring.event().take(), "a pending batch rang twice");
 
-    // The old producer can finish after a new occupant has already staged a write.
+    flush();
+    assert_eq!(fresh.peek(), 2, "the live write did not land");
+
+    // The batch is gone, so the next write is an empty-to-pending transition again.
+    ring.arm();
+    std::thread::spawn(move || fresh.post(3))
+        .join()
+        .expect("producer");
+    assert!(ring.event().take(), "a post after the drain did not ring");
+    ring.disarm();
+    flush();
+
+    // The old producer can finish long after its cell is gone.
     std::thread::spawn(move || stale.post(99))
         .join()
         .expect("late producer");
     flush();
-    assert_eq!(fresh.peek(), 2);
+    assert_eq!(fresh.peek(), 3, "a retired handle's write reached a live cell");
+}
 
-    ring.arm();
-    std::thread::spawn(move || stale.post(100))
-        .join()
-        .expect("late producer after drain");
-    assert!(!ring.event().take(), "a retired producer woke the graph");
+/// The generation carried beside a staged write is what the table has in place of a tombstone
+/// column, and it answers both halves: a dead handle's write never lands, and it never
+/// displaces a live write already staged against the slot it used to hold.
+#[test]
+fn a_late_staged_write_neither_lands_nor_displaces_the_slots_new_one() {
+    let stale = {
+        let (owner, cell) = Owner::scope(|| Cell::new(0_u32));
+        drop(owner);
+        cell
+    };
+    // The free list is last-in first-out and the scope node above it is released last, so this
+    // scope takes that slot and this cell takes the disposed one.
+    let (_owner, fresh) = Owner::scope(|| Cell::new(7_u32));
+
+    std::thread::spawn(move || {
+        fresh.post(3);
+        stale.post(99);
+    })
+    .join()
+    .expect("the producer finished");
+    flush();
+    assert_eq!(fresh.peek(), 3, "a dead handle's write displaced a live one");
 }
 
 #[test]

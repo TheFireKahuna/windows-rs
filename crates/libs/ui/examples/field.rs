@@ -6,10 +6,10 @@ use windows_color::{Ictcp, Radiance};
 use windows_composition::Compositor;
 use windows_core::Result;
 use windows_d2d::Gpu;
-use windows_scene::{BackdropSpec, Backends};
+use windows_scene::{BackdropSpec, Backends, quant_stop};
 use windows_text::{FamilyId, FontLadder, FontSpec};
 use windows_ui::driver::{UiRuntime, observe};
-use windows_ui::layout::{Len, scroll, spacer, stack};
+use windows_ui::layout::{Len, layer, scroll, stack};
 use windows_ui::role::*;
 use windows_ui::signal::Cell;
 use windows_ui::text_input::InputScope;
@@ -84,8 +84,8 @@ fn main() -> Result<()> {
         },
         BackdropSpec {
             base: vec![
-                (0.0, light(2.1, 0.004, ACCENT_HUE)),
-                (1.0, light(2.1, 0.004, ACCENT_HUE)),
+                (quant_stop(0.0), light(2.1, 0.004, ACCENT_HUE)),
+                (quant_stop(1.0), light(2.1, 0.004, ACCENT_HUE)),
             ],
             glows: Vec::new(),
         },
@@ -119,7 +119,7 @@ fn main() -> Result<()> {
                     scroll(ui, |ui| {
                         stack(ui, |ui| {
                             label(ui, "Scroll to the field below");
-                            spacer(ui).height(Len::Times(Metric::RowH, 12.0));
+                            layer(ui, |_| {}).height(Len::times(Metric::RowH, 12.0));
                             field(ui, "scroll-contained input").name("Scrolled field");
                         });
                     })
@@ -204,9 +204,9 @@ impl Palette for Reference {
 
     fn shadow(&self, _scope: Scope) -> Shadow {
         Shadow {
-            blur: 18.0,
+            sigma: 18.0,
             offset: 14.0,
-            tint: Radiance::new(0.0, 0.0, 0.0, 0.45),
+            light: Radiance::new(0.0, 0.0, 0.0, 0.45),
         }
     }
 
@@ -255,7 +255,7 @@ impl Palette for Reference {
         }
     }
 
-    fn content_peak_nits(&self, _gamut: &windows_color::Gamut) -> f32 {
+    fn content_peak_nits(&self, _gamut: &windows_color::Gamut, _scope: Scope) -> f32 {
         290.0
     }
 }

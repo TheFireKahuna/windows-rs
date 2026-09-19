@@ -14,7 +14,7 @@
 use std::rc::Rc;
 
 use windows_color::{DisplayCapability, OutputTransform};
-use windows_scene::{ControlId, Env, HitEntry, HitFlags, HitTable, Ids, NO_ENTRY, NodeId};
+use windows_scene::{ControlId, Env, HitEntry, HitFlags, HitTable, NO_ENTRY, NodeId};
 use windows_ui::gesture::GestureDecl;
 use windows_ui::input::{Doorbell, Inertia, Late, Report, Router};
 use windows_window::Window;
@@ -67,7 +67,6 @@ fn every_pointer_arm_is_handled_so_nothing_can_be_promoted() {
         WM_POINTERCAPTURECHANGED,
         WM_POINTERWHEEL,
         WM_POINTERHWHEEL,
-        WM_CAPTURECHANGED,
     ] {
         assert_eq!(
             bell.wndproc(message, wparam(1, 0), 0),
@@ -203,13 +202,9 @@ fn env() -> Env {
     )
 }
 
-/// Returns the [`ControlId`] these tests route to.
-///
-/// A `ControlId` is a generational index, so it is minted rather than written out. A fresh
-/// [`Ids`] authority always hands out the same first id, so every call names the same control
-/// without any of them sharing state.
+/// Returns the [`ControlId`] these tests route to, which is the first id any authority mints.
 fn target() -> ControlId {
-    Ids::<windows_scene::Control>::new().mint()
+    ControlId::FIRST
 }
 
 /// Returns a hit array holding one interactive, gesture-capable target at [`target`].
@@ -226,7 +221,7 @@ fn table() -> HitTable {
         flags: HitFlags::INTERACTIVE | HitFlags::GESTURE,
         scroll_src: NodeId::NONE,
         id: target(),
-    }]);
+    }], &[(target(), 0)]);
     table
 }
 
@@ -323,7 +318,9 @@ fn a_capture_change_that_takes_nothing_away_is_not_a_cancel() {
     let pacer = window.pacer().expect("a window can be paced");
     let mut router = Router::new(&bell, &window, pacer.wake()).expect("the window is open");
 
-    bell.wndproc(WM_CAPTURECHANGED, 0, 0);
+    // Forwarded rather than consumed: it is a window-state message, not a pointer arm, and
+    // the application's own handling runs behind this one.
+    assert_eq!(bell.wndproc(WM_CAPTURECHANGED, 0, 0), None);
     let hits = table();
     let mut reports = Vec::new();
     router.tick(&hits, env(), &mut reports).expect("a tick");
@@ -343,20 +340,19 @@ fn a_capture_change_that_takes_nothing_away_is_not_a_cancel() {
 #[test]
 fn a_refused_inertia_report_is_not_recorded_as_made() {
     let window = window("inertia");
-    let inertia = Inertia::new(&window, Late::resolve());
-    assert!(!inertia.reported());
+    let mut inertia = Inertia::new(&window, Late::resolve());
 
     assert!(
         !inertia.set(true),
         "an inactive window cannot be reported for"
     );
-    assert!(!inertia.reported(), "a refused report was recorded as made");
-    // The edge survives, so the next tick tries again rather than seeing no change.
-    assert!(!inertia.set(true));
+    // The edge survives, so the next tick tries again rather than seeing no change: a refusal
+    // recorded as made would consume it and the retry would never happen.
+    assert!(!inertia.set(true), "a refused report was recorded as made");
 
     assert!(
-        !inertia.set(false),
-        "content that is not moving is not moving"
+        inertia.set(false),
+        "content that is not moving is already what the system was told"
     );
 }
 
@@ -386,7 +382,7 @@ fn an_undeclared_press_ends_even_when_pointer_startup_fails() {
         flags: HitFlags::INTERACTIVE | HitFlags::GESTURE,
         scroll_src: NodeId::NONE,
         id: target(),
-    }]);
+    }], &[(target(), 0)]);
 
     let mut reports = Vec::new();
     bell.wndproc(WM_POINTERDOWN, wparam(1, 0x2000), 0);

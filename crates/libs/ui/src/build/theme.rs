@@ -1,10 +1,20 @@
 //! Retained paint recipes and one window-owned theme transaction.
-use super::Host;
-use crate::layout::{Edge, Len};
-use crate::role::{Metric, Role, Scope, Silhouette};
+
+use super::host::Host;
+use super::tree;
+use super::ui::{Element, Ui};
+use crate::layout::{Edge, Len, Preset, WidthClass};
+use crate::role::{
+    DataRole, Elevation, Emission, Fill, Metric, Role, Scope, Silhouette, Stroke, Text,
+    content_peak_nits, emission, metric, resolve, shadow,
+};
+use crate::signal::Signal;
 use crate::widget::{Chrome, ModelState, RoleSet, Wash};
+use windows_color::Radiance;
+use windows_numerics::Vector2;
 use windows_scene::{
-    BackdropSpec, ControlId, Env, GeomId, NodeId, Paint, RampId, RegionId, SpriteId,
+    BackdropSpec, Cap, ControlId, Corners, Env, Exit, GeomId, GroupId, Halo, Join, Mask, NodeId,
+    Paint, Prop, RampId, RegionId, Side, SinkPatch, SpriteId, Value,
 };
 
 #[derive(Copy, Clone, Debug)]
@@ -12,95 +22,609 @@ pub(crate) enum HaloStyle {
     Glow(Role),
     Shadow(Edge),
 }
-#[derive(Copy, Clone, Debug, PartialEq)]
+
+/// What a sprite is to the surface that owns it.
+///
+/// `Border`, `Fill` and `Wash` are the closed derived set: a surface decides which of the
+/// three it owns now and holds each one in a slot. `Ink` is a sprite that paints a role
+/// directly — a path, a plate, a glyph tile — and is lit where that role resolves rather than
+/// declaring a halo of its own.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Part {
-    Static,
-    Fill,
-    Label,
     Border,
-    Trail { origin: f32 },
+    Fill,
     Wash,
+    Ink,
 }
+
+impl Part {
+    /// The derived set, in the order a surface's slots hold them and the order they paint in.
+    const DERIVED: [Self; 3] = [Self::Border, Self::Fill, Self::Wash];
+
+    fn role(self, roles: RoleSet, wash: Wash) -> Option<Role> {
+        match self {
+            Self::Border => roles.stroke.map(Role::Stroke),
+            Self::Fill => roles.fill.map(Role::Fill),
+            Self::Wash => Some(wash_role(wash)),
+            Self::Ink => Some(Role::Text(roles.text)),
+        }
+    }
+}
+
+/// The role a wash paints in before its opacity scales it.
+///
+/// The wash is the interaction light over a control's own base, so it is the foreground ink
+/// or the accent and never a third colour the palette does not author.
+const fn wash_role(wash: Wash) -> Role {
+    match wash {
+        Wash::Ink => Role::Text(Text::Primary),
+        Wash::Accent => Role::Fill(Fill::Accent),
+    }
+}
+
+/// The silhouette a part paints, as the recipe stated it. Resolved against a scope and a
+/// solved box at publication; nothing here holds a resolved number.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum PaintMask {
+    /// A filled box. `radius` is authored, and the resolved value is capped at half the
+    /// shorter side of the solved box: `CompositionRoundedRectangleGeometry` saturates there
+    /// anyway, so a pill authored at half a row height renders as a stadium of the wrong axis
+    /// on any box narrower than it is tall unless the cap is applied before the write.
     Box {
-        radius: Option<Len>,
-    },
-    Radius {
-        dips: windows_scene::Corners,
+        radius: Len,
     },
     Outline {
-        radius: windows_scene::Corners,
-        width: f32,
-        open: Option<windows_scene::Side>,
-    },
-    Border {
-        radius: Metric,
+        radius: Len,
         width: Len,
     },
     Shape {
+        geom: GeomId,
         stroke: Option<Len>,
     },
+    Region(RegionId),
+    /// A sprite whose silhouette is not this layer's to state: a glyph tile, whose mask is the
+    /// coverage the shaper publishes. Nothing is emitted for one, so a resolve never clobbers
+    /// the run a text publication pointed it at.
     Bare,
+}
+
+impl PaintMask {
+    /// Whether the resolved silhouette depends on the box it is drawn into, which is what
+    /// decides whether a solved extent owes it a re-emission.
+    const fn box_bound(self) -> bool {
+        matches!(self, Self::Box { .. } | Self::Outline { .. })
+    }
 }
 
 /// A part has one paint source. Owner state never overwrites a gradient or region.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum PaintSource {
     Role(Role),
+    /// Re-read from the owner's model state at every publication, so the whole of what that
+    /// resolves to is what this paints.
     Owner(ControlId),
     Gradient(RampId),
     Region(RegionId),
 }
 
-#[derive(Copy, Clone)]
-pub(crate) struct Appearance {
-    pub id: SpriteId,
-    pub mask: PaintMask,
-    pub source: PaintSource,
-    pub part: Part,
-    pub strength: f32,
-    pub geom: Option<GeomId>,
-    pub scope: Scope,
-    pub surface: Option<NodeId>,
-    pub halo: Option<(HaloStyle, Silhouette)>,
-    pub next: NodeId,
-    pub wash: bool,
+impl PaintSource {
+    pub(crate) const fn data(role: DataRole) -> Self {
+        Self::Role(Role::Data(role))
+    }
+
+    pub(crate) const fn stroke(role: Stroke) -> Self {
+        Self::Role(Role::Stroke(role))
+    }
+
+    const fn owner(self) -> ControlId {
+        match self {
+            Self::Owner(id) => id,
+            _ => ControlId::NONE,
+        }
+    }
 }
 
-impl Appearance {
-    pub(super) fn resolve(&mut self, host: &Host, scope: Scope) {
-        self.scope = scope;
-        let Some(surface) = self.surface.and_then(|node| host.surfaces.get(node)) else {
-            return;
-        };
-        let Some(chrome) = surface.chrome else { return };
-        if self.wash {
-            self.mask = PaintMask::Radius {
-                dips: super::mount::surface_corners(
-                    crate::role::metric(chrome.radius, scope),
-                    Some(chrome),
-                ),
-            };
-        } else if matches!(self.part, Part::Fill | Part::Border) {
-            self.mask = chrome_mask(chrome, self.part, scope, surface.selectable);
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Appearance {
+    pub id: SpriteId,
+    pub source: PaintSource,
+    pub mask: PaintMask,
+    pub part: Part,
+    /// The fraction of its role's alpha this shape paints at. Folded into the colour at
+    /// publication, so a shape drawn faintly costs no compositor channel and leaves
+    /// `Prop::Opacity` for a reveal to own.
+    pub strength: f32,
+    pub scope: Scope,
+    /// The surface whose chrome states this part's silhouette, where it is a derived one.
+    pub surface: u32,
+    pub halo: Option<HaloStyle>,
+    /// Half the shorter side of the box the mask was last resolved against. `NaN` where the
+    /// silhouette does not depend on the box.
+    pub cap: f32,
+    /// The next paint in this mount's chain. Intrusive, because a mount owns an unbounded
+    /// number of non-derived paints and a `Vec` per mount would allocate for the many nodes
+    /// that own one.
+    pub next: NodeId,
+}
+
+/// Canonical appearance of an owning element. Paint resources are derived at publication.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Surface {
+    node: NodeId,
+    chrome: Option<Chrome>,
+    wash: Wash,
+    halo: Option<HaloStyle>,
+    selectable: bool,
+    dirty: bool,
+    /// The sprites of this surface's derived parts, in Border, Fill, Wash order.
+    ///
+    /// Slots and not a search: the derived set is closed, so the slot a part answered from
+    /// last pass is where its sprite is, and a surface that keeps its parts never walks the
+    /// owner's paint chain.
+    parts: [Option<SpriteId>; 3],
+}
+
+impl Surface {
+    fn new(node: NodeId) -> Self {
+        Self {
+            node,
+            chrome: None,
+            wash: Wash::Ink,
+            halo: None,
+            selectable: false,
+            dirty: true,
+            parts: [None; 3],
         }
     }
 
-    fn place(&self, host: &mut Host) {
-        let Some(chrome) = self
-            .surface
-            .and_then(|node| host.surfaces.get(node))
-            .and_then(|surface| surface.chrome)
-        else {
+    /// Returns the roles this surface paints in `state`, or `None` where it has no chrome.
+    fn roles(&self, state: ModelState) -> Option<RoleSet> {
+        let chrome = self.chrome?;
+        Some(match state {
+            ModelState::Selected if !self.selectable => chrome.in_state(ModelState::Rest),
+            state => chrome.in_state(state),
+        })
+    }
+
+    /// Whether this surface owns `part` in any state it can show.
+    ///
+    /// Any state and not the current one: a button that takes a border only while disabled
+    /// still owns the sprite that border paints into, so entering that state retargets a
+    /// sprite rather than minting one on the interaction path.
+    fn owns(&self, part: Part) -> bool {
+        [ModelState::Rest, ModelState::Selected, ModelState::Disabled]
+            .into_iter()
+            .filter_map(|state| self.roles(state))
+            .any(|roles| part.role(roles, self.wash).is_some())
+    }
+
+    /// Returns `part`'s silhouette, authored.
+    ///
+    /// The fill sits a hairline inside a border that exists, so the two do not alias along
+    /// the corner arc.
+    fn mask_of(&self, part: Part) -> PaintMask {
+        let radius = self
+            .chrome
+            .map_or(Len::ZERO, |chrome| Len::from(chrome.radius));
+        match part {
+            Part::Border => PaintMask::Outline {
+                radius,
+                width: Len::from(Metric::HairlineW),
+            },
+            Part::Fill if self.owns(Part::Border) => PaintMask::Box {
+                radius: radius.less(Metric::HairlineW),
+            },
+            _ => PaintMask::Box { radius },
+        }
+    }
+}
+
+/// Every retained paint, and the surfaces whose chrome derives some of them.
+///
+/// One store, because a surface's parts *are* paints: retirement reads one head for the
+/// chain and one for the surface, and neither can be freed without the other's table.
+#[derive(Default)]
+pub(crate) struct Appearances {
+    paints: Vec<Option<(u32, Appearance)>>,
+    /// The retained geometry of a node whose silhouette is a path, so a paint setter states
+    /// the stroke without restating the shape.
+    shapes: Vec<Option<(u32, GeomId)>>,
+    surfaces: Vec<Option<Surface>>,
+    free: Vec<u32>,
+}
+
+impl Appearances {
+    /// How many paints and surfaces are placed. What a fixture asks whether a retirement
+    /// freed, since a node that paints nothing occupies no row here.
+    #[cfg(test)]
+    pub(crate) fn placed(&self) -> usize {
+        self.paints.iter().flatten().count()
+            + self.shapes.iter().flatten().count()
+            + self.surfaces.iter().flatten().count()
+    }
+
+    pub(crate) fn place(&mut self, id: NodeId, paint: Appearance) {
+        if self.paints.len() <= id.index() {
+            self.paints.resize_with(id.index() + 1, || None);
+        }
+        self.paints[id.index()] = Some((id.generation(), paint));
+    }
+
+    pub(crate) fn get(&self, id: NodeId) -> Option<&Appearance> {
+        match self.paints.get(id.index()) {
+            Some(Some((age, paint))) if *age == id.generation() => Some(paint),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn get_mut(&mut self, id: NodeId) -> Option<&mut Appearance> {
+        match self.paints.get_mut(id.index()) {
+            Some(Some((age, paint))) if *age == id.generation() => Some(paint),
+            _ => None,
+        }
+    }
+
+    fn take(&mut self, id: NodeId) -> Option<Appearance> {
+        let slot = self.paints.get_mut(id.index())?;
+        match slot {
+            Some((age, _)) if *age == id.generation() => slot.take().map(|(_, paint)| paint),
+            _ => None,
+        }
+    }
+
+    /// Frees the paint at the head of a mount's chain and answers the next link.
+    ///
+    /// The sprite itself is a tree node the destroy cascades over, so only the row is freed
+    /// here; `patch` carries the release of whatever resource the row alone was holding.
+    pub(crate) fn release(&mut self, head: NodeId, patch: &mut SinkPatch) -> NodeId {
+        let Some(paint) = self.take(head) else {
+            return NodeId::NONE;
+        };
+        let _ = patch;
+        paint.next
+    }
+
+    /// Frees a surface row and forgets the derived parts it held.
+    ///
+    /// The parts are sprites under the surface's own node, so the destroy that retires that
+    /// node takes them; what is freed here is the row that named them.
+    pub(crate) fn release_surface(&mut self, at: u32, patch: &mut SinkPatch) {
+        let _ = patch;
+        if self
+            .surfaces
+            .get_mut(at as usize)
+            .and_then(Option::take)
+            .is_some()
+        {
+            self.free.push(at);
+        }
+    }
+
+    /// The sprite a node's declared halo hangs on, or [`NodeId::NONE`].
+    ///
+    /// A halo's opacity and blur belong to the sprite casting it rather than to the node that
+    /// declared it, and a node's paints are a chain, so this is where the two are joined.
+    pub(crate) fn halo_bearer(&self, head: NodeId) -> NodeId {
+        let mut at = head;
+        while let Some(paint) = self.get(at) {
+            if paint.halo.is_some() {
+                return paint.id.0;
+            }
+            at = paint.next;
+        }
+        NodeId::NONE
+    }
+
+    /// How many paint slots a walk visits, vacated ones included.
+    fn slots(&self) -> usize {
+        self.paints.len()
+    }
+
+    /// The node occupying one paint slot, or `None` where it is vacant.
+    fn id_at(&self, at: usize) -> Option<NodeId> {
+        let (age, _) = self.paints.get(at)?.as_ref()?;
+        Some(NodeId::raw(at as u32, *age))
+    }
+
+    /// Records the retained geometry a path node draws from.
+    pub(crate) fn set_shape(&mut self, id: NodeId, geom: GeomId) {
+        if self.shapes.len() <= id.index() {
+            self.shapes.resize_with(id.index() + 1, || None);
+        }
+        self.shapes[id.index()] = Some((id.generation(), geom));
+    }
+
+    fn shape(&self, id: NodeId) -> Option<GeomId> {
+        match self.shapes.get(id.index()) {
+            Some(Some((age, geom))) if *age == id.generation() => Some(*geom),
+            _ => None,
+        }
+    }
+
+    /// How many surface rows a walk visits, vacated ones included.
+    fn surface_rows(&self) -> u32 {
+        self.surfaces.len() as u32
+    }
+
+    fn place_surface(&mut self, surface: Surface) -> u32 {
+        match self.free.pop() {
+            Some(at) => {
+                self.surfaces[at as usize] = Some(surface);
+                at
+            }
+            None => {
+                self.surfaces.push(Some(surface));
+                self.surfaces.len() as u32 - 1
+            }
+        }
+    }
+
+    fn surface(&self, at: u32) -> Option<&Surface> {
+        self.surfaces.get(at as usize)?.as_ref()
+    }
+
+    fn surface_mut(&mut self, at: u32) -> Option<&mut Surface> {
+        self.surfaces.get_mut(at as usize)?.as_mut()
+    }
+}
+
+// The theme transaction the next fill hands to the scene thread. Held beside the host rather
+// than on it because `set_theme` runs between flushes and the batch it belongs to is built
+// later; the app thread owns both, as it owns the host.
+thread_local! {
+    static PENDING_THEME: core::cell::RefCell<Option<(Scope, BackdropSpec)>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Takes the theme transaction the next batch carries, if one is owed.
+pub(crate) fn take_theme() -> Option<(Scope, BackdropSpec)> {
+    PENDING_THEME.with_borrow_mut(Option::take)
+}
+
+impl Host {
+    pub(crate) fn chrome(&self, id: ControlId) -> Option<Chrome> {
+        let node = self.control(id)?.node;
+        self.appearances.surface(self.surface_row(node))?.chrome
+    }
+
+    /// Returns this node's surface row, minting an empty one, and marks it for the next
+    /// resolve.
+    fn surface_mut(&mut self, node: NodeId) -> Option<&mut Surface> {
+        let mut at = self.surface_row(node);
+        if at == tree::NONE {
+            at = self.appearances.place_surface(Surface::new(node));
+            self.set_surface_row(node, at);
+        }
+        let surface = self.appearances.surface_mut(at)?;
+        surface.dirty = true;
+        Some(surface)
+    }
+
+    pub(crate) fn declare_chrome(&mut self, node: NodeId, chrome: Chrome) {
+        if let Some(surface) = self.surface_mut(node) {
+            surface.chrome = Some(chrome);
+        }
+    }
+
+    pub(super) fn declare_surface(&mut self, group: GroupId, chrome: Chrome) {
+        self.declare_chrome(group.0, chrome);
+    }
+
+    pub(super) fn surface_selectable(&mut self, group: GroupId) {
+        if let Some(surface) = self.surface_mut(group.0) {
+            surface.selectable = true;
+        }
+    }
+
+    pub(super) fn surface_wash(&mut self, group: GroupId, wash: Wash) {
+        if let Some(surface) = self.surface_mut(group.0) {
+            surface.wash = wash;
+        }
+    }
+
+    pub(super) fn surface_halo(&mut self, group: GroupId, halo: HaloStyle) {
+        if let Some(surface) = self.surface_mut(group.0) {
+            surface.halo = Some(halo);
+        }
+    }
+
+    /// Pushes `elevation` onto this node's scope, so every paint already hanging on it
+    /// re-resolves against the new rung.
+    pub(crate) fn elevate(&mut self, node: NodeId, elevation: Elevation) -> u32 {
+        let scope = self.scope_of(node).elevate(elevation);
+        let at = self.intern(scope);
+        self.tree.c.scope[node.index()] = at;
+        let mut link = self.tree.c.paints[node.index()];
+        while let Some(paint) = self.appearances.get_mut(link) {
+            paint.scope = scope;
+            let paint = *paint;
+            link = paint.next;
+            self.publish_paint(paint, true);
+        }
+        at
+    }
+
+    /// Declares one part of one node with one exclusive paint source.
+    ///
+    /// What every appearance setter on `Element` calls. A group takes a derived sprite of its
+    /// own, since a group carries no mask and no paint; a sprite paints itself.
+    pub(crate) fn declare_part(
+        &mut self,
+        node: NodeId,
+        part: Part,
+        source: PaintSource,
+        mask: PaintMask,
+        strength: f32,
+    ) -> SpriteId {
+        let id = match self.tree.c.flags[node.index()] & tree::SPRITE != 0 {
+            true => SpriteId(node),
+            // A group paints through a derived sprite spanning its own box.
+            false => {
+                let id = self.visual(GroupId(node), None);
+                self.visual_insets(id, [0.0; 4]);
+                id
+            }
+        };
+        let held = self.appearances.get(id.0).copied();
+        let paint = Appearance {
+            id,
+            source,
+            mask,
+            part,
+            strength,
+            scope: self.scope_of(node),
+            surface: tree::NONE,
+            halo: held.and_then(|held| held.halo),
+            cap: f32::NAN,
+            next: held.map_or(NodeId::NONE, |held| held.next),
+        };
+        self.publish_paint(paint, true);
+        self.appearances.place(id.0, paint);
+        if held.is_none() {
+            self.own_appearance(id, node);
+        }
+        id
+    }
+
+    /// Resolves only changed owning records, after bindings and before layout and
+    /// publication.
+    ///
+    /// The same resolver publishes initial appearance, theme changes and owner-state changes.
+    /// It updates existing parts and creates only capabilities the recipe declared: there are
+    /// no construction seeds and no second interpreter.
+    ///
+    /// The three derived parts are slots rather than a search: the set is closed, so a pass
+    /// decides which of the three this surface owns now and finds each previous sprite where
+    /// the last pass left it. A surface that keeps its parts touches its paint chain not at
+    /// all.
+    pub(crate) fn publish_surfaces(&mut self) {
+        for at in 0..self.appearances.surface_rows() {
+            let Some(surface) = self.appearances.surface_mut(at) else {
+                continue;
+            };
+            if !core::mem::take(&mut surface.dirty) {
+                continue;
+            }
+            let surface = *surface;
+            self.publish_surface(at, surface);
+        }
+    }
+
+    fn publish_surface(&mut self, row: u32, surface: Surface) {
+        let node = surface.node;
+        let scope = self.scope_of(node);
+        let owner = self.control_of(node);
+        let owner = (!owner.is_none()).then_some(owner);
+        let mut after = None;
+        for (slot, part) in Part::DERIVED.into_iter().enumerate() {
+            let held = self
+                .appearances
+                .surface(row)
+                .and_then(|held| held.parts[slot]);
+            // A wash is minted where a surface's chrome meets a control, and nowhere else:
+            // most of a screen declares no chrome, owns no control and pays nothing.
+            let owned = surface.chrome.is_some()
+                && match part {
+                    Part::Wash => owner.is_some(),
+                    part => surface.owns(part),
+                };
+            let Some(id) = self.claim_part(row, node, slot, held, owned, after) else {
+                continue;
+            };
+            after = Some(id.0);
+            let source = match owner.filter(|_| part != Part::Wash) {
+                Some(owner) => PaintSource::Owner(owner),
+                None => match surface
+                    .roles(ModelState::Rest)
+                    .and_then(|roles| part.role(roles, surface.wash))
+                {
+                    Some(role) => PaintSource::Role(role),
+                    None => continue,
+                },
+            };
+            let paint = Appearance {
+                id,
+                source,
+                mask: surface.mask_of(part),
+                part,
+                strength: 1.0,
+                scope,
+                surface: row,
+                halo: surface.halo.filter(|_| part == Part::Fill),
+                cap: f32::NAN,
+                next: self
+                    .appearances
+                    .get(id.0)
+                    .map_or(NodeId::NONE, |held| held.next),
+            };
+            self.place_part(paint, surface);
+            self.publish_paint(paint, true);
+            self.appearances.place(id.0, paint);
+            if held.is_none() {
+                self.own_appearance(id, node);
+                if let Some(held) = self.appearances.surface_mut(row) {
+                    held.parts[slot] = Some(id);
+                }
+                // The wash is parked at opacity zero at creation; hover and press retarget it
+                // scene-side, in the tick that saw the event.
+                if part == Part::Wash {
+                    self.write_channel(id.0, Prop::Opacity, Value::Scalar(0.0));
+                }
+            }
+        }
+        let Some(id) = owner.filter(|_| surface.chrome.is_some()) else {
             return;
         };
-        let mut insets = [if self.part == Part::Fill {
-            crate::role::metric(Metric::HairlineW, self.scope)
-        } else {
-            0.0
-        }; 4];
-        if let Some(edge) = chrome.attached {
+        let wash = self
+            .appearances
+            .surface(row)
+            .and_then(|held| held.parts[2])
+            .unwrap_or(SpriteId(NodeId::NONE));
+        let paint = scope.for_paint();
+        // Resolved here, on the app thread, and shipped as numbers: realizing a new FP16 cell
+        // mid-hover would be a surface creation on the interaction path. The two fractions are
+        // the alphas the palette authors for the two interaction fills, so the wash has one
+        // colour authority and this layer states none of its own.
+        let hover = resolve(Role::Fill(Fill::Hover), paint).a;
+        let press = resolve(Role::Fill(Fill::Pressed), paint).a;
+        if let Some(row) = self.control_mut(id) {
+            row.front.wash = wash;
+            row.front.hover = hover;
+            row.front.press = press;
+        }
+        self.repaint_control(id);
+    }
+
+    /// Returns the sprite `part` paints into, minting or destroying one where ownership moved.
+    fn claim_part(
+        &mut self,
+        row: u32,
+        node: NodeId,
+        slot: usize,
+        held: Option<SpriteId>,
+        owned: bool,
+        after: Option<NodeId>,
+    ) -> Option<SpriteId> {
+        match (owned, held) {
+            (true, Some(id)) => Some(id),
+            (true, None) => Some(self.visual(GroupId(node), after)),
+            (false, Some(id)) => {
+                self.drop_part(row, node, slot, id);
+                None
+            }
+            (false, None) => None,
+        }
+    }
+
+    /// Insets a derived fill inside the border above it, leaving the flush edge alone.
+    fn place_part(&mut self, paint: Appearance, surface: Surface) {
+        let hairline = match paint.part == Part::Fill && surface.owns(Part::Border) {
+            true => metric(Metric::HairlineW, paint.scope),
+            false => 0.0,
+        };
+        let mut insets = [hairline; 4];
+        if let Some(edge) = surface.chrome.and_then(|chrome| chrome.attached) {
+            // Left, right, top, bottom: the order `visual_insets` reads.
             insets[match edge {
                 Edge::Left => 0,
                 Edge::Right => 1,
@@ -108,288 +632,69 @@ impl Appearance {
                 Edge::Bottom => 3,
             }] = 0.0;
         }
-        host.model.visual_insets(self.id, insets);
+        self.visual_insets(paint.id, insets);
     }
 
-    /// The same resolver publishes initial appearance, theme changes and owner-state changes.
-    pub(super) fn publish(&self, host: &mut Host, mask: bool) {
-        if mask {
-            self.place(host);
-            super::mount::emit_mask(host, self.id, self.mask, self.geom, self.scope);
-        }
-        let role = match self.source {
-            PaintSource::Role(role) => Some((role, self.strength)),
-            PaintSource::Owner(id) => host.controls.get(id).and_then(|owner| {
-                let roles = host.chrome(id)?.in_state(owner.state);
-                part_role(self.part, roles).map(|role| (role, self.strength))
-            }),
+    /// The foreground a control's own chrome states in the model state it stands in.
+    ///
+    /// What a run belonging to that control is painted in where it states no ink of its own,
+    /// so a disabled button's label goes with its border and its fill.
+    pub(crate) fn owner_ink(&self, id: ControlId) -> Option<Role> {
+        let row = self.control(id)?;
+        let surface = self.appearances.surface(self.surface_row(row.node))?;
+        Some(Role::Text(surface.roles(row.state)?.text))
+    }
+
+    /// Returns the role a paint resolves through now, or `None` where its source names none.
+    fn role_of(&self, paint: Appearance) -> Option<Role> {
+        match paint.source {
+            PaintSource::Role(role) => Some(role),
+            PaintSource::Owner(id) => {
+                let row = self.control(id)?;
+                let surface = self.appearances.surface(self.surface_row(row.node))?;
+                surface
+                    .roles(row.state)
+                    .and_then(|roles| paint.part.role(roles, surface.wash))
+            }
             PaintSource::Gradient(_) | PaintSource::Region(_) => None,
-        };
-        let scope = self.scope.for_paint();
-        let light = role.map_or(windows_color::Radiance::TRANSPARENT, |(role, strength)| {
-            let light = crate::role::resolve(role, scope);
-            light.with_alpha(light.a * strength)
+        }
+    }
+
+    /// Resolves one paint against its scope and sends it.
+    ///
+    /// A sprite painting a role as ink is lit where the role resolves, so a badge and a
+    /// section label need no declaration at all; a surface casting light in a role it does not
+    /// paint declares it, and that is the only halo here.
+    fn publish_paint(&mut self, paint: Appearance, mask: bool) {
+        let scope = paint.scope.for_paint();
+        let role = self.role_of(paint);
+        let light = role.map_or(Radiance::TRANSPARENT, |role| {
+            let light = resolve(role, scope);
+            light.with_alpha(light.a * paint.strength)
         });
-        let paint = match self.source {
+        let fill = match paint.source {
             PaintSource::Gradient(id) => Paint::Ramp(id),
             PaintSource::Region(id) => Paint::Presented(id),
             _ => Paint::Solid(light),
         };
-        host.model.paint(self.id, paint);
-        let emission = role
-            .filter(|_| self.part == Part::Label)
-            .map_or(crate::role::Emission::NONE, |(role, _)| {
-                crate::role::emission(role, scope)
-            });
-        host.model.halo(
-            self.id,
-            super::mount::halo_of(emission, Silhouette::Ink, light),
-        );
-        if let Some((halo, silhouette)) = self.halo {
-            super::mount::emit_halo(host, halo, self.id, self.scope, silhouette);
-        }
-    }
-}
-
-fn part_role(part: Part, roles: RoleSet) -> Option<Role> {
-    match part {
-        Part::Fill => roles.fill.map(Role::Fill),
-        Part::Border => roles.stroke.map(Role::Stroke),
-        Part::Label => Some(Role::Text(roles.text)),
-        _ => None,
-    }
-}
-
-pub(super) fn chrome_parts(chrome: Option<Chrome>, selectable: bool) -> impl Iterator<Item = Part> {
-    [Part::Border, Part::Fill].into_iter().filter(move |&part| {
-        chrome.is_some_and(|chrome| {
-            [
-                Some(chrome.roles),
-                selectable.then(|| chrome.in_state(ModelState::Selected)),
-                chrome.disabled,
-            ]
-            .into_iter()
-            .flatten()
-            .any(|roles| part_role(part, roles).is_some())
-        })
-    })
-}
-
-fn chrome_mask(chrome: Chrome, part: Part, scope: Scope, selectable: bool) -> PaintMask {
-    let radius = crate::role::metric(chrome.radius, scope);
-    let width = crate::role::metric(Metric::HairlineW, scope);
-    if part == Part::Border {
-        PaintMask::Outline {
-            radius: super::mount::surface_corners(radius, Some(chrome)),
-            width,
-            open: chrome.attached.map(|edge| match edge {
-                Edge::Left => windows_scene::Side::Left,
-                Edge::Top => windows_scene::Side::Top,
-                Edge::Right => windows_scene::Side::Right,
-                Edge::Bottom => windows_scene::Side::Bottom,
-            }),
-        }
-    } else {
-        let border = chrome_parts(Some(chrome), selectable).any(|part| part == Part::Border);
-        PaintMask::Radius {
-            dips: super::mount::surface_corners(
-                (radius - if border { width } else { 0.0 }).max(0.0),
-                Some(chrome),
-            ),
-        }
-    }
-}
-
-/// Canonical appearance of an owning element. Paint resources are derived at publication.
-#[derive(Copy, Clone)]
-pub(crate) struct Surface {
-    group: windows_scene::GroupId,
-    chrome: Option<Chrome>,
-    selectable: bool,
-    wash: Wash,
-    halo: Option<HaloStyle>,
-    dirty: bool,
-    /// The sprites of this surface's derived parts, in Border, Fill, Wash order.
-    ///
-    /// Slots and not a search: the derived set is closed, so the slot a part answered from
-    /// last pass is where its sprite is, and a surface that keeps its parts never walks the
-    /// owner's paint chain. Here rather than on the mount, because a node with no chrome has
-    /// no derived part and no row in this table.
-    parts: [Option<SpriteId>; 3],
-}
-
-impl Host {
-    pub(crate) fn chrome(&self, id: ControlId) -> Option<Chrome> {
-        self.surfaces.get(self.controls.get(id)?.node)?.chrome
-    }
-
-    fn surface(&mut self, group: windows_scene::GroupId) -> &mut Surface {
-        let node = group.node();
-        if self.surfaces.get(node).is_none() {
-            self.surfaces.place(
-                node,
-                Surface {
-                    group,
-                    chrome: None,
-                    selectable: false,
-                    wash: Wash::Ink,
-                    halo: None,
-                    dirty: true,
-                    parts: [None; 3],
-                },
-            );
-        }
-        self.surfaces_dirty = true;
-        let surface = self.surfaces.get_mut(node).unwrap();
-        surface.dirty = true;
-        surface
-    }
-
-    pub(super) fn declare_surface(&mut self, group: windows_scene::GroupId, chrome: Chrome) {
-        self.surface(group).chrome = Some(chrome);
-    }
-
-    pub(super) fn surface_selectable(&mut self, group: windows_scene::GroupId) {
-        self.surface(group).selectable = true;
-    }
-
-    pub(super) fn surface_wash(&mut self, group: windows_scene::GroupId, wash: Wash) {
-        self.surface(group).wash = wash;
-    }
-
-    pub(super) fn surface_halo(&mut self, group: windows_scene::GroupId, halo: HaloStyle) {
-        self.surface(group).halo = Some(halo);
-    }
-
-    /// Resolve only changed owning records, after bindings and before layout/publication.
-    ///
-    /// The three derived parts are slots rather than a search: the set is closed, so a pass
-    /// decides which of the three this surface owns now and finds each previous sprite where
-    /// the last pass left it. A surface that keeps its parts touches its paint chain not at
-    /// all.
-    pub(crate) fn publish_surfaces(&mut self) {
-        if !core::mem::take(&mut self.surfaces_dirty) {
-            return;
-        }
-        for index in self.surfaces.positions() {
-            let Some(node) = self.surfaces.id_at(index) else {
-                continue;
-            };
-            let surface = self.surfaces.get_mut(node).unwrap();
-            if !core::mem::take(&mut surface.dirty) {
-                continue;
+        // One write: a declared halo is what the sprite casts, and a role-painting sprite with
+        // none casts its role's own ink light.
+        let halo = match paint.halo {
+            // A fill casts as an area; a stroke, a border or ink casts as ink.
+            Some(style) => {
+                let of = if paint.part == Part::Fill { Silhouette::Area } else { Silhouette::Ink };
+                self.halo_of_style(style, paint.scope, of)
             }
-            let surface = *surface;
-            let scope = self.styles.get(node).unwrap().scope;
-            let control = self.mounts.get(node).and_then(|m| m.control);
-            let mut after = None;
-            for (slot, part) in [Part::Border, Part::Fill, Part::Wash]
-                .into_iter()
-                .enumerate()
-            {
-                let wash = part == Part::Wash;
-                let held = self.surfaces.get(node).unwrap().parts[slot];
-                let Some(chrome) = surface.chrome.filter(|chrome| {
-                    if wash {
-                        control.is_some()
-                    } else {
-                        chrome_parts(Some(*chrome), surface.selectable).any(|p| p == part)
-                    }
-                }) else {
-                    if let Some(id) = held {
-                        self.drop_part(node, slot, id);
-                    }
-                    continue;
-                };
-                let id = match held {
-                    Some(id) => id,
-                    None => self.model.visual(surface.group, after),
-                };
-                after = Some(id.node());
-                let role = if wash {
-                    Some(match surface.wash {
-                        Wash::Ink => Role::Text(crate::role::Text::Primary),
-                        Wash::Accent => Role::Fill(crate::role::Fill::Accent),
-                    })
-                } else {
-                    part_role(part, chrome.roles)
-                };
-                // A part with no role of its own resolves transparent; an owned one re-reads
-                // its role from the owner's state at every publication, so the whole of what
-                // that resolves to is what it paints.
-                let (source, strength) = match control.filter(|_| !wash) {
-                    Some(owner) => (PaintSource::Owner(owner), 1.0),
-                    None => (
-                        PaintSource::Role(
-                            role.unwrap_or(Role::Text(crate::role::Text::Primary)),
-                        ),
-                        f32::from(role.is_some()),
-                    ),
-                };
-                let paint = Appearance {
-                    id,
-                    mask: if wash {
-                        PaintMask::Radius {
-                            dips: super::mount::surface_corners(
-                                crate::role::metric(chrome.radius, scope),
-                                Some(chrome),
-                            ),
-                        }
-                    } else {
-                        chrome_mask(chrome, part, scope, surface.selectable)
-                    },
-                    source,
-                    part,
-                    strength,
-                    geom: None,
-                    scope,
-                    surface: Some(node),
-                    halo: if part == Part::Fill {
-                        surface.halo.map(|halo| (halo, Silhouette::Area))
-                    } else {
-                        None
-                    },
-                    next: self
-                        .appearances
-                        .get(id.node())
-                        .map_or(NodeId::NONE, |paint| paint.next),
-                    wash,
-                };
-                paint.publish(self, true);
-                self.appearances.place(id.node(), paint);
-                if held.is_none() {
-                    self.own_appearance(id, node);
-                    self.surfaces.get_mut(node).unwrap().parts[slot] = Some(id);
-                    if wash {
-                        self.model.bind(
-                            id.node(),
-                            windows_scene::Prop::Opacity,
-                            windows_scene::Bind::Set(windows_scene::Value::Scalar(0.0)),
-                        );
-                    }
-                }
+            None => {
+                let ink = role
+                    .filter(|_| paint.part == Part::Ink)
+                    .map_or(Emission::NONE, |role| emission(role, scope));
+                halo_of(ink, Silhouette::Ink, light)
             }
-            if let Some(id) = control.filter(|_| surface.chrome.is_some()) {
-                let parts = self.surfaces.get(node).unwrap().parts;
-                let row = self.controls.get_mut(id).unwrap();
-                row.border = parts[0];
-                row.fill = parts[1];
-                row.front.wash = parts[2];
-                row.dirty = true;
-                self.repaint_control(id);
-            }
-            if let Some(halo) = surface.halo.filter(|_| surface.chrome.is_none()) {
-                let mut at = self.mounts.get(node).unwrap().paints;
-                while let Some(paint) = self.appearances.get_mut(at) {
-                    at = paint.next;
-                    if paint.part == Part::Fill {
-                        paint.halo = Some((halo, Silhouette::Area));
-                        let paint = *paint;
-                        paint.publish(self, false);
-                        break;
-                    }
-                }
-            }
+        };
+        self.paint(paint.id, fill, halo);
+        if mask {
+            self.emit_mask(paint.id, paint.mask, paint.scope, paint.surface);
         }
     }
 
@@ -397,156 +702,562 @@ impl Host {
     ///
     /// The one walk of the paint chain left in this path, and it runs only where a chrome
     /// change took a part away.
-    fn drop_part(&mut self, owner: NodeId, slot: usize, id: SpriteId) {
-        let at = id.node();
+    fn drop_part(&mut self, row: u32, owner: NodeId, slot: usize, id: SpriteId) {
+        let at = id.0;
         let mut previous = NodeId::NONE;
-        let mut link = self.mounts.get(owner).unwrap().paints;
-        while let Some(paint) = self.appearances.get(link) {
-            let next = paint.next;
+        let mut link = self.tree.c.paints[owner.index()];
+        while let Some(paint) = self.appearances.get(link).copied() {
             if link == at {
-                if previous.is_none() {
-                    self.mounts.get_mut(owner).unwrap().paints = next;
-                } else {
-                    self.appearances.get_mut(previous).unwrap().next = next;
+                match previous.is_none() {
+                    true => self.tree.c.paints[owner.index()] = paint.next,
+                    false => {
+                        if let Some(held) = self.appearances.get_mut(previous) {
+                            held.next = paint.next;
+                        }
+                    }
                 }
                 break;
             }
-            previous = link;
-            link = next;
+            (previous, link) = (link, paint.next);
         }
         self.appearances.take(at);
-        self.styles.take(at);
-        self.model.destroy(at, windows_scene::Exit::None);
-        self.surfaces.get_mut(owner).unwrap().parts[slot] = None;
+        self.destroy(at, Exit::None);
+        if let Some(surface) = self.appearances.surface_mut(row) {
+            surface.parts[slot] = None;
+        }
     }
 
+    /// Re-resolves everything this control's model state paints.
+    ///
+    /// One pass over the paint table rather than a walk of the control's subtree: a label is
+    /// an owner-sourced paint like a fill, and it sits on a child node, so a search that
+    /// stopped at the surface's three slots would leave a disabled button's text at its
+    /// resting colour.
     pub(crate) fn repaint_control(&mut self, id: ControlId) {
-        if self.chrome(id).is_none() {
-            return;
-        }
-        self.repaint_owned(self.controls.get(id).unwrap().node, id);
-    }
-
-    fn repaint_owned(&mut self, node: NodeId, owner: ControlId) {
-        if let Some(paint) = self.appearances.get(node).copied()
-            && matches!(paint.source, PaintSource::Owner(id) if id == owner)
-        {
-            paint.publish(self, false);
-        }
-        for index in 0..self.model.child_count(node) {
-            self.repaint_owned(self.model.child(node, index), owner);
-        }
-    }
-
-    pub(crate) fn publish_masks(&mut self) {
-        for index in self.appearances.positions() {
-            let Some(id) = self.appearances.id_at(index) else {
+        for at in 0..self.appearances.slots() {
+            let Some(node) = self.appearances.id_at(at) else {
                 continue;
             };
-            let mut paint = *self.appearances.get(id).unwrap();
-            let scope = paint.scope.at_width(self.model.solved(id).class);
-            if scope == paint.scope {
+            let Some(paint) = self.appearances.get(node).copied() else {
                 continue;
+            };
+            if paint.source.owner() == id {
+                self.publish_paint(paint, false);
             }
-            paint.resolve(self, scope);
-            paint.place(self);
-            if !matches!(paint.mask, PaintMask::Bare) {
-                super::mount::emit_mask(self, paint.id, paint.mask, paint.geom, scope);
-            }
-            self.appearances.place(id, paint);
+        }
+        self.relight_runs(id);
+    }
+
+    /// Hangs `id` on `owner`'s paint chain, newest first.
+    pub(crate) fn own_appearance(&mut self, id: SpriteId, owner: NodeId) {
+        if self.appearances.get(id.0).is_none() {
+            return;
+        }
+        let head = core::mem::replace(&mut self.tree.c.paints[owner.index()], id.0);
+        if let Some(paint) = self.appearances.get_mut(id.0) {
+            paint.next = head;
         }
     }
 
-    pub(crate) fn own_appearance(&mut self, id: SpriteId, owner: NodeId) {
-        let Some(paint) = self.appearances.get_mut(id.node()) else {
-            return;
+    /// Re-emits each paint's mask at the class and the box its solved extent resolved to.
+    ///
+    /// Both, and not the class alone: a rounded silhouette is capped at half the shorter side
+    /// of the box it fills, so a box that moved without changing class leaves a pill rounded
+    /// for the extent it used to have.
+    pub(crate) fn publish_masks(&mut self) {
+        for at in 0..self.appearances.slots() {
+            let Some(node) = self.appearances.id_at(at) else {
+                continue;
+            };
+            let Some(mut paint) = self.appearances.get(node).copied() else {
+                continue;
+            };
+            let scope = paint.scope.at_width(self.tree.class(node));
+            let bound = paint.mask.box_bound();
+            let cap = if bound {
+                self.cap_of(paint.id)
+            } else {
+                f32::NAN
+            };
+            if scope == paint.scope && (!bound || cap == paint.cap) {
+                continue;
+            }
+            paint.scope = scope;
+            paint.cap = cap;
+            self.emit_mask(paint.id, paint.mask, scope, paint.surface);
+            self.appearances.place(node, paint);
+        }
+    }
+
+    /// Half the shorter side of a sprite's solved box, which is where a corner radius
+    /// saturates.
+    fn cap_of(&self, id: SpriteId) -> f32 {
+        let size = self.geom(id.0).size;
+        size.x.min(size.y) * 0.5
+    }
+
+    /// Resolves one authored silhouette against its scope and its solved box, and sends it.
+    fn emit_mask(&mut self, id: SpriteId, mask: PaintMask, scope: Scope, surface: u32) {
+        let attached = self
+            .appearances
+            .surface(surface)
+            .and_then(|surface| surface.chrome)
+            .and_then(|chrome| chrome.attached);
+        let cap = self.cap_of(id);
+        let mask = match mask {
+            PaintMask::Box { radius } => Mask::Box {
+                radius: corners(radius.dips(scope).min(cap), attached),
+            },
+            PaintMask::Outline { radius, width } => Mask::Outline {
+                radius: corners(radius.dips(scope).min(cap), attached),
+                width: width.dips(scope),
+                open: attached.map(side_of),
+            },
+            PaintMask::Shape { geom, stroke } => {
+                let stroke =
+                    stroke.map(|width| self.stroke(width.dips(scope), Cap::Round, Join::Round, &[]));
+                Mask::Shape { geom, stroke }
+            }
+            // A region paints its own buffer over a square box.
+            PaintMask::Region(_) => Mask::Box {
+                radius: Corners::default(),
+            },
+            // The shaper owns this sprite's silhouette; emitting here would replace the
+            // coverage the last text publication pointed it at.
+            PaintMask::Bare => return,
         };
-        let mount = self
-            .mounts
-            .get_mut(owner)
-            .expect("the paint's mount exists");
-        paint.next = mount.paints;
-        mount.paints = id.node();
+        self.mask(id, mask);
+    }
+
+    /// Resolves a declared halo: a role's own light, or the palette's occlusion cast towards
+    /// `edge`.
+    fn halo_of_style(&self, style: HaloStyle, scope: Scope, of: Silhouette) -> Option<Halo> {
+        let paint = scope.for_paint();
+        match style {
+            HaloStyle::Glow(role) => {
+                let halo = halo_of(emission(role, paint), of, resolve(role, paint));
+                debug_assert!(
+                    halo.is_some(),
+                    "a halo was declared in a role the palette gives no light"
+                );
+                halo
+            }
+            HaloStyle::Shadow(edge) => {
+                let shadow = shadow(paint);
+                let offset = match edge {
+                    Edge::Left => Vector2 {
+                        x: -shadow.offset,
+                        y: 0.0,
+                    },
+                    Edge::Right => Vector2 {
+                        x: shadow.offset,
+                        y: 0.0,
+                    },
+                    Edge::Top => Vector2 {
+                        x: 0.0,
+                        y: -shadow.offset,
+                    },
+                    Edge::Bottom => Vector2 {
+                        x: 0.0,
+                        y: shadow.offset,
+                    },
+                };
+                Some(Halo {
+                    blur: shadow.sigma,
+                    tint: shadow.light,
+                    offset,
+                })
+            }
+        }
+    }
+
+    /// Fills the solve's metric cache for every width class.
+    ///
+    /// Filled once per class, so resolving a length during the solve is an index and an FMA
+    /// rather than a call into the application's palette. This is the cache's one writer and
+    /// it fills it by calling `metric` itself, so the cache and the authority cannot disagree.
+    pub(crate) fn fill_metrics(&mut self, root: Scope) {
+        for class in WidthClass::ALL {
+            self.metrics[class as usize] = Metric::BUILTIN.map(|m| metric(m, root.at_width(class)));
+        }
     }
 
     /// Re-resolves this window's retained recipes, preserving node identity and lexical scope.
     /// The matching backdrop is handed to the scene in the same batch as these paint edits.
     pub fn set_theme(&mut self, root: Scope, backdrop: BackdropSpec) {
-        let backdrop_changed = self.theme_backdrop.as_ref() != Some(&backdrop);
-        if self.root_scope == root {
-            if backdrop_changed {
-                self.theme_backdrop = Some(backdrop.clone());
-                self.theme_update = Some((root, backdrop));
-            }
+        if self.root_scope() == root {
+            // A backdrop-only change is published too; repeating an identical request performs
+            // no retained work.
+            PENDING_THEME.with_borrow_mut(|held| {
+                if held.as_ref().map(|(_, held)| held) != Some(&backdrop) {
+                    *held = Some((root, backdrop));
+                }
+            });
             return;
         }
-        self.theme_backdrop = Some(backdrop.clone());
-        self.root_scope = root;
+        // Every interned scope rebases the same way, so the table is rebased once and no
+        // node's own column moves. Lexical elevation and solved width survive it.
+        self.rebase_scopes(root);
+        // The content peak is the palette's brightest authored channel, so a palette change
+        // changes it. Display capability is separate and is not touched here.
         self.env = Env::new(
             self.env.dpi(),
             self.env
                 .output()
-                .with_content_peak_nits(crate::role::content_peak_nits(
-                    &self.env.output().gamut(),
-                    root,
-                )),
+                .with_content_peak_nits(content_peak_nits(&self.env.output().gamut(), root)),
         );
-        for (_, row) in self.regions.iter_mut() {
-            if row.build.is_some() {
-                row.theme.set(row.theme.get().in_theme(root));
+        self.fill_metrics(root);
+        // Each presentation region has no `Scope` on the thread it draws on, so it reads one
+        // through a versioned handle; the version is what wakes a region already awake.
+        for (_, row) in self.regions.iter() {
+            row.theme.set(row.theme.get().in_theme(root));
+        }
+        for at in 0..self.appearances.slots() {
+            let Some(node) = self.appearances.id_at(at) else {
+                continue;
+            };
+            let Some(mut paint) = self.appearances.get(node).copied() else {
+                continue;
+            };
+            paint.scope = self.scope_of(node);
+            self.publish_paint(paint, true);
+            self.appearances.place(node, paint);
+        }
+        // Ramps are authored in roles, so a gradient follows the theme like any other paint.
+        self.relight_ramps();
+        for at in 0..self.appearances.surface_rows() {
+            if let Some(surface) = self.appearances.surface_mut(at) {
+                surface.dirty = true;
             }
         }
-        for position in self.styles.positions() {
-            let Some(id) = self.styles.id_at(position) else {
-                continue;
-            };
-            let recipe = self.styles.get_mut(id).unwrap();
-            recipe.scope = recipe.scope.in_theme(root);
-            let class = self.model.solved(id).class;
-            self.mark_style(id, class);
-        }
-        // Copy each small recipe outside the table borrow; no callback or per-frame work.
-        for index in self.appearances.positions() {
-            let Some(id) = self.appearances.id_at(index) else {
-                continue;
-            };
-            let mut paint = *self.appearances.get(id).unwrap();
-            paint.resolve(self, paint.scope.in_theme(root));
-            paint.publish(self, true);
-            self.appearances.place(id, paint);
-        }
-        for (id, (stops, spread)) in self.ramps.iter() {
-            super::mount::resolve_stops(stops, root, &mut self.ramp_stops);
-            self.model.set_ramp(id, &self.ramp_stops, *spread);
-        }
-        self.text.retheme(root, &mut self.model);
-        self.retheme_fields(root);
+        // The type ramp moved, so every run is behind its source and the next solve reshapes
+        // it. Nothing is emitted here.
+        self.retheme_text(root);
         for (_, control) in self.controls.iter_mut() {
             control.scope = control.scope.in_theme(root);
         }
-        self.theme_update = Some((root, backdrop));
+        PENDING_THEME.with_borrow_mut(|held| *held = Some((root, backdrop)));
     }
 }
 
-impl super::Element<'_, super::Path> {
+// -- the appearance setters ------------------------------------------------------------
+//
+// Each states one part, one source and one silhouette, and nothing else: the resolution is
+// the one resolver's, and these are the vocabulary an author writes it in.
+
+impl Ui<'_> {
+    /// A filled box painted in one role.
+    pub fn plate(&mut self, radius: impl Into<Len>, role: Role, strength: f32) -> Element<'_> {
+        let node = self.sprite(Preset::Layer).node_id();
+        self.element(node).plate(radius, role, strength)
+    }
+}
+
+impl<K> Element<'_, K> {
+    fn part(mut self, part: Part, source: PaintSource, mask: PaintMask, strength: f32) -> Self {
+        let node = self.node_id();
+        self.host().declare_part(node, part, source, mask, strength);
+        self
+    }
+
+    pub fn plate(self, radius: impl Into<Len>, role: Role, strength: f32) -> Self {
+        let mask = PaintMask::Box {
+            radius: radius.into(),
+        };
+        self.part(Part::Fill, PaintSource::Role(role), mask, strength)
+    }
+
+    pub fn outline(self, radius: Metric, role: Role, width: impl Into<Len>) -> Self {
+        let mask = PaintMask::Outline {
+            radius: radius.into(),
+            width: width.into(),
+        };
+        self.part(Part::Border, PaintSource::Role(role), mask, 1.0)
+    }
+
+    /// A gradient over the whole box, rounded as a plate is.
+    pub fn washed(self, id: RampId, radius: Metric) -> Self {
+        let mask = PaintMask::Box {
+            radius: radius.into(),
+        };
+        self.part(Part::Fill, PaintSource::Gradient(id), mask, 1.0)
+    }
+
+    /// Declares the chrome this element's surface resolves through.
+    pub fn appearance(mut self, chrome: Chrome) -> Self {
+        let node = self.node_id();
+        self.host().declare_chrome(node, chrome);
+        self
+    }
+
+    pub fn ghost(self) -> Self {
+        self.button_chrome(crate::widget::roles::GHOST)
+    }
+
+    pub fn accent(self) -> Self {
+        self.button_chrome(crate::widget::roles::ACCENT)
+    }
+
+    pub fn accent_subtle(self) -> Self {
+        self.button_chrome(crate::widget::roles::ACCENT_SUBTLE)
+    }
+
+    fn button_chrome(self, variant: u8) -> Self {
+        let roles = crate::widget::roles::BUTTON[variant as usize];
+        self.appearance(Chrome::new(roles, Metric::Radius))
+    }
+
+    /// Raises this element's scope by one rung, and every paint already on it with it.
+    pub fn elevate(mut self, elevation: Elevation) -> Self {
+        let node = self.node_id();
+        self.host().elevate(node, elevation);
+        self
+    }
+
+    /// Casts this element's own occlusion towards `edge`.
+    pub fn shadowed(self, edge: Edge) -> Self {
+        self.halo_style(HaloStyle::Shadow(edge))
+    }
+
+    /// Casts light in `role`, which this element need not paint in.
+    pub fn halo<M>(mut self, role: impl Signal<Role, M> + 'static) -> Self {
+        if role.is_constant() {
+            return self.halo_style(HaloStyle::Glow(role.read()));
+        }
+        let node = self.node_id();
+        self.host().binding(move || {
+            let role = role.read();
+            Host::with(|host| host.set_halo(node, HaloStyle::Glow(role)));
+        });
+        self
+    }
+
+    /// How much of its halo this element is spending now.
+    pub fn halo_lit<M>(self, value: impl Signal<f32, M> + 'static) -> Self {
+        self.channel(Prop::ShadowOpacity, value)
+    }
+
+    fn halo_style(mut self, halo: HaloStyle) -> Self {
+        let node = self.node_id();
+        self.host().set_halo(node, halo);
+        self
+    }
+}
+
+impl Element<'_, super::Path> {
+    /// Fills this shape in a chromatic role.
+    pub fn fill(self, role: DataRole) -> Self {
+        self.shape(PaintSource::data(role), None, Part::Fill)
+    }
+
+    pub fn fill_ramp(self, id: RampId) -> Self {
+        self.shape(PaintSource::Gradient(id), None, Part::Fill)
+    }
+
+    pub fn stroke(self, role: impl Into<Role>, width: impl Into<Len>) -> Self {
+        self.shape(
+            PaintSource::Role(role.into()),
+            Some(width.into()),
+            Part::Border,
+        )
+    }
+
+    pub fn stroke_ramp(self, id: RampId, width: impl Into<Len>) -> Self {
+        self.shape(PaintSource::Gradient(id), Some(width.into()), Part::Border)
+    }
+
+    pub fn line(self, role: Stroke) -> Self {
+        self.line_stroke(role, Metric::HairlineW)
+    }
+
+    pub fn line_stroke(self, role: Stroke, width: impl Into<Len>) -> Self {
+        self.shape(PaintSource::stroke(role), Some(width.into()), Part::Border)
+    }
+
+    /// Fills this shape in the enclosing control's own foreground, or the window's where it
+    /// has no chrome to take one from.
+    pub fn ink(self) -> Self {
+        self.ink_paint(None)
+    }
+
+    pub fn ink_stroke(self, width: impl Into<Len>) -> Self {
+        self.ink_paint(Some(width.into()))
+    }
+
+    fn ink_paint(mut self, stroke: Option<Len>) -> Self {
+        let owner = self.ui.control;
+        let source = match self.host().chrome(owner) {
+            Some(_) => PaintSource::Owner(owner),
+            None => PaintSource::Role(Role::Text(Text::Primary)),
+        };
+        self.shape(source, stroke, Part::Ink)
+    }
+
+    fn shape(mut self, source: PaintSource, stroke: Option<Len>, part: Part) -> Self {
+        let node = self.node_id();
+        // The shape is the node's own, recorded when it was minted: a path states what it
+        // draws before it states what paints it.
+        let Some(geom) = self.host().appearances.shape(node) else {
+            return self;
+        };
+        self.part(part, source, PaintMask::Shape { geom, stroke }, 1.0)
+    }
+
     /// Paints this shape at `strength` of the alpha its role resolves to.
-    ///
-    /// Folded into the colour at publication, so a shape drawn faintly costs no compositor
-    /// channel and leaves `Prop::Opacity` for a reveal to own.
     ///
     /// # Panics
     ///
     /// Panics where this shape has stated no paint: a strength scales a role, and there is
     /// none to scale before one is named.
-    pub fn strength(self, strength: f32) -> Self {
+    pub fn strength(mut self, strength: f32) -> Self {
+        let node = self.node_id();
         let paint = self
-            .host
+            .host()
             .appearances
-            .get_mut(self.node.target.id())
+            .get_mut(node)
             .expect("a strength scales a paint this shape has already stated");
         paint.strength = strength;
         let paint = *paint;
-        paint.publish(self.host, false);
+        self.host().publish_paint(paint, false);
         self
+    }
+}
+
+impl Host {
+    /// Declares the light a node casts past its own silhouette, on its surface where it owns
+    /// one and on its first paint where it does not.
+    fn set_halo(&mut self, node: NodeId, halo: HaloStyle) {
+        if self.surface_row(node) != tree::NONE
+            || self.tree.c.flags[node.index()] & tree::SPRITE == 0
+        {
+            self.surface_halo(GroupId(node), halo);
+            return;
+        }
+        let Some(paint) = self.appearances.get_mut(node) else {
+            return;
+        };
+        paint.halo = Some(halo);
+        let paint = *paint;
+        self.publish_paint(paint, false);
+    }
+}
+
+/// Returns one silhouette's worth of a role's light, or `None` where it spends none.
+fn halo_of(emission: Emission, of: Silhouette, light: Radiance) -> Option<Halo> {
+    let spend = emission.of(of);
+    spend.is_lit().then(|| Halo {
+        blur: spend.sigma,
+        tint: light.with_alpha(light.a * spend.strength),
+        offset: Vector2::default(),
+    })
+}
+
+/// Returns the four corner radii of a box rounded at `radius`, with the flush edge squared.
+///
+/// The attached edge of a joined control has square corners, so two buttons meeting at that
+/// edge leave no rounded gap between them.
+fn corners(radius: f32, attached: Option<Edge>) -> Corners {
+    let mut corners = Corners::all(radius);
+    match attached {
+        Some(Edge::Left) => (corners.tl, corners.bl) = (0.0, 0.0),
+        Some(Edge::Right) => (corners.tr, corners.br) = (0.0, 0.0),
+        Some(Edge::Top) => (corners.tl, corners.tr) = (0.0, 0.0),
+        Some(Edge::Bottom) => (corners.bl, corners.br) = (0.0, 0.0),
+        None => {}
+    }
+    corners
+}
+
+const fn side_of(edge: Edge) -> Side {
+    match edge {
+        Edge::Left => Side::Left,
+        Edge::Top => Side::Top,
+        Edge::Right => Side::Right,
+        Edge::Bottom => Side::Bottom,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roles(fill: Option<Fill>, stroke: Option<Stroke>) -> RoleSet {
+        RoleSet::new(fill, stroke, Text::Primary)
+    }
+
+    fn surface(chrome: Chrome) -> Surface {
+        Surface {
+            chrome: Some(chrome),
+            ..Surface::new(NodeId::NONE)
+        }
+    }
+
+    /// A part the recipe never gives a role to is not owned, so nothing mints a sprite for it.
+    #[test]
+    fn a_surface_owns_only_the_parts_its_recipe_paints() {
+        let plain = surface(Chrome::new(
+            roles(Some(Fill::Surface), None),
+            Metric::Radius,
+        ));
+        assert!(plain.owns(Part::Fill));
+        assert!(!plain.owns(Part::Border));
+    }
+
+    /// The wrong replacement is what this catches: a fill drawn at the border's own radius
+    /// aliases the border along the corner arc.
+    #[test]
+    fn a_bordered_fill_is_authored_a_hairline_inside_its_border() {
+        let bordered = surface(Chrome::new(
+            roles(Some(Fill::Surface), Some(Stroke::Default)),
+            Metric::Radius,
+        ));
+        let plain = surface(Chrome::new(
+            roles(Some(Fill::Surface), None),
+            Metric::Radius,
+        ));
+        let inset = Len::from(Metric::Radius).less(Metric::HairlineW);
+        assert!(
+            matches!(bordered.mask_of(Part::Fill), PaintMask::Box { radius } if radius == inset)
+        );
+        let whole = Len::from(Metric::Radius);
+        assert!(matches!(plain.mask_of(Part::Fill), PaintMask::Box { radius } if radius == whole));
+        assert!(matches!(
+            bordered.mask_of(Part::Border),
+            PaintMask::Outline { .. }
+        ));
+    }
+
+    /// A disabled-only state still owns its part, so entering that state retargets a sprite
+    /// rather than minting one on the interaction path.
+    #[test]
+    fn a_part_only_a_state_paints_is_still_owned_at_rest() {
+        let chrome = Chrome::new(roles(None, None), Metric::Radius)
+            .when(ModelState::Disabled, roles(Some(Fill::Surface), None));
+        assert!(surface(chrome).owns(Part::Fill));
+    }
+
+    /// The flush edge squares its own two corners and opens the outline there.
+    #[test]
+    fn an_attached_edge_squares_the_corners_it_joins_on() {
+        let joined = corners(8.0, Some(Edge::Right));
+        assert_eq!((joined.tr, joined.br), (0.0, 0.0));
+        assert_eq!((joined.tl, joined.bl), (8.0, 8.0));
+        assert_eq!(corners(8.0, None).max(), 8.0);
+        assert_eq!(side_of(Edge::Right), Side::Right);
+    }
+
+    /// A light the palette spends nothing on declares no composition object.
+    #[test]
+    fn an_unlit_role_casts_no_halo() {
+        assert!(halo_of(Emission::NONE, Silhouette::Ink, Radiance::TRANSPARENT).is_none());
+    }
+
+    /// A glyph tile's silhouette is the coverage the shaper published, so resolving its paint
+    /// must leave the mask alone.
+    #[test]
+    fn a_bare_silhouette_is_not_one_this_layer_states() {
+        assert!(!PaintMask::Bare.box_bound());
+        assert!(PaintMask::Box { radius: Len::ZERO }.box_bound());
+        assert!(!PaintMask::Region(RegionId::NONE).box_bound());
     }
 }

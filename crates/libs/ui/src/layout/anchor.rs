@@ -16,7 +16,7 @@
 use crate::role::Scope;
 use crate::signal::Cell;
 use windows_numerics::Vector2;
-use windows_scene::Rect;
+use super::Rect;
 
 /// One keyed child box, in the origin container's own space.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -35,12 +35,52 @@ pub struct Anchored {
 pub struct Table {
     /// The origin container's own solved size.
     pub size: Vector2,
-    /// The origin container's enclosing scope, absent until the first solve.
-    pub scope: Option<Scope>,
+    /// The origin container's enclosing scope, absent until the first publication.
+    scope: Option<Scope>,
     pub(crate) boxes: Vec<Anchored>,
 }
 
 impl Table {
+    /// Returns the origin container's own solved size.
+    #[must_use]
+    pub fn size(&self) -> Vector2 {
+        self.size
+    }
+
+    /// Returns the origin container's enclosing scope.
+    ///
+    /// # Panics
+    ///
+    /// If the set has never been published. A reader is woken by a publication and the
+    /// publication writes the origin first, so every reader has one.
+    #[must_use]
+    pub fn scope(&self) -> Scope {
+        self.scope
+            .expect("an anchor set is read through the publication that wrote its origin")
+    }
+
+    /// Returns the origin's scope, or `None` before the set's first publication.
+    #[must_use]
+    pub(crate) fn published(&self) -> Option<Scope> {
+        self.scope
+    }
+
+    /// Records the origin container's own box and scope.
+    pub(crate) fn set_origin(&mut self, size: Vector2, scope: Scope) {
+        self.size = size;
+        self.scope = Some(scope);
+    }
+
+    /// Attaches one child's box, already rebased onto the origin.
+    pub(crate) fn push(&mut self, key: u64, rect: Rect) {
+        self.boxes.push(Anchored { key, rect });
+    }
+
+    /// Drops every attachment and keeps the buffer.
+    pub(crate) fn clear(&mut self) {
+        self.boxes.clear();
+    }
+
     /// Returns the box `key` attached under, or `None` where nothing is attached under it.
     #[must_use]
     pub fn get(&self, key: u64) -> Option<Rect> {
@@ -93,6 +133,13 @@ pub struct Anchors(Cell<Table>);
 #[must_use]
 pub fn anchors() -> Anchors {
     Anchors(Cell::new(Table::default()))
+}
+
+/// Two sets are the same set where they are the same cell, whatever each last published.
+impl PartialEq for Anchors {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id() == other.0.id()
+    }
 }
 
 impl Anchors {

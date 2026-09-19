@@ -1,147 +1,108 @@
 //! Parent-first controls: their children register retained parts with the live owner.
-use super::binding::{Destination, Retired};
-use super::host::ControlRow;
-use super::theme::Part;
-use super::ui::Target;
-use super::{Any, Element, Host, Ui};
+
+use super::binding::Retired;
+use super::host::Host;
+use super::text::MeasureKey;
+use super::tree;
+use super::ui::{Element, Ui};
+use crate::gesture::{DragDecl, DragUpdate, GestureDecl};
 use crate::layout::{Align, Len, Preset};
-use crate::role::{Elevation, Metric, Role, Scope, Text};
-use crate::signal::Signal;
-use crate::widget::{Chrome, ModelState, TextSource, TextStyle, UiaRole, Wash};
+use crate::overlay::{Request, Side, Spec};
+use crate::role::{Metric, Role, Scope, Text};
+use crate::signal::{Cell, Signal};
+use crate::text_input::InputScope;
+use crate::widget::{
+    Chrome, ChromeRow, Gesturing, Interaction, ModelState, Range, ScalarPart, ScalarValue,
+    TextSource, TextStyle, UiaRole, ValueRow, Wash, flag, roles,
+};
+use std::borrow::Cow;
 use std::rc::Rc;
-use windows_scene::{ControlId, HitDecl, HitFlags, NodeId};
+use windows_scene::{ControlId, HitDecl, HitFlags, NodeId, Prop, Value};
 
 /// A control whose callbacks exchange scalar values, rather than field text.
-#[derive(Copy, Clone, Debug)]
 pub struct Scalar;
 
-impl Ui<'_> {
-    pub fn toggle<M>(&mut self, on: impl Signal<bool, M> + Copy + 'static) -> Element<'_> {
-        let chrome = Chrome::new(
-            crate::widget::roles::TRACK[crate::widget::roles::TRACK_OFF as usize],
-            Metric::RadiusPill,
-        );
-        let mut element = self
-            .control(Some(chrome), UiaRole::CheckBox, |ui| {
-                let fill = ui
-                    .plate(
-                        Metric::RadiusPill,
-                        Role::Fill(
-                            crate::widget::roles::TRACK[crate::widget::roles::TRACK_ON as usize]
-                                .fill
-                                .unwrap(),
-                        ),
-                        1.0,
-                    )
-                    .cover();
-                if on.is_constant() {
-                    fill.opacity(f32::from(on.read()));
-                } else {
-                    fill.opacity(move || f32::from(on.read()));
-                }
-                ui.plate(
-                    Len::Times(Metric::RowH, 0.4),
-                    Role::Text(Text::Primary),
-                    1.0,
-                )
-                .width(Len::Times(Metric::RowH, 0.8))
-                .height(Len::Times(Metric::RowH, 0.8))
-                .thumb();
-            })
-            .selected(on)
-            .height(Metric::TrackH)
-            .width(Len::Times(Metric::TrackH, 1.7))
-            .padding(Len::Times(Metric::TrackH, 0.1))
-            .justify(Align::Start)
-            .align(Align::Center)
-            .no_shrink();
-        let id = element.control_id(HitFlags::INTERACTIVE);
-        element.host.controls.get_mut(id).unwrap().front.drive =
-            Some(crate::widget::Interaction::Press);
-        if on.is_constant() {
-            element.host.publish_fraction(id, f32::from(on.read()), 0);
-        } else {
-            element
-                .host
-                .bind_to(element.node.target.id(), Destination::Scalar, move || {
-                    let fraction = f32::from(on.read());
-                    Host::with(|host| host.publish_fraction(id, fraction, 0));
-                });
+/// One control's application-side callbacks.
+///
+/// One handler per gesture and not one per phase: a gesture is a sequence with exactly one
+/// end, and a handler per phase would let a caller register the moves and forget the release.
+///
+/// Every field is an `Rc`, because running one is application code and must not hold the
+/// host's borrow: the dispatcher clones the handler out before it calls it, and the overlay
+/// layer clones a description or a flyout body out before it builds one.
+#[derive(Default)]
+pub(crate) struct Handlers {
+    pub click: Option<Rc<dyn Fn()>>,
+    pub scalar: Option<Rc<dyn Fn(Gesturing<f64>)>>,
+    pub drag: Option<Rc<dyn Fn(Gesturing<DragUpdate>)>>,
+    pub commit: Option<Rc<dyn Fn(&str)>>,
+    /// The hover description and the side it opens on.
+    ///
+    /// The side is authored rather than derived: which side clears a control's neighbours
+    /// depends on the axis its author stacked them on, so a description below a toolbar
+    /// button clears its neighbours and the same one below a rail item lands on the next.
+    pub tip: Option<(Rc<TextSource>, Side)>,
+    pub flyout: Option<Rc<dyn Fn(&mut Ui<'_>)>>,
+}
+
+/// One interactive control. Its index is its slot for the life of its mount.
+pub(crate) struct ControlRow {
+    /// The row the scene thread reads: wash sprite, resolved alphas, scope and flags.
+    pub front: ChromeRow,
+    /// The value half, placed only where a value moves.
+    pub value: Option<ValueRow>,
+    /// This control's row in the handler table, or [`tree::NONE`] where it declared none.
+    pub handlers: u32,
+    /// Literal names stay borrowed; generated names are released with the control.
+    pub name: Option<Cow<'static, str>>,
+    pub key: Option<&'static str>,
+    /// The run automation derives this control's name from where it was given none.
+    pub text: Option<MeasureKey>,
+    /// Where a gesture publishes its in-flight value for as long as it owns one.
+    pub live: Option<Cell<Option<f64>>>,
+    pub hovered: Option<Cell<bool>>,
+    pub validation: Option<&'static str>,
+    /// The epoch of the last authoritative source. A changed epoch cancels a live gesture and
+    /// rejects its queued commit; an equal one is an echo and preserves it.
+    pub source_epoch: u64,
+    pub node: NodeId,
+    pub scope: Scope,
+    pub state: ModelState,
+    pub uia: UiaRole,
+}
+
+impl ControlRow {
+    /// A control with no chrome and nothing to light: what a blocker and a scroll rail take.
+    pub fn blank(node: NodeId, scope: Scope) -> Self {
+        Self {
+            front: ChromeRow::default(),
+            value: None,
+            handlers: tree::NONE,
+            name: None,
+            key: None,
+            text: None,
+            live: None,
+            hovered: None,
+            validation: None,
+            source_epoch: 0,
+            node,
+            scope,
+            state: ModelState::Rest,
+            uia: UiaRole::None,
         }
-        element
-    }
-    pub fn scalar<M>(
-        &mut self,
-        chrome: Option<Chrome>,
-        drive: crate::widget::Interaction,
-        value: impl Signal<crate::widget::ScalarValue, M> + 'static,
-        children: impl FnOnce(&mut Ui<'_>),
-    ) -> Element<'_, Scalar> {
-        let mut element = self.control_as::<Scalar>(chrome, UiaRole::Slider, children);
-        let id = element.control_id(HitFlags::GESTURE);
-        let range = match drive {
-            crate::widget::Interaction::Slide(range) | crate::widget::Interaction::Turn(range) => {
-                range
-            }
-            crate::widget::Interaction::Press => panic!("a scalar requires a range"),
-        };
-        element.host.controls.get_mut(id).unwrap().front.drive = Some(drive);
-        let gesture = match drive {
-            crate::widget::Interaction::Slide(range) => {
-                crate::gesture::GestureDecl::slider(range.vertical)
-            }
-            _ => crate::gesture::GestureDecl {
-                drag: Some(crate::gesture::DragDecl::turn()),
-                ..Default::default()
-            },
-        };
-        element.host.gestures.push((id, gesture));
-        let node = element.node.target.id();
-        if value.is_constant() {
-            let value = value.read();
-            element
-                .host
-                .publish_fraction(id, range.fraction(value.value), value.epoch);
-        } else {
-            element.host.bind_to(node, Destination::Scalar, move || {
-                let value = value.read();
-                Host::with(|host| {
-                    host.publish_fraction(id, range.fraction(value.value), value.epoch)
-                });
-            });
-        }
-        element
     }
 
-    pub fn field(
-        &mut self,
-        chrome: Chrome,
-        style: TextStyle,
-        source: impl Into<TextSource>,
-    ) -> Element<'_, super::Field> {
-        let mut element = self.control_as::<super::Field>(Some(chrome), UiaRole::Edit, |ui| {
-            ui.text(style, "");
-        });
-        let id = element.control_id(HitFlags::TEXT);
-        let Target::Group(group) = element.node.target else {
-            unreachable!()
-        };
-        let control = element.host.controls.get(id).unwrap();
-        element.host.install_field(
-            id,
-            group,
-            control.text.unwrap(),
-            crate::text_input::InputScope::Default,
-            control.scope,
-            None,
-        );
-        element
-            .host
-            .field_binding(element.node.target.id(), id, source.into());
-        element
-            .height(Metric::RowH)
-            .layout(|l| l.min_width = Some(Len::Times(Metric::RowH, 4.0)))
+    /// Publishes `value` while a gesture owns it, and clears the cell when one ends.
+    pub fn set_live(&self, value: Option<f64>) {
+        if let Some(cell) = &self.live {
+            cell.set(value);
+        }
     }
+}
+
+// -- construction ---------------------------------------------------------------------
+
+impl Ui<'_> {
     /// The control exists before its body; nested controls start a new part-ownership scope.
     pub fn control(
         &mut self,
@@ -149,51 +110,7 @@ impl Ui<'_> {
         role: UiaRole,
         children: impl FnOnce(&mut Ui<'_>),
     ) -> Element<'_> {
-        self.control_as::<Any>(chrome, role, children)
-    }
-
-    pub(super) fn control_as<K>(
-        &mut self,
-        chrome: Option<Chrome>,
-        role: UiaRole,
-        children: impl FnOnce(&mut Ui<'_>),
-    ) -> Element<'_, K> {
-        let node = self.create(Preset::Row, false);
-        let Target::Group(group) = node.target else {
-            unreachable!()
-        };
-        let id = self.host.direct_control(
-            group.node(),
-            self.scope,
-            role,
-            HitFlags::INTERACTIVE | HitFlags::GESTURE,
-        );
-        let control = self.host.controls.get_mut(id).unwrap();
-        control.front.hover_scope = self.hover_scope;
-        if let Some(chrome) = chrome {
-            self.host.declare_surface(group, chrome);
-        }
-        children(&mut Ui {
-            host: self.host,
-            members: self.members,
-            parent: Some(group),
-            after: None,
-            scope: self.scope,
-            owner: Some(id),
-            hover_scope: self.hover_scope,
-        });
-        self.host.controls.get_mut(id).unwrap().dirty = true;
-        Element {
-            host: self.host,
-            members: Some(self.members),
-            node,
-        }
-        .layout(|layout| {
-            layout.floor = Some(Metric::RowH.into());
-            layout.padding = Some([Metric::SpaceMd.into(), Metric::SpaceXs.into()]);
-            layout.gap = Some(Metric::SpaceSm.into());
-            layout.justify = Some(Align::Center);
-        })
+        self.control_as(chrome, role, children)
     }
 
     pub fn button(
@@ -204,617 +121,608 @@ impl Ui<'_> {
     ) -> Element<'_> {
         let text = text.into();
         self.control(Some(chrome), UiaRole::Button, |ui| {
-            if !match &text {
-                TextSource::Static(text) => text.is_empty(),
-                TextSource::Owned(text) => text.is_empty(),
-                TextSource::Dynamic(_) => false,
-            } {
+            if !text.is_empty() {
                 ui.text(typography, text);
             }
         })
+        .wash(Wash::Ink)
     }
 
-    pub fn surface(
+    pub fn field(
         &mut self,
         chrome: Chrome,
-        elevation: Elevation,
+        style: TextStyle,
+        source: impl Into<TextSource>,
+    ) -> Element<'_, super::Field> {
+        let element = self.control_as::<super::Field>(Some(chrome), UiaRole::Edit, |ui| {
+            // Out of flow: the run is absolute inside the field, so a long edit neither widens
+            // the field nor moves its neighbours, and reveal moves the run.
+            ui.text(style, "")
+                .anchor(0.0, 0.0, [Align::Start, Align::Center]);
+        });
+        let mut element = element.hit(HitFlags::TEXT, UiaRole::Edit);
+        let id = element.control_id();
+        element.host().install_field(id, source.into());
+        element
+    }
+
+    pub fn scalar<M>(
+        &mut self,
+        chrome: Option<Chrome>,
+        drive: Interaction,
+        value: impl Signal<ScalarValue, M> + 'static,
         children: impl FnOnce(&mut Ui<'_>),
-    ) -> Element<'_> {
-        let node = self.create(Preset::Stack, false);
-        let Target::Group(group) = node.target else {
-            unreachable!()
-        };
-        let scope = self.scope.elevate(elevation);
-        self.host.styles.get_mut(group.node()).unwrap().scope = scope;
-        self.host.declare_surface(group, chrome);
-        children(&mut Ui {
-            host: self.host,
-            members: self.members,
-            parent: Some(group),
-            after: None,
-            scope,
-            owner: self.owner,
-            hover_scope: self.hover_scope,
-        });
-        Element {
-            host: self.host,
-            members: Some(self.members),
-            node,
-        }
-        .padding(Metric::SpaceLg)
-    }
-}
-
-impl Host {
-    pub(super) fn control_part(
-        &mut self,
-        owner: ControlId,
-        part: Part,
-        sprite: windows_scene::SpriteId,
-    ) {
-        let row = self
-            .controls
-            .get_mut(owner)
-            .expect("the enclosing control is retained");
-        if let Part::Trail { origin } = part {
-            row.front.trail = Some((sprite.node(), origin));
-        }
+    ) -> Element<'_, Scalar> {
+        self.control_as::<Scalar>(chrome, UiaRole::Slider, children)
+            .drive(drive, value)
     }
 
-    pub(super) fn control_scalar_part(
-        &mut self,
-        owner: ControlId,
-        node: NodeId,
-        part: crate::widget::ScalarPart,
-    ) {
-        assert_eq!(
-            self.mounts.get(node).unwrap().channels & (1 << part.property() as u8),
-            0,
-            "a scalar part cannot also bind its driven property"
-        );
-        let row = self
-            .controls
-            .get_mut(owner)
-            .expect("the enclosing control is retained");
-        let parts = &mut row.front.scalar_parts;
-        let index = parts
-            .iter()
-            .position(|entry| entry.is_some_and(|(held, _)| held == node))
-            .or_else(|| parts.iter().position(Option::is_none))
-            .expect("a scalar supports at most four parts");
-        parts[index] = Some((node, part));
+    /// A two-state control: a track that fills when it is on, and a knob over its travel.
+    ///
+    /// The on-state fill is the chrome ladder's own selected row rather than a second plate
+    /// faded over the first, so the state change is the crossfade every other control's is.
+    pub fn toggle<M>(&mut self, on: impl Signal<bool, M> + Copy + 'static) -> Element<'_> {
+        let chrome = Chrome::new(roles::TRACK[roles::TRACK_OFF as usize], Metric::RadiusPill)
+            .when(ModelState::Selected, roles::TRACK[roles::TRACK_ON as usize]);
+        self.control(Some(chrome), UiaRole::CheckBox, |ui| {
+            ui.plate(Metric::RadiusPill, Role::Text(Text::Primary), 1.0)
+                .size(Len::times(Metric::TrackH, 0.8))
+                .scalar_part(ScalarPart::Thumb { vertical: false });
+        })
+        .selected(on)
+        .driven(Interaction::Press, Flag(on))
+        .height(Metric::TrackH)
+        .width(Len::times(Metric::TrackH, 1.7))
+        .padding(Len::times(Metric::TrackH, 0.1))
+        .justify(Align::Start)
+        .align(Align::Center)
     }
 
-    pub(super) fn direct_control(
+    /// Mints the control row, runs `children` inside its part-ownership scope, and attaches
+    /// the chrome its recipe named.
+    fn control_as<K>(
         &mut self,
-        node: NodeId,
-        scope: Scope,
+        chrome: Option<Chrome>,
         role: UiaRole,
-        flags: HitFlags,
-    ) -> ControlId {
-        let flags = flags
-            | if self.mounts.get(node).unwrap().no_inflate {
-                HitFlags::NO_INFLATE
-            } else {
-                HitFlags::NONE
-            }
-            | if role == UiaRole::None {
-                HitFlags::NONE
-            } else {
-                HitFlags::UIA
-            };
-        let id = self.mint_control(ControlRow {
-            uia: role,
-            ..ControlRow::new(node, scope)
-        });
-        let hit = HitDecl {
-            id,
-            flags,
-            touch_inflate: None,
-        };
-        let row = self.controls.get_mut(id).unwrap();
-        row.hit = Some(hit);
-        row.front.id = id;
-        row.front.hover = 0.06;
-        row.front.press = 0.12;
-        self.mounts.get_mut(node).unwrap().control = Some(id);
-        self.model.hit(node, Some(hit));
-        if flags.contains(HitFlags::GESTURE) {
-            self.gestures
-                .push((id, crate::gesture::GestureDecl::default()));
+        children: impl FnOnce(&mut Ui<'_>),
+    ) -> Element<'_, K> {
+        let node = self.node(Preset::Row).node_id();
+        let scope = self.scope();
+        let inherited = self
+            .host
+            .control(self.control)
+            .map_or(ControlId::NONE, |row| row.front.scope);
+        let id = self.host.mint_control(ControlRow::blank(node, scope));
+        self.host.tree.c.control[node.index()] = id;
+        if let Some(row) = self.host.control_mut(id) {
+            row.uia = role;
+            // The enclosing control's scope reaches this one, so a reveal declared above a
+            // subtree still names the scope every control under it belongs to.
+            row.front.scope = inherited;
         }
-        id
-    }
-
-    pub(super) fn direct_state(&mut self, id: ControlId) {
-        let row = self.controls.get(id).unwrap();
-        if let Some(mut hit) = row.hit {
-            if row.disabled {
-                hit.flags = if hit.flags.contains(HitFlags::UIA) {
-                    HitFlags::UIA
-                } else {
-                    HitFlags::NONE
-                };
-            }
-            self.model.hit(row.node, Some(hit));
+        if let Some(chrome) = chrome {
+            self.host.declare_chrome(node, chrome);
         }
-        self.set_state(
-            id,
-            Some(if row.disabled {
-                ModelState::Disabled
-            } else if row.selected {
-                ModelState::Selected
-            } else {
-                ModelState::Rest
-            }),
-        );
+        let mut element = self.element::<K>(node);
+        element.ui.control = id;
+        element
+            .children(children)
+            .hit(HitFlags::INTERACTIVE | HitFlags::GESTURE, role)
     }
 }
+
+// -- declaration ----------------------------------------------------------------------
 
 impl<K> Element<'_, K> {
-    pub fn thumb(self) -> Self {
-        let id = self
-            .node
-            .owner
-            .expect("a thumb requires an enclosing control");
-        let row = self.host.controls.get_mut(id).unwrap();
-        row.front.thumb = Some(self.node.target.id());
-        row.dirty = true;
-        self
-    }
-    pub fn scalar_part(self, part: crate::widget::ScalarPart) -> Self {
-        let id = self
-            .node
-            .owner
-            .expect("a scalar part requires an enclosing control");
-        let node = self.node.target.id();
-        self.host.control_scalar_part(id, node, part);
-        let row = self.host.controls.get_mut(id).unwrap();
-        row.dirty = true;
-        self
-    }
-    pub(super) fn control_id(&mut self, flags: HitFlags) -> ControlId {
-        let node = self.node.target.id();
-        let id = if let Some(id) = self.host.mounts.get(node).unwrap().control {
-            id
-        } else {
-            let id = self.host.direct_control(
-                node,
-                self.host.styles.get(node).unwrap().scope,
-                UiaRole::None,
-                flags,
-            );
-            self.host.controls.get_mut(id).unwrap().front.hover_scope = self.node.hover_scope;
-            id
-        };
-        if let Some(mut hit) = self.host.controls.get(id).unwrap().hit {
-            hit.flags = hit.flags | flags;
-            self.host.controls.get_mut(id).unwrap().hit = Some(hit);
-            self.host.direct_state(id);
+    /// Returns this element's control, minting one at the node's own scope where the element
+    /// has not been declared a control yet.
+    pub(crate) fn control_id(&mut self) -> ControlId {
+        let node = self.node_id();
+        let held = self.host().control_of(node);
+        if !held.is_none() {
+            return held;
+        }
+        let inherited = self.ui.control;
+        let scope = self.host().scope_of(node);
+        let id = self.host().mint_control(ControlRow::blank(node, scope));
+        self.host().tree.c.control[node.index()] = id;
+        let inherited = self
+            .host()
+            .control(inherited)
+            .map_or(ControlId::NONE, |row| row.front.scope);
+        if let Some(row) = self.host().control_mut(id) {
+            row.front.scope = inherited;
         }
         id
     }
 
-    pub fn on_click(mut self, callback: impl Fn() + 'static) -> Self {
-        let id = self.control_id(HitFlags::INTERACTIVE | HitFlags::GESTURE);
-        self.host
-            .set_handler(id, |row| &mut row.click, Rc::new(callback) as Rc<dyn Fn()>);
+    /// Widens this control's hit flags and names its automation role.
+    ///
+    /// Additive and idempotent: a control is declared by whichever setter is written first,
+    /// and each later one adds what it needs rather than replacing what came before. The hit
+    /// array is rebuilt on layout change only, so the flags are recorded here and read there.
+    pub(crate) fn hit(mut self, flags: HitFlags, role: UiaRole) -> Self {
+        let id = self.control_id();
+        let node = self.node_id();
+        let held = HitFlags::from_bits(tree::unpack_decl(self.host().tree.c.flags[node.index()]));
+        let named = match role {
+            UiaRole::None => HitFlags::NONE,
+            _ => HitFlags::UIA,
+        };
+        let inflate = self.host().tree.c.inflate[node.index()];
+        self.host().hit(
+            node,
+            Some(HitDecl {
+                flags: held | flags | named,
+                id,
+                touch_inflate: inflate.is_finite().then_some(inflate),
+            }),
+        );
+        if role != UiaRole::None
+            && let Some(row) = self.host().control_mut(id)
+        {
+            row.uia = role;
+        }
         self
+    }
+
+    /// Declares this element a control and edits its row.
+    fn declare(mut self, flags: HitFlags, write: impl FnOnce(&mut ControlRow)) -> Self {
+        let id = self.control_id();
+        if let Some(row) = self.host().control_mut(id) {
+            write(row);
+        }
+        self.hit(flags, UiaRole::None)
+    }
+
+    /// Declares this element a control and installs one of its handlers.
+    ///
+    /// The displaced handler is retired rather than dropped here: dropping it runs whatever
+    /// the application captured, and that must not happen under the host's borrow.
+    fn handler(
+        mut self,
+        flags: HitFlags,
+        write: impl FnOnce(&mut Handlers) -> Option<Retired>,
+    ) -> Self {
+        let id = self.control_id();
+        self.host().set_handler(id, write);
+        self.hit(flags, UiaRole::None)
+    }
+
+    /// Installs a writer for one destination, or writes the record once where the source is a
+    /// constant.
+    ///
+    /// The fork lives here and not at each setter: a constant installs no effect, and a
+    /// reactive source installs one writer belonging to the signal scope creation installed,
+    /// so it retires with the subtree that declared it.
+    fn bind<T: 'static, M>(
+        mut self,
+        source: impl Signal<T, M> + 'static,
+        write: impl Fn(&mut Host, T) + 'static,
+    ) -> Self {
+        if source.is_constant() {
+            let value = source.read();
+            write(self.host(), value);
+            return self;
+        }
+        self.host().binding(move || {
+            let value = source.read();
+            Host::with(|host| write(host, value));
+        });
+        self
+    }
+
+    pub fn on_click(self, callback: impl Fn() + 'static) -> Self {
+        self.handler(HitFlags::INTERACTIVE | HitFlags::GESTURE, |row| {
+            row.click.replace(Rc::new(callback)).map(Retired::new)
+        })
     }
 
     /// Literal names stay borrowed; generated names are released with the control.
-    pub fn name(mut self, name: impl Into<std::borrow::Cow<'static, str>>) -> Self {
-        let id = self.control_id(HitFlags::UIA);
-        self.host.set_handler(id, |row| &mut row.name, name.into());
-        self.host.uia_restale();
+    pub fn name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        let named = self.declare(HitFlags::UIA, |row| row.name = Some(name.into()));
+        named.uia_restale()
+    }
+
+    fn uia_restale(mut self) -> Self {
+        self.host().uia_stale.set(true);
         self
     }
 
-    pub fn key(mut self, key: &'static str) -> Self {
-        let id = self.control_id(HitFlags::NONE);
-        self.host.controls.get_mut(id).unwrap().key = Some(key);
-        self
-    }
-
-    pub fn disabled<M>(mut self, value: impl Signal<bool, M> + 'static) -> Self {
-        let id = self.control_id(HitFlags::NONE);
-        self.state_binding(id, Destination::Disabled, value, |row, value| {
-            row.disabled = value
-        })
-    }
-
-    pub fn selected<M>(mut self, value: impl Signal<bool, M> + 'static) -> Self {
-        let id = self.control_id(HitFlags::NONE);
-        if let Target::Group(group) = self.node.target {
-            self.host.surface_selectable(group);
-        }
-        self.state_binding(id, Destination::Selected, value, |row, value| {
-            row.selected = value
-        })
-    }
-
-    fn state_binding<M>(
-        self,
-        id: ControlId,
-        destination: Destination,
-        value: impl Signal<bool, M> + 'static,
-        write: fn(&mut ControlRow, bool),
-    ) -> Self {
-        let node = self.node.target.id();
-        if value.is_constant() {
-            self.host.replace_binding(node, destination);
-            write(self.host.controls.get_mut(id).unwrap(), value.read());
-            self.host.direct_state(id);
-        } else {
-            self.host.bind_to(node, destination, move || {
-                let value = value.read();
-                Host::with(|host| {
-                    write(host.controls.get_mut(id).unwrap(), value);
-                    host.direct_state(id);
-                });
-            });
-        }
-        self
+    pub fn key(self, key: &'static str) -> Self {
+        self.declare(HitFlags::NONE, |row| row.key = Some(key))
     }
 
     pub fn wash(mut self, wash: Wash) -> Self {
-        self.control_id(HitFlags::INTERACTIVE);
-        if let Target::Group(group) = self.node.target {
-            self.host.surface_wash(group, wash);
+        let node = self.node_id();
+        self.host().surface_wash(windows_scene::GroupId(node), wash);
+        self.hit(HitFlags::INTERACTIVE, UiaRole::None)
+    }
+
+    /// Touch inflation never lets two targets claim one point, so a control sitting inside
+    /// another's inflated box states that its own box is the whole of it.
+    pub fn no_inflate(self) -> Self {
+        self.hit(HitFlags::NO_INFLATE, UiaRole::None)
+    }
+
+    pub fn caption(mut self, button: windows_window::CaptionButton) -> Self {
+        let id = self.control_id();
+        self.host().caption[button as usize] = Some(id);
+        self.hit(HitFlags::INTERACTIVE, UiaRole::None)
+    }
+
+    pub fn hover_scope(self, hovered: Cell<bool>) -> Self {
+        self.interaction_scope()
+            .declare(HitFlags::INTERACTIVE, |row| {
+                row.hovered = Some(hovered);
+                row.front.flags |= flag::OBSERVES;
+            })
+    }
+
+    /// Groups hover, press and keyboard focus for one retained reveal target.
+    /// Declare the scope before mounting its children.
+    pub fn interaction_scope(mut self) -> Self {
+        let id = self.control_id();
+        if let Some(row) = self.host().control_mut(id) {
+            row.front.scope = id;
         }
+        self.hit(HitFlags::GESTURE, UiaRole::None)
+    }
+
+    /// Reveals this element while its enclosing interaction scope is active.
+    ///
+    /// Each scope accepts one target, which must be mounted below the scope. The front thread
+    /// owns its opacity; layout and hit testing remain active.
+    ///
+    /// # Panics
+    ///
+    /// Where no interaction scope encloses this element, where the scope already reveals a
+    /// different target, or where the application has claimed this node's opacity.
+    pub fn reveal_on_interaction(mut self) -> Self {
+        let node = self.node_id();
+        let enclosing = self.ui.control;
+        let scope = self
+            .host()
+            .control(enclosing)
+            .map_or(ControlId::NONE, |row| row.front.scope);
+        assert!(!scope.is_none(), "a reveal requires an interaction scope");
+        let held = self.host().control(scope).map(|row| row.front.reveal);
+        assert!(
+            held == Some(NodeId::NONE) || held == Some(node),
+            "one reveal target per scope"
+        );
+        if held == Some(node) {
+            return self;
+        }
+        // The reveal owns opacity, so an application binding on that target is rejected
+        // rather than silently overwritten by the front thread.
+        assert!(
+            self.host().tree.c.channels[node.index()] & (1 << Prop::Opacity as u32) == 0,
+            "an interaction reveal requires unclaimed opacity"
+        );
+        if let Some(row) = self.host().control_mut(scope) {
+            row.front.reveal = node;
+        }
+        self.host()
+            .write_channel(node, Prop::Opacity, Value::Scalar(0.0));
         self
+    }
+
+    pub fn on_unhandled_escape(mut self, callback: impl Fn() + 'static) -> Self {
+        let node = self.node_id();
+        self.host().set_escape(node, Rc::new(callback));
+        self
+    }
+
+    pub fn on_drag(
+        self,
+        decl: DragDecl,
+        callback: impl Fn(Gesturing<DragUpdate>) + 'static,
+    ) -> Self {
+        let mut dragged = self.handler(HitFlags::GESTURE, |row| {
+            row.drag.replace(Rc::new(callback)).map(Retired::new)
+        });
+        let id = dragged.control_id();
+        if let Some(row) = dragged.host().control_mut(id) {
+            row.front.flags |= flag::DRAGS;
+        }
+        dragged
+            .host()
+            .gestures
+            .push((id, GestureDecl::default().with_drag(decl)));
+        dragged
+    }
+
+    pub fn tip(self, text: impl Into<TextSource>) -> Self {
+        self.tip_at(Side::Bottom, text)
+    }
+
+    pub fn tip_at(self, side: Side, text: impl Into<TextSource>) -> Self {
+        self.handler(HitFlags::INTERACTIVE, |row| {
+            row.tip
+                .replace((Rc::new(text.into()), side))
+                .map(Retired::new)
+        })
+    }
+
+    pub fn flyout(self, body: impl Fn(&mut Ui<'_>) + 'static) -> Self {
+        self.handler(HitFlags::GESTURE | HitFlags::INTERACTIVE, |row| {
+            row.flyout.replace(Rc::new(body)).map(Retired::new)
+        })
+    }
+
+    pub fn popup_when<M>(
+        mut self,
+        shown: impl Signal<bool, M> + 'static,
+        spec: Spec,
+        closed: impl Fn() + 'static,
+        body: impl Fn(&mut Ui<'_>) + 'static,
+    ) -> Self {
+        let node = self.node_id();
+        self.host().tree.set_flag(node, tree::POPUP, true);
+        let (body, closed) = (Rc::new(body), Rc::new(closed));
+        self.bind(shown, move |host, open| {
+            host.popups.push(match open {
+                true => Request::Show {
+                    key: node,
+                    spec: spec.clone(),
+                    body: body.clone(),
+                    closed: closed.clone(),
+                },
+                false => Request::Close(node),
+            });
+        })
+    }
+
+    /// Publishes help text only; it does not parse or own validity.
+    pub fn validation(mut self, read: impl Fn() -> Option<&'static str> + 'static) -> Self {
+        let id = self.control_id();
+        self.hit(HitFlags::UIA, UiaRole::None)
+            .bind(read, move |host, text| {
+                if let Some(row) = host.control_mut(id) {
+                    row.validation = text;
+                }
+                host.uia_stale.set(true);
+            })
+    }
+
+    /// Marks this descendant a part the enclosing control's fraction moves.
+    ///
+    /// At most four parts belong to that control, and a duplicate writer for one property is
+    /// rejected: the router and the applier reach the same property through one writer, so a
+    /// second declaration would be a second writer for it.
+    ///
+    /// # Panics
+    ///
+    /// Where no control encloses this element, where the node already binds a property the
+    /// part drives, or where the control already holds four parts.
+    pub fn scalar_part(mut self, part: ScalarPart) -> Self {
+        let owner = self.ui.control;
+        assert!(
+            !owner.is_none(),
+            "a scalar part requires an enclosing control"
+        );
+        let node = self.node_id();
+        assert_eq!(
+            self.host().tree.c.channels[node.index()] & claimed(part),
+            0,
+            "a scalar part cannot also bind its driven property"
+        );
+        let Some(row) = self.host().control_mut(owner) else {
+            return self;
+        };
+        let parts = &mut row.value.get_or_insert_with(ValueRow::default).parts;
+        let slot = parts
+            .iter()
+            .position(|(held, _)| *held == node)
+            .or_else(|| parts.iter().position(|(_, held)| *held == ScalarPart::None))
+            .expect("a scalar supports at most four parts");
+        parts[slot] = (node, part);
+        self
+    }
+
+    /// Records the drive, the range and the gesture it implies, and binds the source.
+    ///
+    /// Generic over the element's marker so a two-state control declares its drive through the
+    /// same path a slider does.
+    fn driven<M>(
+        mut self,
+        drive: Interaction,
+        value: impl Signal<ScalarValue, M> + 'static,
+    ) -> Self {
+        let id = self.control_id();
+        let (role, decl) = match drive {
+            Interaction::Press => (UiaRole::None, GestureDecl::default()),
+            Interaction::Slide(range) => (UiaRole::Slider, GestureDecl::slider(range.vertical)),
+            // A marker that the control is turned. The pivot it rotates about is the
+            // input thread's, which is the side that holds the contact and the box.
+            Interaction::Turn(_) => (
+                UiaRole::Slider,
+                GestureDecl::knob(),
+            ),
+        };
+        if let Some(row) = self.host().control_mut(id) {
+            row.front.flags |= bits_of(drive);
+            if let Some(range) = range_of(drive) {
+                row.value = Some(ValueRow {
+                    min: range.min,
+                    span: range.max - range.min,
+                    step: range.quantum(),
+                    ..row.value.unwrap_or_default()
+                });
+            }
+        }
+        self.host().gestures.push((id, decl));
+        self.hit(HitFlags::INTERACTIVE | HitFlags::GESTURE, role)
+            .bind(value, move |host, source| {
+                let fraction = range_of(drive)
+                    .map_or(source.value as f32, |range| range.fraction(source.value));
+                host.publish_fraction(id, fraction, source.epoch);
+            })
+    }
+}
+
+// -- model state ----------------------------------------------------------------------
+
+impl<K> Element<'_, K> {
+    /// Model state, not interaction: a discrete base-paint swap at event rate rather than a
+    /// wash the scene thread fades. A disabled control keeps its automation entry and loses
+    /// every other hit flag.
+    fn model_state<M>(mut self, value: impl Signal<bool, M> + 'static, state: ModelState) -> Self {
+        let id = self.control_id();
+        self.bind(value, move |host, on| {
+            host.set_state(id, Some(if on { state } else { ModelState::Rest }));
+        })
+    }
+
+    pub fn disabled<M>(self, value: impl Signal<bool, M> + 'static) -> Self {
+        self.model_state(value, ModelState::Disabled)
+    }
+
+    pub fn selected<M>(mut self, value: impl Signal<bool, M> + 'static) -> Self {
+        let node = self.node_id();
+        self.host().surface_selectable(windows_scene::GroupId(node));
+        self.model_state(value, ModelState::Selected)
+    }
+}
+
+// -- scalars --------------------------------------------------------------------------
+
+impl<'a, K> Element<'a, K> {
+    /// Binds this control's authoritative value and the gesture its drive implies, making it
+    /// a scalar.
+    ///
+    /// An accepted echo (the same epoch) preserves an active gesture; a changed epoch is a
+    /// replaced document and cancels it, restoring the gesture's start without committing. A
+    /// source that is never replaced states epoch zero.
+    pub fn drive<M>(
+        self,
+        drive: Interaction,
+        value: impl Signal<ScalarValue, M> + 'static,
+    ) -> Element<'a, Scalar> {
+        self.driven(drive, value).retype()
     }
 }
 
 impl Element<'_, Scalar> {
-    /// Installs the handler this control's gesture reports to.
-    ///
-    /// One handler for the three phases: a gesture is a sequence with exactly one end, and
-    /// a handler per phase would let a caller register the moves and forget the release.
-    pub fn on_gesture(
-        mut self,
-        callback: impl Fn(crate::widget::Gesturing<f64>) + 'static,
-    ) -> Self {
-        let id = self.control_id(HitFlags::GESTURE);
-        self.host
-            .set_handler(
-                id,
-                |row| &mut row.scalar,
-                Rc::new(callback) as Rc<dyn Fn(crate::widget::Gesturing<f64>)>,
-            );
-        self
-    }
-
     /// Publishes this control's value while a gesture moves it, and clears `cell` when the
     /// gesture commits or is canceled.
     ///
-    /// The value a pointer, a key or an automation client is moving lives on the front
-    /// thread until the gesture ends, so a readout beside the control reads it here. The
-    /// document a commit will write states the value the gesture started from.
-    pub fn live(mut self, cell: crate::signal::Cell<Option<f64>>) -> Self {
-        let id = self.control_id(HitFlags::GESTURE);
-        self.host.controls.get_mut(id).unwrap().live = Some(cell);
-        self
+    /// The value a pointer, a key or an automation client is moving lives on the front thread
+    /// until the gesture ends, so a readout beside the control reads it here.
+    pub fn live(self, cell: Cell<Option<f64>>) -> Self {
+        self.declare(HitFlags::GESTURE, |row| row.live = Some(cell))
+    }
+
+    /// Installs the handler this control's gesture reports to.
+    pub fn on_gesture(self, callback: impl Fn(Gesturing<f64>) + 'static) -> Self {
+        self.handler(HitFlags::GESTURE, |row| {
+            row.scalar.replace(Rc::new(callback)).map(Retired::new)
+        })
     }
 }
 
 impl Element<'_, super::Field> {
-    pub fn on_commit(mut self, callback: impl Fn(&str) + 'static) -> Self {
-        let id = self.control_id(HitFlags::TEXT);
-        if let Some(old) = self
-            .host
-            .fields
-            .get_mut(id)
-            .unwrap()
-            .callback
-            .replace(Rc::new(callback))
-        {
-            self.host.retired.push(Retired::new(old));
-        }
-        self
+    pub fn on_commit(self, callback: impl Fn(&str) + 'static) -> Self {
+        self.handler(HitFlags::TEXT, |row| {
+            row.commit.replace(Rc::new(callback)).map(Retired::new)
+        })
     }
-    pub fn scope(mut self, scope: crate::text_input::InputScope) -> Self {
-        let id = self.control_id(HitFlags::TEXT);
-        self.host.fields.get_mut(id).unwrap().scope = scope;
-        for source in &mut self.host.field_sources {
-            if source.id == id {
-                source.scope = scope;
-            }
-        }
+
+    /// Numeric scope requests an input mode; parsing, units, bounds, validation and
+    /// formatting are application policy.
+    ///
+    /// A masked scope is also the run's fold, so the plaintext never reaches the shaper, the
+    /// coverage or the automation snapshot.
+    pub fn scope(mut self, scope: InputScope) -> Self {
+        let id = self.control_id();
+        self.host().set_field_scope(id, scope);
         self
     }
 }
 
-impl<'a> Element<'a> {
-    pub fn turn<M>(
-        self,
-        value: impl Signal<f64, M> + 'static,
-        range: crate::widget::Range,
-    ) -> Element<'a, Scalar> {
-        self.scalar_source(crate::widget::Interaction::Turn(range), value, |value| {
-            crate::widget::ScalarValue { value, epoch: 0 }
-        })
-    }
-    pub fn turn_source<M>(
-        self,
-        value: impl Signal<crate::widget::ScalarValue, M> + 'static,
-        range: crate::widget::Range,
-    ) -> Element<'a, Scalar> {
-        self.scalar_source(crate::widget::Interaction::Turn(range), value, |value| {
-            value
-        })
-    }
-    pub fn slide<M>(
-        self,
-        value: impl Signal<f64, M> + 'static,
-        range: crate::widget::Range,
-    ) -> Element<'a, Scalar> {
-        self.scalar_source(crate::widget::Interaction::Slide(range), value, |value| {
-            crate::widget::ScalarValue { value, epoch: 0 }
-        })
-    }
-    /// A slider source whose epoch invalidates gestures when its document is replaced.
-    pub fn slide_source<M>(
-        self,
-        value: impl Signal<crate::widget::ScalarValue, M> + 'static,
-        range: crate::widget::Range,
-    ) -> Element<'a, Scalar> {
-        self.scalar_source(crate::widget::Interaction::Slide(range), value, |value| {
-            value
-        })
-    }
-    fn scalar_source<T: Copy + 'static, M>(
-        mut self,
-        drive: crate::widget::Interaction,
-        value: impl Signal<T, M> + 'static,
-        map: impl Fn(T) -> crate::widget::ScalarValue + 'static,
-    ) -> Element<'a, Scalar> {
-        let id = self.control_id(HitFlags::GESTURE | HitFlags::INTERACTIVE | HitFlags::UIA);
-        let row = self.host.controls.get_mut(id).unwrap();
-        row.uia = UiaRole::Slider;
-        row.front.drive = Some(drive);
-        row.dirty = true;
-        let range = match drive {
-            crate::widget::Interaction::Turn(range) | crate::widget::Interaction::Slide(range) => {
-                range
-            }
-            _ => unreachable!(),
-        };
-        let gesture = match drive {
-            crate::widget::Interaction::Slide(range) => {
-                crate::gesture::GestureDecl::slider(range.vertical)
-            }
-            _ => crate::gesture::GestureDecl {
-                drag: Some(crate::gesture::DragDecl::turn()),
-                ..Default::default()
-            },
-        };
-        self.host.gestures.push((id, gesture));
-        let node = self.node.target.id();
-        if value.is_constant() {
-            let value = map(value.read());
-            self.host.replace_binding(node, Destination::Scalar);
-            self.host
-                .publish_fraction(id, range.fraction(value.value), value.epoch);
-        } else {
-            self.host.bind_to(node, Destination::Scalar, move || {
-                let value = map(value.read());
-                Host::with(|h| h.publish_fraction(id, range.fraction(value.value), value.epoch));
-            });
-        }
-        Element {
-            host: self.host,
-            members: self.members,
-            node: super::Node {
-                target: self.node.target,
-                runtime: self.node.runtime,
-                owner: self.node.owner,
-                hover_scope: self.node.hover_scope,
-                kind: core::marker::PhantomData,
-            },
-        }
+/// The range a drive runs over, or `None` for a two-state control.
+const fn range_of(drive: Interaction) -> Option<Range> {
+    match drive {
+        Interaction::Press => None,
+        Interaction::Slide(range) | Interaction::Turn(range) => Some(range),
     }
 }
-impl<K> Element<'_, K> {
-    pub(crate) fn hit(mut self, flags: HitFlags, role: UiaRole) -> Self {
-        let id = self.control_id(
-            flags
-                | if role == UiaRole::None {
-                    HitFlags::NONE
-                } else {
-                    HitFlags::UIA
-                },
-        );
-        let row = self.host.controls.get_mut(id).unwrap();
-        row.uia = role;
-        row.front.hover_scope = if row.front.hover_scope == Some(id) {
-            Some(id)
-        } else {
-            self.node.hover_scope
-        };
-        row.dirty = true;
-        self
+
+/// The chrome-row bits a drive sets: how a pointer reads the value, and which way it grows.
+const fn bits_of(drive: Interaction) -> u8 {
+    let (kind, range) = match drive {
+        Interaction::Press => return 0,
+        Interaction::Slide(range) => (flag::SLIDE, range),
+        Interaction::Turn(range) => (flag::TURN, range),
+    };
+    match range.vertical {
+        true => kind | flag::VERTICAL,
+        false => kind,
     }
-    pub fn no_inflate(mut self) -> Self {
-        self.host
-            .mounts
-            .get_mut(self.node.target.id())
-            .unwrap()
-            .no_inflate = true;
-        if self
-            .host
-            .mounts
-            .get(self.node.target.id())
-            .unwrap()
-            .control
-            .is_some()
-        {
-            self.control_id(HitFlags::NO_INFLATE);
+}
+
+/// The channel mask a part drives, which is what a second writer would collide with.
+///
+/// A trail writes no channel from its mapping — it is driven by a compositor expression onto
+/// the thumb's own offset — so its two trim endpoints are named here rather than derived.
+fn claimed(part: ScalarPart) -> u32 {
+    match part {
+        ScalarPart::Trail { .. } => (1 << Prop::TrimStart as u32) | (1 << Prop::TrimEnd as u32),
+        part => part
+            .channels(0.0, 0.0, 1.0)
+            .into_iter()
+            .flatten()
+            .fold(0, |mask, (prop, _)| mask | 1 << prop as u32),
+    }
+}
+
+/// Lifts a two-state source into the fraction its control stands at.
+struct Flag<S>(S);
+
+impl<S: Signal<bool, M>, M> Signal<ScalarValue, M> for Flag<S> {
+    fn read(&self) -> ScalarValue {
+        ScalarValue {
+            value: f64::from(self.0.read()),
+            epoch: 0,
         }
-        self
-    }
-    pub fn caption(mut self, button: windows_window::CaptionButton) -> Self {
-        let id = self.control_id(HitFlags::INTERACTIVE);
-        self.host.caption.set(button, id);
-        self
-    }
-    pub fn hover_scope(mut self, hovered: crate::signal::Cell<bool>) -> Self {
-        let id = self.control_id(HitFlags::INTERACTIVE);
-        let row = self.host.controls.get_mut(id).unwrap();
-        row.hovered = Some(hovered);
-        row.front.observes_hover = true;
-        row.front.hover_scope = Some(id);
-        row.dirty = true;
-        self
-    }
-    /// Groups hover, press and keyboard focus for one retained reveal target.
-    /// Declare the scope before mounting its children.
-    pub fn interaction_scope(mut self) -> Self {
-        let id = self.control_id(HitFlags::GESTURE);
-        let row = self.host.controls.get_mut(id).unwrap();
-        row.front.hover_scope = Some(id);
-        row.dirty = true;
-        self
     }
 
-    /// Reveals this element while its enclosing interaction scope is active.
-    /// Each scope accepts one target, which must be mounted below the scope.
-    /// The front thread owns its opacity; layout and hit testing remain active.
-    pub fn reveal_on_interaction(self) -> Self {
-        let scope = self
-            .node
-            .hover_scope
-            .expect("a reveal requires an interaction scope");
-        let node = self.node.target.id();
-        let row = self.host.controls.get_mut(scope).unwrap();
-        assert!(
-            row.front.reveal.is_none() || row.front.reveal == node,
-            "one reveal target per scope"
+    fn is_constant(&self) -> bool {
+        self.0.is_constant()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_drive_states_how_a_pointer_reads_the_value_and_which_way_it_grows() {
+        let up = Range::new(0.0, 1.0).vertical();
+        assert_eq!(bits_of(Interaction::Press), 0);
+        assert_eq!(bits_of(Interaction::Slide(Range::UNIT)), flag::SLIDE);
+        assert_eq!(bits_of(Interaction::Turn(up)), flag::TURN | flag::VERTICAL);
+        assert_eq!(range_of(Interaction::Press), None);
+        assert_eq!(range_of(Interaction::Slide(Range::UNIT)), Some(Range::UNIT));
+    }
+
+    /// A trail drives its two trim endpoints through a compositor expression, so a second
+    /// writer on either is what the part declaration rejects.
+    #[test]
+    fn a_trail_claims_both_trim_endpoints_and_a_thumb_claims_its_offset() {
+        let trail = claimed(ScalarPart::Trail { from: 0.0 });
+        assert_eq!(
+            trail,
+            (1 << Prop::TrimStart as u32) | (1 << Prop::TrimEnd as u32)
         );
-        if row.front.reveal == node {
-            return self;
-        }
-        assert!(
-            self.host.mounts.get(node).unwrap().channels
-                & (1 << windows_scene::Prop::Opacity as u8)
-                == 0,
-            "an interaction reveal requires unclaimed opacity"
-        );
-        let row = self.host.controls.get_mut(scope).unwrap();
-        row.front.reveal = node;
-        row.dirty = true;
-        self.host.set_channel(
-            node,
-            node,
-            windows_scene::Prop::Opacity,
-            windows_scene::Value::Scalar(0.0),
-        );
-        self
+        assert_ne!(claimed(ScalarPart::Thumb { vertical: false }), 0);
+        assert_eq!(claimed(ScalarPart::None), 0);
     }
-    pub fn on_unhandled_escape(self, callback: impl Fn() + 'static) -> Self {
-        self.host
-            .set_escape(self.node.target.id(), Rc::new(callback));
-        self
-    }
-    pub fn drag(mut self, decl: crate::gesture::DragDecl) -> Self {
-        let id = self.control_id(HitFlags::GESTURE);
-        self.host
-            .gestures
-            .push((id, crate::gesture::GestureDecl::default().with_drag(decl)));
-        self
-    }
-    pub fn on_drag(
-        mut self,
-        decl: crate::gesture::DragDecl,
-        callback: impl Fn(crate::widget::Gesturing<crate::gesture::DragUpdate>) + 'static,
-    ) -> Self {
-        let id = self.control_id(HitFlags::GESTURE);
-        self.host
-            .set_handler(
-            id,
-            |row| &mut row.drag,
-            Rc::new(callback) as Rc<dyn Fn(crate::widget::Gesturing<crate::gesture::DragUpdate>)>,
-        );
-        self.drag(decl)
-    }
-    pub fn gesture(mut self, decl: crate::gesture::GestureDecl) -> Self {
-        let id = self.control_id(HitFlags::GESTURE);
-        self.host.gestures.push((id, decl));
-        self
-    }
-    pub fn tip(self, text: impl Into<TextSource>) -> Self {
-        self.tip_at(crate::overlay::Side::Bottom, text)
-    }
-    pub fn tip_at(mut self, side: crate::overlay::Side, text: impl Into<TextSource>) -> Self {
-        let id = self.control_id(HitFlags::INTERACTIVE);
-        self.host
-            .set_handler(id, |row| &mut row.tip, (Rc::new(text.into()), side));
-        self
-    }
-    pub fn flyout(mut self, body: impl Fn(&mut Ui<'_>) + 'static) -> Self {
-        let id = self.control_id(HitFlags::GESTURE | HitFlags::INTERACTIVE);
-        self.host
-            .set_handler(
-            id,
-            |row| &mut row.flyout,
-            Rc::new(body) as Rc<dyn Fn(&mut Ui<'_>)>,
-        );
-        self
-    }
-    pub fn popup_when<M>(
-        self,
-        shown: impl Signal<bool, M> + 'static,
-        spec: crate::overlay::Spec,
-        closed: impl Fn() + 'static,
-        body: impl Fn(&mut Ui<'_>) + 'static,
-    ) -> Self {
-        let node = self.node.target.id();
-        self.host.mounts.get_mut(node).unwrap().popup = true;
-        let body = Rc::new(body);
-        let closed = Rc::new(closed);
-        if shown.is_constant() {
-            self.host.replace_binding(node, Destination::Popup);
-            let request = if shown.read() {
-                crate::overlay::Request::Show {
-                    key: node,
-                    spec,
-                    body,
-                    closed,
-                }
-            } else {
-                self.host.retired.push(Retired::new(body));
-                self.host.retired.push(Retired::new(closed));
-                crate::overlay::Request::Close(node)
-            };
-            self.host.request_popup(request);
-            return self;
-        }
-        self.host.bind_to(node, Destination::Popup, move || {
-            let request = if shown.read() {
-                crate::overlay::Request::Show {
-                    key: node,
-                    spec,
-                    body: body.clone(),
-                    closed: closed.clone(),
-                }
-            } else {
-                crate::overlay::Request::Close(node)
-            };
-            Host::with(|h| h.request_popup(request));
-        });
-        self
-    }
-    pub fn validation(mut self, read: impl Fn() -> Option<&'static str> + 'static) -> Self {
-        let id = self.control_id(HitFlags::UIA);
-        let node = self.node.target.id();
-        self.host.bind_to(node, Destination::Validation, move || {
-            let value = read();
-            Host::with(|h| {
-                h.controls.get_mut(id).unwrap().validation = value;
-                h.direct_state(id);
-                h.uia_restale();
-            });
-        });
-        self
+
+    #[test]
+    fn a_flag_reads_as_the_fraction_its_control_stands_at() {
+        assert_eq!(Flag(true).read(), ScalarValue { value: 1.0, epoch: 0 });
+        assert!(Flag(true).is_constant());
     }
 }

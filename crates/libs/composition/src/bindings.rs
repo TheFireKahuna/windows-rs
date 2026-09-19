@@ -6273,9 +6273,27 @@ impl windows_core::RuntimeType for INaturalMotionAnimation {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
+impl INaturalMotionAnimation {
+    pub(crate) fn SetDelayTime(&self, value: windows_time::TimeSpan) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetDelayTime)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+}
 #[repr(C)]
 pub struct INaturalMotionAnimation_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
+    DelayBehavior: usize,
+    SetDelayBehavior: usize,
+    DelayTime: usize,
+    pub SetDelayTime: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_time::TimeSpan,
+    ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     IRectangleClip,

@@ -1,8 +1,6 @@
 //! Start-up and the threads: the process-wide installs, the window, and the four threads a
 //! running window is made of.
 //!
-//! # The threads
-//!
 //! ```text
 //! input   the window's own thread: the pump, the doorbell, the router, the caption's answers.
 //!         Resolves contacts against a copy of the hit array, moves nothing on screen, and
@@ -10,14 +8,14 @@
 //!         contact or an inertia is live.
 //! scene   owns the compositor and the retained tree. Applies a patch when it arrives and
 //!         turns a report into a retarget when it arrives; has no clock of its own.
-//! app     owns the signal graph, the model and the overlay stack; parks on a doorbell and
+//! app     owns the signal graph, the tree and the overlay stack; parks on a doorbell and
 //!         wakes on a write. Has no clock.
 //! present owns the presentation regions and draws them off the compositor clock; posts to
 //!         nobody but the scene thread's binder.
 //! ```
 //!
-//! Every crossing between them is a mailbox over a buffer allocated once, and every wait is
-//! on a doorbell or the compositor's own clock. An idle window costs no wakes on any of them.
+//! Every crossing between them is a mailbox over a buffer allocated once, and every wait is on
+//! a doorbell or the compositor's own clock. An idle window costs no wakes on any of them.
 //!
 //! # Why the order lives here
 //!
@@ -25,42 +23,56 @@
 //! ordering comment names what breaks if the line moves. Start-up carries one constraint that
 //! is not about order: the shaping engine's font ladder must be the same instance the
 //! rasterizing engine holds, because two ladders agree on face 0 and disagree on everything
-//! after it. The scene thread builds the [`Backends`] and publishes their ladder before the
-//! app thread starts.
+//! after it. The scene thread builds the [`Backends`] and publishes that ladder before the app
+//! thread starts.
 //!
 //! # What stays the application's
 //!
 //! The compositor and the GPU. This crate declares into a retained tree and never builds one,
-//! which is what keeps `windows-composition` and `windows-d2d` out of its dependencies, so
-//! the application constructs the [`Backends`] — on the scene thread, through the closure it
-//! hands over.
+//! which is what keeps `windows-composition` and `windows-d2d` out of its dependencies, so the
+//! application constructs the [`Backends`] — on the scene thread, through the closure it hands
+//! over.
 
-mod app;
-mod input;
-mod links;
-mod scene;
-
-#[cfg(feature = "test-support")]
-pub mod testing;
-
-use crate::build::Ui;
-use crate::input::Report;
-use crate::role::{AccentId, Density, Palette, Scope};
-pub use crate::seam::AppCensus;
-use core::sync::atomic::Ordering;
-use input::Frame;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::*;
+
 use windows_color::OutputTransform;
 use windows_core::{Error, Result};
 use windows_numerics::Vector2;
 use windows_scene::{BackdropSpec, Backends, Census, Env};
-use windows_window::{CaptionHit, CaptionState, E_HANDLE, Handoff, Watch, Window, WindowBuilder};
+use windows_window::{
+    CaptionHit, CaptionState, E_HANDLE, Handoff, WM_FRAME, Window, WindowBuilder,
+};
+
+use crate::input::Report;
+use crate::role::{AccentId, Density, Palette, Scope};
+use crate::seam::SceneTally;
+
+mod links;
+mod pass;
+#[cfg(feature = "test-support")]
+pub mod testing;
+mod tick;
+
+pub use crate::seam::AppCensus;
+use links::Links;
+
+/// The system's own questions this crate answers, by number. None of them has a constant in
+/// either binding filter.
+const WM_DESTROY: u32 = 0x0002;
+const WM_MOVE: u32 = 0x0003;
+const WM_SETTINGCHANGE: u32 = 0x001a;
+const WM_GETOBJECT: u32 = 0x003d;
+
+/// How long the window waits for the first patch before showing anyway, in milliseconds.
+///
+/// Bounded, so an application whose first build never emits shows its empty window rather than
+/// nothing at all.
+const FIRST_PATCH_MS: u32 = 5_000;
 
 /// Window runtime configuration and the root [`Scope`] it owns.
-/// Obtain the scope through [`root_scope`](Self::root_scope) when resolving application
-/// metrics before opening the window.
 #[derive(Copy, Clone)]
 pub struct UiRuntime {
     root_scope: Scope,
@@ -69,13 +81,14 @@ pub struct UiRuntime {
 /// What the application's tree builder is handed, on the app thread.
 pub struct AppCtx {
     /// The window's visibility, for a producer that should stop while nobody can see it.
-    pub watch: Watch,
+    pub visibility: windows_window::Watch,
     /// The client area the window opened at, in DIPs.
-    pub window_dips: Vector2,
+    pub size: Vector2,
 }
 
 impl UiRuntime {
     /// Starts an independent window with explicitly selected theme axes.
+    #[must_use]
     pub const fn from_scope(root_scope: Scope) -> Self {
         Self { root_scope }
     }
@@ -83,13 +96,11 @@ impl UiRuntime {
     /// Selects the palette and default dark root scope for this window.
     #[must_use]
     pub fn new(palette: &'static dyn Palette, accent: AccentId, density: Density) -> Self {
-        Self {
-            root_scope: Scope::root(palette, accent, density),
-        }
+        Self::from_scope(crate::role::install(palette, accent, density))
     }
 
-    /// Returns the root scope fixed at [`new`](Self::new), for the numbers an
-    /// application needs before its window exists.
+    /// Returns the root scope fixed at [`new`](Self::new), for the numbers an application needs
+    /// before its window exists.
     #[must_use]
     pub const fn root_scope(self) -> Scope {
         self.root_scope
@@ -97,90 +108,88 @@ impl UiRuntime {
 
     /// Creates the window, starts the scene and app threads, and pumps until quit.
     ///
-    /// `backends` runs on the scene thread once the window exists: a system compositor needs
-    /// a dispatcher queue on the calling thread, and the scene thread has made its own.
+    /// `backends` runs on the scene thread once the window exists: a system compositor needs a
+    /// dispatcher queue on the calling thread, and the scene thread has made its own.
     ///
-    /// `mount` runs on the app thread with a borrowed authoring context once the scene
-    /// exists. The runtime owns the declared content and retires it during shutdown.
+    /// `mount` runs on the app thread with a borrowed authoring context once the scene exists.
+    /// The runtime owns the declared content and retires it during shutdown.
     ///
     /// `on_resize`, `on_scale_changed`, `on_caption_hit` and `on_caption_state` are attached
     /// here, after `window` is configured, so those four handlers are the driver's.
     /// `on_message` is **chained**: a caller's own handler survives and answers first, and the
-    /// tick and the doorbell see whatever it returned `None` for. Everything else about the
-    /// window is the caller's.
+    /// tick and the doorbell see whatever it returned `None` for.
     ///
     /// # Errors
     ///
     /// The window could not be created, a thread could not be started, the backends or the
     /// scene could not be brought up, or a thread failed. A failure on a worker thread closes
     /// the window, so the pump returns, and surfaces here after both workers are joined.
-    pub fn run(
+    pub fn run<B, M>(
         self,
         window: WindowBuilder,
-        backends: impl FnOnce() -> Result<Backends> + Send + 'static,
+        backends: B,
         backdrop: BackdropSpec,
-        mount: impl FnOnce(&mut Ui<'_>, AppCtx) + Send + 'static,
-    ) -> Result<()> {
-        let bell = Rc::new(crate::input::Doorbell::new());
-        let uia = Rc::new(RefCell::new(crate::uia::Uia::new()));
-        // The client extent, in pixels, posted whenever the system changes it and taken by
-        // the next tick, which forwards it in DIPs. Likewise a scale change, which carries
-        // nothing: the tick re-reads the display and forwards what differs.
-        let resized: Rc<Handoff<(i32, i32)>> = Rc::new(Handoff::new());
-        let rescaled: Rc<Handoff<()>> = Rc::new(Handoff::new());
+        mount: M,
+    ) -> Result<()>
+    where
+        B: FnOnce() -> Result<Backends> + Send + 'static,
+        M: FnOnce(&mut crate::build::Ui<'_>, AppCtx) + Send + 'static,
+    {
         // The tick, reachable from the window procedure. Empty until everything it needs
-        // exists, which is after the window whose handler reaches it. That handler holds a
-        // weak reference: the frame owns the window, and two strong ones would be a cycle
-        // that never lets either go.
-        let frame: Rc<RefCell<Option<Frame>>> = Rc::new(RefCell::new(None));
+        // exists, which is after the window whose handler reaches it. That handler holds a weak
+        // reference: the tick owns the window, and two strong ones would be a cycle that never
+        // lets either go.
+        let tick: Rc<RefCell<Option<tick::Tick>>> = Rc::default();
+        // Posted whenever the system changes the client extent or the scale, and taken by the
+        // next tick, which forwards what differs. A scale change carries nothing: the tick
+        // re-reads the display. Hover and press over a window command land the same way,
+        // because the handler runs inside the window procedure.
+        let resized: Rc<Handoff<(i32, i32)>> = Rc::default();
+        let rescaled: Rc<Handoff<()>> = Rc::default();
+        let nonclient: Rc<Handoff<CaptionState>> = Rc::default();
+        let uia = Rc::new(RefCell::new(crate::uia::Uia::new()));
         // Where a failed tick lands. It has no call stack this side owns to return up.
-        let settings_changed = Rc::new(std::cell::Cell::new(false));
-        let failed: Rc<RefCell<Option<Error>>> = Rc::new(RefCell::new(None));
+        let failed: Rc<RefCell<Option<Error>>> = Rc::default();
 
         let window = window
-            // The tick, and the doorbell for every other message. `WM_FRAME` is answered
-            // inside the window procedure rather than after the pump returns, so a
-            // drag-resize keeps routing: the system's sizing loop pumps this message and
-            // does not return until the contact lifts.
+            // The tick, and the doorbell for every other message. `WM_FRAME` is answered inside
+            // the window procedure rather than after the pump returns, so a drag-resize keeps
+            // routing: the system's sizing loop pumps this message and does not return until
+            // the contact lifts.
             //
             // Chained, so a caller's own handler survives being handed to this method and
             // answers first. Replacing it would discard it without a diagnostic.
             .chain_message({
-                let bell = Rc::clone(&bell);
-                let uia = Rc::clone(&uia);
-                let settings_changed = Rc::clone(&settings_changed);
-                let rescaled = Rc::clone(&rescaled);
-                let frame = Rc::downgrade(&frame);
-                let failed = Rc::clone(&failed);
-                move |_, message, wparam, lparam| {
-                    if message == 0x001a {
-                        settings_changed.set(true);
-                        rescaled.post(());
+                let (tick, failed) = (Rc::downgrade(&tick), Rc::clone(&failed));
+                let (uia, rescaled) = (Rc::clone(&uia), Rc::clone(&rescaled));
+                move |_, msg, w, l| {
+                    // The system's own questions, answered before the tick: a settings change
+                    // and a move both re-read the display, `WM_GETOBJECT` is a synchronous
+                    // cross-process call, and `WM_DESTROY` releases the provider while its
+                    // handle is still valid.
+                    match msg {
+                        WM_SETTINGCHANGE | WM_MOVE => rescaled.post(()),
+                        WM_GETOBJECT => return uia.borrow_mut().get_object(w, l),
+                        WM_DESTROY => uia.borrow_mut().detach(),
+                        _ => {}
                     }
-                    if message == 0x0003 {
-                        rescaled.post(());
+                    let held = tick.upgrade()?;
+                    if msg == WM_FRAME {
+                        // A frame arriving while one is running is skipped rather than nested:
+                        // `try_borrow_mut` fails, and the pacer's gate reopens so the next
+                        // frame serves whatever this one missed.
+                        let mut slot = held.try_borrow_mut().ok()?;
+                        if let Some(Err(e)) = slot.as_mut().map(tick::Tick::run) {
+                            _ = failed.borrow_mut().get_or_insert(e);
+                            windows_window::quit();
+                        }
+                        return Some(0);
                     }
-                    if message == 0x003d {
-                        return uia.borrow_mut().get_object(wparam, lparam);
-                    }
-                    if message == 0x0002 {
-                        uia.borrow_mut().detach();
-                    }
-                    if message != windows_window::WM_FRAME {
-                        return bell.wndproc(message, wparam, lparam);
-                    }
-                    // A frame arriving while one is running is skipped rather than nested:
-                    // `try_borrow_mut` fails, and the pacer's gate reopens so the next
-                    // frame serves whatever this one missed.
-                    if let Some(cell) = frame.upgrade()
-                        && let Ok(mut slot) = cell.try_borrow_mut()
-                        && let Some(frame) = slot.as_mut()
-                        && let Err(error) = frame.tick()
-                    {
-                        *failed.borrow_mut() = Some(error);
-                        windows_window::quit();
-                    }
-                    Some(0)
+                    // Removed-key pretranslation and the pointer doorbell both run inside the
+                    // system's nested pumps, so this answers through the same borrow the frame
+                    // takes and fails rather than nesting one inside the other.
+                    let mut slot = held.try_borrow_mut().ok()?;
+                    slot.as_mut()?.message(msg, w, l)
                 }
             })
             .on_resize({
@@ -197,195 +206,134 @@ impl UiRuntime {
 
         uia.borrow_mut().attach(window.hwnd());
         let text = crate::text_input::TextInput::new(&window)?;
-        let tsf = Rc::clone(&text.tsf);
         // Removed-key pretranslation also runs in the system's nested pumps. Drain earlier
-        // discrete input before offering this key, so TSF sees the click/Tab's focus.
-        // Release Frame before calling a TIP: it can synchronously enter our store.
+        // discrete input before offering this key, so TSF sees the click or Tab's focus.
+        // Release the tick before calling a TIP: it can synchronously enter our store.
         let key_filter = window.key_filter({
-            let frame = Rc::downgrade(&frame);
-            let failed = Rc::clone(&failed);
+            let (held, failed, tsf) = (
+                Rc::downgrade(&tick),
+                Rc::clone(&failed),
+                Rc::clone(&text.tsf),
+            );
             move |message| {
-                if let Some(cell) = frame.upgrade()
+                if let Some(cell) = held.upgrade()
                     && let Ok(mut slot) = cell.try_borrow_mut()
-                    && let Some(frame) = slot.as_mut()
-                    && let Err(error) = frame.tick()
+                    && let Some(Err(e)) = slot.as_mut().map(tick::Tick::run)
                 {
-                    *failed.borrow_mut() = Some(error);
+                    _ = failed.borrow_mut().get_or_insert(e);
                     windows_window::quit();
                     return true;
                 }
                 tsf.filter(message)
             }
         })?;
-
         let pacer = window.pacer()?;
         resized.arm(pacer.wake());
         rescaled.arm(pacer.wake());
-        // Every query below answers for the window's current display, so a window closed
-        // under start-up fails here rather than starting threads against invented numbers.
+        nonclient.arm(pacer.wake());
+
+        // Every query below answers for the window's current display, so a window closed under
+        // start-up fails here rather than starting threads against invented numbers.
         let env = env_of(&window, self.root_scope).ok_or_else(closed)?;
-        let output = output_of(&window, self.root_scope).ok_or_else(closed)?;
-        let window_dips = client_dips(&window).ok_or_else(closed)?;
-        let links = Arc::new(links::Links::new(window.handle())?);
+        let size = client_size(&window).ok_or_else(closed)?;
+        let links = Arc::new(Links::new(&window)?);
 
         // The scene thread first: it builds the backends whose font ladder the app thread's
         // shaping engine is made over, and it publishes that ladder before it signals ready.
-        let scene_thread = std::thread::Builder::new()
-            .name("ui-scene".into())
-            .spawn({
-                let links = Arc::clone(&links);
-                let start = scene::Start {
-                    scope: self.root_scope,
-                    backends: Box::new(backends),
-                    backdrop,
-                    env,
-                    output,
-                    watch: window.watch()?,
-                    scene_watch: window.watch()?,
-                };
-                move || scene::run(links, start)
-            })
-            .map_err(spawn_failed)?;
+        //
+        // Two watches, not one: each watcher holds its own wake and an auto-reset event is
+        // unicast, so the scene thread's wait and the present thread's park cannot share one.
+        let scene = pass::spawn_scene(
+            &links,
+            backends,
+            backdrop,
+            env,
+            self.root_scope,
+            window.watch()?,
+            window.watch()?,
+        )?;
         links.scene_ready.wait(windows_window::clock::INFINITE);
-        if let Some(error) = links.failure() {
-            _ = scene_thread.join();
-            return Err(error);
+        if let Err(e) = links.failure() {
+            _ = scene.join();
+            return Err(e);
         }
+        let app = pass::spawn_app(&links, mount, env, size, self.root_scope, window.watch()?)?;
 
-        let app_thread = std::thread::Builder::new()
-            .name("ui-app".into())
-            .spawn({
-                let links = Arc::clone(&links);
-                let start = app::Start {
-                    mount: Box::new(mount),
-                    root_scope: self.root_scope,
-                    env,
-                    window_dips,
-                    watch: window.watch()?,
-                };
-                move || app::run(links, start)
-            })
-            .map_err(spawn_failed)?;
-
-        let router = crate::input::Router::new(&bell, &window, pacer.wake())?;
+        *tick.borrow_mut() = Some(tick::Tick::new(
+            &window,
+            &links,
+            self.root_scope,
+            tick::Handoffs {
+                text,
+                uia,
+                resized,
+                rescaled,
+                nonclient: Rc::clone(&nonclient),
+                wake: pacer.wake(),
+            },
+        )?);
 
         // What is at a point in the caption band, answered from the array copy this thread
         // holds, so the drag strip is whatever the bar's controls leave over rather than a
         // second rect stated beside them. The result is discarded because a window with no
         // custom caption has no band to answer for.
-        let _ = window.on_caption_hit({
-            let frame = Rc::downgrade(&frame);
+        _ = window.on_caption_hit({
+            let held = Rc::downgrade(&tick);
             move |x, y| {
                 // Fallible: a tick holds the frame while it runs, and a re-entrant question
                 // answers `Drag` rather than panicking in the window procedure.
-                match frame.upgrade().as_ref().map(|cell| cell.try_borrow()) {
-                    Some(Ok(slot)) => slot.as_ref().map_or(CaptionHit::Drag, |frame| {
-                        crate::caption::hit(
-                            &frame.hits,
-                            frame.router.shadows(),
-                            &frame.caption,
-                            x,
-                            y,
-                        )
-                    }),
-                    _ => CaptionHit::Drag,
-                }
+                let answer = held.upgrade().and_then(|held| {
+                    let slot = held.try_borrow().ok()?;
+                    slot.as_ref().map(|t| t.caption_hit(x, y))
+                });
+                answer.unwrap_or(CaptionHit::Drag)
             }
         });
-        // Hover and press over a window command, which the router never sees: once the hit
-        // test names one, its pointer stream is the system's. Recorded here and forwarded by
-        // the tick, because this runs inside the window procedure.
-        let nonclient: Rc<Handoff<CaptionState>> = Rc::new(Handoff::new());
-        nonclient.arm(pacer.wake());
-        let _ = window.on_caption_state({
-            let nonclient = Rc::clone(&nonclient);
-            move |state| nonclient.post(state)
-        });
+        // Hover and press over a window command, which the router never sees: once the hit test
+        // names one, its pointer stream is the system's. Posted here and forwarded by the tick,
+        // because this runs inside the window procedure.
+        _ = window.on_caption_state(move |state| nonclient.post(state));
 
-        *frame.borrow_mut() = Some(Frame {
-            scope: self.root_scope,
-            window: Rc::clone(&window),
-            links: Arc::clone(&links),
-            router,
-            text,
-            settings_changed,
-            uia,
-            uia_actions: Vec::new(),
-            text_actions: Vec::new(),
-            hits: windows_scene::HitTable::default(),
-            picks: crate::present::Picks::default(),
-            caption: crate::caption::Registry::default(),
-            focus: Vec::new(),
-            reports: Vec::new(),
-            intents: Vec::new(),
-            resized,
-            rescaled,
-            nonclient,
-            out: Some(Box::default()),
-            wake: pacer.wake(),
-            holding: None,
-            sent_env: Some(env),
-            census: Census::default(),
-            scene_wakes: 0,
-            scene_applies: 0,
-            app: AppCensus::default(),
-            ticks: 0,
-        });
-
-        // Shown once the scene thread has applied the first patch: `ShowWindow` over an
-        // empty tree shows a frame of whatever has not been painted yet. Bounded, so an
-        // application whose first build never emits shows its empty window rather than
-        // nothing at all.
-        links.first_frame.wait(FIRST_FRAME_MS);
+        // Shown once the scene thread has applied the first patch: `ShowWindow` over an empty
+        // tree shows a frame of whatever has not been painted yet.
+        links.first_patch.wait(FIRST_PATCH_MS);
         window.show();
 
         // Parked, on `GetMessage`. Every wake is a message somebody posted: the pacer's
-        // `WM_FRAME`, an input contact, a system question about the window, the scene
-        // thread's nudge to take a batch.
+        // `WM_FRAME`, an input contact, a system question about the window, the scene thread's
+        // nudge to take a batch.
         windows_window::run();
 
-        // The app thread first: its tree comes down on its own thread and the destroys ride
-        // one last batch. Then the scene thread, which applies that batch, releases every
-        // region and stops the present thread before its compositor goes.
-        links.stop_app.store(true, Ordering::Release);
-        links.app_ring.ring();
-        _ = app_thread.join();
-        links.stop_scene.store(true, Ordering::Release);
-        links.scene_ring.ring();
-        _ = scene_thread.join();
+        // The app thread first: its tree comes down on its own thread and the destroys ride one
+        // last batch. The scene thread drains that batch as it leaves, releases every region
+        // and stops the present thread before its compositor goes.
+        links.stop.store(true, Release);
+        links.app_bell.ring();
+        _ = app.join();
+        links.scene_bell.ring();
+        _ = scene.join();
         drop(key_filter);
-        drop(frame);
+        drop(tick);
 
-        if let Some(error) = links.failure() {
-            return Err(error);
-        }
+        links.failure()?;
         match failed.borrow_mut().take() {
-            Some(error) => Err(error),
+            Some(e) => Err(e),
             None => Ok(()),
         }
     }
 }
 
-/// How long the window waits for the first patch before showing anyway.
-const FIRST_FRAME_MS: u32 = 5_000;
-
 /// The error a closed window answers with, for the start-up queries that need it.
-fn closed() -> Error {
+pub(crate) fn closed() -> Error {
     Error::new(E_HANDLE, "the window is closed")
 }
 
-fn spawn_failed(error: std::io::Error) -> Error {
-    Error::new(E_HANDLE, error.to_string())
-}
-
 /// What one input tick settled on, and the latest each other thread reported about itself.
-#[derive(Copy, Clone)]
 pub struct Observed<'a> {
     /// The reports this tick produced, in order.
     pub reports: &'a [Report],
     /// The scene's tallies as of its last batch to the input thread.
     pub census: Census,
-    /// How many times the scene thread has woken and how many patches it has applied.
     pub scene_wakes: u64,
     pub scene_applies: u64,
     /// The app thread's tallies as of its last batch.
@@ -394,11 +342,9 @@ pub struct Observed<'a> {
     pub ticks: u64,
 }
 
-type Observer = Box<dyn FnMut(Observed<'_>)>;
-
 thread_local! {
     /// What every input tick reports to, where a caller installed one.
-    static OBSERVER: RefCell<Option<Observer>> = const { RefCell::new(None) };
+    static OBSERVER: RefCell<Option<Box<dyn FnMut(Observed<'_>)>>> = const { RefCell::new(None) };
 }
 
 /// Installs a function run at the end of every input tick, with what that tick saw.
@@ -407,47 +353,59 @@ thread_local! {
 /// reads the **real** tick rather than a copy of it. Installed on the thread that will own the
 /// window, before [`UiRuntime::run`].
 ///
-/// The arguments are the tick's own buffers and are not held past the call, so an observer
-/// that counts allocates nothing. Installing a second replaces the first.
+/// The arguments are the tick's own buffers and are not held past the call, so an observer that
+/// counts allocates nothing. Installing a second replaces the first.
 pub fn observe(f: impl FnMut(Observed<'_>) + 'static) {
-    OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(f)));
+    OBSERVER.with(|o| *o.borrow_mut() = Some(Box::new(f)));
 }
 
 /// Reports one tick, where an observer is installed and is not already running.
-pub(crate) fn observed(seen: Observed<'_>) {
+fn observed(seen: Observed<'_>) {
     // Fallibly, so an observer reaching back into the tick is a dropped report rather than a
     // panic inside the window procedure.
-    let _ = OBSERVER.try_with(|slot| {
-        if let Ok(mut slot) = slot.try_borrow_mut()
-            && let Some(observer) = slot.as_mut()
+    _ = OBSERVER.try_with(|o| {
+        if let Ok(mut o) = o.try_borrow_mut()
+            && let Some(f) = o.as_mut()
         {
-            observer(seen);
+            f(seen);
         }
+    });
+}
+
+/// Reports the scene and app tallies the tick last took off its inbox.
+pub(crate) fn tallies(scene: SceneTally, app: AppCensus, reports: &[Report], ticks: u64) {
+    observed(Observed {
+        reports,
+        census: scene.census,
+        scene_wakes: scene.wakes,
+        scene_applies: scene.applies,
+        app,
+        ticks,
     });
 }
 
 /// The client area in DIPs, which is the space every layout is stated in. `None` once the
 /// window is closed.
-fn client_dips(window: &Window) -> Option<Vector2> {
-    let scale = window.scale()?;
+pub(crate) fn client_size(window: &Window) -> Option<Vector2> {
     let (w, h) = window.client_size()?;
+    let scale = window.scale()?;
     Some(Vector2 {
         x: w as f32 / scale,
         y: h as f32 / scale,
     })
 }
 
-/// Returns the window's account of the display it is on: its DPI, and the output transform
-/// for the display's colour capability. `None` once the window is closed.
+/// Returns the window's account of the display it is on: its DPI, and the output transform for
+/// the display's colour capability. `None` once the window is closed.
 ///
-/// Read per tick and never held: the window and its monitor own both, so a cached copy is
-/// one a display hop leaves stale. The content peak comes from the installed palette rather
-/// than a parameter, because it is a property of the authored table.
+/// Read per tick and never held: the window and its monitor own both, so a cached copy is one a
+/// display hop leaves stale. The content peak comes from the installed palette rather than a
+/// parameter, because it is a property of the authored table.
 ///
 /// Both queries fail closed rather than substituting 96 DPI and `Sdr`. A window is the only
-/// thing that answers for its display, so a default here is an invented measurement — every
-/// DIP laid out against it and every colour transformed through it would be wrong in a way
-/// nothing downstream can detect.
+/// thing that answers for its display, so a default here is an invented measurement — every DIP
+/// laid out against it and every colour transformed through it would be wrong in a way nothing
+/// downstream can detect.
 pub(crate) fn env_of(window: &Window, scope: Scope) -> Option<Env> {
     Some(Env::new(
         window.metrics()?.dpi as f32,

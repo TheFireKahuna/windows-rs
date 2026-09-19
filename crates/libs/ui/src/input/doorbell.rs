@@ -5,50 +5,43 @@
 //! live in a system-side history ring addressed by pointer id, so a consumer that reads the
 //! ring once per frame keeps the intermediate samples legacy coalescing discards.
 //!
-//! Every arm here writes a ring slot or a bit and returns. It performs no hit test, touches
-//! no tree state and mutates no interaction state: the cost of hover is
-//! (moves × tree size), and the frame clock bounds the first factor. A source lint enforces
-//! the shape — a window procedure's pointer arms may not hit-test, reach into a tree, or
-//! run application work.
+//! Every arm here writes a ring slot or a bit and returns. It performs no hit test, touches no
+//! tree state and mutates no interaction state.
 //!
 //! Discrete transitions retain their Win32 position and, for down, up and wheel, a WinRT
-//! point. The system's message data may be gone after the pump retrieves another message;
-//! keeping only an id makes a short touch impossible to finish. The ring storage is fixed;
-//! the platform owns each point's allocation, released when its ring record is consumed.
-//! Motion still sets a bit without constructing a point here.
+//! point. The system's message data may be gone after the pump retrieves another message, so
+//! keeping only an id makes a short touch impossible to finish. The ring storage is fixed; the
+//! platform owns each point's allocation, released when its ring record is consumed.
 
-use super::coords::{Coords, PointerSpace, Unit};
-use super::service::Service;
+use super::{Coords, PointerSpace, Service};
 use crate::bindings::*;
-use core::cell::Cell;
+use crate::gesture::SLOTS;
+use core::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use windows_core::{ComObject, Result};
-use windows_window::{Tick, Wake};
+use windows_window::{Tick, Wake, Window};
 
 /// How many discrete transitions one frame may carry.
 ///
-/// Sized for the worst frame rather than the common one: ten contacts lifting together with
-/// their button changes, plus a burst of wheel notches. Overflow is a violated invariant
-/// rather than a lossy path — asserted in debug, and counted in every build.
-const RING_CAPACITY: usize = 64;
+/// Sized for the worst frame: ten contacts lifting together with their button changes, plus a
+/// burst of wheel notches. Overflow is a violated invariant rather than a lossy path.
+const RING: usize = 64;
 
-/// How many contacts are tracked at once. Ten is what a digitizer reports; the two spare
-/// slots absorb a pen and a mouse arriving alongside a full hand.
-const MAX_CONTACTS: usize = 12;
-
-/// Names which transition a ring record carries. Motion has no variant: it sets a
-/// per-contact bit instead.
+/// Names which transition a ring record carries. Motion has no variant: it sets a per-contact
+/// bit instead.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EventKind {
     Down,
     Up,
-    /// A button changed while the contact stayed down — the second mouse button pressed
-    /// during a drag, or a pen's barrel button.
+    /// A button changed while the contact stayed down — the second mouse button pressed during
+    /// a drag, or a pen's barrel button.
     Button,
-    /// Ends the contact without an up: the gesture aborts and no value is committed.
+    /// Ends one contact without an up: the gesture aborts and no value is committed. An id of
+    /// zero names whatever holds the window's explicit capture.
     Cancel,
+    /// The window lost every contact at once, which is what losing focus does.
     CaptureLost,
-    Deactivated,
     Wheel,
 }
 
@@ -64,8 +57,8 @@ pub enum PointerType {
 }
 
 impl PointerType {
-    /// Maps a `POINTER_INPUT_TYPE` onto this enum. An unknown type reads as a mouse, which
-    /// is the one classification that routes through every path unchanged.
+    /// Maps a `POINTER_INPUT_TYPE` onto this enum. An unknown type reads as a mouse, which is
+    /// the one classification that routes through every path unchanged.
     #[must_use]
     pub(crate) const fn from_raw(raw: POINTER_INPUT_TYPE) -> Self {
         match raw as i32 {
@@ -88,7 +81,7 @@ impl PointerType {
         }
     }
 
-    /// Returns `true` when this device's contacts go to the precision-touchpad recogniser.
+    /// Returns whether this device's contacts go to the precision-touchpad recogniser.
     #[must_use]
     pub const fn is_touchpad(self) -> bool {
         matches!(self, Self::Touchpad)
@@ -97,10 +90,10 @@ impl PointerType {
 
 /// Names the flag word a pointer message carries in the high half of its `wParam`.
 ///
-/// `GET_POINTERID_WPARAM` and the `IS_POINTER_*_WPARAM` family are C macros with no
-/// metadata, so each test is written here over the generated constants. Two are load-bearing
-/// rather than informational: [`confident`](Self::confident) gates palm rejection, and
-/// [`canceled`](Self::canceled) separates a cancel from an up.
+/// `GET_POINTERID_WPARAM` and the `IS_POINTER_*_WPARAM` family are C macros with no metadata,
+/// so each test is written here over the generated constants. Two are load-bearing:
+/// [`confident`](Self::confident) gates palm rejection, and [`canceled`](Self::canceled)
+/// separates a cancel from an up.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PointerFlags(pub u32);
 
@@ -115,69 +108,40 @@ impl PointerFlags {
         self.0 & (bit as u32) != 0
     }
 
-    /// Returns `true` for the primary contact — the one that drives hover and the one a
+    /// Returns whether this is the primary contact — the one that drives hover and the one a
     /// single-pointer gesture is measured from.
     #[must_use]
     pub const fn primary(self) -> bool {
         self.has(POINTER_FLAG_PRIMARY)
     }
 
-    /// Returns `true` while the contact touches the digitizer or holds a button.
+    /// Returns whether the contact touches the digitizer or holds a button.
     #[must_use]
     pub const fn in_contact(self) -> bool {
         self.has(POINTER_FLAG_INCONTACT)
     }
 
-    /// Returns `true` while the device is detectable without touching, which is what makes
-    /// pen hover possible.
-    #[must_use]
-    pub const fn in_range(self) -> bool {
-        self.has(POINTER_FLAG_INRANGE)
-    }
-
-    /// Returns `true` on the contact's first message.
-    #[must_use]
-    pub const fn new(self) -> bool {
-        self.has(POINTER_FLAG_NEW)
-    }
-
-    /// Returns `true` when the contact was aborted rather than released, so the pre-drag
-    /// value is restored.
+    /// Returns whether the contact was aborted rather than released, so the pre-drag value is
+    /// restored.
     #[must_use]
     pub const fn canceled(self) -> bool {
         self.has(POINTER_FLAG_CANCELED)
     }
 
-    /// Returns `true` when the digitizer reports a deliberate contact rather than a palm.
+    /// Returns whether the digitizer reports a deliberate contact rather than a palm.
     ///
-    /// A contact without it is tracked but never fed to a recogniser, so it cannot start a
-    /// gesture. Palm rejection on this stack is that rule alone.
+    /// A contact without it is tracked but never fed to a recogniser. Palm rejection on this
+    /// stack is that rule alone.
     #[must_use]
     pub const fn confident(self) -> bool {
         self.has(POINTER_FLAG_CONFIDENCE)
     }
 
-    /// Returns the held buttons, as the five `POINTER_FLAG_*BUTTON` bits packed into bits
-    /// 0 to 4.
+    /// Returns the held buttons, as the five contiguous `POINTER_FLAG_*BUTTON` bits packed
+    /// into bits 0 to 4.
     #[must_use]
     pub const fn buttons(self) -> u32 {
-        let mut held = 0;
-        if self.has(POINTER_FLAG_FIRSTBUTTON) {
-            held |= 1;
-        }
-        if self.has(POINTER_FLAG_SECONDBUTTON) {
-            held |= 2;
-        }
-        if self.has(POINTER_FLAG_THIRDBUTTON) {
-            held |= 4;
-        }
-        if self.has(POINTER_FLAG_FOURTHBUTTON) {
-            held |= 8;
-        }
-        if self.has(POINTER_FLAG_FIFTHBUTTON) {
-            held |= 16;
-        }
-        held
+        (self.0 >> 4) & 0x1f
     }
 }
 
@@ -196,23 +160,31 @@ pub struct PointerEvent {
     pub y_px: i32,
     /// Notches × `WHEEL_DELTA`, signed. Zero on every kind but [`EventKind::Wheel`].
     pub wheel: i32,
-    /// Whether the wheel was horizontal.
     pub horizontal: bool,
     pub time: u32,
     /// The recogniser's point, retained before the pump retrieves another message and the
     /// system may retire this pointer. Aborts and button changes need no recogniser point.
     point: Option<Result<PointerPoint>>,
-    pub(super) manipulation: Option<Result<windows_scene::ManipulationPointer>>,
+    /// The input record a touch press hands to the compositor when the press is offered to a
+    /// scroll container, captured for the same reason and at the same moment.
+    manipulation: Option<Result<windows_scene::ManipulationPointer>>,
 }
 
 impl PointerEvent {
-    /// Reads the retained point of a down, up or wheel, including any capture failure.
-    pub(super) fn point(&self) -> Result<&PointerPoint> {
+    /// Returns the retained point of a down, up or wheel.
+    ///
+    /// `None` on a transition that carries none, and the capture failure where taking the
+    /// point failed — a failure travels with the record rather than being replaced with an
+    /// invented point.
+    pub(crate) fn point(&self) -> Option<Result<&PointerPoint>> {
         self.point
             .as_ref()
-            .expect("this transition carries a point")
-            .as_ref()
-            .map_err(Clone::clone)
+            .map(|held| held.as_ref().map_err(Clone::clone))
+    }
+
+    /// Returns the input record a scroll handoff redirects with, on a touch down alone.
+    pub(crate) fn manipulation(&self) -> Option<Result<windows_scene::ManipulationPointer>> {
+        self.manipulation.clone()
     }
 }
 
@@ -240,9 +212,9 @@ impl Mods {
         // pointer.
         unsafe {
             Self {
-                shift: GetKeyState(VK_SHIFT as i32) < 0,
-                ctrl: GetKeyState(VK_CONTROL as i32) < 0,
-                alt: GetKeyState(VK_MENU as i32) < 0,
+                shift: GetKeyState(VK_SHIFT) < 0,
+                ctrl: GetKeyState(VK_CONTROL) < 0,
+                alt: GetKeyState(VK_MENU) < 0,
             }
         }
     }
@@ -270,18 +242,18 @@ pub enum InputEvent {
 }
 
 /// One tracked contact. Motion writes nothing but [`moved`](Self::moved).
-#[derive(Default)]
+#[derive(Copy, Clone, Default, Debug)]
 struct Contact {
-    id: Cell<u32>,
-    live: Cell<bool>,
+    /// Zero means the slot is free.
+    id: u32,
     /// The per-pointer dirty bit, which is all a `WM_POINTERUPDATE` writes.
-    moved: Cell<bool>,
-    /// Whether the contact was in contact at its last transition, so the tick can tell a
-    /// drag from a hover without asking the system.
-    down: Cell<bool>,
-    /// Which buttons were held at the last message, so a button change is detectable from
-    /// the flag word alone.
-    buttons: Cell<u32>,
+    moved: bool,
+    /// Whether the contact was in contact at its last transition, so the tick can tell a drag
+    /// from a hover without asking the system.
+    down: bool,
+    /// The buttons held at the last message, so a button change is detectable from the flag
+    /// word alone.
+    buttons: u32,
 }
 
 /// Counts what the doorbell could not record.
@@ -291,10 +263,80 @@ pub struct DoorbellHealth {
     /// Discrete transitions dropped because the ring was full. A violated invariant: any
     /// non-zero value means the ring capacity is too small for a frame the host can produce.
     pub dropped: u32,
-    /// Contacts refused because every slot was taken.
-    pub unslotted: u32,
     /// The deepest the ring has been, which the ring capacity is sized from.
     pub peak: u32,
+}
+
+/// Everything one `RefCell` borrow reaches, so a window-procedure arm takes one borrow and
+/// writes.
+#[derive(Default)]
+struct State {
+    /// The ring, allocated once at construction.
+    ring: VecDeque<InputEvent>,
+    slots: [Contact; SLOTS],
+    /// Which pointer is over the client area, tracked from motion and the leave message, so no
+    /// move needs a `TrackMouseEvent`.
+    hovering: Option<u32>,
+    /// A system request to stop content inertia.
+    stop: bool,
+    /// The frame clock, set once the window has a pacer. Messages arriving before that are
+    /// recorded and consumed by the first tick.
+    wake: Option<Wake>,
+    /// One frame request covering everything outstanding, taken on the first arrival and
+    /// dropped by the tick that finds nothing left. Not one per event, so the steady state
+    /// during a drag is several messages and no kernel call at all.
+    pending: Option<Tick>,
+    health: DoorbellHealth,
+}
+
+impl State {
+    /// Returns whether nothing is waiting for the next tick.
+    fn idle(&self) -> bool {
+        self.ring.is_empty() && !self.stop && !self.slots.iter().any(|c| c.moved)
+    }
+
+    /// Asks for a frame, once, for everything outstanding.
+    fn frame(&mut self) {
+        if self.pending.is_none() {
+            self.pending = self.wake.as_ref().map(Wake::tick);
+        }
+    }
+
+    /// Appends one record and asks for a frame.
+    ///
+    /// Overflow drops the oldest record, so the survivors stay in order, and counts the drop
+    /// in [`DoorbellHealth::dropped`].
+    fn push(&mut self, event: InputEvent) {
+        if self.ring.len() == RING {
+            debug_assert!(
+                false,
+                "the doorbell ring overflowed: RING is too small for a frame the host produces"
+            );
+            self.ring.pop_front();
+            self.health.dropped += 1;
+        }
+        self.ring.push_back(event);
+        self.health.peak = self.health.peak.max(self.ring.len() as u32);
+        self.frame();
+    }
+
+    /// Finds or takes a slot for `id`. `None` once every slot is taken.
+    fn slot(&mut self, id: u32) -> Option<usize> {
+        if let Some(i) = self.slots.iter().position(|c| c.id == id) {
+            return Some(i);
+        }
+        let i = self.slots.iter().position(|c| c.id == 0)?;
+        self.slots[i] = Contact {
+            id,
+            ..Contact::default()
+        };
+        Some(i)
+    }
+
+    /// Returns how many contacts are tracked.
+    fn live(&self) -> usize {
+        self.slots.iter().filter(|c| c.id != 0).count()
+    }
 }
 
 /// Records what a window message says, for the frame clock to resolve.
@@ -302,38 +344,19 @@ pub struct DoorbellHealth {
 /// Installed into the window at creation and shared with the [`Router`](super::Router) that
 /// drains it on the frame clock.
 pub struct Doorbell {
+    /// The window this doorbell serves, null until [`Doorbell::pace`] names it.
     hwnd: Cell<HWND>,
-    /// One coordinate authority for captured transitions and the router's move batches.
-    pub(super) space: ComObject<PointerSpace>,
-    pub(super) transform: IPointerPointTransform,
-    /// Calibration watermark, never used as the current window scale.
-    scale: Cell<f32>,
-    /// The ring, allocated once at construction. An empty slot is `None`: there is no
-    /// [`InputEvent`] meaning "no transition", and inventing one would be a variant every
-    /// match has to handle.
-    slots: Box<[Cell<Option<InputEvent>>]>,
-    head: Cell<usize>,
-    tail: Cell<usize>,
-    contacts: [Contact; MAX_CONTACTS],
-    /// Which pointer is over the client area, tracked from the enter and leave messages, so
-    /// no move needs a `TrackMouseEvent`.
-    hover: Cell<Option<u32>>,
-    /// A system request to stop content inertia. See [`super::Inertia`].
-    stop_inertia: Cell<bool>,
-    /// The frame clock, set once the window has a pacer. Messages arriving before that are
-    /// recorded and consumed by the first tick.
-    wake: Cell<Option<Wake>>,
+    /// The `user32` exports this build carries, resolved once and shared with every conversion
+    /// this doorbell hands out.
+    late: super::Late,
+    /// The unit the WinRT pointer statics were measured to answer in, and the transform the
+    /// recogniser's points are taken through.
+    space: ComObject<PointerSpace>,
+    transform: IPointerPointTransform,
     /// The request-for-service gate, shared with every other producer of latency-critical
-    /// input — the dial's handler holds a clone of it, so one tick services both.
+    /// input — the dial's handler holds a clone, so one tick services both.
     service: Rc<Service>,
-    /// One frame request covering everything outstanding, taken on the first arrival and
-    /// dropped by the tick that finds nothing left. Not one per event, so the steady state
-    /// during a drag is several messages and no kernel call at all.
-    pending: Cell<Option<Tick>>,
-    /// Whether [`pending`](Self::pending) holds a guard. A `Cell` cannot be peeked, and
-    /// taking the guard out to inspect it would drop the request it stands for.
-    held: Cell<bool>,
-    health: Cell<DoorbellHealth>,
+    state: RefCell<State>,
 }
 
 impl Default for Doorbell {
@@ -346,24 +369,18 @@ impl Doorbell {
     /// Creates a doorbell with an empty ring and nothing pending.
     #[must_use]
     pub fn new() -> Self {
-        let space = ComObject::new(PointerSpace::new());
+        let space = ComObject::new(PointerSpace::default());
         let transform = space.to_interface();
         Self {
             hwnd: Cell::new(core::ptr::null_mut()),
+            late: super::Late::resolve(),
             space,
             transform,
-            scale: Cell::new(0.0),
-            slots: (0..RING_CAPACITY).map(|_| Cell::new(None)).collect(),
-            head: Cell::new(0),
-            tail: Cell::new(0),
-            contacts: Default::default(),
-            hover: Cell::new(None),
-            stop_inertia: Cell::new(false),
-            wake: Cell::new(None),
-            service: Rc::new(Service::new()),
-            pending: Cell::new(None),
-            held: Cell::new(false),
-            health: Cell::new(DoorbellHealth::default()),
+            service: Rc::new(Service::default()),
+            state: RefCell::new(State {
+                ring: VecDeque::with_capacity(RING),
+                ..State::default()
+            }),
         }
     }
 
@@ -372,10 +389,15 @@ impl Doorbell {
     /// Separate from construction: the doorbell is installed into the window builder, so it
     /// exists before the window, and a pacer cannot exist before the window it posts to.
     /// Anything that arrives in between is recorded and consumed by the first tick.
-    pub fn pace(&self, window: &windows_window::Window, wake: Wake) {
-        self.hwnd.set(window.hwnd());
-        self.service.attach(window.hwnd());
-        self.wake.set(Some(wake));
+    pub fn pace(&self, window: &Window, wake: Wake) {
+        let hwnd = window.hwnd();
+        self.hwnd.set(hwnd);
+        self.service.attach(hwnd);
+        let mut state = self.state.borrow_mut();
+        state.wake = Some(wake);
+        if !state.idle() {
+            state.frame();
+        }
     }
 
     /// Returns the request-for-service gate, for another producer of latency-critical input.
@@ -390,13 +412,22 @@ impl Doorbell {
     /// Returns the counters for what the doorbell could not record.
     #[must_use]
     pub fn health(&self) -> DoorbellHealth {
-        self.health.get()
+        self.state.borrow().health
     }
 
     /// Returns the contact hovering the client area, or `None` when none is.
     #[must_use]
     pub fn hovering(&self) -> Option<u32> {
-        self.hover.get()
+        self.state.borrow().hovering
+    }
+
+    /// Returns whether nothing is waiting for the next tick.
+    ///
+    /// The frame request is derived from this: a doorbell that is never idle is a window that
+    /// never parks.
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        self.state.borrow().idle()
     }
 
     // ── the window-procedure arms ─────────────────────────────────────────────────
@@ -411,59 +442,63 @@ impl Doorbell {
     /// `WM_POINTERLEAVE` is the exception. The custom caption reads the same message to clear
     /// a window command's hover, and the window procedure runs the application's handler
     /// before the caption's, so consuming it here would leave a close button lit after the
-    /// pointer had gone. It carries no position and starts no contact, so a promoted move has
-    /// nothing to be about; what `DefWindowProc` may make of it is a `WM_MOUSELEAVE`, which
-    /// is in the set nothing here can handle anyway.
+    /// pointer had gone. It carries no position and starts no contact, so what
+    /// `DefWindowProc` may make of it is a `WM_MOUSELEAVE`, which is in the set nothing here
+    /// can handle anyway. The key messages and the two window-state messages are forwarded for
+    /// the same reason: `WM_KEYDOWN` has to reach `TranslateMessage` for `WM_CHAR` to exist at
+    /// all, and the application's own focus handling runs behind this one.
     pub fn wndproc(&self, message: u32, wparam: usize, lparam: isize) -> Option<isize> {
+        let id = (wparam & 0xffff) as u32;
+        let flags = PointerFlags::from_wparam(wparam);
         match message as i32 {
-            WM_POINTERDOWN => self.transition(wparam, EventKind::Down),
-            WM_POINTERUP => self.transition(wparam, EventKind::Up),
-            WM_POINTERUPDATE => self.update(wparam),
-            WM_POINTERENTER => self.enter(wparam),
-            WM_POINTERLEAVE => self.leave(wparam),
-            WM_POINTERCAPTURECHANGED | WM_CAPTURECHANGED => {
-                self.transition(wparam, EventKind::CaptureLost)
-            }
-            WM_POINTERWHEEL => self.wheel(wparam, false),
-            WM_POINTERHWHEEL => self.wheel(wparam, true),
+            WM_POINTERDOWN => self.discrete(id, flags, EventKind::Down, 0, false),
+            WM_POINTERUP => self.discrete(id, flags, EventKind::Up, 0, false),
+            WM_POINTERWHEEL => self.discrete(id, flags, EventKind::Wheel, notches(wparam), false),
+            WM_POINTERHWHEEL => self.discrete(id, flags, EventKind::Wheel, notches(wparam), true),
+            WM_POINTERCAPTURECHANGED => self.discrete(id, flags, EventKind::Cancel, 0, false),
+            WM_POINTERUPDATE | WM_POINTERENTER => self.motion(id, flags),
+            WM_POINTERLEAVE => self.leave(id),
+            // A window-level capture change names no pointer: its `wParam` is a window handle.
+            // The tick resolves it against whatever holds the explicit capture, and a change
+            // that takes nothing away is not a cancel.
+            WM_CAPTURECHANGED => self.window_event(EventKind::Cancel),
+            // A window that loses focus loses every contact with it, since the input that
+            // would have ended them goes elsewhere.
+            WM_KILLFOCUS => self.window_event(EventKind::CaptureLost),
             WM_KEYDOWN | WM_SYSKEYDOWN => self.key(KeyKind::Down, wparam, lparam),
             WM_KEYUP | WM_SYSKEYUP => self.key(KeyKind::Up, wparam, lparam),
             WM_CHAR => self.key(KeyKind::Char, wparam, lparam),
-            // A window that loses focus loses every contact with it, since the input that
-            // would have ended them goes elsewhere. Recorded as a lost capture and not
-            // consumed, so the application's own focus handling still runs.
-            0x0018 | 0x000a if wparam == 0 => {
-                self.transition_now(EventKind::Deactivated);
-                None
-            }
-            WM_KILLFOCUS => {
-                self.transition_now(EventKind::Deactivated);
-                None
-            }
             _ => None,
         }
     }
 
     /// Records a discrete transition, resolving the point it happened at.
-    fn transition(&self, wparam: usize, kind: EventKind) -> Option<isize> {
-        let id = pointer_id(wparam);
-        let flags = PointerFlags::from_wparam(wparam);
-        // A cancel arrives as an up carrying the canceled bit. The two stay distinct because
-        // an up commits a value and a cancel must not.
-        let kind = if flags.canceled() && kind == EventKind::Up {
-            EventKind::Cancel
-        } else {
-            kind
-        };
-
+    ///
+    /// Asks for service on the next pump iteration rather than at the next composition frame:
+    /// a press, a release, a cancel and a wheel notch are latency-critical, and waiting for
+    /// the frame clock would add a frame to each.
+    fn discrete(
+        &self,
+        id: u32,
+        flags: PointerFlags,
+        kind: EventKind,
+        wheel: i32,
+        horizontal: bool,
+    ) -> Option<isize> {
         let mut info = POINTER_INFO::default();
-        // SAFETY: the destination is a stack local of the type the call writes, and the id
-        // came from the message being serviced.
+        // A record is written whether or not the system still answers about this pointer: the
+        // transition happened, and a dropped record is a swallowed press.
+        //
+        // SAFETY: `info` is a stack local of the type the call writes, and the id came from
+        // the message being serviced.
         _ = unsafe { GetPointerInfo(id, &mut info) };
+        // A cancel is not an up: it aborts the gesture and commits nothing.
+        let kind = match (kind, flags.canceled()) {
+            (EventKind::Up, true) => EventKind::Cancel,
+            (kind, _) => kind,
+        };
         let ptype = PointerType::from_raw(info.pointerType);
-
-        self.mark(id, kind, ptype, flags);
-        self.push(InputEvent::Pointer(PointerEvent {
+        let event = PointerEvent {
             id,
             kind,
             ptype,
@@ -471,214 +506,189 @@ impl Doorbell {
             flags,
             x_px: info.ptPixelLocationRaw.x,
             y_px: info.ptPixelLocationRaw.y,
-            wheel: 0,
-            horizontal: false,
+            wheel,
+            horizontal,
             time: info.dwTime,
-            point: matches!(kind, EventKind::Down | EventKind::Up).then(|| self.point(id, &info)),
+            point: matches!(kind, EventKind::Down | EventKind::Up | EventKind::Wheel)
+                .then(|| self.capture(id, &info)),
             manipulation: (kind == EventKind::Down && ptype == PointerType::Touch)
                 .then(|| windows_scene::ManipulationPointer::capture(id)),
-        }));
-        self.skip_frame(id);
+        };
+        let mut state = self.state.borrow_mut();
+        // A wheel notch is not a contact: it takes no slot, so a burst of them over a window
+        // cannot fill the table with pointers that will never lift.
+        if kind != EventKind::Wheel
+            && let Some(i) = state.slot(id)
+        {
+            state.slots[i].down = flags.in_contact();
+            state.slots[i].buttons = event.buttons;
+            // Kept dirty until the tick has consumed the transition, so the frame that ends a
+            // drag still reports the contact that ended it.
+            state.slots[i].moved = true;
+        }
+        state.push(InputEvent::Pointer(event));
+        drop(state);
+        self.service.now();
         Some(0)
     }
 
-    /// Records a transition that belongs to no particular pointer — the window losing focus,
-    /// or capture being taken away.
-    fn transition_now(&self, kind: EventKind) {
-        self.push(InputEvent::Pointer(PointerEvent {
-            id: 0,
-            kind,
-            ptype: PointerType::Mouse,
-            buttons: 0,
-            flags: PointerFlags::default(),
-            x_px: 0,
-            y_px: 0,
-            wheel: 0,
-            horizontal: false,
-            time: 0,
-            point: None,
-            manipulation: None,
-        }));
+    /// Records a transition that belongs to no particular pointer.
+    fn window_event(&self, kind: EventKind) -> Option<isize> {
+        self.state
+            .borrow_mut()
+            .push(InputEvent::Pointer(PointerEvent {
+                id: 0,
+                kind,
+                ptype: PointerType::Mouse,
+                buttons: 0,
+                flags: PointerFlags::default(),
+                x_px: 0,
+                y_px: 0,
+                wheel: 0,
+                horizontal: false,
+                time: 0,
+                point: None,
+                manipulation: None,
+            }));
+        self.service.now();
+        None
     }
 
     /// Records motion: sets one bit and returns.
     ///
     /// It also establishes hover presence. On 26200 a mouse moving into this window's client
     /// area produces `WM_POINTERUPDATE` and no `WM_POINTERENTER` at all, so a hover state
-    /// derived from the enter message alone never begins. Only the entering half is inferred
-    /// — a pointer that updates over the client area is over it — while leave stays the real
+    /// derived from the enter message alone never begins. Only the entering half is inferred —
+    /// a pointer that updates over the client area is over it — while leave stays the real
     /// message, which the custom caption depends on.
-    fn update(&self, wparam: usize) -> Option<isize> {
-        let id = pointer_id(wparam);
-        let flags = PointerFlags::from_wparam(wparam);
-        let buttons = flags.buttons();
-        match self.slot(id) {
-            Some(slot) => {
-                slot.moved.set(true);
-                slot.down.set(flags.in_contact());
-                // A second button pressed while the first is held arrives here, not as a
-                // second `WM_POINTERDOWN`. The flag word already says which buttons are held,
-                // so noticing the change is a bit compare rather than a syscall per move, and
-                // only the change itself pays for a point.
-                if slot.buttons.replace(buttons) != buttons {
-                    self.transition(wparam, EventKind::Button);
-                }
-            }
-            // A pointer whose enter was missed — a contact that began outside the window and
-            // was captured into it. Claim a slot rather than dropping the motion.
-            None => self.claim(id, flags.in_contact()),
-        }
-        if flags.primary() {
-            self.hover.set(Some(id));
-        }
-        self.request();
-        self.skip_frame(id);
-        Some(0)
-    }
-
-    fn enter(&self, wparam: usize) -> Option<isize> {
-        let id = pointer_id(wparam);
-        let flags = PointerFlags::from_wparam(wparam);
-        self.claim(id, flags.in_contact());
+    fn motion(&self, id: u32, flags: PointerFlags) -> Option<isize> {
+        let mut state = self.state.borrow_mut();
         // Only the primary contact drives hover: a second finger arriving does not move the
         // hover chrome, and a pen entering range while a finger is down does not either.
         if flags.primary() {
-            self.hover.set(Some(id));
+            state.hovering = Some(id);
         }
-        self.request();
+        let Some(i) = state.slot(id) else {
+            return Some(0);
+        };
+        state.slots[i].moved = true;
+        state.slots[i].down = flags.in_contact();
+        let changed = state.slots[i].buttons != flags.buttons();
+        state.slots[i].buttons = flags.buttons();
+        state.frame();
+        let many = state.live() > 1;
+        drop(state);
+        // The tick reads the whole input frame from history itself, so the rest of it need not
+        // arrive one message at a time. A single contact has no rest of the frame, so the call
+        // would be a syscall per move.
+        if many {
+            // SAFETY: `SkipPointerFrameMessages` takes the id by value and writes through no
+            // pointer; the id came from the message being serviced.
+            unsafe {
+                _ = SkipPointerFrameMessages(id);
+            }
+        }
+        // A second button pressed during a drag arrives as an update with a changed button
+        // set, never as a second down, so the change is a bit compare against the slot.
+        if changed {
+            return self.discrete(id, flags, EventKind::Button, 0, false);
+        }
         Some(0)
     }
 
-    fn leave(&self, wparam: usize) -> Option<isize> {
-        let id = pointer_id(wparam);
-        if self.hover.get() == Some(id) {
-            self.hover.set(None);
+    /// Clears hover presence, and the slot with it unless a captured drag still owns it.
+    fn leave(&self, id: u32) -> Option<isize> {
+        let mut state = self.state.borrow_mut();
+        if state.hovering == Some(id) {
+            state.hovering = None;
         }
-        if let Some(slot) = self.slot(id) {
+        if let Some(i) = state.slot(id) {
             // The contact is gone from this window, but a captured drag still owns it until
             // its up arrives — so the slot is released only when nothing is down on it.
-            if !slot.down.get() {
-                slot.live.set(false);
+            if state.slots[i].down {
+                state.slots[i].moved = true;
+            } else {
+                state.slots[i] = Contact::default();
             }
-            slot.moved.set(true);
         }
-        self.request();
-        // Not consumed, so the custom caption behind this handler still sees it. `wndproc`
-        // states why.
+        // The hover the tick has to clear is not a moved contact, so the frame is asked for
+        // here rather than derived from a dirty bit.
+        state.frame();
+        // Not consumed, so the custom caption behind this handler still sees it.
         None
     }
 
-    fn wheel(&self, wparam: usize, horizontal: bool) -> Option<isize> {
-        let id = pointer_id(wparam);
-        let flags = PointerFlags::from_wparam(wparam);
-        let mut info = POINTER_INFO::default();
-        // SAFETY: the destination is a stack local of the type the call writes, and the id
-        // came from the message being serviced.
-        let read = unsafe { GetPointerInfo(id, &mut info) }.as_bool();
-        // The notch count rides in the high half of `wParam`, signed, as it does on the
-        // legacy wheel message.
-        let notches = ((wparam >> 16) as u16 as i16) as i32;
-        self.push(InputEvent::Pointer(PointerEvent {
-            id,
-            kind: EventKind::Wheel,
-            ptype: PointerType::from_raw(info.pointerType),
-            buttons: flags.buttons(),
-            flags,
-            x_px: info.ptPixelLocationRaw.x,
-            y_px: info.ptPixelLocationRaw.y,
-            wheel: notches,
-            horizontal,
-            time: if read { info.dwTime } else { 0 },
-            point: Some(self.point(id, &info)),
-            manipulation: None,
-        }));
-        Some(0)
-    }
-
-    /// Captures a point while its message owns the platform's pointer information.
-    fn point(&self, id: u32, info: &POINTER_INFO) -> Result<PointerPoint> {
-        let hwnd = self.hwnd.get();
-        if !hwnd.is_null() {
-            let scale = windows_window::Metrics::for_window(hwnd).scale;
-            if self.scale.replace(scale) != scale {
-                self.space.forget();
-            }
-            if self.space.unit() == Unit::Unmeasured {
-                let raw = PointerPoint::GetCurrentPoint(id)?.RawPosition()?;
-                let at = Coords::new(hwnd).client_at_scale(
-                    scale,
-                    id,
-                    info.ptPixelLocationRaw.x,
-                    info.ptPixelLocationRaw.y,
-                );
-                self.space
-                    .calibrate(windows_scene::Point { x: raw.x, y: raw.y }, at);
-            }
-        }
-        PointerPoint::GetCurrentPointTransformed(id, &self.transform)
-    }
-
+    /// Records a key transition and asks for service on the next pump iteration.
     fn key(&self, kind: KeyKind, wparam: usize, lparam: isize) -> Option<isize> {
-        self.push(InputEvent::Key(KeyEvent {
+        self.state.borrow_mut().push(InputEvent::Key(KeyEvent {
             kind,
             key: wparam as u16,
             // Bit 30 of the key message's `lParam` is the previous key state.
             repeat: kind != KeyKind::Char && lparam & (1 << 30) != 0,
             mods: Mods::now(),
         }));
-        // Not consumed: `WM_KEYDOWN` has to reach `TranslateMessage` for `WM_CHAR` to exist
-        // at all, and `WM_SYSKEY*` carries the system's own commands.
+        self.service.now();
         None
     }
 
-    /// Tells the system not to deliver the rest of this pointer's input frame one message
-    /// at a time, because the tick reads the whole frame from history itself.
+    /// Captures a point while its message owns the platform's pointer information.
     ///
-    /// Called only while more than one contact is live: a single contact has no rest of the
-    /// frame, so the call would add a syscall per move.
-    fn skip_frame(&self, id: u32) {
-        if self.contacts.iter().filter(|c| c.live.get()).count() < 2 {
-            return;
+    /// A pointer id does not retain its data: Windows may discard it when the pump retrieves
+    /// the next message, so a touch release followed by a leave cannot be looked up again at
+    /// the tick.
+    ///
+    /// # Errors
+    ///
+    /// The system no longer answers about this pointer, which is what a contact retired
+    /// between the message and the capture looks like.
+    fn capture(&self, id: u32, info: &POINTER_INFO) -> Result<PointerPoint> {
+        // Measured before the point is taken, so even the first gesture is transformed by a
+        // number that was measured rather than assumed.
+        let hwnd = self.hwnd.get();
+        if !self.space.measured()
+            && !hwnd.is_null()
+            && let Ok(untransformed) = PointerPoint::GetCurrentPoint(id)
+            && let Ok(raw) = untransformed.RawPosition()
+        {
+            let scale = windows_window::Metrics::for_window(hwnd).scale;
+            let ours = Coords::new(hwnd, self.late).client_at_scale(
+                scale,
+                id,
+                info.ptPixelLocationRaw.x,
+                info.ptPixelLocationRaw.y,
+            );
+            self.space
+                .calibrate(windows_scene::Point { x: raw.x, y: raw.y }, ours);
         }
-        // SAFETY: `SkipPointerFrameMessages` takes the id by value and writes through no
-        // pointer; the id came from the message being serviced.
-        unsafe {
-            _ = SkipPointerFrameMessages(id);
-        }
+        PointerPoint::GetCurrentPointTransformed(id, &self.transform)
     }
 
-    // ── the ring and the contact table ────────────────────────────────────────────
+    // ── what the tick reads ───────────────────────────────────────────────────────
 
-    /// Appends one record and asks for service. Overflow drops the oldest record, so the
-    /// survivors stay in order, and counts the drop in [`DoorbellHealth::dropped`].
-    fn push(&self, event: InputEvent) {
-        let head = self.head.get();
-        let tail = self.tail.get();
-        let mut health = self.health.get();
-        if head - tail == RING_CAPACITY {
-            debug_assert!(
-                false,
-                "the doorbell ring overflowed: RING_CAPACITY is too small"
-            );
-            health.dropped += 1;
-            self.tail.set(tail + 1);
-        }
-        self.slots[head % RING_CAPACITY].set(Some(event));
-        self.head.set(head + 1);
-        health.peak = health.peak.max((self.head.get() - self.tail.get()) as u32);
-        self.health.set(health);
-        self.request();
-        self.now();
+    /// Returns the conversion every contact on this window resolves through.
+    pub(crate) fn coords(&self) -> Coords {
+        Coords::new(self.hwnd.get(), self.late)
+    }
+
+    /// Returns the `user32` exports this build carries.
+    pub(crate) const fn late(&self) -> super::Late {
+        self.late
+    }
+
+    /// Returns the measured relation between the WinRT pointer statics' space and the hit
+    /// array's DIPs.
+    pub(crate) fn space(&self) -> &PointerSpace {
+        &self.space
+    }
+
+    /// Returns the transform the recogniser's points are taken through.
+    pub(crate) fn transform(&self) -> &IPointerPointTransform {
+        &self.transform
     }
 
     /// Removes and returns the oldest record, or `None` when the ring is empty.
     pub(crate) fn pop(&self) -> Option<InputEvent> {
-        let tail = self.tail.get();
-        if tail == self.head.get() {
-            return None;
-        }
-        self.tail.set(tail + 1);
-        self.slots[tail % RING_CAPACITY].take()
+        self.state.borrow_mut().ring.pop_front()
     }
 
     /// Writes the contacts that moved since the last tick into `out`, clearing their dirty
@@ -686,250 +696,84 @@ impl Doorbell {
     ///
     /// Fills a caller-owned buffer rather than returning a collection: this is on the
     /// per-frame hover path, which allocates nothing.
-    pub(crate) fn take_moved(&self, out: &mut Vec<u32>) {
+    pub(crate) fn moved_into(&self, out: &mut Vec<u32>) {
         out.clear();
-        for contact in &self.contacts {
-            if contact.live.get() && contact.moved.replace(false) {
-                out.push(contact.id.get());
+        for contact in self.state.borrow_mut().slots.iter_mut() {
+            if contact.id != 0 && core::mem::take(&mut contact.moved) {
+                out.push(contact.id);
             }
         }
     }
 
-    /// Returns `true` while the contact `id` is down.
+    /// Returns whether the contact `id` is down.
     pub(crate) fn is_down(&self, id: u32) -> bool {
-        self.slot(id).is_some_and(|slot| slot.down.get())
+        self.state
+            .borrow()
+            .slots
+            .iter()
+            .any(|c| c.id == id && c.down)
     }
 
-    /// Takes the system's request to stop content inertia, clearing it.
-    pub(crate) fn take_stop_inertia(&self) -> bool {
-        self.stop_inertia.replace(false)
+    /// Releases a contact's slot.
+    ///
+    /// Called by the tick once its up has been consumed, so a frame that both ends a drag and
+    /// starts a new contact still sees both.
+    pub(crate) fn release(&self, id: u32) {
+        if let Some(contact) = self
+            .state
+            .borrow_mut()
+            .slots
+            .iter_mut()
+            .find(|c| c.id == id)
+        {
+            *contact = Contact::default();
+        }
     }
 
     /// Records a system inertia stop.
     ///
-    /// No message arm reaches this: `WM_STOPINERTIA` and `WM_ENDINERTIA` are redacted from
-    /// the 26100 SDK's own `winuser.h` and absent from the vendored metadata, so there is no
-    /// constant to match on. [`super::Inertia`] drives it instead.
+    /// No message arm reaches this: neither `WM_STOPINERTIA` nor `WM_ENDINERTIA` is in the
+    /// generated bindings, so there is no constant to match on.
     pub(crate) fn stop_inertia(&self) {
-        self.stop_inertia.set(true);
-        self.request();
-    }
-
-    /// Records what a transition did to a contact's slot.
-    fn mark(&self, id: u32, kind: EventKind, _ptype: PointerType, flags: PointerFlags) {
-        match kind {
-            EventKind::Down | EventKind::Button => {
-                self.claim(id, flags.in_contact());
-                if let Some(slot) = self.slot(id) {
-                    slot.buttons.set(flags.buttons());
-                }
-            }
-            EventKind::Up | EventKind::Cancel | EventKind::CaptureLost | EventKind::Deactivated => {
-                if let Some(slot) = self.slot(id) {
-                    slot.down.set(false);
-                    // Kept live until the tick has consumed the up, so the frame that ends a
-                    // drag still reports the contact that ended it.
-                    slot.moved.set(true);
-                }
-            }
-            EventKind::Wheel => {}
-        }
-    }
-
-    /// Finds or takes a slot for `id`.
-    fn claim(&self, id: u32, down: bool) {
-        if let Some(slot) = self.slot(id) {
-            slot.down.set(down);
-            return;
-        }
-        for contact in &self.contacts {
-            if !contact.live.get() {
-                contact.id.set(id);
-                contact.live.set(true);
-                contact.moved.set(true);
-                contact.down.set(down);
-                contact.buttons.set(0);
-                return;
-            }
-        }
-        let mut health = self.health.get();
-        health.unslotted += 1;
-        self.health.set(health);
-    }
-
-    /// Releases a contact's slot. Called by the tick once its up has been consumed, so a
-    /// frame that both ends a drag and starts a new contact still sees both.
-    pub(crate) fn release(&self, id: u32) {
-        if let Some(slot) = self.slot(id) {
-            slot.live.set(false);
-            slot.moved.set(false);
-            slot.down.set(false);
-            slot.buttons.set(0);
-        }
-    }
-
-    fn slot(&self, id: u32) -> Option<&Contact> {
-        self.contacts
-            .iter()
-            .find(|contact| contact.live.get() && contact.id.get() == id)
-    }
-
-    /// Asks to be serviced on the next pump iteration rather than at the next composition
-    /// frame.
-    ///
-    /// Only discrete transitions reach this — a press, a release, a cancel, a wheel notch, a
-    /// keystroke — because waiting for the frame clock would add a frame of latency to each.
-    /// Motion does not: it coalesces into a bit and is consumed once per frame, because an
-    /// intermediate hover state between two presents is not observable and a manipulation
-    /// reads its samples from history at whatever instant the tick runs. [`Service`] holds
-    /// the gate.
-    fn now(&self) {
+        self.state.borrow_mut().stop = true;
         self.service.now();
     }
 
-    /// Asks for a frame, once, for everything outstanding.
-    fn request(&self) {
-        if self.held.get() {
-            return;
-        }
-        let wake = self.wake.take();
-        if let Some(wake) = &wake {
-            self.pending.set(Some(wake.tick()));
-            self.held.set(true);
-        }
-        self.wake.set(wake);
-    }
-
-    /// Re-opens the immediate-service gate.
-    pub(crate) fn begin(&self) {
-        self.service.begin();
+    /// Takes the system's request to stop content inertia, clearing it.
+    pub(crate) fn take_stop_inertia(&self) -> bool {
+        core::mem::take(&mut self.state.borrow_mut().stop)
     }
 
     /// Releases the frame request. The tick calls this once it finds nothing outstanding.
     pub(crate) fn settle(&self) {
-        self.held.set(false);
-        drop(self.pending.take());
-    }
-
-    /// Returns `true` when nothing is waiting for the next tick.
-    ///
-    /// The frame request is derived from this: a doorbell that is never idle is a window
-    /// that never parks.
-    #[must_use]
-    pub fn idle(&self) -> bool {
-        self.head.get() == self.tail.get()
-            && !self.stop_inertia.get()
-            && !self.contacts.iter().any(|c| c.live.get() && c.moved.get())
+        let mut state = self.state.borrow_mut();
+        if state.idle() {
+            state.pending = None;
+        }
     }
 }
 
-/// Extracts the pointer id from a message's `wparam`. `GET_POINTERID_WPARAM` is a C macro
-/// with no metadata.
-const fn pointer_id(wparam: usize) -> u32 {
-    (wparam & 0xffff) as u32
+/// Returns the wheel delta a pointer wheel message carries in the high half of its `wParam`,
+/// which is the flag word's place on every other pointer message.
+const fn notches(wparam: usize) -> i32 {
+    ((wparam >> 16) as u16) as i16 as i32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn capture_handoff_unmount_and_palm_release_preserve_contact_ownership() -> Result<()> {
-        use crate::gesture::GestureDecl;
-        use crate::input::{Report, Router};
-        use windows_scene::{Control, Env, HitTable, Ids};
-        use windows_window::{Apartment, Window, ensure_dispatcher_queue};
-        ensure_dispatcher_queue(Apartment::Asta)?;
-        let window = Window::new("contact lifetime regression")
-            .pointer_input()
-            .create()?;
-        let pacer = window.pacer()?;
-        let bell = Rc::new(Doorbell::new());
-        let mut router = Router::new(&bell, &window, pacer.wake())?;
-        let mut ids = Ids::<Control>::new();
-        let a = ids.mint();
-        let b = ids.mint();
-        let env = Env::new(
-            96.0,
-            windows_color::OutputTransform::for_display(
-                windows_color::DisplayCapability::Sdr,
-                1000.0,
-            ),
-        );
-        let hits = HitTable::default();
-        let event = |id, kind| PointerEvent {
-            id,
-            kind,
-            ptype: PointerType::Touch,
-            buttons: 0,
-            flags: PointerFlags(0),
-            x_px: 0,
-            y_px: 0,
-            wheel: 0,
-            horizontal: false,
-            time: 0,
-            point: None,
-            manipulation: None,
-        };
-        router.pool.bind(
-            1,
-            PointerType::Touch,
-            a,
-            GestureDecl::tap(),
-            Default::default(),
-            false,
-        )?;
-        router.pool.bind(
-            2,
-            PointerType::Touch,
-            b,
-            GestureDecl::tap(),
-            Default::default(),
-            true,
-        )?;
-        let mut out = Vec::new();
-        router.pointer(event(1, EventKind::CaptureLost), &hits, env, &mut out)?;
-        assert_eq!(
-            out,
-            [Report::Canceled {
-                target: a,
-                contact: 1
-            }]
-        );
-        assert!(router.pool.get(1).is_none() && router.pool.get(2).is_some());
-        out.clear();
-        router.pointer(event(0, EventKind::CaptureLost), &hits, env, &mut out)?;
-        assert!(
-            out.is_empty() && router.pool.get(2).is_some(),
-            "a delayed mouse capture notification cannot cancel touch"
-        );
-        router.up(event(2, EventKind::Up), env, &mut out)?;
-        assert_eq!(
-            out,
-            [Report::Canceled {
-                target: b,
-                contact: 2
-            }],
-            "a rejected palm never invokes a control"
-        );
-        router.pool.bind(
-            3,
-            PointerType::Mouse,
-            a,
-            GestureDecl::tap(),
-            Default::default(),
-            false,
-        )?;
-        router.capture = Some(3);
-        router.declare(a, GestureDecl::tap());
-        router.forget(a);
-        assert!(router.pool.get(3).is_none() && router.capture.is_none());
-        assert!(!router.decls.contains_key(&a));
-        Ok(())
-    }
-
     fn wparam(id: u32, flags: i32) -> usize {
         (id as usize) | ((flags as u32 as usize) << 16)
+    }
+
+    fn key(key: u16) -> InputEvent {
+        InputEvent::Key(KeyEvent {
+            kind: KeyKind::Down,
+            key,
+            repeat: false,
+            mods: Mods::default(),
+        })
     }
 
     #[test]
@@ -943,7 +787,6 @@ mod tests {
         assert!(!flags.canceled());
         assert!(!flags.confident());
         assert_eq!(flags.buttons(), 1);
-        assert_eq!(pointer_id(wparam(7, 0)), 7);
     }
 
     #[test]
@@ -965,19 +808,14 @@ mod tests {
     #[test]
     fn the_ring_keeps_order() {
         let bell = Doorbell::new();
-        for key in 0..5u16 {
-            bell.push(InputEvent::Key(KeyEvent {
-                kind: KeyKind::Down,
-                key,
-                repeat: false,
-                mods: Mods::default(),
-            }));
+        for k in 0..5u16 {
+            bell.state.borrow_mut().push(key(k));
         }
-        for key in 0..5u16 {
+        for k in 0..5u16 {
             let Some(InputEvent::Key(event)) = bell.pop() else {
                 panic!("the ring lost a record");
             };
-            assert_eq!(event.key, key);
+            assert_eq!(event.key, k);
         }
         assert_eq!(bell.pop(), None);
     }
@@ -985,22 +823,16 @@ mod tests {
     #[test]
     fn overflow_drops_the_oldest_and_says_so() {
         let bell = Doorbell::new();
-        let push = |key| {
-            bell.push(InputEvent::Key(KeyEvent {
-                kind: KeyKind::Down,
-                key,
-                repeat: false,
-                mods: Mods::default(),
-            }));
-        };
-        for key in 0..RING_CAPACITY as u16 {
-            push(key);
+        for k in 0..RING as u16 {
+            bell.state.borrow_mut().push(key(k));
         }
         assert_eq!(bell.health().dropped, 0);
-        assert_eq!(bell.health().peak, RING_CAPACITY as u32);
+        assert_eq!(bell.health().peak, RING as u32);
         // One past capacity. `debug_assert!` panics in a debug build, so the drop is checked
         // only where the push returned; the count reports it in either build.
-        let overflowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| push(999)));
+        let overflowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bell.state.borrow_mut().push(key(999))
+        }));
         if overflowed.is_ok() {
             assert_eq!(bell.health().dropped, 1);
             let Some(InputEvent::Key(first)) = bell.pop() else {
@@ -1016,33 +848,42 @@ mod tests {
     #[test]
     fn a_contact_slot_is_reused_only_after_it_is_released() {
         let bell = Doorbell::new();
-        bell.claim(3, true);
+        bell.wndproc(
+            WM_POINTERUPDATE as u32,
+            wparam(3, POINTER_FLAG_PRIMARY | POINTER_FLAG_INCONTACT),
+            0,
+        );
         assert!(bell.is_down(3));
         let mut moved = Vec::new();
-        bell.take_moved(&mut moved);
+        bell.moved_into(&mut moved);
         assert_eq!(moved, [3]);
         // Taking clears the bit, so a frame with no motion reports none.
-        bell.take_moved(&mut moved);
+        bell.moved_into(&mut moved);
         assert!(moved.is_empty());
 
         bell.release(3);
         assert!(!bell.is_down(3));
-        bell.take_moved(&mut moved);
+        bell.moved_into(&mut moved);
         assert!(moved.is_empty());
     }
 
     #[test]
-    fn a_canceled_up_is_a_cancel() {
-        // Exercised over the flag word rather than through `transition`, which needs a live
-        // pointer id to resolve a point.
-        let flags = PointerFlags::from_wparam(wparam(1, POINTER_FLAG_CANCELED));
-        assert!(flags.canceled());
-        let kind = if flags.canceled() {
-            EventKind::Cancel
-        } else {
-            EventKind::Up
-        };
-        assert_eq!(kind, EventKind::Cancel);
+    fn a_captured_drag_keeps_its_slot_across_leave() {
+        // The contact is gone from this window, but its up has still to arrive: a slot
+        // released here loses the release that ends the drag.
+        let bell = Doorbell::new();
+        let down = wparam(3, POINTER_FLAG_PRIMARY | POINTER_FLAG_INCONTACT);
+        bell.wndproc(WM_POINTERUPDATE as u32, down, 0);
+        assert_eq!(bell.wndproc(WM_POINTERLEAVE as u32, wparam(3, 0), 0), None);
+        assert_eq!(bell.hovering(), None, "hover survived the pointer leaving");
+        assert!(bell.is_down(3), "a captured drag lost its slot on leave");
+
+        // A hovering contact owns nothing, so leave frees its slot outright.
+        bell.wndproc(WM_POINTERUPDATE as u32, wparam(4, POINTER_FLAG_PRIMARY), 0);
+        bell.wndproc(WM_POINTERLEAVE as u32, wparam(4, 0), 0);
+        let mut moved = Vec::new();
+        bell.moved_into(&mut moved);
+        assert_eq!(moved, [3]);
     }
 
     #[test]
@@ -1068,14 +909,33 @@ mod tests {
     fn the_doorbell_is_idle_until_something_rings_it() {
         let bell = Doorbell::new();
         assert!(bell.idle());
-        bell.claim(1, false);
+        bell.wndproc(WM_POINTERUPDATE as u32, wparam(1, POINTER_FLAG_PRIMARY), 0);
         assert!(!bell.idle(), "a moved contact is not idle");
         let mut moved = Vec::new();
-        bell.take_moved(&mut moved);
+        bell.moved_into(&mut moved);
         assert!(bell.idle());
         bell.stop_inertia();
         assert!(!bell.idle());
         assert!(bell.take_stop_inertia());
         assert!(bell.idle());
+    }
+
+    #[test]
+    fn a_canceled_up_is_a_cancel_and_a_window_capture_change_names_no_pointer() {
+        let bell = Doorbell::new();
+        bell.wndproc(WM_POINTERUP as u32, wparam(1, POINTER_FLAG_CANCELED), 0);
+        let Some(InputEvent::Pointer(event)) = bell.pop() else {
+            panic!("the up was not recorded");
+        };
+        assert_eq!(event.kind, EventKind::Cancel);
+        assert_eq!(event.id, 1);
+
+        // `WM_CAPTURECHANGED` carries a window handle, so its record names no pointer and the
+        // tick resolves it against whatever holds the explicit capture.
+        assert_eq!(bell.wndproc(WM_CAPTURECHANGED as u32, 0x1234, 0), None);
+        let Some(InputEvent::Pointer(event)) = bell.pop() else {
+            panic!("the capture change was not recorded");
+        };
+        assert_eq!((event.kind, event.id), (EventKind::Cancel, 0));
     }
 }

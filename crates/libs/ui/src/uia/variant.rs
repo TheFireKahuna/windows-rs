@@ -18,6 +18,7 @@ const VT_R8: VARTYPE = 5;
 const VT_BSTR: VARTYPE = 8;
 const VT_BOOL: VARTYPE = 11;
 const VT_UNKNOWN: VARTYPE = 13;
+const VT_ARRAY: VARTYPE = 0x2000;
 
 /// First element of a fragment's runtime id: "append this to the host's".
 pub const APPEND_RUNTIME_ID: i32 = 3;
@@ -36,6 +37,16 @@ fn variant(vt: VARTYPE, value: VARIANT_0_0_0) -> VARIANT {
     }
 }
 
+/// Returns a variant of `vt` whose payload is the low bytes of `bits`.
+///
+/// Every payload this module writes through here — an `i32`, an `f64`, an OLE boolean, and
+/// the empty variant's zero — is at most eight bytes and sits at the union's offset zero,
+/// so writing the widest arm sets the narrower one the tag names. Windows is
+/// little-endian, which is what puts a narrow arm in the low bytes.
+fn scalar(vt: VARTYPE, bits: u64) -> VARIANT {
+    variant(vt, VARIANT_0_0_0 { ullVal: bits })
+}
+
 /// Returns the `VT_EMPTY` variant, which is how a provider answers a property the element
 /// does not have.
 ///
@@ -43,36 +54,31 @@ fn variant(vt: VARTYPE, value: VARIANT_0_0_0) -> VARIANT {
 /// element logs nothing.
 #[must_use]
 pub fn empty() -> VARIANT {
-    variant(VT_EMPTY, VARIANT_0_0_0 { llVal: 0 })
+    scalar(VT_EMPTY, 0)
 }
 
 /// Returns `value` as a `VT_I4` variant.
 #[must_use]
 pub fn i4(value: i32) -> VARIANT {
-    variant(VT_I4, VARIANT_0_0_0 { lVal: value })
+    scalar(VT_I4, u64::from(value as u32))
 }
 
 /// Returns `value` as a `VT_R8` variant.
 #[must_use]
 pub fn r8(value: f64) -> VARIANT {
-    variant(VT_R8, VARIANT_0_0_0 { dblVal: value })
+    scalar(VT_R8, value.to_bits())
 }
 
 /// Returns `value` as a `VT_BOOL` variant.
 #[must_use]
 pub fn bool(value: bool) -> VARIANT {
-    variant(
-        VT_BOOL,
-        VARIANT_0_0_0 {
-            // The OLE truth value is all-ones, not one.
-            boolVal: if value { -1 } else { 0 },
-        },
-    )
+    // The OLE truth value is all-ones across the arm's two bytes, not one.
+    scalar(VT_BOOL, if value { 0xffff } else { 0 })
 }
 
 /// Returns `value` as a `VT_BSTR` variant, or [`empty`] where the slice is empty.
 ///
-/// The tree stores its strings as UTF-16, which is what automation accepts, so the
+/// The pool stores its strings as UTF-16, which is what automation accepts, so the
 /// conversion is a length prefix and a memcpy with no transcode.
 #[must_use]
 pub fn wide(value: &[u16]) -> VARIANT {
@@ -113,6 +119,21 @@ pub fn provider(value: &crate::bindings::IRawElementProviderSimple) -> VARIANT {
             )),
         },
     )
+}
+
+/// Returns `values` as a `VT_R8 | VT_ARRAY` variant, which is how automation carries a
+/// rectangle inside a property.
+///
+/// The variant owns the array, which the client releases with the rest of the variant.
+/// Answers [`empty`] where the allocation failed, because a property is answered rather
+/// than failed.
+#[must_use]
+pub fn rect_property(values: &[f64]) -> VARIANT {
+    let array = rect_array(values);
+    if array.is_null() {
+        return empty();
+    }
+    variant(VT_R8 | VT_ARRAY, VARIANT_0_0_0 { parray: array })
 }
 
 /// Returns a `SAFEARRAY` of `vt` holding one element per entry of `values`, each written
@@ -178,21 +199,6 @@ pub fn range_array(values: &[crate::bindings::ITextRangeProvider]) -> *mut SAFEA
 /// property.
 #[must_use]
 pub fn runtime_id(id: u32, part: u32) -> *mut SAFEARRAY {
-    // SAFETY: `SafeArrayCreateVector` returns either null, which is checked, or an array
-    // of three `i32`s. Each of the three indices is written once and is below that length,
-    // and each source value is an `i32` alive for the duration of the call.
-    unsafe {
-        let array = SafeArrayCreateVector(VT_I4, 0, 3);
-        if array.is_null() {
-            return array;
-        }
-        for (at, value) in [APPEND_RUNTIME_ID, id as i32, part as i32]
-            .iter()
-            .enumerate()
-        {
-            let at = at as i32;
-            _ = SafeArrayPutElement(array, &raw const at, (&raw const *value).cast());
-        }
-        array
-    }
+    let values = [APPEND_RUNTIME_ID, id as i32, part as i32];
+    array(VT_I4, &values, |value| (&raw const *value).cast())
 }

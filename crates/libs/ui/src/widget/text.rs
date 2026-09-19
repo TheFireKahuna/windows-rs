@@ -46,6 +46,19 @@ impl TextSource {
         !matches!(self, Self::Dynamic(_))
     }
 
+    /// Returns whether this source is known to be empty without reading it.
+    ///
+    /// For the callers that mint a run only where there is text: an empty button label mints
+    /// none. A dynamic source is never known to be empty, because answering would run it.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Static(s) => s.is_empty(),
+            Self::Owned(s) => s.is_empty(),
+            Self::Dynamic(_) => false,
+        }
+    }
+
     /// Appends the current text to `out`, registering a signal dependency where the source
     /// has one.
     ///

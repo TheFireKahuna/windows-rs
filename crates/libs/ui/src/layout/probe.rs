@@ -27,15 +27,13 @@
 //! [`Anchors`](super::Anchors) covers the keyed case: many child boxes, in one container's
 //! own space, under the application's own identities.
 
-use crate::role::WidthClass;
+use super::{Rect, WidthClass};
 use crate::signal::Cell;
 use windows_numerics::Vector2;
-use windows_scene::{Rect, Solved};
 
 /// Where the solve put a node.
 ///
-/// The four fields a consumer acts on. Narrower than [`Solved`], which also carries the
-/// content size and the clipping flag a scroll container is published with.
+/// The five fields a consumer acts on, which is narrower than the node's own solved row.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Placed {
     /// Absolute, window-relative, pixel-snapped and **unscrolled**: where layout put the
@@ -52,18 +50,6 @@ pub struct Placed {
     pub class: WidthClass,
     /// The actual enclosing scope, published after the first solve.
     pub scope: Option<crate::role::Scope>,
-}
-
-impl From<Solved> for Placed {
-    fn from(solved: Solved) -> Self {
-        Self {
-            rect: solved.rect,
-            size: solved.size,
-            local: solved.local,
-            class: solved.class,
-            scope: None,
-        }
-    }
 }
 
 /// A handle to where the solve put a node.
@@ -97,6 +83,13 @@ pub struct Probe(Cell<Placed>);
 #[must_use]
 pub fn probe() -> Probe {
     Probe(Cell::new(Placed::default()))
+}
+
+/// Two probes are the same probe where they are the same cell, whatever each last read.
+impl PartialEq for Probe {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id() == other.0.id()
+    }
 }
 
 impl Probe {

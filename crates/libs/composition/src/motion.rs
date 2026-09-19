@@ -205,6 +205,17 @@ macro_rules! spring {
                 }
             }
 
+            /// Sets how long the spring waits before it runs.
+            ///
+            /// The delay behaviour is the platform default, which states the initial value
+            /// before the wait rather than after it. This crate never sets an initial value,
+            /// so that value is the property's own and the channel holds where it stands for
+            /// the delay. A delay set on one call holds until the next, as the period does.
+            pub fn set_delay(&self, delay: Duration) {
+                let motion: bindings::INaturalMotionAnimation = self.0.cast().unwrap();
+                motion.SetDelayTime(to_time_span(delay)).unwrap();
+            }
+
             /// Sets the velocity the spring starts with, per second.
             ///
             /// A released gesture continues at the speed the user was moving when its

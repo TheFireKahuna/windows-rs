@@ -76,11 +76,11 @@ impl Palette for Reference {
         }
     }
 
-    fn shadow(&self, _scope: Scope) -> super::Shadow {
-        super::Shadow {
-            blur: 18.0,
+    fn shadow(&self, _scope: Scope) -> Shadow {
+        Shadow {
+            sigma: 18.0,
             offset: 14.0,
-            tint: Radiance::new(0.0, 0.0, 0.0, 0.45),
+            light: Radiance::new(0.0, 0.0, 0.0, 0.45),
         }
     }
 
@@ -131,7 +131,7 @@ impl Palette for Reference {
         }
     }
 
-    fn content_peak_nits(&self, _gamut: &windows_color::Gamut) -> f32 {
+    fn content_peak_nits(&self, _gamut: &windows_color::Gamut, _scope: Scope) -> f32 {
         290.0
     }
 }
@@ -401,3 +401,13 @@ test_metric!(CORNER, 6.0);
 test_metric!(TOP_BAND, 48.0);
 test_metric!(BOTTOM_BAND, 28.0);
 test_metric!(MAX_WIDTH, 420.0);
+
+#[test]
+fn every_builtin_metric_indexes_its_own_row() {
+    // `Host::metrics` caches exactly this array per width class and `Len::resolve` indexes it
+    // by `row`, so a row that names another metric is a spacing resolved as a radius.
+    for (at, metric) in Metric::BUILTIN.into_iter().enumerate() {
+        assert_eq!(metric.row(), Some(at), "{metric:?} is not at its own row");
+    }
+    assert_eq!(EXTENT.row(), None, "a custom token has no cached row");
+}

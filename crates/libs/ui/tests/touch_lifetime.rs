@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use injector::{Injector, Point, Space};
 use windows_color::{DisplayCapability, OutputTransform};
-use windows_scene::{ControlId, Env, HitEntry, HitFlags, HitTable, Ids, NO_ENTRY, NodeId};
+use windows_scene::{ControlId, Env, HitEntry, HitFlags, HitTable, NO_ENTRY, NodeId};
 use windows_ui::gesture::{GestureDecl, Recognised};
 use windows_ui::input::{Doorbell, Report, Router};
 use windows_window::Window;
@@ -45,7 +45,7 @@ fn retired_taps_and_cancels_drain_in_order_and_release_the_frame_request() {
     }
     pump_for(Duration::from_millis(200));
 
-    let target = Ids::<windows_scene::Control>::new().mint();
+    let target = ControlId::FIRST;
     let mut hits = HitTable::default();
     hits.replace(&[HitEntry {
         x0: 40.0,
@@ -58,7 +58,7 @@ fn retired_taps_and_cancels_drain_in_order_and_release_the_frame_request() {
         flags: HitFlags::INTERACTIVE | HitFlags::GESTURE,
         scroll_src: NodeId::NONE,
         id: target,
-    }]);
+    }], &[(target, 0)]);
     router.declare(target, GestureDecl::tap());
     let env = Env::new(
         window.metrics().unwrap().dpi as f32,

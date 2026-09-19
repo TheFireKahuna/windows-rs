@@ -1,192 +1,190 @@
-use super::scalar_tests::{press, publish};
-use super::*;
-use crate::{
-    build::Host,
-    signal::{Cell, Owner},
-    widget::button,
-};
-use windows_scene::{Model, Point};
+//! The interaction reveal and the observed-hover edges, driven against a real compositor.
 
-fn hover(from: Option<ControlId>, to: Option<ControlId>) -> Report {
+use super::scalar_tests::{Rig, entry, press};
+use super::*;
+use windows_scene::Point;
+
+fn hover(from: ControlId, to: ControlId) -> Report {
     Report::HoverChanged {
-        from,
-        to,
+        from: (!from.is_none()).then_some(from),
+        to: (!to.is_none()).then_some(to),
         at: Point::default(),
         qpc: 0,
     }
 }
 
-#[test]
-fn native_reveal_preserves_controls_and_retires_targets() -> Result<()> {
-    windows_window::ensure_dispatcher_queue(windows_window::Apartment::Asta)?;
-    let (_owner, result) = Owner::scope(|| -> Result<()> {
-        let _ = crate::build::tests::fixture();
-        let (env, scope) = Host::with(|h| (h.env, h.root_scope));
-        let mut model = Model::new(crate::layout::root());
-        model.set_window(windows_numerics::Vector2::new(800.0, 600.0));
-        Host::install(model, env, scope);
-        let window = windows_window::Window::new("interaction reveal")
-            .size_dips(800.0, 600.0)
-            .create()?;
-        let back = Backends::new(
-            windows_composition::Compositor::new()?,
-            &windows_d2d::Gpu::for_window()?,
-            windows_text::FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"]),
-        )?;
-        Host::install_text(back.ladder().clone())?;
-        let mut scene = Scene::new_at(
-            window.handle(),
-            &back,
-            env,
-            windows_scene::BackdropSpec::default(),
-        )?;
-        let mut front = Front {
-            scene: &mut scene,
-            back: &back,
-            env,
-        };
-        let shown = Cell::new(true);
-        let held = crate::build::Ui::mount_root(|ui| {
-            ui.node(crate::layout::Preset::Row)
-                .interaction_scope()
-                .row(|ui| {
-                    button(ui, "Route").key("route");
-                    ui.when(shown, |ui| {
-                        button(ui, "Remove").key("remove").reveal_on_interaction();
-                    });
-                });
-        });
-        let mut controls = Controls::new();
-        let mut down = crate::seam::Down::default();
-        publish(&mut down, &mut controls, &mut front)?;
-        let named = |name| {
-            Host::with(|h| {
-                h.controls
-                    .iter()
-                    .find(|(_, r)| r.key == Some(name))
-                    .unwrap()
-                    .0
-            })
-        };
-        let route = named("route");
-        let remove = named("remove");
-        let scope = controls.rows.get(route).unwrap().hover_scope.unwrap();
-        let reveal = controls.rows.get(scope).unwrap().reveal;
-        assert!(!controls.rows.get(scope).unwrap().observes_hover);
-        assert!(
-            !front
-                .scene
-                .hits()
-                .entry(scope)
-                .unwrap()
-                .flags
-                .contains(windows_scene::HitFlags::INTERACTIVE)
-        );
-        assert!(
-            front
-                .scene
-                .hits()
-                .entry(remove)
-                .unwrap()
-                .flags
-                .contains(windows_scene::HitFlags::INTERACTIVE)
-        );
-        let mut out = Vec::with_capacity(16);
-        let before = *front.scene.census();
-        controls.tick(&[hover(None, Some(route))], &mut front, &mut out)?;
-        assert!(controls.revealed.contains(&(scope, reveal)));
-        assert!(
-            out.is_empty(),
-            "cosmetic hover must not wake the application"
-        );
-        let animations = front.scene.census().animations;
-        for _ in 0..16 {
-            controls.tick(
-                &[
-                    hover(Some(route), Some(remove)),
-                    hover(Some(remove), Some(route)),
-                ],
-                &mut front,
-                &mut out,
-            )?;
-            controls.tick(&[], &mut front, &mut out)?;
-        }
-        // Button washes may move; the reveal target retains the same ownership and node.
-        assert_eq!(
-            front.scene.census().animations - animations,
-            64,
-            "crossing children must animate only their existing washes"
-        );
-        assert!(controls.revealed.contains(&(scope, reveal)));
-        assert_eq!(front.scene.census().visuals_minted, before.visuals_minted);
-        assert!(out.is_empty());
-        controls.tick(
-            &[
-                Report::FocusChanged {
-                    from: None,
-                    to: Some(remove),
+/// A scope carrying a reveal target, and two children that belong to it.
+struct Scoped {
+    scope: ControlId,
+    a: ControlId,
+    b: ControlId,
+}
+
+fn scoped(rig: &mut Rig, observes: bool) -> Result<Scoped> {
+    let reveal = rig.node()?;
+    let washes = [SpriteId(rig.node()?), SpriteId(rig.node()?)];
+    let (scope, a, b) = (rig.ids.mint(), rig.ids.mint(), rig.ids.mint());
+    let child = |wash| ChromeRow {
+        wash,
+        scope,
+        hover: 0.08,
+        press: 0.16,
+        ..ChromeRow::default()
+    };
+    rig.publish_hits(&[
+        entry(scope, 0.0, 0.0, 200.0, 32.0),
+        entry(a, 0.0, 0.0, 100.0, 32.0),
+        entry(b, 100.0, 0.0, 200.0, 32.0),
+    ])?;
+    rig.adopt(
+        &[
+            (
+                scope,
+                ChromeRow {
+                    reveal,
+                    scope,
+                    flags: if observes { flag::OBSERVES } else { 0 },
+                    ..ChromeRow::default()
                 },
-                hover(Some(route), None),
-            ],
-            &mut front,
-            &mut out,
-        )?;
-        assert!(
-            controls.revealed.contains(&(scope, reveal)),
-            "keyboard focus must keep actions visible"
-        );
-        controls.tick(
-            &[Report::FocusChanged {
-                from: Some(remove),
-                to: None,
-            }],
-            &mut front,
-            &mut out,
-        )?;
-        assert!(controls.revealed.iter().all(|(_, node)| node.is_none()));
-        assert!(front.scene.census().animations > animations);
-        controls.tick(&[press(remove)], &mut front, &mut out)?;
-        assert!(
-            controls.revealed.contains(&(scope, reveal)),
-            "touch press must reveal without hover"
-        );
-        controls.tick(
-            &[Report::Canceled {
-                target: remove,
-                contact: 1,
-            }],
-            &mut front,
-            &mut out,
-        )?;
-        assert!(controls.revealed.iter().all(|(_, node)| node.is_none()));
-        out.clear();
-        controls.tick(&[hover(None, Some(route))], &mut front, &mut out)?;
-        for show in [false, true, false, true] {
-            shown.set(show);
-            publish(&mut down, &mut controls, &mut front)?;
-            let target = controls.rows.get(scope).unwrap().reveal;
-            assert_eq!(target.is_none(), !show);
-            assert_eq!(
-                controls.revealed.iter().any(|(_, node)| !node.is_none()),
-                show
-            );
-        }
-        assert!(
-            controls.rows.get(remove).is_none(),
-            "retired control generation must stay absent"
-        );
-        assert_eq!(front.scene.census().visuals_live, before.visuals_live);
-        let settled = *front.scene.census();
-        for _ in 0..16 {
-            controls.tick(&[], &mut front, &mut out)?;
-        }
-        assert_eq!(*front.scene.census(), settled);
-        drop(held);
-        publish(&mut down, &mut controls, &mut front)?;
-        assert!(controls.revealed.iter().all(|(_, node)| node.is_none()));
-        controls.tick(&[hover(Some(route), Some(remove))], &mut front, &mut out)?;
-        assert!(out.is_empty());
-        Ok(())
-    });
-    result
+            ),
+            (a, child(washes[0])),
+            (b, child(washes[1])),
+        ],
+        &[],
+        &[],
+    )?;
+    Ok(Scoped { scope, a, b })
+}
+
+#[test]
+fn native_a_reveal_survives_crossings_between_the_children_of_one_scope() -> Result<()> {
+    let mut rig = Rig::new("interaction reveal")?;
+    let Scoped { scope, a, b } = scoped(&mut rig, false)?;
+    let mut out = Vec::with_capacity(16);
+    let minted = rig.visuals_minted();
+
+    let before = rig.animations();
+    rig.tick(&[hover(ControlId::NONE, a)], &mut out)?;
+    assert!(
+        out.is_empty(),
+        "a cosmetic hover must not wake the application"
+    );
+    // One wash and one reveal: the target came up and the control under the pointer lit.
+    assert_eq!(rig.animations() - before, 2);
+
+    let settled = rig.animations();
+    for _ in 0..16 {
+        rig.tick(&[hover(a, b), hover(b, a)], &mut out)?;
+    }
+    assert_eq!(
+        rig.animations() - settled,
+        64,
+        "crossing children must animate only their existing washes"
+    );
+    assert_eq!(
+        rig.visuals_minted(),
+        minted,
+        "an interaction mints no visual"
+    );
+    assert!(out.is_empty());
+
+    // Keyboard focus keeps the actions visible while the pointer leaves.
+    rig.tick(
+        &[
+            Report::FocusChanged {
+                from: None,
+                to: Some(b),
+            },
+            hover(a, ControlId::NONE),
+        ],
+        &mut out,
+    )?;
+    let held = rig.animations();
+    rig.tick(&[], &mut out)?;
+    assert_eq!(
+        rig.animations(),
+        held,
+        "an unchanged reveal is not restarted"
+    );
+
+    // Focus leaves and nothing is left holding the scope, so the target fades.
+    rig.tick(
+        &[Report::FocusChanged {
+            from: Some(b),
+            to: None,
+        }],
+        &mut out,
+    )?;
+    assert!(rig.animations() > held);
+
+    // A touch press reveals without a hover, and a canceled contact takes it back down.
+    let up = rig.animations();
+    rig.tick(&[press(b)], &mut out)?;
+    assert!(rig.animations() > up);
+    let down = rig.animations();
+    rig.tick(
+        &[Report::Canceled {
+            target: b,
+            contact: 1,
+        }],
+        &mut out,
+    )?;
+    assert!(rig.animations() > down);
+
+    // The scope itself retires: the target is gone, so nothing may be written to it.
+    rig.adopt(&[], &[], &[scope])?;
+    let retired = rig.animations();
+    rig.tick(&[hover(ControlId::NONE, a), hover(a, b)], &mut out)?;
+    assert_eq!(
+        rig.animations() - retired,
+        3,
+        "only the two washes move once the reveal target is gone"
+    );
+    Ok(())
+}
+
+#[test]
+fn native_semantic_hover_reports_scope_edges_and_ignores_child_crossings() -> Result<()> {
+    let mut rig = Rig::new("observed hover")?;
+    let Scoped { scope, a, b } = scoped(&mut rig, true)?;
+    let ordinary = rig.ids.mint();
+    rig.adopt(&[(ordinary, ChromeRow::default())], &[], &[])?;
+
+    let mut out = Vec::with_capacity(2);
+    rig.tick(&[hover(ControlId::NONE, a)], &mut out)?;
+    assert_eq!(
+        out,
+        [Intent {
+            target: scope,
+            what: What::Hovered(true)
+        }]
+    );
+    out.clear();
+
+    for _ in 0..1000 {
+        rig.tick(&[hover(a, b), hover(b, a)], &mut out)?;
+    }
+    assert!(out.is_empty(), "child crossings must stay scene-side");
+
+    rig.tick(&[hover(a, ordinary)], &mut out)?;
+    assert_eq!(
+        out,
+        [Intent {
+            target: scope,
+            what: What::Hovered(false)
+        }]
+    );
+    out.clear();
+
+    rig.tick(&[hover(ordinary, ControlId::NONE)], &mut out)?;
+    assert!(
+        out.is_empty(),
+        "leaving a control outside a scope is not an edge"
+    );
+    assert_eq!(
+        out.capacity(),
+        2,
+        "the edge path appends and never allocates"
+    );
+    Ok(())
 }

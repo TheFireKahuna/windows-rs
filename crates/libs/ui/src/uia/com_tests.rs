@@ -4,6 +4,7 @@
 //! [`tests`](super::tests) covers the data model. These calls go through the generated
 //! implement-side vtables, which is the surface automation itself calls.
 
+use super::NONE;
 use super::tests::{Screen, listening};
 use crate::bindings::{
     IRawElementProviderFragment, IRawElementProviderFragmentRoot, IRawElementProviderSimple,
@@ -13,7 +14,6 @@ use crate::bindings::{
 };
 use crate::widget::{Range, UiaRole};
 use windows_core::Interface;
-use windows_scene::NO_ENTRY;
 
 /// A raw provider pointer, moved to another thread and called from there the way automation
 /// calls one: from any apartment, without marshalling.
@@ -139,7 +139,7 @@ fn number(value: &VARIANT) -> i32 {
 fn a_provider_answers_from_a_thread_that_never_published() {
     let mut uia = listening();
     let mut screen = Screen::new();
-    let group = screen.add(NO_ENTRY, (0.0, 0.0, 200.0, 80.0), UiaRole::Group, "output");
+    let group = screen.add(NONE, (0.0, 0.0, 200.0, 80.0), UiaRole::Group, "output");
     screen.add(group, (8.0, 8.0, 80.0, 32.0), UiaRole::Button, "mute");
     screen.slider(group, (96.0, 8.0, 190.0, 32.0), Range::new(-60.0, 0.0));
     screen.publish(&mut uia);
@@ -201,7 +201,7 @@ fn a_provider_answers_from_a_thread_that_never_published() {
 fn one_element_is_one_object_however_it_is_reached() {
     let mut uia = listening();
     let mut screen = Screen::new();
-    let group = screen.add(NO_ENTRY, (0.0, 0.0, 200.0, 80.0), UiaRole::Group, "output");
+    let group = screen.add(NONE, (0.0, 0.0, 200.0, 80.0), UiaRole::Group, "output");
     screen.add(group, (8.0, 8.0, 80.0, 32.0), UiaRole::Button, "mute");
     screen.publish(&mut uia);
 
@@ -222,7 +222,7 @@ fn one_element_is_one_object_however_it_is_reached() {
 fn an_unmounted_element_stops_resolving_rather_than_answering_for_its_successor() {
     let mut uia = listening();
     let mut screen = Screen::new();
-    let group = screen.add(NO_ENTRY, (0.0, 0.0, 200.0, 80.0), UiaRole::Group, "output");
+    let group = screen.add(NONE, (0.0, 0.0, 200.0, 80.0), UiaRole::Group, "output");
     screen.add(group, (8.0, 8.0, 80.0, 32.0), UiaRole::Button, "mute");
     screen.publish(&mut uia);
 
@@ -236,8 +236,8 @@ fn an_unmounted_element_stops_resolving_rather_than_answering_for_its_successor(
 
     // The screen is replaced by a different one; the client is still holding the button.
     let mut next = screen.successor();
-    next.add(NO_ENTRY, (0.0, 0.0, 200.0, 80.0), UiaRole::Group, "input");
-    next.add(0, (8.0, 8.0, 80.0, 32.0), UiaRole::Button, "solo");
+    next.add(NONE, (0.0, 0.0, 200.0, 80.0), UiaRole::Group, "input");
+    next.add(0u16, (8.0, 8.0, 80.0, 32.0), UiaRole::Button, "solo");
     next.publish(&mut uia);
 
     assert_eq!(

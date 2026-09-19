@@ -1,85 +1,210 @@
 //! App half of fields: callbacks and shaping. The working document remains input-owned.
 
-use super::Host;
-use crate::role::{Fill, Role, Scope, Text};
-use crate::text_input::{Commit, Geometry, InputScope, Layout, Selection, Source, Update};
-use std::{rc::Rc, sync::Arc};
+use super::host::Host;
+use super::text::{Fold, MeasureKey};
+use crate::role::{Fill, Metric, Role, Scope, Text, metric, resolve};
+use crate::text_input::{
+    Cluster, Commit, Geometry, InputScope, Layout, Selection, Source, Update, system,
+};
+use crate::widget::TextSource;
+use std::borrow::Cow;
+use std::sync::Arc;
 use windows_numerics::Vector2;
 use windows_scene::{
-    Bind, Clip, ControlId, Corners, Easing, GroupId, Iterations, Mask, MeasureKey, Paint, Prop,
-    SpriteId, Value, taffy,
+    Anim, Bind, Clip, ControlId, Corners, Easing, GroupId, Iterations, Mask, NodeId, Paint, Prop,
+    SpriteId, Value,
 };
+use windows_text::Rect;
 
+/// One field's app-side row.
+///
+/// The input STA owns the editable UTF-16 buffer, the private selection and affinity, and the
+/// composition lifetime; nothing here mirrors them.
 pub(crate) struct Row {
+    /// The run this field shapes through. Password masking also shapes on this thread, as the
+    /// fold the run was minted with.
     key: MeasureKey,
     group: GroupId,
-    pub scope: InputScope,
-    style: Scope,
-    pub callback: Option<Rc<dyn Fn(&str)>>,
+    /// The published immutable text, in UTF-16 because the positions input names are UTF-16
+    /// offsets and converting at every caret query would make each one a scan.
+    pub text: Arc<[u16]>,
+    pub selection: Selection,
+    composition: Option<core::ops::Range<u32>>,
+    pub geometry: Option<Arc<Geometry>>,
+    /// The user revision `text` was written against, and the layout revision published beside
+    /// it. A source record carries the revision it was based on, and later typing supersedes
+    /// it; a key waiting for geometry completes before blur applies a pending replacement.
     pub revision: u64,
     layout_revision: u64,
     pub callback_revision: Option<u64>,
     pub delivered_revision: Option<u64>,
-    pub text: Arc<[u16]>,
-    pub selection: Selection,
-    composition: Option<core::ops::Range<u32>>,
-    focused: bool,
-    dirty: bool,
+    /// Where the text stands inside the clip. Text is absolute inside the field, so a long
+    /// edit does not continually resize its neighbours, and reveal moves this rather than the
+    /// box.
     scroll: f32,
-    last_size: Vector2,
-    last_origin: Vector2,
-    font: Option<windows_text::FontSpec>,
+    /// One caret, one sprite per selection rect, one per composition underline. Pooled, so a
+    /// keystroke inside a selection retargets rather than mints.
     caret: SpriteId,
     selections: Vec<SpriteId>,
     underlines: Vec<SpriteId>,
-    pub geometry: Option<Arc<Geometry>>,
-    scratch: Vec<windows_text::Rect>,
-    password_run: Option<windows_text::ShapedRun>,
-    password_map: Vec<(u32, u32)>,
+    /// Where this field's shaped clusters and highlight boxes are staged. Per field rather
+    /// than per host, so publishing one field borrows nothing another owns.
+    clusters: Vec<Cluster>,
+    rects: Vec<Rect>,
+    style: Scope,
+    pub scope: InputScope,
+    focused: bool,
+    dirty: bool,
+}
+
+impl Row {
+    fn new(key: MeasureKey, group: GroupId, style: Scope, caret: SpriteId) -> Self {
+        Self {
+            key,
+            group,
+            text: Arc::from([]),
+            selection: Selection::default(),
+            composition: None,
+            geometry: None,
+            revision: 0,
+            layout_revision: 0,
+            callback_revision: None,
+            delivered_revision: None,
+            scroll: 0.0,
+            caret,
+            selections: Vec::new(),
+            underlines: Vec::new(),
+            clusters: Vec::new(),
+            rects: Vec::new(),
+            style,
+            scope: InputScope::Default,
+            focused: false,
+            dirty: true,
+        }
+    }
+}
+
+/// Remaps a masked run's cluster boundaries onto the source's own positions.
+///
+/// The mask is one dot per source character and not one code unit per code unit, so a
+/// supplementary character is one dot whose span is two. Input names positions in the
+/// source's units, so the boundaries are translated here rather than the mask being made to
+/// match by length.
+fn remap<'a>(text: &[u16], scope: InputScope, clusters: &'a [Cluster]) -> Cow<'a, [Cluster]> {
+    if scope != InputScope::Password {
+        return Cow::Borrowed(clusters);
+    }
+    let mut out = clusters.to_vec();
+    let mut at = 0;
+    for cluster in &mut out {
+        let end = at + source_units(text, at);
+        (cluster.start, cluster.end) = (at, end);
+        at = end;
+    }
+    Cow::Owned(out)
+}
+
+/// The range one decoration covers: the selection, the composition, or nothing at all where
+/// the field does not hold focus.
+fn decorated(
+    focused: bool,
+    selection: Selection,
+    composition: Option<&core::ops::Range<u32>>,
+    underline: bool,
+) -> core::ops::Range<u32> {
+    match (focused, underline) {
+        (false, _) => 0..0,
+        (true, false) => selection.range(),
+        (true, true) => composition.cloned().unwrap_or(0..0),
+    }
+}
+
+/// What one plan writes, computed under a read of the table and applied through the host.
+struct Plan {
+    /// The run's own node, which the origin is written onto.
+    node: NodeId,
+    geometry: Geometry,
+    caret: Rect,
+    line_h: f32,
+}
+
+/// Removes the separators a single-line field cannot hold: CR, LF, NEL, LINE SEPARATOR and
+/// PARAGRAPH SEPARATOR.
+///
+/// Applied to paste and to source values. Enter claimed by the text service belongs to the
+/// composition; otherwise it inserts no newline, so this is the only way one reaches the
+/// buffer.
+fn units(text: &str) -> impl Iterator<Item = u16> + '_ {
+    text.encode_utf16()
+        .filter(|u| !matches!(u, 10 | 13 | 0x0085 | 0x2028 | 0x2029))
+}
+
+/// The code units the source character at `at` occupies: two for a surrogate pair, one
+/// otherwise.
+fn source_units(text: &[u16], at: u32) -> u32 {
+    match text.get(at as usize) {
+        Some(0xd800..=0xdbff) => 2,
+        _ => 1,
+    }
+}
+
+/// The pool a decoration draws from: selection fills, or composition underlines.
+fn pool(row: &Row, underline: bool) -> &Vec<SpriteId> {
+    match underline {
+        true => &row.underlines,
+        false => &row.selections,
+    }
+}
+
+fn pool_mut(row: &mut Row, underline: bool) -> &mut Vec<SpriteId> {
+    match underline {
+        true => &mut row.underlines,
+        false => &mut row.selections,
+    }
+}
+
+/// Moves `rect` into the run's space and, for an underline, reduces it to a rule on its
+/// baseline edge.
+fn decoration(rect: Rect, origin: Vector2, thickness: f32) -> Rect {
+    let rect = Rect {
+        x: rect.x + origin.x,
+        y: rect.y + origin.y,
+        ..rect
+    };
+    match thickness > 0.0 {
+        true => Rect {
+            y: rect.y + rect.h - thickness,
+            h: thickness,
+            ..rect
+        },
+        false => rect,
+    }
 }
 
 impl Host {
-    pub(super) fn field_binding(
-        &mut self,
-        node: windows_scene::NodeId,
-        id: ControlId,
-        source: crate::widget::TextSource,
-    ) {
-        self.replace_binding(node, super::binding::Destination::Text);
-        match source {
-            crate::widget::TextSource::Static(text) => self.field_source(id, text),
-            crate::widget::TextSource::Owned(text) => self.field_source(id, &text),
-            crate::widget::TextSource::Dynamic(read) => {
-                let mut scratch = String::new();
-                self.bind_to(node, super::binding::Destination::Text, move || {
-                    scratch.clear();
-                    read(&mut scratch);
-                    Host::with(|host| host.field_source(id, &scratch));
-                });
-            }
-        }
-    }
-
-    pub(crate) fn install_field(
-        &mut self,
-        id: ControlId,
-        group: GroupId,
-        key: MeasureKey,
-        scope: InputScope,
-        style: Scope,
-        callback: Option<Rc<dyn Fn(&str)>>,
-    ) {
-        let caret = self.model().visual(group, None);
-        self.model().mask(
+    /// Mints a field row for `id` and installs its application source.
+    ///
+    /// Field storage is released on unmount and the slot is generation checked, so a late
+    /// callback cannot address a reused control slot.
+    pub(crate) fn install_field(&mut self, id: ControlId, source: TextSource) {
+        let Some(control) = self.control(id) else {
+            return;
+        };
+        let (node, style) = (control.node, control.scope);
+        let Some(key) = control.text else {
+            return;
+        };
+        let group = GroupId(node);
+        let caret = self.visual(group, None);
+        self.mask(
             caret,
             Mask::Box {
                 radius: Corners::default(),
             },
         );
-        self.model()
-            .bind(caret.node(), Prop::Opacity, Bind::Set(Value::Scalar(0.0)));
-        self.model().clip(
-            group.node(),
+        self.write_channel(caret.0, Prop::Opacity, Value::Scalar(0.0));
+        self.clip(
+            node,
             Clip::Rect {
                 l: 0.0,
                 t: 0.0,
@@ -88,71 +213,77 @@ impl Host {
                 radius: Corners::default(),
             },
         );
-        // Text is absolute: editing a long value cannot widen its field or its neighbours.
-        if let Some((node, _)) = self.text.field_geometry(key, 0) {
-            let mut style = taffy::Style::DEFAULT;
-            style.position = taffy::Position::Absolute;
-            self.model().style(node, &style);
+        self.fields.place(id, Row::new(key, group, style, caret));
+        match source {
+            TextSource::Static(text) => self.field_source(id, text),
+            TextSource::Owned(text) => self.field_source(id, &text),
+            TextSource::Dynamic(read) => {
+                // The writer belongs to the signal scope creation installed, so it retires
+                // with the subtree that declared this field.
+                let mut scratch = String::new();
+                self.binding(move || {
+                    scratch.clear();
+                    read(&mut scratch);
+                    Host::with(|host| host.field_source(id, &scratch));
+                });
+            }
         }
-        self.fields.place(
-            id,
-            Row {
-                key,
-                group,
-                scope,
-                style,
-                callback,
-                revision: 0,
-                layout_revision: 0,
-                callback_revision: None,
-                delivered_revision: None,
-                text: Arc::from([]),
-                selection: Selection::default(),
-                composition: None,
-                focused: false,
-                dirty: true,
-                scroll: 0.0,
-                last_size: Vector2::default(),
-                last_origin: Vector2::default(),
-                font: None,
-                caret,
-                selections: Vec::new(),
-                underlines: Vec::new(),
-                geometry: None,
-                scratch: Vec::new(),
-                password_run: None,
-                password_map: Vec::new(),
-            },
-        );
     }
 
+    /// States a field's text-service context, and the fold its run draws under.
+    ///
+    /// The mask is the run's own fold rather than a second shaped string, so a masked field's
+    /// plaintext never reaches the shaper, the coverage or the automation snapshot.
+    pub(crate) fn set_field_scope(&mut self, id: ControlId, scope: InputScope) {
+        let Some(row) = self.fields.get_mut(id) else {
+            return;
+        };
+        row.scope = scope;
+        row.dirty = true;
+        let (key, fold) = (
+            row.key,
+            match scope {
+                InputScope::Password => Fold::Mask,
+                _ => Fold::None,
+            },
+        );
+        if let Some(node) = self.text.set_fold(key, fold) {
+            self.tree.mark(node);
+        }
+    }
+
+    /// Adopts an application-authored value.
+    ///
+    /// Source records carry the user revision they were based on, so later typing supersedes
+    /// them; an equal echo therefore reaches input as the same bytes and acknowledges without
+    /// resetting selection.
     pub(crate) fn field_source(&mut self, id: ControlId, source: &str) {
         let Some(row) = self.fields.get(id) else {
             return;
         };
-        let units = || {
-            source
-                .encode_utf16()
-                .filter(|u| !matches!(u, 10 | 13 | 0x0085 | 0x2028 | 0x2029))
+        let text: Arc<[u16]> = match units(source).eq(row.text.iter().copied()) {
+            true => Arc::clone(&row.text),
+            false => units(source).collect::<Vec<_>>().into(),
         };
-        let value: Arc<[u16]> = if units().eq(row.text.iter().copied()) {
-            row.text.clone()
-        } else {
-            units().collect::<Vec<_>>().into()
-        };
-        if let Some(old) = self.field_sources.iter_mut().find(|s| s.id == id) {
-            old.text = value;
-            old.based_on = row.callback_revision.unwrap_or(row.revision);
-        } else {
-            self.field_sources.push(Source {
+        let based_on = row.callback_revision.unwrap_or(row.revision);
+        let scope = row.scope;
+        match self.field_sources.iter_mut().find(|held| held.id == id) {
+            Some(held) => (held.text, held.based_on, held.scope) = (text, based_on, scope),
+            None => self.field_sources.push(Source {
                 id,
-                scope: row.scope,
-                based_on: row.callback_revision.unwrap_or(row.revision),
-                text: value,
-            });
+                scope,
+                based_on,
+                text,
+            }),
         }
     }
 
+    /// Adopts a change the input STA completed.
+    ///
+    /// Selection and intermediate composition changes are visual updates and carry no commit;
+    /// typing, deletion, paste and the end of a composition are completed edits, and Enter and
+    /// blur do not duplicate one. A stale revision is a superseded echo and is dropped rather
+    /// than applied.
     pub(crate) fn field_update(&mut self, update: &Update) {
         let Some(row) = self.fields.get_mut(update.id) else {
             return;
@@ -165,260 +296,271 @@ impl Host {
         row.composition.clone_from(&update.composition);
         row.focused = update.focused;
         row.dirty = true;
-        if let Some(value) = &update.text {
-            row.text = Arc::clone(value);
+        let (key, replaced) = (row.key, update.text.clone());
+        if let Some(value) = replaced {
+            row.text = Arc::clone(&value);
             row.geometry = None;
-            let original = String::from_utf16_lossy(value);
-            let display = if row.scope == InputScope::Password {
-                self.text.password_display(
-                    row.key,
-                    &original,
-                    &mut row.password_run,
-                    &mut row.password_map,
-                )
-            } else {
-                original
-            };
-            let node = self.text.set_text(row.key, &display);
-            if let Some(node) = node {
-                self.model().remeasure(node);
+            // The fold is the run's, so a masked field draws its dots from this same string
+            // and the plaintext goes no further than the row.
+            let display = String::from_utf16_lossy(&value);
+            if let Some(node) = self.text.set_text(key, &display) {
+                self.tree.mark(node);
             }
         }
         if let Some(value) = &update.commit {
+            // Coalescing visuals must preserve all completed-edit callbacks in order, so the
+            // edit is queued and delivered after its pixels are applied rather than here.
             self.field_commits.push(Commit {
                 id: update.id,
                 revision: update.revision,
                 text: Arc::clone(value),
             });
         }
-        self.uia_restale();
+        self.uia_stale.set(true);
     }
 
-    pub(crate) fn retheme_fields(&mut self, root: Scope) {
-        for (_, row) in self.fields.iter_mut() {
-            row.style = row.style.in_theme(root);
-            row.dirty = true;
-        }
-    }
-
+    /// Publishes each changed field's shaped geometry, decorations and caret.
+    ///
+    /// Missing geometry makes the text service answer `TS_E_NOLAYOUT`; this publication is
+    /// what causes the layout notification that lets input ask again. Geometry-dependent
+    /// navigation, deletion and pointer placement queue in order until the matching text
+    /// revision arrives, so the revision travels with the geometry.
+    ///
+    /// Coordinate conversion is input's: this side publishes an origin and a viewport, and
+    /// input combines them with the hit table, the live scroll shadow, ancestor clipping, the
+    /// window origin and the current scale.
     pub(crate) fn publish_fields(&mut self) {
-        // Split ownership instead of re-entering Host while shaping publishes geometry.
-        let mut fields = core::mem::take(&mut self.fields);
-        for (id, row) in fields.iter_mut() {
-            let solved = self.model().solved(row.group.node());
-            let Some((node, font)) = self.text.field_font(row.key) else {
-                continue;
-            };
-            if !row.dirty
-                && row.last_size == solved.size
-                && row.last_origin == solved.local
-                && row.font == Some(font)
-            {
-                continue;
-            }
-            let mut geometry = if row.font == Some(font)
-                && row
-                    .geometry
-                    .as_ref()
-                    .is_some_and(|g| g.revision == row.revision)
-            {
-                (**row.geometry.as_ref().unwrap()).clone()
-            } else {
-                let Some((_, mut geometry)) = self.text.field_geometry(row.key, row.revision)
-                else {
-                    continue;
-                };
-                if row.scope == InputScope::Password {
-                    for cluster in Arc::make_mut(&mut geometry.clusters) {
-                        if let Some(&(start, _)) = row.password_map.get(cluster.start as usize) {
-                            let end = row
-                                .password_map
-                                .get(cluster.end.saturating_sub(1) as usize)
-                                .map_or(start, |r| r.1);
-                            cluster.start = start;
-                            cluster.end = end;
-                        }
-                    }
-                }
-                geometry
-            };
-            row.font = Some(font);
-            let line = self.model().solved(node);
-            let inset = crate::layout::Len::Metric(crate::role::Metric::SpaceSm)
-                .dips(row.style)
-                .unwrap_or(0.0);
-            let width = (solved.size.x - inset * 2.0).max(1.0);
-            let caret = geometry.caret(row.selection);
-            // Shorter source text or a wider field must release obsolete scroll.
-            row.scroll = row
-                .scroll
-                .min(caret.x)
-                .max(caret.x - width)
-                .max(0.0)
-                .min((line.size.x - width).max(0.0));
-            geometry.origin = Vector2 {
-                x: inset - row.scroll,
-                y: (solved.size.y - line.size.y) * 0.5,
-            };
-            geometry.viewport = windows_text::Rect {
-                x: inset,
-                y: 0.0,
-                w: width,
-                h: solved.size.y,
-            };
-            self.model()
-                .bind(node, Prop::Offset, Bind::Set(Value::Vec2(geometry.origin)));
-            self.model().paint(
-                row.caret,
-                Paint::Solid(crate::role::resolve(
-                    Role::Text(Text::Primary),
-                    row.style.for_paint(),
-                )),
-            );
-            let (caret_width, blink) = crate::text_input::settings::caret();
-            let caret_width = (caret_width as f32 / self.env.scale()).max(crate::role::metric(
-                crate::role::Metric::HairlineW,
-                row.style,
-            ));
-            place(
-                self.model(),
-                row.caret,
-                windows_text::Rect {
-                    x: geometry.origin.x + caret.x,
-                    y: geometry.origin.y + caret.y,
-                    w: caret_width,
-                    h: caret.h.max(line.size.y),
-                },
-            );
-            if row.focused && row.selection.range().is_empty() && blink != 0 && blink != u32::MAX {
-                let anim = self.model().frames(
-                    &[
-                        (0.0, Value::Scalar(1.0), Easing::Linear),
-                        (0.499, Value::Scalar(1.0), Easing::Linear),
-                        (0.5, Value::Scalar(0.0), Easing::Linear),
-                        (1.0, Value::Scalar(0.0), Easing::Linear),
-                    ],
-                    blink.saturating_mul(2),
-                    Iterations::Forever,
-                );
-                self.model()
-                    .bind(row.caret.node(), Prop::Opacity, Bind::Animate(anim));
-            } else {
-                self.model().bind(
-                    row.caret.node(),
-                    Prop::Opacity,
-                    Bind::Set(Value::Scalar(
-                        if row.focused && row.selection.range().is_empty() {
-                            1.0
-                        } else {
-                            0.0
-                        },
-                    )),
-                );
-            }
-            geometry.rects(row.selection.range(), &mut row.scratch);
-            if !row.focused {
-                row.scratch.clear();
-            }
-            decoration(
-                self.model(),
-                row.group,
-                &mut row.selections,
-                &row.scratch,
-                geometry.origin,
-                row.style,
-                false,
-            );
-            geometry.rects(row.composition.clone().unwrap_or(0..0), &mut row.scratch);
-            if !row.focused {
-                row.scratch.clear();
-            }
-            decoration(
-                self.model(),
-                row.group,
-                &mut row.underlines,
-                &row.scratch,
-                geometry.origin,
-                row.style,
-                true,
-            );
-            row.layout_revision += 1;
-            geometry.layout_revision = row.layout_revision;
-            let geometry = Arc::new(geometry);
-            row.geometry = Some(Arc::clone(&geometry));
-            self.field_layouts.push(Layout { id, geometry });
-            row.dirty = false;
-            row.last_size = solved.size;
-            row.last_origin = solved.local;
+        let mut after = ControlId::NONE;
+        while let Some(id) = self.next_field(after) {
+            after = id;
+            self.publish_field(id);
         }
-        self.fields = fields;
     }
-}
 
-fn place(model: &mut windows_scene::Model, sprite: SpriteId, rect: windows_text::Rect) {
-    model.bind(
-        sprite.node(),
-        Prop::Offset,
-        Bind::Set(Value::Vec2(Vector2 {
-            x: rect.x,
-            y: rect.y,
-        })),
-    );
-    model.bind(
-        sprite.node(),
-        Prop::Size,
-        Bind::Set(Value::Vec2(Vector2 {
-            x: rect.w,
-            y: rect.h,
-        })),
-    );
-}
+    /// The live field after `after` in slot order, which is how the walk holds its place
+    /// without borrowing the table across a publication.
+    fn next_field(&self, after: ControlId) -> Option<ControlId> {
+        self.fields
+            .iter()
+            .map(|(id, _)| id)
+            .find(|id| id.index() > after.index())
+    }
 
-fn decoration(
-    model: &mut windows_scene::Model,
-    group: GroupId,
-    sprites: &mut Vec<SpriteId>,
-    rects: &[windows_text::Rect],
-    origin: Vector2,
-    scope: Scope,
-    underline: bool,
-) {
-    let role = if underline {
-        Role::Text(Text::Primary)
-    } else {
-        Role::Fill(Fill::Selected)
-    };
-    while sprites.len() < rects.len() {
-        let sprite = model.visual(group, None);
-        model.mask(
+    fn publish_field(&mut self, id: ControlId) {
+        let Some(plan) = self.plan_field(id) else {
+            return;
+        };
+        self.write_channel(plan.node, Prop::Offset, Value::Vec2(plan.geometry.origin));
+        self.place_caret(id, plan.caret, plan.line_h, plan.geometry.origin);
+        self.decorate(id, &plan.geometry, false);
+        self.decorate(id, &plan.geometry, true);
+        let Self {
+            fields,
+            field_layouts,
+            ..
+        } = self;
+        let Some(row) = fields.get_mut(id) else {
+            return;
+        };
+        row.layout_revision += 1;
+        let mut geometry = plan.geometry;
+        geometry.layout_revision = row.layout_revision;
+        let geometry = Arc::new(geometry);
+        row.geometry = Some(Arc::clone(&geometry));
+        field_layouts.push(Layout { id, geometry });
+    }
+
+    /// Shapes one field's view and resolves where its text stands, without emitting.
+    ///
+    /// Every borrow here is short and disjoint: the table's rows, the text table and the geom
+    /// column are three fields of the host and are never live together.
+    fn plan_field(&mut self, id: ControlId) -> Option<Plan> {
+        let (group, style) = {
+            let row = self.fields.get(id)?;
+            (row.group, row.style)
+        };
+        let box_ = self.geom(group.0).size;
+        let (node, end) = {
+            let Self { fields, text, .. } = self;
+            let row = fields.get_mut(id)?;
+            if !core::mem::take(&mut row.dirty) {
+                return None;
+            }
+            let (node, _, end) = text.field_view(row.key, &mut row.clusters)?;
+            (node, end)
+        };
+        let line = self.geom(node).size;
+        let inset = metric(Metric::SpaceSm, style);
+        let width = (box_.x - inset * 2.0).max(1.0);
+        let row = self.fields.get_mut(id)?;
+        // The cluster table is shared with the geometry published against the same text
+        // revision, so a caret move re-publishes the boxes it already handed out.
+        let clusters = match row
+            .geometry
+            .as_ref()
+            .filter(|held| held.revision == row.revision)
+        {
+            Some(held) => Arc::clone(&held.clusters),
+            None => Arc::from(remap(&row.text, row.scope, &row.clusters).into_owned()),
+        };
+        let mut geometry = Geometry {
+            revision: row.revision,
+            clusters,
+            end,
+            ..Geometry::default()
+        };
+        let caret = geometry.caret(row.selection);
+        // Horizontal reveal stays inside the field clip, and shorter text or a wider box must
+        // release scroll it no longer needs.
+        row.scroll = row
+            .scroll
+            .min(caret.x)
+            .max(caret.x - width)
+            .clamp(0.0, (line.x - width).max(0.0));
+        geometry.origin = Vector2 {
+            x: inset - row.scroll,
+            y: (box_.y - line.y) * 0.5,
+        };
+        geometry.viewport = Rect {
+            x: inset,
+            y: 0.0,
+            w: width,
+            h: box_.y,
+        };
+        Some(Plan {
+            node,
+            geometry,
+            caret,
+            line_h: line.y,
+        })
+    }
+
+    /// Places the caret and retargets its blink.
+    ///
+    /// Width and interval come from the system caret settings, and the blink is a compositor
+    /// keyframe animation, so it plays with zero frames on any thread of ours and never
+    /// requests an application tick. There is no text timer, polling loop, debounce or
+    /// independent clock here. A zero or `u32::MAX` interval is the system asking for no
+    /// blink at all.
+    fn place_caret(&mut self, id: ControlId, caret: Rect, line_h: f32, origin: Vector2) {
+        let Some(row) = self.fields.get(id) else {
+            return;
+        };
+        let (sprite, style) = (row.caret, row.style);
+        let shown = row.focused && row.selection.range().is_empty();
+        let (width, blink) = system::caret();
+        let width = (width as f32 / self.env.scale()).max(metric(Metric::HairlineW, style));
+        self.paint(
             sprite,
-            Mask::Box {
-                radius: Corners::default(),
+            Paint::Solid(resolve(Role::Text(Text::Primary), style.for_paint())),
+            None,
+        );
+        self.visual_rect(
+            sprite,
+            Vector2 {
+                x: origin.x + caret.x,
+                y: origin.y + caret.y,
+            },
+            Vector2 {
+                x: width,
+                y: caret.h.max(line_h),
             },
         );
-        sprites.push(sprite);
-    }
-    for (i, &sprite) in sprites.iter().enumerate() {
-        let shown = i < rects.len();
-        model.bind(
-            sprite.node(),
-            Prop::Opacity,
-            Bind::Set(Value::Scalar(if shown { 1.0 } else { 0.0 })),
-        );
-        if let Some(rect) = rects.get(i) {
-            let mut rect = *rect;
-            rect.x += origin.x;
-            rect.y += origin.y;
-            if underline {
-                let thickness = crate::role::metric(crate::role::Metric::BorderW, scope);
-                rect.y += rect.h - thickness;
-                rect.h = thickness;
+        let bind = match (shown, blink) {
+            (true, 1..=0xFFFF_FFFE) => {
+                let frames = self.frames(&[
+                    (0.0, Value::Scalar(1.0), Easing::Linear),
+                    (0.499, Value::Scalar(1.0), Easing::Linear),
+                    (0.5, Value::Scalar(0.0), Easing::Linear),
+                    (1.0, Value::Scalar(0.0), Easing::Linear),
+                ]);
+                Bind::Animate(Anim::Frames {
+                    frames,
+                    duration_ms: blink.saturating_mul(2),
+                    iterations: Iterations::Forever,
+                })
             }
-            place(model, sprite, rect);
-            model.paint(
+            _ => Bind::Set(Value::Scalar(f32::from(shown))),
+        };
+        self.bind(sprite.0, Prop::Opacity, bind);
+    }
+
+    /// Points this field's selection fills or composition underlines at their rects.
+    ///
+    /// Sprites are pooled and parked at opacity zero rather than destroyed: a selection grows
+    /// and shrinks with every arrow key, and minting on that path would churn the far side's
+    /// table for a box that returns a keystroke later.
+    fn decorate(&mut self, id: ControlId, geometry: &Geometry, underline: bool) {
+        let Some(row) = self.fields.get(id) else {
+            return;
+        };
+        let (group, style) = (row.group, row.style);
+        let range = decorated(
+            row.focused,
+            row.selection,
+            row.composition.as_ref(),
+            underline,
+        );
+        let wanted = {
+            let Self { fields, .. } = self;
+            let Some(row) = fields.get_mut(id) else {
+                return;
+            };
+            geometry.rects(range, &mut row.rects);
+            row.rects.len()
+        };
+        let (role, thickness) = match underline {
+            true => (Role::Text(Text::Primary), metric(Metric::BorderW, style)),
+            false => (Role::Fill(Fill::Selected), 0.0),
+        };
+        let light = resolve(role, style.for_paint());
+        while self
+            .fields
+            .get(id)
+            .is_some_and(|row| pool(row, underline).len() < wanted)
+        {
+            let sprite = self.visual(group, None);
+            self.mask(
                 sprite,
-                Paint::Solid(crate::role::resolve(role, scope.for_paint())),
+                Mask::Box {
+                    radius: Corners::default(),
+                },
             );
+            if let Some(row) = self.fields.get_mut(id) {
+                pool_mut(row, underline).push(sprite);
+            }
+        }
+        let held = self
+            .fields
+            .get(id)
+            .map_or(0, |row| pool(row, underline).len());
+        for at in 0..held {
+            let Some((sprite, rect)) = self
+                .fields
+                .get(id)
+                .map(|row| (pool(row, underline)[at], row.rects.get(at).copied()))
+            else {
+                return;
+            };
+            self.write_channel(
+                sprite.0,
+                Prop::Opacity,
+                Value::Scalar(f32::from(rect.is_some())),
+            );
+            let Some(rect) = rect else { continue };
+            let rect = decoration(rect, geometry.origin, thickness);
+            self.visual_rect(
+                sprite,
+                Vector2 {
+                    x: rect.x,
+                    y: rect.y,
+                },
+                Vector2 {
+                    x: rect.w,
+                    y: rect.h,
+                },
+            );
+            self.paint(sprite, Paint::Solid(light), None);
         }
     }
 }
@@ -426,138 +568,89 @@ fn decoration(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::tests::fixture;
-    use crate::text_input::{Affinity, Command, Editor};
 
+    /// A masked run draws one dot per character, so the span a dot stands for is two units
+    /// where that character is a surrogate pair.
     #[test]
-    fn field_shapes_on_app_reuses_clusters_for_selection_and_releases_on_unmount() {
-        let mut patch = fixture();
-        let root = Host::with(|h| h.model().root());
-        let mounted =
-            crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
-                crate::widget::field(ui, "á😀ffi العربية");
-            });
-        Host::flush(&mut patch);
-        let source = Host::with(|h| h.field_sources[0].clone());
-        let mut editor = Editor::new(source.id, source.scope, &source.text);
-        editor.publish(true, false);
-        Host::with(|h| {
-            for update in editor.updates.drain(..) {
-                h.field_update(&update);
-            }
-        });
-        Host::flush(&mut patch);
-        let first = Host::with(|h| h.fields.get(source.id).unwrap().geometry.clone().unwrap());
-        assert!(!first.clusters.is_empty());
-        assert!(
-            first.clusters.iter().all(|c| c.start != 1 && c.start != 3),
-            "combining marks and surrogate pairs stay together"
-        );
-        editor.layout(first.clone());
-        editor.command(Command::End { select: false });
-        Host::with(|h| {
-            for update in editor.updates.drain(..) {
-                h.field_update(&update);
-            }
-        });
-        Host::flush(&mut patch);
-        let second = Host::with(|h| h.fields.get(source.id).unwrap().geometry.clone().unwrap());
-        assert!(Arc::ptr_eq(&first.clusters, &second.clusters));
-        assert_eq!(editor.selection().affinity, Affinity::Upstream);
-        drop(mounted);
-        assert!(Host::with(|h| h.fields.get(source.id).is_none()));
+    fn a_masked_cluster_keeps_the_span_of_the_character_it_hides() {
+        let text: Vec<u16> = "a\u{1f600}".encode_utf16().collect();
+        assert_eq!(source_units(&text, 0), 1);
+        assert_eq!(source_units(&text, 1), 2);
+        assert_eq!(source_units(&text, 9), 1, "past the end names one unit");
     }
 
+    /// The whole of a password field's cluster table is the source's own positions, so a
+    /// client that places a range reads back masked text at the offsets it named.
     #[test]
-    fn shorter_source_on_blur_releases_horizontal_scroll() {
-        let mut patch = fixture();
-        let root = Host::with(|h| h.model().root());
-        let _mounted =
-            crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
-                crate::widget::field(ui, "1234.56789123456789").width(crate::layout::Len::Pct(0.1));
-            });
-        Host::flush(&mut patch);
-        let source = Host::with(|h| h.field_sources[0].clone());
-        let mut editor = Editor::new(source.id, source.scope, &source.text);
-        editor.publish(true, false);
-        editor.focus(true);
-        Host::with(|h| {
-            for update in editor.updates.drain(..) {
-                h.field_update(&update);
+    fn a_password_remap_covers_the_source_and_a_plain_field_borrows() {
+        let text: Vec<u16> = "a\u{1f600}".encode_utf16().collect();
+        let shaped = [Cluster::default(), Cluster::default()];
+        assert!(matches!(
+            remap(&text, InputScope::Default, &shaped),
+            Cow::Borrowed(_)
+        ));
+        let masked = remap(&text, InputScope::Password, &shaped);
+        assert_eq!(
+            masked[0],
+            Cluster {
+                start: 0,
+                end: 1,
+                ..Cluster::default()
             }
-        });
-        Host::flush(&mut patch);
-        editor.layout(Host::with(|h| {
-            h.fields.get(source.id).unwrap().geometry.clone().unwrap()
-        }));
-        editor.command(Command::End { select: false });
-        Host::with(|h| {
-            for update in editor.updates.drain(..) {
-                h.field_update(&update);
-            }
-        });
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            assert!(h.fields.get(source.id).unwrap().scroll > 0.0);
-        });
-        editor.source(
-            editor.revision,
-            "1235".encode_utf16().collect::<Vec<_>>().into(),
         );
-        assert!(
-            editor.updates.is_empty(),
-            "source stays deferred while editing"
-        );
-        editor.focus(false);
-        Host::with(|h| {
-            for update in editor.updates.drain(..) {
-                assert!(
-                    update.commit.is_none(),
-                    "formatting does not commit an edit"
-                );
-                h.field_update(&update);
-            }
-        });
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            let row = h.fields.get(source.id).unwrap();
-            assert_eq!(String::from_utf16_lossy(&row.text), "1235");
-            assert_eq!(row.scroll, 0.0, "short text starts at the field inset");
-            let geometry = row.geometry.as_ref().unwrap();
-            assert_eq!(geometry.origin.x, geometry.viewport.x);
-        });
+        assert_eq!(masked.last().unwrap().end, 3, "the mask covers the pair");
     }
 
+    /// A newline never reaches a single-line buffer, whichever separator it arrives as.
     #[test]
-    fn password_geometry_keeps_original_acp_and_uia_never_contains_plaintext() {
-        let mut patch = fixture();
-        let root = Host::with(|h| h.model().root());
-        let _mounted =
-            crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
-                crate::widget::field(ui, "á😀")
-                    .scope(InputScope::Password)
-                    .name("Password");
-            });
-        Host::flush(&mut patch);
-        let source = Host::with(|h| h.field_sources[0].clone());
-        let mut editor = Editor::new(source.id, source.scope, &source.text);
-        editor.publish(true, false);
-        let mut seeds = crate::uia::Seeds::default();
-        Host::with(|h| {
-            for update in editor.updates.drain(..) {
-                h.field_update(&update);
+    fn a_source_value_loses_every_line_separator() {
+        let held: Vec<u16> = units("a\r\nb\u{2028}c").collect();
+        assert_eq!(String::from_utf16_lossy(&held), "abc");
+    }
+
+    /// An underline is a rule on the box's baseline edge; a selection fill is the whole box.
+    #[test]
+    fn an_underline_is_a_rule_on_the_edge_its_fill_would_cover() {
+        let box_ = Rect {
+            x: 1.0,
+            y: 2.0,
+            w: 10.0,
+            h: 20.0,
+        };
+        let origin = Vector2 { x: 3.0, y: 4.0 };
+        assert_eq!(
+            decoration(box_, origin, 0.0),
+            Rect {
+                x: 4.0,
+                y: 6.0,
+                w: 10.0,
+                h: 20.0
             }
-        });
-        Host::flush(&mut patch);
-        Host::with(|h| {
-            h.uia_seeds(&mut seeds);
-        });
-        let field = &seeds.fields[0];
-        assert!(field.password);
-        assert!(field.text.is_empty());
-        assert!(field.geometry.is_none());
-        assert!(!String::from_utf16_lossy(&seeds.blob).contains("á"));
-        let geometry = Host::with(|h| h.fields.get(source.id).unwrap().geometry.clone().unwrap());
-        assert_eq!(geometry.clusters.last().unwrap().end, 4);
+        );
+        assert_eq!(
+            decoration(box_, origin, 2.0),
+            Rect {
+                x: 4.0,
+                y: 24.0,
+                w: 10.0,
+                h: 2.0
+            }
+        );
+    }
+
+    /// Nothing is drawn for an unfocused field, whichever range it holds.
+    #[test]
+    fn an_unfocused_field_draws_no_selection_and_no_underline() {
+        let selection = Selection {
+            anchor: 0,
+            caret: 3,
+            ..Selection::default()
+        };
+        let composition = 0..2;
+        assert!(decorated(false, selection, Some(&composition), false).is_empty());
+        assert!(decorated(false, selection, Some(&composition), true).is_empty());
+        assert_eq!(decorated(true, selection, Some(&composition), false), 0..3);
+        assert_eq!(decorated(true, selection, Some(&composition), true), 0..2);
+        assert!(decorated(true, selection, None, true).is_empty());
     }
 }
