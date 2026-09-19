@@ -62,9 +62,6 @@ pub(crate) struct ControlRow {
     pub live: Option<Cell<Option<f64>>>,
     pub hovered: Option<Cell<bool>>,
     pub validation: Option<&'static str>,
-    /// The epoch of the last authoritative source. A changed epoch cancels a live gesture and
-    /// rejects its queued commit; an equal one is an echo and preserves it.
-    pub source_epoch: u64,
     pub node: NodeId,
     pub scope: Scope,
     pub state: ModelState,
@@ -84,18 +81,10 @@ impl ControlRow {
             live: None,
             hovered: None,
             validation: None,
-            source_epoch: 0,
             node,
             scope,
             state: ModelState::Rest,
             uia: UiaRole::None,
-        }
-    }
-
-    /// Publishes `value` while a gesture owns it, and clears the cell when one ends.
-    pub fn set_live(&self, value: Option<f64>) {
-        if let Some(cell) = &self.live {
-            cell.set(value);
         }
     }
 }
@@ -323,7 +312,7 @@ impl<K> Element<'_, K> {
     }
 
     /// Literal names stay borrowed; generated names are released with the control.
-    pub fn name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+    pub fn name(self, name: impl Into<Cow<'static, str>>) -> Self {
         let named = self.declare(HitFlags::UIA, |row| row.name = Some(name.into()));
         named.uia_restale()
     }

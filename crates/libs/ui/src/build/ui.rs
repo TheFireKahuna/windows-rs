@@ -7,7 +7,7 @@
 use super::host::Host;
 use super::mount::Mount;
 use super::tree;
-use crate::layout::{Align, Anchors, Layout, Len, Preset, Probe, Templates, Track, WidthClass};
+use crate::layout::{Align, Anchors, Layout, Len, Preset, Probe, Track, WidthClass};
 use crate::role::{Scope, ScopedToken};
 use crate::signal::{Effect, Signal};
 use crate::structure::{Branch, Keyed, Step};
@@ -273,7 +273,7 @@ impl<'a> Ui<'a> {
             node,
             super::theme::Part::Ink,
             super::theme::PaintSource::Region(sink),
-            super::theme::PaintMask::Region(sink),
+            super::theme::PaintMask::Region,
             1.0,
         );
         self.element(node)
@@ -706,15 +706,6 @@ impl<'a, K> Element<'a, K> {
     /// and no space from its siblings.
     pub fn anchor(self, x: f32, y: f32, align: [Align; 2]) -> Self {
         self.author(|l| l.position = crate::layout::Position::Anchor { at: [x, y, x, y], align })
-    }
-
-    /// Spans this node over its parent's whole box, out of flow: an underlay or an overlay
-    /// of a container whose other children keep their flow.
-    pub fn cover(self) -> Self {
-        self.author(|l| {
-            l.position =
-                crate::layout::Position::Anchor { at: [0.0, 0.0, 1.0, 1.0], align: [Align::Stretch; 2] };
-        })
     }
 
     pub fn cols(self, tracks: impl IntoIterator<Item = Track>) -> Self {

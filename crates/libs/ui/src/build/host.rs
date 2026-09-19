@@ -13,7 +13,7 @@ use super::tree::{self, Geom, Pool, Tree};
 use crate::layout::{Align, Anchors, Len, Placed, Probe, Rect, solve};
 use crate::role::Scope;
 use crate::signal::Cell;
-use crate::widget::{ChromeRow, Gesturing, Intent, ModelState, ValueRow, What};
+use crate::widget::{Gesturing, Intent, ModelState, ValueRow, What};
 use std::cell::RefCell;
 use std::rc::Rc;
 use windows_numerics::Vector2;
@@ -348,7 +348,7 @@ impl Host {
     }
 
     /// The window's client extent, read without re-entering the host.
-    pub(crate) fn window_extent(&self) -> windows_numerics::Vector2 {
+    pub(crate) fn window_extent(&self) -> Vector2 {
         self.window.get()
     }
 
@@ -1024,7 +1024,7 @@ impl Host {
         }
         // A retired node has no box, and a probe reads a zero box wherever its node has none.
         if let Some(probe) = side.probe.filter(|probe| probe.cell().alive()) {
-            probe.cell().set(crate::layout::Placed::default());
+            probe.cell().set(Placed::default());
         }
         self.geometry.release(side.geometry, &mut self.retired);
         if side.region != tree::NONE {
@@ -1237,7 +1237,6 @@ impl Host {
                 rect: geom.rect,
                 size: geom.size,
                 local: geom.local,
-                class: self.tree.class(node),
                 scope: Some(self.scope_of(node).at_width(self.tree.class(node))),
             });
         }
@@ -1528,61 +1527,20 @@ const _: () = {
 
 // ── what a fixture names a node by ──────────────────────────────────────────────────
 //
-// Production code reads a column by index and never searches for a node. A test that built
-// a view has no id for what it built, so these two answer "the nodes, in the order they were
-// minted" and "what the solve wrote for one of them".
+// Production code reads a column by index and never counts; a test asks what a transaction
+// left live to prove that a retire freed it.
 
 #[cfg(test)]
 impl Host {
-    /// The handler row a control placed, or `None` where it declared no callback.
-    pub(crate) fn handlers_of(&self, id: ControlId) -> Option<&super::control::Handlers> {
-        self.handlers.get(self.control(id)?.handlers)
-    }
-
-    /// Every node a transaction declared, in mint order.
-    ///
-    /// The window root and every derived sprite are left out: a fixture names what it wrote,
-    /// and neither of those is something it wrote.
-    pub(crate) fn nodes(&self) -> Vec<NodeId> {
-        (0..self.tree.c.flags.len() as u32)
-            .map(|at| self.tree.ids.id_at(at))
-            .filter(|&id| !id.is_none() && id != self.root)
-            .filter(|id| self.tree.c.flags[id.index()] & tree::DERIVED == 0)
-            .collect()
-    }
-
     /// How many nodes are live, the window root included.
     pub(crate) fn live_nodes(&self) -> usize {
         self.tree.ids.live()
-    }
-
-    /// Every keyed anchor attachment, in attachment order, as `(set, node, key)`.
-    pub(crate) fn anchor_members(&self) -> Vec<(Anchors, NodeId, u64)> {
-        self.anchors.iter().map(|a| (a.set, a.node, a.key)).collect()
-    }
-
-    /// The node each placed geometry job hangs on.
-    pub(crate) fn geometry_jobs(&self) -> Vec<NodeId> {
-        (0..self.sides.slots())
-            .filter_map(|at| self.sides.get(at))
-            .filter(|side| side.geometry != tree::NONE)
-            .map(|side| side.node)
-            .collect()
     }
 
     /// How many side rows are placed. A node that declares none of the rare things pays
     /// four bytes for the absence, so this is what a test asks whether one was freed with.
     pub(crate) fn side_rows(&self) -> usize {
         self.sides.len()
-    }
-
-    /// Every node carrying a run, with the key layout names it by, in mint order.
-    pub(crate) fn runs(&self) -> Vec<(NodeId, super::text::MeasureKey)> {
-        self.nodes()
-            .into_iter()
-            .map(|node| (node, self.tree.c.text[node.index()]))
-            .filter(|&(_, key)| key != super::text::MeasureKey::NONE)
-            .collect()
     }
 }
 

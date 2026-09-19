@@ -51,7 +51,7 @@ use windows_present::{
 use windows_scene::{ControlId, HitTable, NodeId, RegionId};
 use windows_window::Watch;
 
-use crate::build::{Element, Host, Region, Ui};
+use crate::build::{Element, Host, Region};
 use crate::input::Report;
 use crate::layout::{Len, Preset};
 use crate::role::{Metric, Scope};
@@ -318,12 +318,12 @@ impl Regions {
     }
 }
 
-/// The present thread and the inbox its binder writes to.
-///
-/// Installed by the scene thread, which is the thread that applies a binding: a [`Presenter`]
-/// needs the window's visibility watch and the display's output transform, and neither exists
-/// before the window does. A thread-local, because there is one present thread per scene thread
-/// and a second would be a second answer to which surfaces are flipping.
+// The present thread and the inbox its binder writes to.
+//
+// Installed by the scene thread, which is the thread that applies a binding: a `Presenter`
+// needs the window's visibility watch and the display's output transform, and neither exists
+// before the window does. A thread-local, because there is one present thread per scene thread
+// and a second would be a second answer to which surfaces are flipping.
 thread_local! {
     static PRESENT: RefCell<Option<(Presenter, Arc<Mutex<Vec<Waiting>>>)>> =
         const { RefCell::new(None) };
@@ -717,23 +717,7 @@ fn hover(picks: &mut Picks, id: ControlId, at: Vector2, hits: &HitTable) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{Host, Published};
-
-    /// Returns how many regions the host holds and how many of them are still pending.
-    ///
-    /// A pending region is one that has not been handed to the present thread, which is what
-    /// the deferred mount is about: it still holds the builder it will be mounted with.
-    pub(crate) fn census(host: &Host) -> (usize, usize) {
-        let rows = host.regions.iter();
-        rows.fold((0, 0), |(held, pending), (_, row)| {
-            (held + 1, pending + usize::from(row.build.is_some()))
-        })
-    }
-
-    /// Returns the control the one declared region occupies in the hit array.
-    pub(crate) fn control(host: &Host) -> Option<windows_scene::ControlId> {
-        host.regions.iter().next().map(|(_, row)| row.control)
-    }
+    use super::Published;
 
     /// A reader sees the version move with the value, and both reads answer the same one.
     ///

@@ -667,7 +667,7 @@ impl Overlays {
     /// [`FocusOp::Push`] named by that blocker, with the invoker as the scope's restore target.
     /// `body` writes through a borrowed creation context; UI effects wait until that
     /// transaction releases the host.
-    pub fn open(
+    pub(crate) fn open(
         &mut self,
         focus: &mut Vec<FocusOp>,
         spec: Spec,
@@ -812,7 +812,7 @@ impl Overlays {
     /// An id whose generation does not match the one at that depth closes nothing, so a close
     /// queued behind the close of the overlay above it is a miss rather than closing whatever
     /// has since taken the depth.
-    pub fn close(&mut self, overlay: OverlayId, focus: &mut Vec<FocusOp>) {
+    pub(crate) fn close(&mut self, overlay: OverlayId, focus: &mut Vec<FocusOp>) {
         let depth = usize::from(overlay.depth);
         if self
             .open
@@ -824,7 +824,7 @@ impl Overlays {
     }
 
     /// Closes the topmost overlay, which is what `Esc` and a light-dismiss press do.
-    pub fn close_top(&mut self, focus: &mut Vec<FocusOp>) {
+    pub(crate) fn close_top(&mut self, focus: &mut Vec<FocusOp>) {
         if !self.open.is_empty() {
             self.truncate(self.open.len() - 1, focus);
         }

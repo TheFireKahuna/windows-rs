@@ -3,9 +3,7 @@
 use super::{shift, snap, solve_root, take_asks, take_roots, take_visits};
 use crate::build::Host;
 use crate::build::tree::{self, Geom};
-use crate::layout::{
-    Align, Layout, Len, NO_TRACKS, Position, Preset, Rect, Templates, Track, WidthClass,
-};
+use crate::layout::{Align, Layout, Len, Position, Preset, Rect, Track, WidthClass};
 use crate::role::{AccentId, Density, Metric, Scope, ScopedToken};
 use windows_color::{DisplayCapability, OutputTransform};
 use windows_numerics::Vector2;

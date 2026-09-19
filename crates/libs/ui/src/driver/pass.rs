@@ -220,8 +220,7 @@ impl Worker for App {
         }
         if work {
             self.first = false;
-            signal::flush();
-            self.overlays.sync(&mut self.focus);
+            reconcile(&mut self.overlays, &mut self.focus);
         }
         self.flush();
         Ok(())
@@ -358,10 +357,9 @@ impl App {
 }
 
 /// The declaration pass shared by the app thread and headless layout tests.
-pub(super) fn reconcile(overlays: &mut Overlays, focus: &mut Vec<FocusOp>) -> bool {
-    let work = signal::flush();
+pub(super) fn reconcile(overlays: &mut Overlays, focus: &mut Vec<FocusOp>) {
+    signal::flush();
     overlays.sync(focus);
-    work | !focus.is_empty()
 }
 
 /// Delivers a field's committed text to its handler, one revision at a time.

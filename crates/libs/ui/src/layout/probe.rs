@@ -27,13 +27,13 @@
 //! [`Anchors`](super::Anchors) covers the keyed case: many child boxes, in one container's
 //! own space, under the application's own identities.
 
-use super::{Rect, WidthClass};
+use super::Rect;
 use crate::signal::Cell;
 use windows_numerics::Vector2;
 
 /// Where the solve put a node.
 ///
-/// The five fields a consumer acts on, which is narrower than the node's own solved row.
+/// The four fields a consumer acts on, which is narrower than the node's own solved row.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Placed {
     /// Absolute, window-relative, pixel-snapped and **unscrolled**: where layout put the
@@ -44,11 +44,9 @@ pub struct Placed {
     pub size: Vector2,
     /// Offset relative to the parent group, which is what the node's own visual carries.
     pub local: Vector2,
-    /// The width class the enclosing responsive container resolved at this node. A consumer
-    /// drawing against this geometry resolves its own metrics at the same class, so both
-    /// halves of one row come out at one density.
-    pub class: WidthClass,
-    /// The actual enclosing scope, published after the first solve.
+    /// The enclosing scope at the width class the solve resolved this node under, published
+    /// after the first solve. A consumer drawing against this geometry resolves its own
+    /// metrics through it, so both halves of one row come out at one density.
     pub scope: Option<crate::role::Scope>,
 }
 

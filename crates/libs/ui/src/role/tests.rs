@@ -138,7 +138,7 @@ impl Palette for Reference {
         }
     }
 
-    fn content_peak_nits(&self, _gamut: &windows_color::Gamut, _scope: Scope) -> f32 {
+    fn content_peak_nits(&self, _gamut: &Gamut, _scope: Scope) -> f32 {
         290.0
     }
 }
@@ -235,7 +235,7 @@ fn every_role_in_every_scope_resolves_to_finite_light() {
 #[test]
 fn a_data_role_carries_no_polarity() {
     let dark = Scope::root(
-        crate::role::tests::palette(),
+        palette(),
         AccentId(0),
         Density::Comfortable,
     );
@@ -254,7 +254,7 @@ fn a_data_role_carries_no_polarity() {
 #[test]
 fn a_chrome_role_does_carry_polarity() {
     let dark = Scope::root(
-        crate::role::tests::palette(),
+        palette(),
         AccentId(0),
         Density::Comfortable,
     );
@@ -267,7 +267,7 @@ fn a_chrome_role_does_carry_polarity() {
 #[test]
 fn elevating_a_scope_changes_the_surface_and_nothing_else_about_the_call() {
     let base = Scope::root(
-        crate::role::tests::palette(),
+        palette(),
         AccentId(0),
         Density::Comfortable,
     );
@@ -288,7 +288,7 @@ fn an_interaction_state_is_the_same_role_re_resolved() {
     // Hover, pressed and selected are not extra colour parameters. The application never
     // writes one; the scene ramps between two resolutions of the same scope.
     let scope = Scope::root(
-        crate::role::tests::palette(),
+        palette(),
         AccentId(0),
         Density::Comfortable,
     )
@@ -302,7 +302,7 @@ fn an_interaction_state_is_the_same_role_re_resolved() {
 #[test]
 fn a_wash_is_derived_from_a_role_rather_than_stored() {
     let scope = Scope::root(
-        crate::role::tests::palette(),
+        palette(),
         AccentId(0),
         Density::Comfortable,
     )
@@ -319,7 +319,7 @@ fn a_wash_is_derived_from_a_role_rather_than_stored() {
     let base = resolve(
         Role::Fill(Fill::Surface),
         Scope::root(
-            crate::role::tests::palette(),
+            palette(),
             AccentId(0),
             Density::Comfortable,
         ),
@@ -334,7 +334,7 @@ fn a_wash_is_derived_from_a_role_rather_than_stored() {
 #[test]
 fn density_and_width_are_separate_axes_and_both_reach_a_metric() {
     let root = Scope::root(
-        crate::role::tests::palette(),
+        palette(),
         AccentId(0),
         Density::Comfortable,
     );
@@ -384,7 +384,7 @@ fn a_pill_radius_is_a_real_value_and_not_a_sentinel() {
 #[test]
 fn the_type_ramp_resolves_through_the_same_scope_the_colours_use() {
     let root = Scope::root(
-        crate::role::tests::palette(),
+        palette(),
         AccentId(0),
         Density::Comfortable,
     );
@@ -404,10 +404,6 @@ macro_rules! test_metric {
     };
 }
 test_metric!(EXTENT, 128.0);
-test_metric!(CORNER, 6.0);
-test_metric!(TOP_BAND, 48.0);
-test_metric!(BOTTOM_BAND, 28.0);
-test_metric!(MAX_WIDTH, 420.0);
 
 #[test]
 fn every_builtin_metric_indexes_its_own_row() {

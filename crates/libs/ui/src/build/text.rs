@@ -50,11 +50,6 @@ pub(crate) struct MeasureKey {
 impl MeasureKey {
     /// The `text` column's empty value. A live slot always carries a non-zero age.
     pub(crate) const NONE: Self = Self { at: 0, age: 0 };
-
-    #[must_use]
-    pub(crate) const fn is_none(self) -> bool {
-        self.age == 0
-    }
 }
 
 /// Where one entry's lines are drawn.
@@ -217,15 +212,6 @@ impl Entry {
             Target::Line { run, .. } => Some(run),
             Target::Wrapped { .. } => None,
         }
-    }
-
-    /// Returns the string this run was laid out from, capitals, masks and all.
-    ///
-    /// Test-only: what a run draws is otherwise readable only off the rasterized glyphs, and
-    /// the drawn fold is a claim worth pinning.
-    #[cfg(test)]
-    pub(crate) fn shaped_str(&self) -> &str {
-        self.text.as_str()
     }
 }
 
@@ -608,12 +594,6 @@ impl Table {
                 h: hit.rect.h,
             },
         ))
-    }
-
-    /// Returns one run by the position a walk reached, live or vacated.
-    #[cfg(test)]
-    pub(crate) fn entry(&self, key: MeasureKey) -> Option<&Entry> {
-        self.entries.get(key)
     }
 
     /// How many slots a walk visits, vacated ones included.
@@ -1027,6 +1007,5 @@ mod tests {
         let stale = MeasureKey { at: 0, age: 1 };
         store.rows[0].0 = 2;
         assert!(store.get(stale).is_none());
-        assert!(MeasureKey::NONE.is_none());
     }
 }

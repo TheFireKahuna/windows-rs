@@ -79,6 +79,7 @@ pub mod rotary;
 // UI Automation. A provider is a COM object and a `VARIANT` is a union, so this reaches the
 // raw surface. The tree it publishes is plain data and every mutable field beside it is an
 // atomic, so a client reads it from its own thread without involving the window's thread.
+#[expect(non_upper_case_globals, reason = "the property and pattern ids are matched by their bound names")]
 pub mod uia;
 
 mod front;

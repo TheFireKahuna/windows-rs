@@ -124,7 +124,8 @@ impl Host {
         let mut buffers: [Vec<PathVerb>; N] =
             core::array::from_fn(|at| Vec::with_capacity(caps[at]));
         // The fill is application code, so it runs outside the host borrow: it may set a ramp
-        // or read a probe, and both enter the host themselves.
+        // or read a probe, and both enter the host themselves. Signal writes are refused for
+        // its duration: a write here would feed the solve this effect runs downstream of.
         let effect = Effect::geometry(move || {
             for buffer in &mut buffers {
                 buffer.clear();
@@ -132,9 +133,13 @@ impl Host {
             match source {
                 Source::Anchors(set) => set.with(|table| {
                     let Some(scope) = table.published() else { return };
-                    fill(&Inputs { size: table.size(), scope, anchors: Some(table) }, &mut buffers);
+                    let inputs = Inputs { size: table.size(), scope, anchors: Some(table) };
+                    crate::signal::read_only(|| fill(&inputs, &mut buffers));
                 }),
-                _ => fill(&Host::with(|h| h.own_inputs(node, source)), &mut buffers),
+                _ => {
+                    let inputs = Host::with(|h| h.own_inputs(node, source));
+                    crate::signal::read_only(|| fill(&inputs, &mut buffers));
+                }
             }
             Host::with(|h| {
                 for (id, buffer) in ids.iter().zip(&buffers) {

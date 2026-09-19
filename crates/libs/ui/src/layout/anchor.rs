@@ -149,12 +149,6 @@ impl Anchors {
         self.0.with(f)
     }
 
-    /// Returns this set's identity, which is what an attachment is tagged with.
-    #[must_use]
-    pub(crate) fn id(self) -> crate::signal::SignalId {
-        self.0.id()
-    }
-
     /// Returns the cell behind the set, which the host publishes into during the flush.
     pub(crate) const fn cell(self) -> Cell<Table> {
         self.0

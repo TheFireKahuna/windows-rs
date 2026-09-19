@@ -67,8 +67,8 @@ pub struct Shared {
     /// What presentation regions declare. Held beside the snapshot rather than in it, so a
     /// band drag republishes no element.
     pub regions: Regions,
-    pub actions: Queue<Action>,
-    pub edits: Queue<TextAction>,
+    pub(crate) actions: Queue<Action>,
+    pub(crate) edits: Queue<TextAction>,
     /// Latched by the first `WM_GETOBJECT` and cleared only by [`disconnect`].
     /// `UiaClientsAreListening` is a hint; having been asked for a provider is not.
     pub asked: AtomicBool,

@@ -81,11 +81,8 @@ pub(crate) enum PaintMask {
         geom: GeomId,
         stroke: Option<Len>,
     },
-    Region(RegionId),
-    /// A sprite whose silhouette is not this layer's to state: a glyph tile, whose mask is the
-    /// coverage the shaper publishes. Nothing is emitted for one, so a resolve never clobbers
-    /// the run a text publication pointed it at.
-    Bare,
+    /// A square box a presented region paints its own buffer over.
+    Region,
 }
 
 impl PaintMask {
@@ -404,10 +401,6 @@ impl Host {
         if let Some(surface) = self.surface_mut(node) {
             surface.chrome = Some(chrome);
         }
-    }
-
-    pub(super) fn declare_surface(&mut self, group: GroupId, chrome: Chrome) {
-        self.declare_chrome(group.0, chrome);
     }
 
     pub(super) fn surface_selectable(&mut self, group: GroupId) {
@@ -818,13 +811,9 @@ impl Host {
                     stroke.map(|width| self.stroke(width.dips(scope), Cap::Round, Join::Round, &[]));
                 Mask::Shape { geom, stroke }
             }
-            // A region paints its own buffer over a square box.
-            PaintMask::Region(_) => Mask::Box {
+            PaintMask::Region => Mask::Box {
                 radius: Corners::default(),
             },
-            // The shaper owns this sprite's silhouette; emitting here would replace the
-            // coverage the last text publication pointed it at.
-            PaintMask::Bare => return,
         };
         self.mask(id, mask);
     }
@@ -1252,12 +1241,10 @@ mod tests {
         assert!(halo_of(Emission::NONE, Silhouette::Ink, Radiance::TRANSPARENT).is_none());
     }
 
-    /// A glyph tile's silhouette is the coverage the shaper published, so resolving its paint
-    /// must leave the mask alone.
+    /// A region paints its own buffer, so its silhouette owes a solved box no re-emission.
     #[test]
-    fn a_bare_silhouette_is_not_one_this_layer_states() {
-        assert!(!PaintMask::Bare.box_bound());
+    fn a_box_silhouette_is_box_bound_and_a_region_is_not() {
         assert!(PaintMask::Box { radius: Len::ZERO }.box_bound());
-        assert!(!PaintMask::Region(RegionId::NONE).box_bound());
+        assert!(!PaintMask::Region.box_bound());
     }
 }

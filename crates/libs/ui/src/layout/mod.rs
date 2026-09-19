@@ -26,8 +26,7 @@ pub use scroll::{
 };
 pub use solve::{shift, snap, solve_root};
 
-pub(crate) use layout::NO_TRACKS;
-pub(crate) use scroll::{ScrollRow, ScrollTable, front as scroll_front, grab_decl, grab_hit};
+pub(crate) use scroll::{ScrollRow, ScrollTable, front as scroll_front};
 
 use crate::build::{Element, Ui};
 
