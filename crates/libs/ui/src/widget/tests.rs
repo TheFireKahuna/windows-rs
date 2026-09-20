@@ -17,7 +17,7 @@
 use crate::build::Host;
 use crate::build::rig::Rig;
 use crate::build::tree::DERIVED;
-use crate::layout::{Len, Preset};
+use crate::layout::{Len, Preset, Track};
 use crate::signal::Cell;
 use crate::widget::{Range, ScalarPart, UiaRole, icon_button, knob, meter, text, toggle};
 use windows_scene::{ContactKind, NodeId};
@@ -153,4 +153,112 @@ fn an_icon_button_is_its_side_square_and_centres_its_mark() {
             "mark {mark}: not on the box's centre"
         );
     }
+}
+
+#[test]
+fn a_run_in_a_grid_cell_is_as_wide_as_its_ink() {
+    let mut rig = Rig::new();
+    let (mut loose, mut celled) = (None, None);
+    let _frame = rig.mount(|ui| {
+        loose = Some(text(ui, "none").id().into());
+        ui.node(Preset::Grid)
+            .width(Len::dip(400.0))
+            .cols([Track::AUTO, Track::fr(1.0)])
+            .children(|ui| {
+                text(ui, "Routing points");
+                celled = Some(text(ui, "none").id().into());
+            });
+    });
+    let (loose, celled): (NodeId, NodeId) = (loose.unwrap(), celled.unwrap());
+    let (ink, cell) = Host::with(|h| (h.geom(loose).rect.width(), h.geom(celled).rect.width()));
+    assert!(ink > 0.0, "the run measured nothing");
+    assert!(
+        (cell - ink).abs() <= 0.5,
+        "the weighted column stretched the run: {cell} against an ink of {ink}"
+    );
+}
+
+#[test]
+fn a_flipped_toggle_states_a_new_revision() {
+    let mut rig = Rig::new();
+    let on = Cell::new(false);
+    let mut track = None;
+    let frame = rig.mount(|ui| track = Some(toggle(ui, on).id().into()));
+    let track: NodeId = track.unwrap();
+    let published = || {
+        Host::with(|h| {
+            let id = h.control_of(track);
+            h.control(id)?.value.map(|v| (v.fraction, v.revision))
+        })
+    };
+    let off = published().expect("a toggle publishes a value");
+    drop(frame);
+    rig.set(on, true);
+    let lit = published().expect("a flip publishes a value");
+    assert_ne!(off.0, lit.0, "the fraction did not move");
+    assert_ne!(
+        off.1, lit.1,
+        "a repeated revision is a geometry-only update: the front keeps its own fraction \
+         and the knob stays where it was"
+    );
+}
+
+/// A scroll container's thumb and content ride a tracker expression on `Offset.Y`. Setting
+/// `Offset` whole replaces it, so the layout must never write the composite on a node whose
+/// sub-channel a binding drives.
+#[test]
+fn the_layout_never_writes_the_composite_offset_over_a_driven_axis() {
+    use crate::layout::{Len, scroll};
+    use std::collections::HashSet;
+    use windows_scene::{Bind, Id, Op, Prop};
+    let mut rig = Rig::new();
+    let mut driven: HashSet<Id<{ windows_scene::NODE }>> = HashSet::new();
+    let mut clobbered = Vec::new();
+    let inspect = |frame: &crate::build::rig::Frame<'_>,
+                       driven: &mut HashSet<Id<{ windows_scene::NODE }>>,
+                       clobbered: &mut Vec<String>| {
+        for op in frame.patch().ops() {
+            let Op::Bind { id, prop, bind } = op else { continue };
+            match (prop, bind) {
+                (Prop::OffsetX | Prop::OffsetY, Bind::Track { .. }) => {
+                    driven.insert(*id);
+                }
+                (Prop::OffsetX | Prop::OffsetY, Bind::Stop) => {
+                    driven.remove(id);
+                }
+                (Prop::Offset, Bind::Set(_)) if driven.contains(id) => {
+                    clobbered.push(format!("{id:?}"));
+                }
+                _ => {}
+            }
+        }
+    };
+    let mount = rig.mount(|ui| {
+        scroll(ui, |ui| {
+            for row in 0..60 {
+                text(ui, format!("row {row}")).height(Len::dip(24.0));
+            }
+        })
+        .width(Len::dip(300.0))
+        .height(Len::dip(200.0));
+    });
+    inspect(&mount, &mut driven, &mut clobbered);
+    drop(mount);
+    assert!(!driven.is_empty(), "the container bound nothing to its tracker");
+    // Several passes and a resize: the thumb's box is republished whenever the extents move,
+    // which is where the composite used to come back.
+    for _ in 0..3 {
+        let frame = rig.flush();
+        inspect(&frame, &mut driven, &mut clobbered);
+        drop(frame);
+    }
+    for (w, h) in [(300.0, 260.0), (420.0, 200.0), (300.0, 200.0)] {
+        let frame = rig.resize(w, h);
+        inspect(&frame, &mut driven, &mut clobbered);
+        drop(frame);
+    }
+    assert!(
+        clobbered.is_empty(),
+        "the composite offset was written over a driven axis on {clobbered:?}"
+    );
 }

@@ -430,10 +430,29 @@ struct TrackerState {
     /// The reported position again, in one word, for a hit test that runs wherever the
     /// contact arrived.
     shadow: Arc<AtomicU64>,
+    /// The range the layout stated, before any extra extent is added to it.
+    bounds: (Vector2, Vector2),
+    /// Extent held past the stated maximum for as long as something occludes the viewport.
+    extra: Vector2,
     pending: [Option<(i32, TrackerRequest)>; PENDING_REQUESTS],
 }
 
 impl TrackerState {
+    /// Applies the stated range with whatever extra extent is held on top of it.
+    ///
+    /// The two are kept apart so that a layout restating its extents cannot drop the extra,
+    /// and so that clearing the extra restores the layout's own maximum exactly.
+    fn apply_bounds(&self) {
+        let (min, max) = self.bounds;
+        self.inner.set_position_bounds(
+            v3(min),
+            v3(Vector2 {
+                x: max.x + self.extra.x,
+                y: max.y + self.extra.y,
+            }),
+        );
+    }
+
     /// Issues a request and holds it against its id.
     ///
     /// A request is not an assignment: a position update arriving while the user is
@@ -1836,14 +1855,17 @@ impl Scene {
                         scale: 1.0,
                         phase: Phase::Idle,
                         shadow: Arc::new(AtomicU64::new(pack_offset(0.0, 0.0))),
+                        bounds: (Vector2::zero(), Vector2::zero()),
+                        extra: Vector2::zero(),
                         pending: [None; PENDING_REQUESTS],
                     },
                 );
                 self.census.trackers_live += 1;
             }
             TrackerOp::Bounds { min, max } => {
-                if let Some(state) = self.trackers.get(id.id()) {
-                    state.inner.set_position_bounds(v3(min), v3(max));
+                if let Some(state) = self.trackers.get_mut(id.id()) {
+                    state.bounds = (min, max);
+                    state.apply_bounds();
                 }
             }
             // A wheel-originated motion is distinguishable from a fling at inertia entry and
@@ -1863,6 +1885,26 @@ impl Scene {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Holds `extra` extent past the maximum the layout stated for this tracker.
+    ///
+    /// What the layout states is how far the content can travel inside the viewport. An
+    /// occlusion over the viewport takes room off it without shortening the content, so the
+    /// position a surface at the end of the content has to reach is past that maximum. The
+    /// extra is held here rather than folded into the stated bounds, so a resize while the
+    /// occlusion stands keeps it and clearing it restores the stated maximum exactly.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `id` names no live tracker.
+    pub fn extend_bounds<O>(&mut self, id: TrackerId<O>, extra: Vector2) -> Result<()> {
+        let Some(state) = self.trackers.get_mut(id.id()) else {
+            return Err(invalid_arg());
+        };
+        state.extra = extra;
+        state.apply_bounds();
         Ok(())
     }
 

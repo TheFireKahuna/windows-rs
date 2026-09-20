@@ -62,6 +62,19 @@ pub(crate) struct ControlRow {
     pub live: Option<Cell<Option<f64>>>,
     pub hovered: Option<Cell<bool>>,
     pub validation: Option<&'static str>,
+    /// The number the application last published, in its own units, or `None` where the
+    /// application publishes none and the value is written elsewhere — a presented read-out's
+    /// is its renderer's. Automation reports this rather than the fraction beside it, which is
+    /// an `f32` and lands a millionth away from the number a client just wrote.
+    pub number: Option<f64>,
+    /// The overlay this control is the slot root of, where it is one. What decides the
+    /// element its contents are announced inside, and which opening and closing event the
+    /// publish owes.
+    pub overlay: Option<crate::overlay::Kind>,
+    /// Whether the control is one of a selection, which is a capability rather than a state:
+    /// a row that is not selected still answers `SelectionItem`, or a client enumerating a
+    /// list would find only the row already chosen.
+    pub selectable: bool,
     pub node: NodeId,
     pub scope: Scope,
     pub state: ModelState,
@@ -81,6 +94,9 @@ impl ControlRow {
             live: None,
             hovered: None,
             validation: None,
+            number: None,
+            overlay: None,
+            selectable: false,
             node,
             scope,
             state: ModelState::Rest,
@@ -326,6 +342,14 @@ impl<K> Element<'_, K> {
         self.declare(HitFlags::NONE, |row| row.key = Some(key))
     }
 
+    /// States what this element is to automation, where its widget does not already say.
+    ///
+    /// A presented read-out is a progress bar and an analyzer is a graph; neither is a
+    /// control the widget set minted, so neither carries a role of its own.
+    pub fn role(self, role: UiaRole) -> Self {
+        self.hit(HitFlags::UIA, role)
+    }
+
     pub fn wash(mut self, wash: Wash) -> Self {
         let node = self.node_id();
         self.host().surface_wash(windows_scene::GroupId(node), wash);
@@ -445,14 +469,13 @@ impl<K> Element<'_, K> {
     }
 
     pub fn popup_when<M>(
-        mut self,
+        self,
         shown: impl Signal<bool, M> + 'static,
         spec: Spec,
         closed: impl Fn() + 'static,
         body: impl Fn(&mut Ui<'_>) + 'static,
     ) -> Self {
         let node = self.node_id();
-        self.host().tree.set_flag(node, tree::POPUP, true);
         let (body, closed) = (Rc::new(body), Rc::new(closed));
         self.bind(shown, move |host, open| {
             host.popups.push(match open {
@@ -550,7 +573,7 @@ impl<K> Element<'_, K> {
             .bind(value, move |host, source| {
                 let fraction = range_of(drive)
                     .map_or(source.value as f32, |range| range.fraction(source.value));
-                host.publish_fraction(id, fraction, source.epoch);
+                host.publish_fraction(id, fraction, source.value, source.epoch);
             })
     }
 }
@@ -574,7 +597,11 @@ impl<K> Element<'_, K> {
 
     pub fn selected<M>(mut self, value: impl Signal<bool, M> + 'static) -> Self {
         let node = self.node_id();
+        let id = self.control_id();
         self.host().surface_selectable(windows_scene::GroupId(node));
+        if let Some(row) = self.host().control_mut(id) {
+            row.selectable = true;
+        }
         self.model_state(value, ModelState::Selected)
     }
 }
@@ -675,9 +702,14 @@ struct Flag<S>(S);
 
 impl<S: Signal<bool, M>, M> Signal<ScalarValue, M> for Flag<S> {
     fn read(&self) -> ScalarValue {
+        let on = self.0.read();
+        // The state is the revision. A repeated revision tells the front thread the
+        // publication is geometry-only and its own fraction stands, so a source that never
+        // states a new one can never move the part it drives. A flag has two values, and a
+        // flip is a new one by definition.
         ScalarValue {
-            value: f64::from(self.0.read()),
-            epoch: 0,
+            value: f64::from(on),
+            epoch: u64::from(on),
         }
     }
 
@@ -715,7 +747,11 @@ mod tests {
 
     #[test]
     fn a_flag_reads_as_the_fraction_its_control_stands_at() {
-        assert_eq!(Flag(true).read(), ScalarValue { value: 1.0, epoch: 0 });
+        assert_eq!(Flag(true).read(), ScalarValue { value: 1.0, epoch: 1 });
+        assert_eq!(Flag(false).read(), ScalarValue { value: 0.0, epoch: 0 });
+        // Two states, two revisions: a repeated one says the publication is geometry-only
+        // and leaves the front thread's own fraction standing.
+        assert_ne!(Flag(true).read().epoch, Flag(false).read().epoch);
         assert!(Flag(true).is_constant());
     }
 }

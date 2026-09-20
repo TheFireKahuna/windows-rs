@@ -24,8 +24,9 @@ use crate::bindings::{
     UIA_ToggleToggleStatePropertyId, UIA_ToolTipOpenedEventId, UIA_ValueValuePropertyId,
     UiaClientsAreListening, UiaRaiseAutomationEvent, UiaRaiseAutomationPropertyChangedEvent,
     UiaRaiseStructureChangedEvent,
-};
-use std::sync::Arc;
+    UIA_AutomationPropertyChangedEventId,
+    UIA_StructureChangedEventId,};
+use std::sync::{Arc, Mutex, PoisonError};
 use windows_core::Interface;
 use windows_scene::ControlId;
 
@@ -87,7 +88,7 @@ impl Raise {
     /// change, and the event id where it is a plain event.
     fn key(&self) -> (ControlId, Option<Property>, i32) {
         match *self {
-            Self::Structure => (ControlId::NONE, None, 0),
+            Self::Structure => (ControlId::NONE, None, UIA_StructureChangedEventId),
             Self::Event(id, event) => (id, None, event),
             Self::Property(id, what, _) => (id, Some(what), 0),
         }
@@ -173,7 +174,16 @@ impl Pending {
     pub fn flush(&mut self, shared: &Arc<Shared>, tree: &Tree) {
         if listening() {
             for raise in self.0.drain(..) {
-                one(&raise, shared, tree);
+                // A property change is advised by its own event id, which is the one automation
+                // names when a client subscribes to any of them.
+                let (_, property, event) = raise.key();
+                let event = match property {
+                    Some(_) => UIA_AutomationPropertyChangedEventId,
+                    None => event,
+                };
+                if shared.advised.wanted(event) {
+                    one(&raise, shared, tree);
+                }
             }
         }
         self.0.clear();
@@ -228,6 +238,53 @@ fn one(raise: &Raise, shared: &Arc<Shared>, tree: &Tree) {
                 );
             }
         }
+    }
+}
+
+/// What clients have subscribed to, as a count per event id.
+///
+/// Automation tells a fragment root which events a client is listening for, and a raise for an
+/// event nobody asked for is work that ends in the platform dropping it. Counts rather than a
+/// set, because two clients may advise the same event and the first to leave must not silence
+/// it for the second.
+///
+/// Empty means "nothing has said", which is not the same as "nothing is wanted": a client that
+/// never advises still receives what it asked automation for by other means, so an empty table
+/// admits everything.
+#[derive(Default)]
+pub struct Advised(Mutex<Vec<(i32, u32)>>);
+
+impl Advised {
+    /// Records that a client is listening for `event`.
+    pub fn added(&self, event: i32) {
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match held.iter_mut().find(|(id, _)| *id == event) {
+            Some((_, count)) => *count += 1,
+            None => held.push((event, 1)),
+        }
+    }
+
+    /// Records that a client has stopped listening for `event`.
+    pub fn removed(&self, event: i32) {
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = held.iter().position(|(id, _)| *id == event) {
+            held[at].1 = held[at].1.saturating_sub(1);
+            if held[at].1 == 0 {
+                held.swap_remove(at);
+            }
+        }
+    }
+
+    /// Returns whether `event` is worth raising.
+    #[cfg(test)]
+    pub(super) fn wanted_for_test(&self, event: i32) -> bool {
+        self.wanted(event)
+    }
+
+    /// Returns whether `event` is worth raising.
+    fn wanted(&self, event: i32) -> bool {
+        let held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        held.is_empty() || held.iter().any(|&(id, count)| id == event && count > 0)
     }
 }
 

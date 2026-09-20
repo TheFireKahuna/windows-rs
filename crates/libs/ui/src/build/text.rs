@@ -329,6 +329,20 @@ impl Ui<'_> {
         if let Some(row) = self.host.control_mut(self.control) {
             // The first run a control declares is the one its name is read from.
             row.text.get_or_insert(key);
+        } else {
+            // A run with no control to name is its own element, so a label an author wrote is
+            // readable rather than absent: a status bar of loose readouts is otherwise silence.
+            // It declares no hit entry, because nothing routes to it — only the control column
+            // is written, which is what the automation walk reads.
+            let scope = self.scope();
+            let id = self
+                .host
+                .mint_control(super::control::ControlRow::blank(node, scope));
+            self.host.tree.c.control[node.index()] = id;
+            if let Some(row) = self.host.control_mut(id) {
+                row.uia = crate::widget::UiaRole::Text;
+                row.text = Some(key);
+            }
         }
         self.element(node)
     }

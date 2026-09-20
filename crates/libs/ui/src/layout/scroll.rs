@@ -1032,6 +1032,12 @@ impl Ui<'_> {
             host.bind(thumb.0, Prop::Opacity, Bind::Set(Value::Scalar(0.0)));
         }
         let hover = host.mint_control(ControlRow::blank(node, scope));
+        // The viewport is where the scroll pattern hangs, so it is an element: a group, which
+        // the control view carries and the content view does not, so a reader walks past it and
+        // a client can still move it.
+        if let Some(row) = host.control_mut(hover) {
+            row.uia = crate::widget::UiaRole::Group;
+        }
         let grab = host.mint_control(ControlRow::blank(rail, scope));
         // The surface itself is a target so a hover can reveal its bar and a wheel notch the
         // tracker did not take reaches it. Its own box is the whole of it, so it is not
@@ -1111,6 +1117,10 @@ impl Host {
         }
         // Everything below is a function of the extents, so it is re-sent only when they move.
         if !created || moved {
+            // Automation reports how far the content can travel and how much of it is shown,
+            // which are these extents: a tree published before a card opened would report a
+            // container that cannot scroll while the thumb beside it says otherwise.
+            self.uia_stale.set(true);
             self.bind(thumb.0, Prop::OffsetY, track(front.tracker, geom.affine()));
             self.tracker_bounds(
                 front.tracker,
@@ -1197,6 +1207,28 @@ struct Live {
     /// `StartAnimation` resets the property's velocity, so a retarget per pointer sample would
     /// pin the opacity instead of ramping it.
     shown: bool,
+    /// The extent this container holds past the maximum its layout stated, for as long as a
+    /// docked occlusion needs it. Zero restores the stated maximum.
+    ///
+    /// Held beside the published geometry rather than folded into it, because the layout
+    /// restates that geometry whenever its extents move and an occlusion outlives a resize.
+    extended: f32,
+}
+
+impl Live {
+    /// Returns the geometry this container is actually at: the one its layout published, with
+    /// whatever extent an occlusion is holding added to the distance the content can travel.
+    ///
+    /// The rail and the thumb are solved nodes and an occlusion reflows neither, so the thumb's
+    /// height and travel are the layout's. What changes is how far the content moves across
+    /// that travel, which is the one number the affine and the grab both read. Deriving both
+    /// from here is what keeps the thumb inside its rail while the extent is held.
+    fn geom(&self) -> ThumbGeom {
+        ThumbGeom {
+            max_scroll: self.last.max_scroll + self.extended,
+            ..self.last
+        }
+    }
 }
 
 /// Every scroll container, as the half that moves thumbs holds them.
@@ -1210,6 +1242,61 @@ pub(crate) struct ScrollTable {
     shadows: Vec<(NodeId, Arc<AtomicU64>)>,
     /// Whether a container has arrived or left since the shadows were listed.
     relist: bool,
+    /// Containers whose thumb binding is owed a rebind, because their layout restated a
+    /// geometry while an extent was held. Drained by the pass that applied the batch.
+    rebind: Vec<NodeId>,
+    /// What the last reveal asked of each container on the field's scroll ancestry, innermost
+    /// first. Kept across reveals so a settled window plans one allocating nothing.
+    steps: Vec<(usize, RevealStep)>,
+}
+
+/// What one scroll container has to do to bring a box into view.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct RevealStep {
+    /// Where the content has to stand.
+    to: f32,
+    /// Extent owed past the container's own maximum, which is what an occlusion asks for.
+    extra: f32,
+}
+
+/// Returns where `target` asks the content to stand, and the extent the occlusion asks for
+/// past `max_scroll`.
+///
+/// `target` and `view` are the same space's vertical spans, `at` is where the content stands
+/// and `bottom` is the lowest line of the viewport nothing covers. A box already inside answers
+/// `None`: a request for the position the content already has cancels whatever inertia is
+/// running.
+///
+/// The extent is what an occlusion takes off the viewport, and nothing else. How far content
+/// can travel is its own length less the viewport's, so a viewport an occlusion has shortened
+/// by that much can carry it that much further — which is what makes a surface at the end of
+/// the content reachable. Stating it from the occlusion rather than from where the content
+/// happens to stand is what makes it idempotent: an occlusion that goes away asks for none,
+/// and the position clamps back into the range the content has.
+fn reveal_step(
+    target: (f32, f32),
+    view: (f32, f32),
+    bottom: f32,
+    at: f32,
+    max_scroll: f32,
+) -> Option<RevealStep> {
+    let bottom = bottom.max(view.0);
+    let delta = if target.1 - at > bottom {
+        target.1 - at - bottom
+    } else if target.0 - at < view.0 {
+        target.0 - at - view.0
+    } else {
+        return None;
+    };
+    let extra = (view.1 - bottom).max(0.0);
+    // `clamp` needs an ordered range, and a container whose geometry has not been published
+    // yet states `NaN` for its maximum, which orders against nothing.
+    let limit = max_scroll + extra;
+    let to = match limit >= 0.0 {
+        true => (at + delta).clamp(0.0, limit),
+        false => (at + delta).max(0.0),
+    };
+    Some(RevealStep { to, extra })
 }
 
 impl ScrollTable {
@@ -1236,9 +1323,15 @@ impl ScrollTable {
                         last: ThumbGeom::UNSENT,
                         requested: f32::NAN,
                         grab_from: f32::NAN,
+                        extended: 0.0,
                     });
                 }
-                ScrollOp::Thumb { viewport, geom } => self.edit(viewport, |row| row.last = geom),
+                ScrollOp::Thumb { viewport, geom } => {
+                    self.edit(viewport, |row| row.last = geom);
+                    // The affine the thumb is bound through is a function of the extended
+                    // geometry, so a restated layout owes a rebind while an extent is held.
+                    self.rebind.push(viewport);
+                }
                 ScrollOp::Reveal { viewport, to } => {
                     self.edit(viewport, |row| row.requested = to.y);
                 }
@@ -1269,66 +1362,177 @@ impl ScrollTable {
             .is_none_or(|row| row.observe)
     }
 
-    /// Brings the field `request` names inside its scroll container, clear of whatever occludes
-    /// it.
+    /// Brings the field `request` names clear of whatever occludes it, through every scroll
+    /// container that encloses it.
     ///
-    /// The container is named by the field's own hit entry rather than by a parent walk, because
-    /// the entry already carries the surface its rect resolves through.
+    /// Each container is named by the enclosed entry's own `scroll_src` rather than by a parent
+    /// walk, because that entry already carries the surface its rect resolves through. The walk
+    /// then asks the next container out to show where the field has just been placed, so a
+    /// field nested two containers deep is reached by both.
+    ///
+    /// Every container the walk does not reach gives back whatever extent it was holding, which
+    /// is what returns the content to its own range when the keyboard closes.
     ///
     /// # Errors
     ///
-    /// The compositor refused the tracker request.
-    pub(crate) fn reveal_field(
+    /// The compositor refused a tracker request or an extent.
+    /// Moves the container `hover` names to an absolute content offset.
+    ///
+    /// What a client asked for through the scroll pattern, resolved against the same tracker a
+    /// wheel notch and a thumb drag move, so the three cannot disagree about where the content
+    /// is. A control that is not a container moves nothing.
+    ///
+    /// # Errors
+    ///
+    /// The compositor refused the request.
+    pub(crate) fn scroll_to(
         &mut self,
-        request: crate::text_input::Reveal,
+        hover: ControlId,
+        to: Vector2,
         front: &mut Front<'_>,
     ) -> Result<()> {
-        let Some(field) = front.scene.hits().entry(request.id).copied() else {
+        let Some(row) = self.rows.iter().find(|row| row.of.hover == hover) else {
             return Ok(());
         };
-        let Some(at) = self
-            .rows
-            .iter()
-            .position(|row| row.of.viewport == field.scroll_src)
-        else {
+        let tracker = row.of.tracker;
+        request(front, tracker, to.y)
+    }
+
+    pub(crate) fn reveal_field(
+        &mut self,
+        reveal: crate::text_input::Reveal,
+        front: &mut Front<'_>,
+    ) -> Result<()> {
+        self.steps.clear();
+        if let Some(id) = reveal.id
+            && let Some(field) = front.scene.hits().entry(id).copied()
+        {
+            let column = (field.x0, field.x1);
+            // The span to bring into view, stated in the space of the container being asked.
+            let mut target = (field.y0, field.y1);
+            let mut viewport = field.scroll_src;
+            while let Some(at) = self.rows.iter().position(|row| row.of.viewport == viewport) {
+                let hover = self.rows[at].of.hover;
+                let Some(view) = front.scene.hits().entry(hover).copied() else {
+                    break;
+                };
+                let Some(offset) = self.shadow(viewport, front) else {
+                    break;
+                };
+                // A candidate window or panel over the field takes room off the bottom of the
+                // viewport, but only where it actually overlaps the field's own column.
+                let bottom = reveal
+                    .occlusion
+                    .filter(|r| r.x0 < column.1 && column.0 < r.x1)
+                    .map_or(view.y1, |r| view.y1.min(r.y0));
+                // Against the layout's own maximum, not the extended one: the extent a reveal
+                // asks for is stated afresh each time, so one that no longer needs it gives it
+                // back rather than compounding it.
+                let step = reveal_step(
+                    target,
+                    (view.y0, view.y1),
+                    bottom,
+                    offset.y,
+                    self.rows[at].last.max_scroll,
+                );
+                let stands = step.map_or(offset.y, |step| step.to);
+                if let Some(step) = step {
+                    self.steps.push((at, step));
+                }
+                // Where the field comes to rest inside this container, stated in the space the
+                // container itself sits in, which is what the next container out is shown.
+                let top = view.y0 + (target.0 - stands);
+                target = (
+                    top.max(view.y0),
+                    (top + (target.1 - target.0)).min(view.y1),
+                );
+                viewport = view.scroll_src;
+            }
+        }
+        let mut first = Ok(());
+        // Extents before positions: a request issued against the range it needs widening past
+        // lands short of the occlusion it was meant to clear.
+        for i in 0..self.steps.len() {
+            let (at, step) = self.steps[i];
+            keep(&mut first, self.extend(at, step.extra, front));
+        }
+        for at in 0..self.rows.len() {
+            if !self.steps.iter().any(|(held, _)| *held == at) {
+                keep(&mut first, self.extend(at, 0.0, front));
+            }
+        }
+        for i in 0..self.steps.len() {
+            let (at, step) = self.steps[i];
+            let tracker = self.rows[at].of.tracker;
+            keep(&mut first, request(front, tracker, step.to));
+        }
+        first
+    }
+
+    /// Holds `extra` extent on one container, moving the tracker's range and the thumb's map
+    /// together so neither can describe a range the other does not have.
+    ///
+    /// # Errors
+    ///
+    /// The compositor refused the extent or the binding.
+    fn extend(&mut self, at: usize, extra: f32, front: &mut Front<'_>) -> Result<()> {
+        let Some(row) = self.rows.get_mut(at) else {
             return Ok(());
         };
-        let hover = self.rows[at].of.hover;
-        let Some(view) = front
-            .scene
-            .hits()
-            .entries()
-            .iter()
-            .find(|entry| entry.id == hover)
-            .copied()
-        else {
+        if row.extended == extra {
+            return Ok(());
+        }
+        row.extended = extra;
+        self.apply_extent(at, front)
+    }
+
+    /// Writes one container's extended geometry to the tracker and to the thumb.
+    ///
+    /// Both sides of the map are written from [`Live::geom`], so the range the content rests in
+    /// and the range the thumb traverses are the same number by construction. The thumb is
+    /// bound rather than sprung: it is a map from a position, not a destination.
+    ///
+    /// # Errors
+    ///
+    /// The compositor refused the extent or the binding.
+    fn apply_extent(&mut self, at: usize, front: &mut Front<'_>) -> Result<()> {
+        let Some(row) = self.rows.get(at) else {
             return Ok(());
         };
-        let viewport = self.rows[at].of.viewport;
-        let Some(offset) = self.shadow(viewport, front) else {
+        let (tracker, thumb, geom) = (row.of.tracker, row.thumb, row.geom());
+        front.scene.extend_bounds(
+            tracker,
+            Vector2 {
+                x: 0.0,
+                y: row.extended,
+            },
+        )?;
+        let Some(thumb) = thumb else {
             return Ok(());
-        };
-        // A candidate window or panel over the field takes room off the bottom of the viewport,
-        // but only where it actually overlaps the field's own column.
-        let bottom = request
-            .occlusion
-            .filter(|r| r.x0 < field.x1 && field.x0 < r.x1)
-            .map_or(view.y1, |r| view.y1.min(r.y0));
-        let delta = if field.y1 - offset.y > bottom {
-            field.y1 - offset.y - bottom
-        } else if field.y0 - offset.y < view.y0 {
-            field.y0 - offset.y - view.y0
-        } else {
-            return Ok(());
-        };
-        let to = Vector2 {
-            x: offset.x,
-            y: (offset.y + delta).max(0.0),
         };
         front
             .scene
-            .request(self.rows[at].of.tracker, TrackerRequest::To(to))
-            .map(|_| ())
+            .retarget(thumb.0, Prop::OffsetY, track(tracker, geom.affine()), front.back)
+    }
+
+    /// Re-applies the extent of every container whose layout restated its geometry.
+    ///
+    /// # Errors
+    ///
+    /// The compositor refused an extent or a binding. The first failure is kept and the rest of
+    /// the batch still runs.
+    pub(crate) fn rebind_extents(&mut self, front: &mut Front<'_>) -> Result<()> {
+        let mut first = Ok(());
+        while let Some(viewport) = self.rebind.pop() {
+            let Some(at) = self.rows.iter().position(|row| row.of.viewport == viewport) else {
+                continue;
+            };
+            if self.rows[at].extended == 0.0 {
+                continue;
+            }
+            keep(&mut first, self.apply_extent(at, front));
+        }
+        first
     }
 
     /// Returns the offset the tracker bound to `viewport` last reported.
@@ -1562,8 +1766,9 @@ fn drag(
         table.rows[at].grab_from = offset.y;
     }
     let row = &table.rows[at];
-    let thumb_y = thumb_y_for_scroll(row.grab_from, row.last) + update.delta.y;
-    let to = scroll_for_thumb_y(thumb_y, row.last);
+    let geom = row.geom();
+    let thumb_y = thumb_y_for_scroll(row.grab_from, geom) + update.delta.y;
+    let to = scroll_for_thumb_y(thumb_y, geom);
     let tracker = row.of.tracker;
     request(front, tracker, to)
 }
@@ -1591,6 +1796,149 @@ mod tests {
     /// Returns the geometry for a viewport showing `content_h` of content.
     fn geom(viewport_h: f32, content_h: f32) -> ThumbGeom {
         thumb_geom(viewport_h, content_h)
+    }
+
+    /// A 400-DIP viewport over 1000 DIPs of content: 600 of travel, and a field at 940..980.
+    const TRAVEL: f32 = 600.0;
+
+    /// A held extent moves the range the content rests in and the map the thumb is drawn
+    /// through together. The thumb is a map from a position, so the two cannot be written
+    /// apart: at the end of the extended range it is at the end of its own travel, and a grab
+    /// there asks for the position it is showing.
+    #[test]
+    fn a_held_extent_keeps_the_thumb_and_the_content_on_one_range() {
+        let published = thumb_geom(400.0, 1000.0);
+        let mut row = Live {
+            of: ScrollFront {
+                viewport: NodeId::NONE,
+                tracker: TrackerId::new(Id::raw(0, 1)),
+                hover: ControlId::NONE,
+                grab: ControlId::NONE,
+            },
+            thumb: None,
+            reveal: Reveal::OnDemand,
+            observe: false,
+            shown: false,
+            last: published,
+            requested: f32::NAN,
+            grab_from: f32::NAN,
+            extended: 0.0,
+        };
+        assert_eq!(row.geom(), published, "with nothing held, the layout's own");
+
+        row.extended = 230.0;
+        let geom = row.geom();
+        assert_eq!(geom.max_scroll, published.max_scroll + 230.0);
+        assert_eq!(
+            (geom.thumb_h, geom.travel),
+            (published.thumb_h, published.travel),
+            "an occlusion reflows neither the rail nor the thumb"
+        );
+        let end = thumb_y_for_scroll(geom.max_scroll, geom);
+        assert_eq!(
+            end,
+            THUMB_MARGIN + geom.travel,
+            "the extended end of the content is the end of the thumb's travel"
+        );
+        assert!(
+            (scroll_for_thumb_y(end, geom) - geom.max_scroll).abs() < 1e-3,
+            "and a grab there asks for the position the thumb is showing"
+        );
+        assert!(
+            thumb_y_for_scroll(published.max_scroll, geom) < end,
+            "the layout's own maximum no longer reaches the end of the rail"
+        );
+
+        row.extended = 0.0;
+        assert_eq!(row.geom(), published, "clearing it restores the layout's");
+    }
+
+    #[test]
+    fn a_box_already_inside_the_viewport_asks_for_nothing() {
+        assert_eq!(
+            reveal_step((100.0, 140.0), (0.0, 400.0), 400.0, 0.0, TRAVEL),
+            None
+        );
+        assert_eq!(
+            reveal_step((700.0, 740.0), (0.0, 400.0), 400.0, 400.0, TRAVEL),
+            None,
+            "already inside once the content has travelled"
+        );
+    }
+
+    #[test]
+    fn a_box_below_the_fold_comes_to_rest_against_the_bottom_of_the_viewport() {
+        let step = reveal_step((940.0, 980.0), (0.0, 400.0), 400.0, 0.0, TRAVEL).unwrap();
+        assert_eq!(step.to, 580.0, "980 - 400");
+        assert_eq!(step.extra, 0.0, "nothing occludes, so nothing is owed");
+    }
+
+    #[test]
+    fn a_box_above_the_viewport_comes_to_rest_against_its_top() {
+        let step = reveal_step((100.0, 140.0), (0.0, 400.0), 400.0, 500.0, TRAVEL).unwrap();
+        assert_eq!(step.to, 100.0);
+        assert_eq!(step.extra, 0.0);
+    }
+
+    /// A docked keyboard takes the bottom 250 DIPs off a 400-DIP viewport. The last field in
+    /// the content has to stand 230 DIPs past the maximum the content's own length states.
+    /// A keyboard takes the bottom 250 DIPs of a 400-DIP viewport. The content can travel 250
+    /// further than its own length allows for as long as it does, which is exactly what the
+    /// last field in that content needs to be seen.
+    #[test]
+    fn a_docked_occlusion_lends_the_content_what_it_took_off_the_viewport() {
+        let step = reveal_step((940.0, 980.0), (0.0, 400.0), 150.0, 0.0, TRAVEL).unwrap();
+        assert_eq!(step.extra, 250.0, "400 - 150");
+        assert_eq!(step.to, 830.0, "980 - 150, and inside the 850 now reachable");
+    }
+
+    /// The extent is the occlusion's, so the same occlusion asks for the same extent wherever
+    /// the content stands. Without that a reveal would compound its own last answer.
+    #[test]
+    fn the_extent_is_the_occlusions_and_not_the_contents_position() {
+        for at in [0.0, 300.0, 600.0, 850.0] {
+            let step = reveal_step((940.0, 980.0), (0.0, 400.0), 150.0, at, TRAVEL);
+            assert!(step.is_none_or(|step| step.extra == 250.0), "at {at}");
+        }
+    }
+
+    /// An occlusion that goes away lends nothing, so a content standing past its own maximum is
+    /// asked for a position inside that maximum rather than for the one that cleared the
+    /// occlusion.
+    ///
+    /// A box the lift left fully inside the viewport asks for nothing at all; what brings the
+    /// content back there is the extent being given up, which shortens the range the tracker
+    /// rests in.
+    #[test]
+    fn clearing_an_occlusion_clamps_what_it_asks_for_into_the_contents_own_range() {
+        let lifted = reveal_step((940.0, 980.0), (0.0, 400.0), 400.0, 960.0, TRAVEL).unwrap();
+        assert_eq!(lifted.extra, 0.0);
+        assert_eq!(lifted.to, TRAVEL, "not the 940 that would clear nothing");
+        assert_eq!(
+            reveal_step((940.0, 980.0), (0.0, 400.0), 400.0, 850.0, TRAVEL),
+            None,
+            "a box the lift left inside asks for nothing"
+        );
+    }
+
+    #[test]
+    fn an_occlusion_covering_the_whole_viewport_still_rests_against_its_top() {
+        let step = reveal_step((940.0, 980.0), (0.0, 400.0), -50.0, 0.0, TRAVEL).unwrap();
+        assert_eq!(step.extra, 400.0, "the whole viewport is owed");
+        assert_eq!(step.to, 980.0, "the occluded bottom cannot rise above the top");
+    }
+
+    #[test]
+    fn a_container_whose_geometry_is_unpublished_is_not_clamped_into_a_range_it_has_not_stated() {
+        let step = reveal_step((940.0, 980.0), (0.0, 400.0), 400.0, 0.0, f32::NAN).unwrap();
+        assert_eq!(step.extra, 0.0);
+        assert_eq!(step.to, 580.0);
+    }
+
+    #[test]
+    fn a_reveal_never_asks_for_a_position_above_the_content() {
+        let step = reveal_step((0.0, 40.0), (100.0, 400.0), 400.0, 0.0, TRAVEL).unwrap();
+        assert_eq!(step.to, 0.0, "clamped, rather than asking for -100");
     }
 
     /// A viewport bigger than its content has no thumb, no travel and nothing to scroll.

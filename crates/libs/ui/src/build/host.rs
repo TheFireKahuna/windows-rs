@@ -35,6 +35,10 @@ use windows_scene::{
 pub(crate) struct Placement {
     pub root: NodeId,
     pub blocker: Option<ControlId>,
+    /// The control this overlay opened from, where it opened from one. What automation
+    /// reports as that control's expand-collapse state, which is otherwise a button that
+    /// answers "collapsed" with its own menu open beside it.
+    pub invoker: Option<ControlId>,
     pub anchor: crate::overlay::Anchor,
     /// The client box this overlay is inset into, resolved: its origin is where the insets
     /// put it, and its extent is written into the root's own authored bounds before each solve.
@@ -191,10 +195,15 @@ pub struct Host {
     pub(crate) values: Vec<(ControlId, ValueRow)>,
     pub(crate) gestures: Vec<(ControlId, crate::gesture::GestureDecl)>,
     pub(crate) released: Vec<ControlId>,
+    /// What a presentation region declares about its own pixels, for automation to join with
+    /// the renderer's geometry. One row per region, written as the region is declared.
+    pub(crate) peers: Vec<crate::uia::RegionPeer>,
     pub(crate) region_ops: Vec<crate::seam::RegionOp>,
     pub(crate) scroll_ops: Vec<crate::seam::ScrollOp>,
     pub(crate) popups: Vec<crate::overlay::Request>,
     pub(crate) uia_stale: core::cell::Cell<bool>,
+    /// The id paths the last publish used, held for their allocations.
+    uia_seen: Vec<(String, u32)>,
     census: crate::seam::AppCensus,
     /// Values whose drop runs application code, held until the borrow ends.
     pub(crate) retired: Vec<Retired>,
@@ -258,6 +267,8 @@ impl Host {
                 values: Vec::new(),
                 gestures: Vec::new(),
                 released: Vec::new(),
+                peers: Vec::new(),
+                uia_seen: Vec::new(),
                 region_ops: Vec::new(),
                 scroll_ops: Vec::new(),
                 popups: Vec::new(),
@@ -460,6 +471,39 @@ impl Host {
         GroupId(id)
     }
 
+    /// Gives an overlay's slot root the element its contents are announced inside.
+    ///
+    /// Declares no hit entry: an overlay is positioned, not pressed, and the rows inside it
+    /// carry their own. Only the control column is written, which is what the automation walk
+    /// reads.
+    pub(crate) fn name_overlay(
+        &mut self,
+        root: NodeId,
+        scope: u32,
+        kind: crate::overlay::Kind,
+        invoker: Option<ControlId>,
+    ) {
+        use crate::overlay::Kind;
+        let scope = self.scope_at(scope);
+        // The control it opened from, so a reader announces "Channel scope menu" rather than
+        // an unnamed container. A menu is the one place a control's name belongs to two
+        // elements, because the menu is what that control turned into.
+        let named = invoker
+            .and_then(|id| self.control(id))
+            .and_then(|row| row.name.clone());
+        let id = self.mint_control(ControlRow::blank(root, scope));
+        self.tree.c.control[root.index()] = id;
+        if let Some(row) = self.control_mut(id) {
+            row.uia = match kind {
+                Kind::Flyout => crate::widget::UiaRole::Menu,
+                Kind::Popup => crate::widget::UiaRole::Group,
+                Kind::Tooltip => crate::widget::UiaRole::ToolTip,
+            };
+            row.overlay = Some(kind);
+            row.name = named;
+        }
+    }
+
     /// Mints a sprite whose geometry is its own rather than the solve's: a text line tile, a
     /// wash, a scroll thumb. It takes no space from its parent and is skipped by the walks.
     pub(crate) fn visual(&mut self, parent: GroupId, after: Option<NodeId>) -> SpriteId {
@@ -587,7 +631,18 @@ impl Host {
     }
 
     pub(crate) fn bind(&mut self, id: NodeId, prop: Prop, bind: Bind) {
-        self.tree.c.channels[id.index()] |= 1 << prop as u32;
+        let bit = 1 << prop as u32;
+        self.tree.c.channels[id.index()] |= bit;
+        // A tracked or followed channel is driven for as long as the binding stands, and
+        // writing the composite that contains it disconnects it: setting `Offset` replaces
+        // whatever animates `Offset.Y`. Recorded so the encode leaves that channel alone.
+        match bind {
+            Bind::Track { .. } | Bind::FollowOffset { .. } => {
+                self.tree.c.driven[id.index()] |= bit;
+            }
+            Bind::Stop => self.tree.c.driven[id.index()] &= !bit,
+            Bind::Set(_) | Bind::Animate(_) => {}
+        }
         self.pending.push(Op::Bind { id, prop, bind });
     }
 
@@ -896,8 +951,26 @@ impl Host {
         self.repaint_control(id);
     }
 
-    pub(crate) fn publish_fraction(&mut self, id: ControlId, fraction: f32, epoch: u64) {
+    /// Runs `edit` on the automation peer of the region `id` names, adding a row on first use.
+    ///
+    /// One row per region and a handful of regions per screen, so the lookup is a scan.
+    pub(crate) fn region_peer(&mut self, id: ControlId, edit: impl FnOnce(&mut crate::uia::RegionPeer)) {
+        let at = self.peers.iter().position(|peer| peer.id == id).unwrap_or_else(|| {
+            self.peers.push(crate::uia::RegionPeer {
+                id,
+                geometry: std::sync::Arc::new(windows_present::RegionParts::new()),
+                parts: Vec::new(),
+                values: None,
+                value: None,
+            });
+            self.peers.len() - 1
+        });
+        edit(&mut self.peers[at]);
+    }
+
+    pub(crate) fn publish_fraction(&mut self, id: ControlId, fraction: f32, number: f64, epoch: u64) {
         let Some(row) = self.control_mut(id) else { return };
+        row.number = Some(number);
         let value = row.value.get_or_insert_with(ValueRow::default);
         value.fraction = fraction;
         value.revision = epoch;
@@ -1427,7 +1500,7 @@ impl Host {
             scratch_text,
             ..
         } = self;
-        let walk = hits::Walk { tree, controls, text, handlers, fields };
+        let walk = hits::Walk { tree, controls, text, handlers, fields, overlays };
         let mut out = hits::Out { hits, patch: pending, uia, scratch: scratch_text };
         hits::begin(&mut out);
         hits::walk(&walk, &mut out, root, 0);
@@ -1452,6 +1525,19 @@ impl Host {
     /// plain `Send` data.
     pub fn uia_entries(&mut self, out: &mut crate::uia::Snapshot) {
         self.build_hits(Some(out));
+        // The extents the solve settled on, taken here rather than in the walk: the walk sees
+        // the viewport, and how far its content reaches is the scroll table's to say.
+        for view in &mut out.scrolls {
+            let Some(row) = (0..self.scrolls.slots())
+                .filter_map(|at| self.scrolls.get(at))
+                .find(|row| row.node == view.node)
+            else {
+                continue;
+            };
+            view.view = self.tree.c.geom[view.node.index()].size;
+            view.content = self.tree.c.geom[row.content.index()].size;
+        }
+        crate::uia::derive_keys(out, &mut self.uia_seen);
     }
 
     // ── the fill ────────────────────────────────────────────────────────────────────
@@ -1478,6 +1564,7 @@ impl Host {
         down.fields.layouts.append(&mut self.field_layouts);
         down.fields.commits.append(&mut self.field_commits);
         down.declared.released.append(&mut self.released);
+        down.declared.peers.append(&mut self.peers);
         if self.caption != self.sent_caption {
             self.sent_caption = self.caption;
             down.declared.caption = self.caption;

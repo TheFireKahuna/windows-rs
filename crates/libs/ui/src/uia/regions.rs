@@ -57,6 +57,8 @@ pub struct RegionPeer {
     /// One slot per part, indexed by [`SubId`], written by whichever thread owns the number.
     /// One allocation for the whole region rather than an `Arc` per part.
     pub values: Option<Arc<[AtomicU64]>>,
+    /// The slot the region itself reports its number from.
+    pub value: Option<Arc<AtomicU64>>,
 }
 
 /// One declared region and the buffers its join reuses.
@@ -177,6 +179,11 @@ impl Regions {
             row.decls = peer.parts;
             row.geometry = Some(peer.geometry);
             row.values = peer.values;
+            // A cell bound separately stands: a peer that declares none is stating its parts,
+            // not withdrawing the region's own number.
+            if peer.value.is_some() {
+                row.value = peer.value;
+            }
             row.seen = u64::MAX;
         });
     }
@@ -199,6 +206,23 @@ impl Regions {
             .unwrap_or_else(PoisonError::into_inner)
             .iter_mut()
             .fold(false, |moved, row| row.join() || moved)
+    }
+
+    /// Collects every region that publishes a number of its own, with the number it holds.
+    ///
+    /// Reuses `out`'s allocation, so a tick that finds the same regions allocates nothing.
+    pub fn readings(&self, out: &mut Vec<(ControlId, f64)>) {
+        out.clear();
+        let held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for row in held.iter() {
+            let Some(cell) = row.value.as_ref() else {
+                continue;
+            };
+            let value = f64::from_bits(cell.load(Relaxed));
+            if value.is_finite() {
+                out.push((row.id, value));
+            }
+        }
     }
 
     /// Returns the part `sub` names under `id`.
@@ -280,6 +304,7 @@ mod tests {
             geometry: Arc::clone(&geometry),
             parts: decls(),
             values,
+            value: None,
         });
         (regions, id, geometry)
     }
@@ -391,6 +416,7 @@ mod tests {
             geometry,
             parts: decls(),
             values: None,
+            value: None,
         });
         assert!(
             regions.sync(),

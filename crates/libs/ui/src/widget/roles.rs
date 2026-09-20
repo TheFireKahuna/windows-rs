@@ -188,6 +188,9 @@ pub enum UiaRole {
     Menu,
     ProgressBar,
     Graph,
+    /// A hover description. Raised as opened by the overlay layer, and doubling as its
+    /// target's help text.
+    ToolTip,
 }
 
 /// A resolved component recipe: the three rows a control can show, and its shape.

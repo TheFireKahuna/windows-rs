@@ -3,7 +3,7 @@
 use super::doc::Doc;
 use super::store::{Inner, NOTIMPL, error, store};
 use crate::bindings::*;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::ffi::c_void;
 use std::rc::Rc;
 use windows_core::{Error, GUID, HRESULT, Interface, Result};
@@ -19,6 +19,14 @@ pub(crate) struct Session {
     document: ITfDocumentMgr,
     keys: ITfKeystrokeMgr,
     compositions: ITfContextOwnerCompositionServices,
+    /// Set while a focus transition is on the stack.
+    ///
+    /// Terminating a composition and moving the document's focus both run a text service's own
+    /// code, and that code pumps. A key removed inside one belongs to no document: the one
+    /// losing focus has had its composition terminated and the one taking it has not been told
+    /// yet. [`filter`](Self::filter) declines there, which leaves the message in the queue for
+    /// the router to deliver once.
+    moving: Cell<bool>,
 }
 
 impl Session {
@@ -61,6 +69,7 @@ impl Session {
                 document,
                 keys,
                 compositions,
+                moving: Cell::new(false),
             }),
             Err(e) => {
                 let _ = unsafe { manager.Deactivate() };
@@ -74,6 +83,7 @@ impl Session {
     /// Clearing focus can finish that composition synchronously, so the caller holds no
     /// document borrow across this call.
     pub fn focus(&self, on: bool) -> Result<()> {
+        let _moving = Moving::of(self);
         if !on && self.inner.composing() {
             unsafe {
                 self.compositions
@@ -90,6 +100,11 @@ impl Session {
         .ok()
     }
 
+    /// Reports whether a focus transition is on the stack.
+    pub fn moving(&self) -> bool {
+        self.moving.get()
+    }
+
     /// Marks the published view stale, so the next tick tells the sink to ask again.
     pub fn layout_changed(&self) {
         self.inner.dirty_layout();
@@ -98,9 +113,10 @@ impl Session {
     /// Offers one removed keyboard message to TSF, reporting whether it was consumed.
     ///
     /// A key a TIP claims is not interpreted by the input layer, which is what keeps an
-    /// active composition's Enter and Escape out of the overlay scope.
+    /// active composition's Enter and Escape out of the overlay scope. A key removed inside a
+    /// focus transition is declined for the reason [`moving`](Self::moving) states.
     pub fn filter(&self, key: KeyMessage) -> bool {
-        if self.inner.doc.borrow().focused().is_none() {
+        if self.moving() || self.inner.doc.borrow().focused().is_none() {
             return false;
         }
         let down = matches!(key.message, 0x100 | 0x104);
@@ -125,8 +141,26 @@ fn named<T>(cast: Result<T>, what: &str) -> Result<T> {
     cast.map_err(|e: Error| Error::new(e.code(), format!("TSF {what} initialization failed")))
 }
 
+/// Marks a focus transition for as long as it is on the stack, including the paths out of it
+/// that fail.
+struct Moving<'s>(&'s Cell<bool>);
+
+impl<'s> Moving<'s> {
+    fn of(session: &'s Session) -> Self {
+        session.moving.set(true);
+        Self(&session.moving)
+    }
+}
+
+impl Drop for Moving<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
+        let _moving = Moving::of(self);
         unsafe {
             let _ = self
                 .compositions

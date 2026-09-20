@@ -88,7 +88,11 @@ pub(crate) fn place(
             continue;
         }
         let cell = read(s, base, k);
-        let cw = span_width(&groups, cols, cell[1], cell[3], gap);
+        let room = span_width(&groups, cols, cell[1], cell[3], gap);
+        // The cell is room, not width: a child that does not stretch takes its natural
+        // extent inside it. A text leaf is `NO_STRETCH`, and its box is what its glyph
+        // mask is sampled across, so a box wider than the ink draws the run stretched.
+        let cw = s.cross_inline(c, l.justify, inner, room);
         let pair = s.place(c, cw, inner);
         let last = last_row(cell);
         let span = f32::from(cell[2].max(1));

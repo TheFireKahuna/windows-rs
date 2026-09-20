@@ -369,6 +369,13 @@ pub(crate) struct Declared {
     pub(crate) focus: Vec<FocusOp>,
     /// Read by `Uia::publish`. Filled only on a pass a listening provider asked for.
     pub(crate) uia: crate::uia::Snapshot,
+    /// Read by `Uia::observe`: what a control did between publishes, so a moved number and a
+    /// completed action reach a client without republishing the tree. Filled only while a
+    /// provider is listening, which is what keeps a drag free of it.
+    pub(crate) intents: Vec<Intent>,
+    /// Read by `Uia::watch_region`: what a presentation region's pixels mean. Declared where
+    /// the region is mounted, and joined with the renderer's own geometry on the tick.
+    pub(crate) peers: Vec<crate::uia::RegionPeer>,
     /// The window commands, in the order minimise, maximise, close. Read by `caption::hit`.
     pub(crate) caption: [Option<ControlId>; 3],
     /// Read by the observer on the input thread.
@@ -387,6 +394,8 @@ impl Declared {
         self.gestures.append(&mut from.gestures);
         self.released.append(&mut from.released);
         self.focus.append(&mut from.focus);
+        self.intents.append(&mut from.intents);
+        self.peers.append(&mut from.peers);
         // The snapshot travels with the publish rather than with the buffer: it is swapped out
         // of the drained batch before that buffer is recycled.
         if !from.uia.entries.is_empty() {
@@ -405,6 +414,8 @@ impl Declared {
             && self.released.is_empty()
             && self.focus.is_empty()
             && self.uia.entries.is_empty()
+            && self.intents.is_empty()
+            && self.peers.is_empty()
             && self.caption == NO_CAPTION
     }
 
@@ -413,6 +424,8 @@ impl Declared {
         self.released.clear();
         self.focus.clear();
         self.uia.clear();
+        self.intents.clear();
+        self.peers.clear();
         self.caption = NO_CAPTION;
         self.census = AppCensus::default();
     }
@@ -626,6 +639,12 @@ row! {
 pub struct SceneTally {
     pub wakes: u64,
     pub applies: u64,
+    /// When the scene thread finished applying its last patch.
+    ///
+    /// Read where the apply completed rather than where this batch is taken, so measuring how
+    /// long an input took to reach the compositor does not also measure how long the input
+    /// thread took to hear about it. Absent until the first apply.
+    pub applied_at: Option<std::time::Instant>,
     pub census: Census,
 }
 

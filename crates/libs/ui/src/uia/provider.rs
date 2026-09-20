@@ -14,8 +14,8 @@
 
 use super::action::{Action, Queue, TextAction};
 use super::regions::Regions;
-use super::roles;
-use super::snapshot::{ColFlags as F, Entry, NONE, Part, State as S, Tree, Versioned};
+use super::roles::{self, Patterns};
+use super::snapshot::{ColFlags as F, Entry, NONE, Part, ScrollView, State as S, Tree, Versioned};
 use super::snapshot::{ColFlags, State};
 use super::variant::{self, bool as vb, i4 as vi, wide as vw};
 use crate::bindings::*;
@@ -24,6 +24,7 @@ use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use windows_core::{BOOL, BSTR, Error, IUnknown, Interface, PCWSTR, Result, implement_decl};
+use windows_numerics::Vector2;
 use windows_scene::{ControlId, Point};
 
 /// The provider options this stack advertises.
@@ -56,6 +57,13 @@ const SMALL_FRACTION: f64 = 0.01;
 
 const FRAMEWORK: &str = "windows-ui";
 
+/// `UIA_ScrollPatternNoScroll`, the percentage an axis that cannot move reports and the one a
+/// client passes to leave an axis where it is.
+const NO_SCROLL: f32 = -1.0;
+
+/// A small scroll step, as a fraction of one page.
+const SMALL_STEP: f32 = 0.1;
+
 /// Everything a provider can reach, and the only state shared across threads.
 ///
 /// Held by the front thread's [`Uia`](super::Uia) as an `Arc` and by every provider as a
@@ -72,6 +80,9 @@ pub struct Shared {
     /// Latched by the first `WM_GETOBJECT` and cleared only by [`disconnect`].
     /// `UiaClientsAreListening` is a hint; having been asked for a provider is not.
     pub asked: AtomicBool,
+    /// What clients have subscribed to, as automation reports it to the fragment root. An
+    /// event nobody advised is not raised.
+    pub(crate) advised: super::events::Advised,
     hwnd: AtomicIsize,
     /// One object per element identity, sorted by it, so an element always answers as the same
     /// object. Automation matches a raised event to a listener by object identity.
@@ -213,6 +224,7 @@ implement_decl! {
         ISelectionItemProvider,
         IExpandCollapseProvider,
         IScrollItemProvider,
+        IScrollProvider,
         ITextProvider
     ]
 }
@@ -221,7 +233,8 @@ implement_decl! {
     impl Root as pub Root_Impl: [
         IRawElementProviderSimple,
         IRawElementProviderFragment,
-        IRawElementProviderFragmentRoot
+        IRawElementProviderFragmentRoot,
+        IRawElementProviderAdviseEvents
     ]
 }
 
@@ -297,19 +310,25 @@ impl At {
         self.tree.at(self.at).copied().unwrap_or_default()
     }
 
-    /// Returns the element's own box in screen pixels, with a region part placed inside it.
+    /// Returns what a client sees of the element, in screen pixels, with a region part placed
+    /// inside it.
+    ///
+    /// Cut by every clipping ancestor, because automation reports where a thing can be reached
+    /// and a row a list has carried past its own edge is not reachable where it was laid out. A
+    /// row carried out of the list entirely answers an empty rectangle at its own corner, which
+    /// is what `IsOffscreen` says in numbers.
     pub(super) fn rect(&self) -> UiaRect {
-        self.box_of(self.at, self.part())
+        self.screen(self.clipped(self.unclipped_box()))
     }
 
-    /// Returns the box of the entry at `at` in screen pixels, with its scroll ancestry applied
-    /// and `part` placed inside it.
+    /// Returns the element's box before any clip, in DIPs, with its scroll ancestry applied and
+    /// its part placed inside it.
     ///
-    /// Automation reports screen pixels and everything above reports DIPs, so the window's
-    /// origin and scale convert between them here.
-    fn box_of(&self, at: u16, part: Option<Part>) -> UiaRect {
-        let mut box_ = self.tree.shifted(at);
-        if let Some(part) = part {
+    /// The uncut box is what a run inside it is stated against, so the text pattern resolves
+    /// its clusters here and cuts afterwards.
+    pub(super) fn unclipped_box(&self) -> [f32; 4] {
+        let mut box_ = self.tree.shifted(self.at);
+        if let Some(part) = self.part() {
             box_ = [
                 box_[0] + part.rect[0],
                 box_[1] + part.rect[1],
@@ -317,6 +336,28 @@ impl At {
                 box_[1] + part.rect[3],
             ];
         }
+        box_
+    }
+
+    /// Returns `box_` cut by every clipping ancestor, never inverted.
+    pub(super) fn clipped(&self, box_: [f32; 4]) -> [f32; 4] {
+        let Some(clip) = self.tree.clip_box(self.at) else {
+            return box_;
+        };
+        let cut = [
+            box_[0].max(clip[0]),
+            box_[1].max(clip[1]),
+            box_[2].min(clip[2]),
+            box_[3].min(clip[3]),
+        ];
+        match cut[2] > cut[0] && cut[3] > cut[1] {
+            true => cut,
+            false => [box_[0], box_[1], box_[0], box_[1]],
+        }
+    }
+
+    /// Converts a box in DIPs to the screen pixels automation reports.
+    pub(super) fn screen(&self, box_: [f32; 4]) -> UiaRect {
         let (origin, scale) = self.tree.window();
         UiaRect {
             left: f64::from(origin.x + box_[0] * scale),
@@ -370,7 +411,7 @@ impl At {
 
     /// Returns the spoken name of this element's control type.
     fn localized(&self) -> &'static str {
-        roles::row(self.role()).localized
+        resolved(self).1
     }
 
     /// Returns the role automation is told about, which for a part is the part's own.
@@ -405,7 +446,7 @@ impl At {
 ///
 /// A region part answers from the same rows: its name and role come from the part, and every
 /// structural property reads the region's entry, which is where a part sits.
-const PROPERTIES: [(i32, fn(&At) -> VARIANT); 17] = [
+const PROPERTIES: [(i32, fn(&At) -> VARIANT); 19] = [
     (UIA_NamePropertyId, |a| vw(&a.name())),
     (UIA_HelpTextPropertyId, |a| vw(a.tree.help(a.at))),
     (UIA_ControlTypePropertyId, |a| vi(control_type(a))),
@@ -426,6 +467,8 @@ const PROPERTIES: [(i32, fn(&At) -> VARIANT); 17] = [
     (UIA_LiveSettingPropertyId, |a| {
         vi(live_setting(a.entry().flags))
     }),
+    (UIA_PositionInSetPropertyId, |a| set_place(a).0),
+    (UIA_SizeOfSetPropertyId, |a| set_place(a).1),
     (UIA_LabeledByPropertyId, labelled_by),
     (UIA_BoundingRectanglePropertyId, bounding_rectangle),
     (UIA_FrameworkIdPropertyId, |_| vw(&wide(FRAMEWORK))),
@@ -437,9 +480,18 @@ const PROPERTIES: [(i32, fn(&At) -> VARIANT); 17] = [
 /// is authored for either container. A popup reports a window, which makes a reader announce
 /// its title before its content.
 fn control_type(a: &At) -> i32 {
+    resolved(a).0
+}
+
+/// Returns the control type this element reports and the name it is spoken by.
+///
+/// A button is a menu item inside a menu and a list item inside a list, because the same
+/// widget is authored for either container. A popup reports a window, which makes a reader
+/// announce its title before its content.
+fn resolved(a: &At) -> (i32, &'static str) {
     let entry = a.entry();
     if a.part == NO_PART && entry.flags.has(ColFlags::DIALOG) {
-        return roles::DIALOG_CONTROL_TYPE;
+        return (roles::DIALOG_CONTROL_TYPE, roles::DIALOG_NAME);
     }
     let parent = a
         .tree
@@ -448,11 +500,17 @@ fn control_type(a: &At) -> i32 {
     roles::control_type_in(a.role(), parent)
 }
 
-/// Returns the automation-id segment, widened only where a client asks for it.
+/// Returns the automation id, which is already in the pool as UTF-16.
 fn automation_id(a: &At) -> VARIANT {
-    a.tree
-        .key(a.at)
-        .map_or_else(variant::empty, |key| variant::wide(&wide(key)))
+    // A region part addresses its region's id plus its own sub, because the two are one
+    // element to a client and only the pair identifies it.
+    match a.part {
+        NO_PART => variant::wide(a.tree.key(a.at)),
+        part => variant::wide(&wide(&format!(
+            "{}.{part}",
+            String::from_utf16_lossy(a.tree.key(a.at))
+        ))),
+    }
 }
 
 /// Returns the element's bounding rectangle as a property, which is the same rectangle
@@ -460,6 +518,34 @@ fn automation_id(a: &At) -> VARIANT {
 fn bounding_rectangle(a: &At) -> VARIANT {
     let rect = a.rect();
     variant::rect_property(&[rect.left, rect.top, rect.width, rect.height])
+}
+
+/// Returns where this element sits among the siblings that share its role, and how many there
+/// are, which is what a reader announces as "two of three".
+///
+/// Only for an element that is one of a selection: every other element is one of a set of one,
+/// and reporting that says nothing and is read aloud anyway.
+fn set_place(a: &At) -> (VARIANT, VARIANT) {
+    let entry = a.entry();
+    if a.part != NO_PART || !a.tree.patterns(a.at).has(Patterns::SELECTION_ITEM) {
+        return (variant::empty(), variant::empty());
+    }
+    let mut place = 0;
+    let mut size = 0;
+    for child in children(&a.tree, entry.parent) {
+        let Some(sibling) = a.tree.at(child) else { continue };
+        if sibling.role != entry.role {
+            continue;
+        }
+        size += 1;
+        if child == a.at {
+            place = size;
+        }
+    }
+    match place {
+        0 => (variant::empty(), variant::empty()),
+        place => (variant::i4(place), variant::i4(size)),
+    }
 }
 
 /// Returns the run this element took its name from, where it took one.
@@ -526,7 +612,7 @@ fn pattern(element: &Element, id: PATTERNID) -> Result<IUnknown> {
         Some(part) => roles::row(part.role).patterns,
         None => at.tree.patterns(at.at),
     };
-    if wanted == roles::Patterns::NONE || !held.has(wanted) {
+    if wanted == Patterns::NONE || !held.has(wanted) {
         return Err(none());
     }
     at.shared.object(at.entry().id, at.part).cast()
@@ -742,11 +828,28 @@ vtable! {
         fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> { self.this.element_at(x, y)?.cast() }
         fn GetFocus(&self) -> Result<IRawElementProviderFragment> { self.this.focused()?.cast() }
     }
+    // Automation calls these on the fragment root alone, and only while a client is attached.
+    // The property ids are not read: this side folds a property change to one per element per
+    // tick already, so knowing which property a client wants would save nothing a raise costs.
+    IRawElementProviderAdviseEvents_Impl for Root_Impl {
+        fn AdviseEventAdded(&self, event: EVENTID, _: *const SAFEARRAY) -> Result<()> { advise(&self.this, event, true) }
+        fn AdviseEventRemoved(&self, event: EVENTID, _: *const SAFEARRAY) -> Result<()> { advise(&self.this, event, false) }
+    }
     IInvokeProvider_Impl for Element_Impl {
         fn Invoke(&self) -> Result<()> { self.command(Action::Invoke) }
     }
     IScrollItemProvider_Impl for Element_Impl {
         fn ScrollIntoView(&self) -> Result<()> { self.command(Action::Reveal) }
+    }
+    IScrollProvider_Impl for Element_Impl {
+        fn Scroll(&self, x: ScrollAmount, y: ScrollAmount) -> Result<()> { scroll_by(&self.this, x, y) }
+        fn SetScrollPercent(&self, x: f64, y: f64) -> Result<()> { scroll_to(&self.this, x, y) }
+        fn HorizontalScrollPercent(&self) -> Result<f64> { Ok(percent(&self.this)?.x.into()) }
+        fn VerticalScrollPercent(&self) -> Result<f64> { Ok(percent(&self.this)?.y.into()) }
+        fn HorizontalViewSize(&self) -> Result<f64> { Ok(view_size(&self.this)?.x.into()) }
+        fn VerticalViewSize(&self) -> Result<f64> { Ok(view_size(&self.this)?.y.into()) }
+        fn HorizontallyScrollable(&self) -> Result<BOOL> { Ok(BOOL::from(viewport(&self.this)?.0.travel().x > 0.0)) }
+        fn VerticallyScrollable(&self) -> Result<BOOL> { Ok(BOOL::from(viewport(&self.this)?.0.travel().y > 0.0)) }
     }
     IToggleProvider_Impl for Element_Impl {
         fn Toggle(&self) -> Result<()> { self.command(Action::Toggle) }
@@ -788,7 +891,101 @@ vtable! {
     }
 }
 
+/// Records a client subscribing to `event`, or dropping it.
+fn advise(root: &Root, event: EVENTID, added: bool) -> Result<()> {
+    let (shared, _) = root.window()?;
+    match added {
+        true => shared.advised.added(event),
+        false => shared.advised.removed(event),
+    }
+    Ok(())
+}
+
 // ── the readers the vtables delegate to ─────────────────────────────────────────
+
+/// Returns the container this element is, and the offset it stands at.
+fn viewport(element: &Element) -> Result<(ScrollView, Vector2)> {
+    let at = element.at()?;
+    at.tree.viewport(at.at).ok_or_else(none)
+}
+
+/// Returns how far along each axis the content stands, as a percentage, or
+/// [`NO_SCROLL`] for an axis that cannot move.
+fn percent(element: &Element) -> Result<Vector2> {
+    let (view, offset) = viewport(element)?;
+    let travel = view.travel();
+    let axis = |travel: f32, at: f32| {
+        if travel <= 0.0 {
+            NO_SCROLL
+        } else {
+            (at / travel).clamp(0.0, 1.0) * 100.0
+        }
+    };
+    Ok(Vector2 {
+        x: axis(travel.x, offset.x),
+        y: axis(travel.y, offset.y),
+    })
+}
+
+/// Returns how much of the content each axis shows, as a percentage. An axis showing all of
+/// its content shows a hundred percent of it, which is what a client reads as "no thumb".
+fn view_size(element: &Element) -> Result<Vector2> {
+    let (view, _) = viewport(element)?;
+    let axis = |view: f32, content: f32| {
+        if content <= 0.0 {
+            100.0
+        } else {
+            (view / content).clamp(0.0, 1.0) * 100.0
+        }
+    };
+    Ok(Vector2 {
+        x: axis(view.view.x, view.content.x),
+        y: axis(view.view.y, view.content.y),
+    })
+}
+
+/// Queues a move to a percentage along each axis. [`NO_SCROLL`] leaves that axis where it is,
+/// which is what the pattern defines it to mean.
+fn scroll_to(element: &Element, x: f64, y: f64) -> Result<()> {
+    let (view, offset) = viewport(element)?;
+    let travel = view.travel();
+    let axis = |percent: f64, travel: f32, at: f32| {
+        if percent == f64::from(NO_SCROLL) {
+            return Ok(at);
+        }
+        if !(0.0..=100.0).contains(&percent) {
+            return Err(invalid());
+        }
+        Ok((percent as f32 / 100.0) * travel)
+    };
+    let to = Vector2 {
+        x: axis(x, travel.x, offset.x)?,
+        y: axis(y, travel.y, offset.y)?,
+    };
+    element.command(|id| Action::ScrollTo(id, to.x, to.y))
+}
+
+/// Queues a move by one of the pattern's five amounts on each axis.
+///
+/// A large step is a page of the viewport and a small step a tenth of one, so what a client
+/// asks for moves the surface by what the surface itself shows.
+fn scroll_by(element: &Element, x: ScrollAmount, y: ScrollAmount) -> Result<()> {
+    let (view, offset) = viewport(element)?;
+    let travel = view.travel();
+    let axis = |amount: ScrollAmount, page: f32, travel: f32, at: f32| match amount {
+        ScrollAmount_LargeDecrement => at - page,
+        ScrollAmount_LargeIncrement => at + page,
+        ScrollAmount_SmallDecrement => at - page * SMALL_STEP,
+        ScrollAmount_SmallIncrement => at + page * SMALL_STEP,
+        _ => at,
+    }
+    .clamp(0.0, travel);
+    let to = Vector2 {
+        x: axis(x, view.view.x, travel.x, offset.x),
+        y: axis(y, view.view.y, travel.y, offset.y),
+    };
+    element.command(|id| Action::ScrollTo(id, to.x, to.y))
+}
 
 /// Returns whether the element reports itself toggled.
 fn toggle_state(element: &Element) -> Result<ToggleState> {
@@ -911,7 +1108,7 @@ fn value_text(element: &Element) -> Result<BSTR> {
     if let Some(range) = at.tree.range(at.at) {
         return Ok(BSTR::from(formatted(at.number()?, range.step)));
     }
-    Ok(variant::bstr(&at.name()))
+    Ok(variant::bstr(at.tree.shown(at.at)))
 }
 
 /// Returns whether the element refuses a write through the value pattern.

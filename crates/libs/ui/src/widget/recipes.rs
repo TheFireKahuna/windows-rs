@@ -221,10 +221,16 @@ pub fn flyout<'a>(ui: &'a mut Ui<'_>) -> Element<'a> {
     surface(ui, Elevation::Flyout, roles::SURFACE_FLYOUT)
 }
 
-/// A filled container with no padding and no elevation of its own.
+/// A filled container with no padding and no elevation of its own, stacking its children on
+/// the block axis.
+///
+/// Arranged rather than layered: a container that stretched every child over the same box
+/// would draw two runs on top of one another, and an author reaching for a plain filled box
+/// has said nothing about wanting that. A caller that does states it, with
+/// [`Element::layer`](crate::Element::layer) or [`Element::grid`](crate::Element::grid).
 pub fn box_<'a>(ui: &'a mut Ui<'_>) -> Element<'a> {
     let roles = roles::SURFACE[roles::SURFACE_PANEL as usize];
-    ui.node(Preset::Layer)
+    ui.node(Preset::Stack)
         .appearance(Chrome::new(roles, Metric::RadiusSurface))
 }
 

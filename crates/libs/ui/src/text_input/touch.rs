@@ -13,11 +13,43 @@ struct Pending {
     unread: bool,
 }
 
+/// Writes an occlusion into the window's mailbox and rings it, exactly as the system's own
+/// callback does.
+///
+/// The one seam a harness drives an occlusion through, because the production path is the
+/// thing under test: what a synthetic occlusion reaches is the same mailbox, the same
+/// doorbell and the same reveal.
+#[derive(Clone)]
+pub struct Occluder {
+    pending: Arc<Mutex<Pending>>,
+    hwnd: Hwnd,
+}
+
+impl Occluder {
+    /// Reports `docked` as the occlusion, or its absence, and rings the window once.
+    pub fn report(&self, docked: Option<Rect>) {
+        report(&self.pending, self.hwnd, docked);
+    }
+}
+
+/// Records one occlusion and rings the window if nothing has read the last one yet.
+fn report(pending: &Mutex<Pending>, hwnd: Hwnd, docked: Option<Rect>) {
+    let mut held = pending.lock().unwrap_or_else(|e| e.into_inner());
+    held.docked = docked;
+    if !core::mem::replace(&mut held.unread, true) {
+        hwnd.post(WM_FRAME, 0, 0);
+    }
+}
+
 pub(crate) struct Touch {
     view: Option<CoreInputView>,
     _framework: Option<CoreFrameworkInputView>,
     _subscription: Option<EventRevoker>,
     pending: Arc<Mutex<Pending>>,
+    /// Kept for the occlusion handle a harness reports through, which is what posts the
+    /// frame the report has to be seen on.
+    #[cfg(feature = "test-support")]
+    hwnd: Hwnd,
     /// The docked occlusion in client DIPs, or none while nothing docked occludes.
     pub docked: Option<Rect>,
 }
@@ -63,11 +95,7 @@ impl Touch {
                     };
                     docked = Some(docked.map_or(r, |old| old.union(r)));
                 }
-                let mut held = inbox.lock().unwrap_or_else(|e| e.into_inner());
-                held.docked = docked;
-                if !core::mem::replace(&mut held.unread, true) {
-                    hwnd.post(WM_FRAME, 0, 0);
-                }
+                report(&inbox, hwnd, docked);
             });
             probe("CoreFrameworkInputView.OcclusionsChanged", handler)
         });
@@ -76,6 +104,8 @@ impl Touch {
             _framework: framework,
             _subscription: subscription,
             pending,
+            #[cfg(feature = "test-support")]
+            hwnd,
             docked: None,
         }
     }
@@ -86,6 +116,15 @@ impl Touch {
         let changed = core::mem::take(&mut held.unread) && self.docked != held.docked;
         self.docked = held.docked;
         changed
+    }
+
+    /// Returns the handle a harness reports an occlusion through.
+    #[cfg(feature = "test-support")]
+    pub fn occluder(&self) -> Occluder {
+        Occluder {
+            pending: Arc::clone(&self.pending),
+            hwnd: self.hwnd,
+        }
     }
 
     /// Requests the primary input view for a touch press on a field.

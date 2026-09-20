@@ -33,7 +33,7 @@
 //! application constructs the [`Backends`] — on the scene thread, through the closure it hands
 //! over.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::*;
@@ -42,9 +42,7 @@ use windows_color::OutputTransform;
 use windows_core::{Error, Result};
 use windows_numerics::Vector2;
 use windows_scene::{BackdropSpec, Backends, Census, Env};
-use windows_window::{
-    CaptionHit, CaptionState, E_HANDLE, Handoff, WM_FRAME, Window, WindowBuilder,
-};
+use windows_window::{CaptionState, E_HANDLE, Handoff, WM_FRAME, Window, WindowBuilder};
 
 use crate::input::Report;
 use crate::role::{AccentId, Density, Palette, Scope};
@@ -52,12 +50,45 @@ use crate::seam::SceneTally;
 
 mod links;
 mod pass;
+mod reentry;
 #[cfg(feature = "test-support")]
 pub mod testing;
 mod tick;
 
 pub use crate::seam::AppCensus;
 use links::Links;
+use reentry::Reentry;
+
+/// The input pass, and the re-entrancy state the window procedure reads it through.
+///
+/// The tick is borrowed for the whole of a pass, and the system's nested pumps run inside one.
+/// Everything the procedure has to answer while a pass is on the stack — a frame wake, a
+/// pointer message, a removed key — is answered off [`Frame::phase`] and the doorbell instead,
+/// so no borrow decides whether an event is recorded.
+#[derive(Default)]
+struct Frame {
+    tick: RefCell<Option<tick::Tick>>,
+    phase: Reentry,
+}
+
+
+impl Frame {
+    /// Runs input passes until none is owed.
+    ///
+    /// A wake taken by a nested pump is recorded rather than dropped: the pass on the stack
+    /// sees it and runs again before it returns. A dropped wake leaves the gate its sender
+    /// closed latched shut, and the field that asked for it is never serviced.
+    ///
+    /// # Errors
+    ///
+    /// A pass failed. Whatever was still owed is abandoned with it.
+    fn run(&self) -> Result<()> {
+        self.phase.passes(|| match self.tick.borrow_mut().as_mut() {
+            Some(tick) => tick.run(&self.phase),
+            None => Ok(()),
+        })
+    }
+}
 
 /// The system's own questions this crate answers, by number. None of them has a constant in
 /// either binding filter.
@@ -139,7 +170,15 @@ impl UiRuntime {
         // exists, which is after the window whose handler reaches it. That handler holds a weak
         // reference: the tick owns the window, and two strong ones would be a cycle that never
         // lets either go.
-        let tick: Rc<RefCell<Option<tick::Tick>>> = Rc::default();
+        let frame: Rc<Frame> = Rc::default();
+        // Built before the window, because the procedure answers through it from the first
+        // message. What arrives before the router exists is recorded and consumed by the first
+        // pass.
+        let bell = Rc::new(crate::input::Doorbell::new());
+        let settings: Rc<Cell<bool>> = Rc::default();
+        // The one hit array, shared with the pass rather than owned by it: the caption's hit
+        // test is answered from the window procedure while a pass is on the stack.
+        let view = Rc::new(crate::input::HitView::default());
         // Posted whenever the system changes the client extent or the scale, and taken by the
         // next tick, which forwards what differs. A scale change carries nothing: the tick
         // re-reads the display. Hover and press over a window command land the same way,
@@ -160,36 +199,38 @@ impl UiRuntime {
             // Chained, so a caller's own handler survives being handed to this method and
             // answers first. Replacing it would discard it without a diagnostic.
             .chain_message({
-                let (tick, failed) = (Rc::downgrade(&tick), Rc::clone(&failed));
+                let (frame, failed) = (Rc::downgrade(&frame), Rc::clone(&failed));
                 let (uia, rescaled) = (Rc::clone(&uia), Rc::clone(&rescaled));
+                let (bell, settings) = (Rc::clone(&bell), Rc::clone(&settings));
                 move |_, msg, w, l| {
                     // The system's own questions, answered before the tick: a settings change
                     // and a move both re-read the display, `WM_GETOBJECT` is a synchronous
                     // cross-process call, and `WM_DESTROY` releases the provider while its
                     // handle is still valid.
                     match msg {
-                        WM_SETTINGCHANGE | WM_MOVE => rescaled.post(()),
+                        WM_SETTINGCHANGE => {
+                            settings.set(true);
+                            rescaled.post(());
+                        }
+                        WM_MOVE => rescaled.post(()),
                         WM_GETOBJECT => return uia.borrow_mut().get_object(w, l),
                         WM_DESTROY => uia.borrow_mut().detach(),
                         _ => {}
                     }
-                    let held = tick.upgrade()?;
-                    if msg == WM_FRAME {
-                        // A frame arriving while one is running is skipped rather than nested:
-                        // `try_borrow_mut` fails, and the pacer's gate reopens so the next
-                        // frame serves whatever this one missed.
-                        let mut slot = held.try_borrow_mut().ok()?;
-                        if let Some(Err(e)) = slot.as_mut().map(tick::Tick::run) {
-                            _ = failed.borrow_mut().get_or_insert(e);
-                            windows_window::quit();
-                        }
-                        return Some(0);
+                    // The doorbell answers without the tick, so a pointer or key message the
+                    // system's nested pump dispatches while a pass is on the stack is recorded
+                    // in the order it arrived rather than dropped for want of a borrow.
+                    if let Some(answer) = bell.wndproc(msg, w, l) {
+                        return Some(answer);
                     }
-                    // Removed-key pretranslation and the pointer doorbell both run inside the
-                    // system's nested pumps, so this answers through the same borrow the frame
-                    // takes and fails rather than nesting one inside the other.
-                    let mut slot = held.try_borrow_mut().ok()?;
-                    slot.as_mut()?.message(msg, w, l)
+                    if msg != WM_FRAME {
+                        return None;
+                    }
+                    if let Err(e) = frame.upgrade()?.run() {
+                        _ = failed.borrow_mut().get_or_insert(e);
+                        windows_window::quit();
+                    }
+                    Some(0)
                 }
             })
             .on_resize({
@@ -206,23 +247,41 @@ impl UiRuntime {
 
         uia.borrow_mut().attach(window.hwnd());
         let text = crate::text_input::TextInput::new(&window)?;
+        // The one seam a harness drives a docked occlusion through, published where the window's
+        // own text input is built so what it reaches is the production mailbox.
+        #[cfg(feature = "test-support")]
+        testing::publish_occluder(text.occluder());
         // Removed-key pretranslation also runs in the system's nested pumps. Drain earlier
         // discrete input before offering this key, so TSF sees the click or Tab's focus.
         // Release the tick before calling a TIP: it can synchronously enter our store.
         let key_filter = window.key_filter({
             let (held, failed, tsf) = (
-                Rc::downgrade(&tick),
+                Rc::downgrade(&frame),
                 Rc::clone(&failed),
                 Rc::clone(&text.tsf),
             );
             move |message| {
-                if let Some(cell) = held.upgrade()
-                    && let Ok(mut slot) = cell.try_borrow_mut()
-                    && let Some(Err(e)) = slot.as_mut().map(tick::Tick::run)
-                {
-                    _ = failed.borrow_mut().get_or_insert(e);
-                    windows_window::quit();
-                    return true;
+                let Some(frame) = held.upgrade() else {
+                    return false;
+                };
+                // The key is offered behind the input in front of it. Outside a pass that means
+                // running one, so an earlier click or Tab has moved focus; inside a pass that
+                // has already routed its input it means offering directly, which is the state
+                // every nested pump a text service, the clipboard or automation opens runs in.
+                //
+                // The remaining case is a pump opened before this pass routed anything, which
+                // no call-out of the pass can produce. It is answered rather than assumed away:
+                // the key is declined, and the message left in the queue reaches the router
+                // exactly once through `TranslateMessage` and the doorbell.
+                if !frame.phase.may_offer() {
+                    if frame.phase.running() {
+                        return false;
+                    }
+                    if let Err(e) = frame.run() {
+                        _ = failed.borrow_mut().get_or_insert(e);
+                        windows_window::quit();
+                        return true;
+                    }
                 }
                 tsf.filter(message)
             }
@@ -259,9 +318,11 @@ impl UiRuntime {
         }
         let app = pass::spawn_app(&links, mount, env, size, self.root_scope, window.watch()?)?;
 
-        *tick.borrow_mut() = Some(tick::Tick::new(
+        *frame.tick.borrow_mut() = Some(tick::Tick::new(
             &window,
             &links,
+            &bell,
+            &view,
             self.root_scope,
             tick::Handoffs {
                 text,
@@ -269,6 +330,7 @@ impl UiRuntime {
                 resized,
                 rescaled,
                 nonclient: Rc::clone(&nonclient),
+                settings,
                 wake: pacer.wake(),
             },
         )?);
@@ -278,16 +340,8 @@ impl UiRuntime {
         // second rect stated beside them. The result is discarded because a window with no
         // custom caption has no band to answer for.
         _ = window.on_caption_hit({
-            let held = Rc::downgrade(&tick);
-            move |x, y| {
-                // Fallible: a tick holds the frame while it runs, and a re-entrant question
-                // answers `Drag` rather than panicking in the window procedure.
-                let answer = held.upgrade().and_then(|held| {
-                    let slot = held.try_borrow().ok()?;
-                    slot.as_ref().map(|t| t.caption_hit(x, y))
-                });
-                answer.unwrap_or(CaptionHit::Drag)
-            }
+            let view = Rc::clone(&view);
+            move |x, y| view.caption_hit(x, y)
         });
         // Hover and press over a window command, which the router never sees: once the hit test
         // names one, its pointer stream is the system's. Posted here and forwarded by the tick,
@@ -313,7 +367,7 @@ impl UiRuntime {
         links.scene_bell.ring();
         _ = scene.join();
         drop(key_filter);
-        drop(tick);
+        drop(frame);
 
         links.failure()?;
         match failed.borrow_mut().take() {
@@ -336,10 +390,26 @@ pub struct Observed<'a> {
     pub census: Census,
     pub scene_wakes: u64,
     pub scene_applies: u64,
+    /// When the scene thread finished its last apply.
+    ///
+    /// The scene's own reading, carried down with its tallies, so the interval from an input to
+    /// the frame it produced is measured at the end that produced it.
+    pub scene_applied_at: Option<std::time::Instant>,
     /// The app thread's tallies as of its last batch.
     pub app: AppCensus,
     /// Input ticks so far, this one included.
     pub ticks: u64,
+    /// The focused field's box in screen pixels, or `None` while no field holds focus.
+    ///
+    /// The number an occlusion has to clear, read where the editor publishes it rather than
+    /// derived a second time from the array.
+    pub focused_field: Option<crate::layout::Rect>,
+    /// Shaped field geometries taken off the app thread's seam so far.
+    ///
+    /// One per field the app shaped, counted where the tick adopts them. A field the app left
+    /// alone publishes none, so the difference across a keystroke is how many fields that
+    /// keystroke reshaped.
+    pub field_shapes: u64,
 }
 
 thread_local! {
@@ -373,14 +443,24 @@ fn observed(seen: Observed<'_>) {
 }
 
 /// Reports the scene and app tallies the tick last took off its inbox.
-pub(crate) fn tallies(scene: SceneTally, app: AppCensus, reports: &[Report], ticks: u64) {
+pub(crate) fn tallies(
+    scene: SceneTally,
+    app: AppCensus,
+    reports: &[Report],
+    ticks: u64,
+    field_shapes: u64,
+    focused_field: Option<crate::layout::Rect>,
+) {
     observed(Observed {
         reports,
         census: scene.census,
         scene_wakes: scene.wakes,
         scene_applies: scene.applies,
+        scene_applied_at: scene.applied_at,
         app,
         ticks,
+        focused_field,
+        field_shapes,
     });
 }
 

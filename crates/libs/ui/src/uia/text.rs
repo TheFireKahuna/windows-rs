@@ -413,42 +413,50 @@ fn find_text(
 /// Returns the rectangles the range covers, in screen pixels.
 ///
 /// A static run is one line and one paint, so it is its own element's box. A document reports
-/// the clusters the shaper published, clipped to the field's own viewport: a scrolled-out run
-/// is behind the edit's edge, and a client drawing an unclipped rect would highlight the
+/// the clusters the shaper published, cut to the field's own reveal viewport: a scrolled-out
+/// run is behind the edit's edge, and a client drawing an unclipped rect would highlight the
 /// chrome.
+///
+/// Both are then cut by every clipping ancestor, through the same rule the element's own
+/// bounding rectangle is cut by, so a highlight and the box it sits in agree. A run a list has
+/// carried past its edge contributes no rectangle rather than one over whatever the list sits
+/// under.
 fn rectangles(range: &Range) -> Result<*mut SAFEARRAY> {
     let body = range.body()?;
     let at = body.tree.index_of(range.owner).ok_or_else(gone)?;
-    let element = At::of(&body.shared, &body.tree, at).rect();
+    let element = At::of(&body.shared, &body.tree, at);
+    let own = element.unclipped_box();
+    // Every box below is stated against the element's own uncut corner, so one closure carries
+    // it into the tree's space, cuts it and converts it once.
+    let emit = |x0: f32, y0: f32, x1: f32, y1: f32, out: &mut Vec<f64>| {
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let box_ = element.clipped([own[0] + x0, own[1] + y0, own[0] + x1, own[1] + y1]);
+        if box_[2] <= box_[0] || box_[3] <= box_[1] {
+            return;
+        }
+        let r = element.screen(box_);
+        out.extend_from_slice(&[r.left, r.top, r.width, r.height]);
+    };
+    let mut out = Vec::new();
     if !body.editable {
-        return Ok(variant::rect_array(&[
-            element.left,
-            element.top,
-            element.width,
-            element.height,
-        ]));
+        emit(0.0, 0.0, own[2] - own[0], own[3] - own[1], &mut out);
+        return Ok(variant::rect_array(&out));
     }
     let clusters = body.clusters.as_ref().ok_or_else(none)?;
-    let (_, scale) = body.tree.window();
     let mut boxes = Vec::new();
     clusters.rects(body.span.0..body.span.1, &mut boxes);
     if body.span.0 == body.span.1 {
         boxes.push(clusters.caret(Selection::at(body.span.0)));
     }
-    let mut out = Vec::with_capacity(boxes.len() * 4);
+    out.reserve(boxes.len() * 4);
     for box_ in boxes {
         let left = (box_.x + clusters.origin.x).max(clusters.viewport.x);
         let right =
             (box_.x + box_.w + clusters.origin.x).min(clusters.viewport.x + clusters.viewport.w);
-        if right < left {
-            continue;
-        }
-        out.extend_from_slice(&[
-            element.left + f64::from(left * scale),
-            element.top + f64::from((box_.y + clusters.origin.y) * scale),
-            f64::from((right - left) * scale),
-            f64::from(box_.h * scale),
-        ]);
+        let top = box_.y + clusters.origin.y;
+        emit(left, top, right, top + box_.h, &mut out);
     }
     Ok(variant::rect_array(&out))
 }
@@ -633,7 +641,7 @@ mod tests {
             })),
         });
 
-        let current = Arc::new(Tree::adopt(&snapshot));
+        let current = Arc::new(Tree::adopt(&snapshot, &[]));
         let shared = Arc::new(Shared::default());
         shared.tree.write(|held| *held = Arc::clone(&current));
         let range = Range::new(&shared, id, (0, 4));
@@ -649,7 +657,7 @@ mod tests {
         snapshot.fields[0].revision = 2;
         shared
             .tree
-            .write(|held| *held = Arc::new(Tree::adopt(&snapshot)));
+            .write(|held| *held = Arc::new(Tree::adopt(&snapshot, &[])));
         let stale = range.body().expect("the field is still published");
         assert!(
             range.walk(&stale, 0, TextUnit_Character, 1).is_err(),

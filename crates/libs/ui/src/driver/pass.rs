@@ -94,6 +94,9 @@ struct App {
     overlays: Overlays,
     /// Focus edits the overlay stack emitted since the last batch went out.
     focus: Vec<FocusOp>,
+    /// What controls did since the last batch went out, for automation to report. Empty while
+    /// no client is listening.
+    uia_intents: Vec<Intent>,
     /// A batch flushed into but not yet accepted by the scene thread's mailbox. The tree is
     /// not flushed again while one is held: a flush swaps the host's pending ops with the
     /// buffer it is given, so flushing into a full buffer would drop what it holds.
@@ -168,6 +171,7 @@ where
                     root: Some(root),
                     overlays: Overlays::new(),
                     focus: Vec::new(),
+                    uia_intents: Vec::new(),
                     held: None,
                     owed: false,
                     woken,
@@ -288,6 +292,12 @@ impl App {
         // After the front table has consumed them, which it did on the scene thread before
         // they were forwarded: the press that opens an overlay here has already lit its button.
         Host::dispatch(&up.intents);
+        // A client is owed the number a drag settled on and the fact that an action completed,
+        // and neither restales the tree. Collected only while one is listening, so a drag with
+        // nothing attached copies nothing.
+        if self.links.uia_listening.load(Acquire) {
+            self.uia_intents.extend_from_slice(&up.intents);
+        }
         // Overlay scopes turn Escape into their own report before it reaches this fallback, so
         // one press closes the overlay or the screen's inspector.
         for report in &up.reports {
@@ -343,6 +353,7 @@ impl App {
             }
         });
         down.declared.focus.append(&mut self.focus);
+        down.declared.intents.append(&mut self.uia_intents);
         if down.is_empty() {
             _ = self.links.down.give(down);
             return;
@@ -707,8 +718,13 @@ impl SceneThread {
             &mut front,
         )?;
         self.scrolls.apply_ops(&mut down.scrolls);
+        // A restated geometry replaces the map the thumb is bound through, so a container
+        // holding an occlusion's extent is bound again from the extended one. Here, because the
+        // patch that restated it has just been applied.
+        self.scrolls.rebind_extents(&mut front)?;
         self.caption = down.declared.caption;
         self.tally.applies += 1;
+        self.tally.applied_at = Some(std::time::Instant::now());
         self.applied = true;
         self.links.first_patch.signal();
 
@@ -783,6 +799,14 @@ impl SceneThread {
         // intent causes a visual: by the time one exists, the visual has happened.
         self.controls
             .tick(&to.reports, &mut front, &mut self.up.intents)?;
+        // A container's own move, before the controls see the batch: nothing in the front table
+        // knows what a viewport is, and the two never name the same control.
+        for action in &to.automation {
+            if let crate::uia::Action::ScrollTo(id, x, y) = *action {
+                self.scrolls
+                    .scroll_to(id, Vector2 { x, y }, &mut front)?;
+            }
+        }
         self.controls
             .automation(&to.automation, &mut front, &mut self.up.intents)?;
         for &reveal in &to.reveals {

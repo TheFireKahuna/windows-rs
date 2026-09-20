@@ -5,6 +5,7 @@
 //! message pump or a COM apartment.
 
 use super::*;
+use super::snapshot::FieldText;
 use crate::counting::allocations;
 use crate::widget::{Range, UiaRole};
 use core::sync::atomic::Ordering::Relaxed;
@@ -117,10 +118,95 @@ impl Screen {
         at
     }
 
+    /// Adds an editable field under `parent` and returns its index.
+    ///
+    /// `text` is shaped into one cluster per character, each `advance` wide and as tall as the
+    /// field, so a supplementary character is one cluster over two code units and a cluster
+    /// walk is distinguishable from a code-unit walk. The field's viewport is its own box, so
+    /// nothing is cut by the reveal.
+    pub(super) fn field(
+        &mut self,
+        parent: u16,
+        rect: (f32, f32, f32, f32),
+        text: &str,
+        advance: f32,
+    ) -> u16 {
+        let at = self.add(parent, rect, UiaRole::Edit, "value");
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let height = rect.3 - rect.1;
+        let mut clusters = Vec::new();
+        let mut start = 0u32;
+        for (index, ch) in text.chars().enumerate() {
+            let end = start + ch.len_utf16() as u32;
+            let x = index as f32 * advance;
+            clusters.push(crate::text_input::Cluster {
+                start,
+                end,
+                rect: windows_text::Rect {
+                    x,
+                    y: 0.0,
+                    w: advance,
+                    h: height,
+                },
+                leading: x,
+                trailing: x + advance,
+            });
+            start = end;
+        }
+        self.snapshot.entries[at as usize].flags =
+            self.snapshot.entries[at as usize].flags | ColFlags::BODY | ColFlags::FIELD;
+        self.snapshot.fields.push(FieldText {
+            id: self.minted[at as usize],
+            revision: 1,
+            text: units.into(),
+            selection: crate::text_input::Selection::default(),
+            geometry: Some(Arc::new(crate::text_input::Geometry {
+                revision: 1,
+                clusters: clusters.into(),
+                viewport: windows_text::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: rect.2 - rect.0,
+                    h: height,
+                },
+                ..crate::text_input::Geometry::default()
+            })),
+            password: false,
+        });
+        at
+    }
+
+    /// Replaces the published text of the field at `at`, advancing its revision.
+    pub(super) fn retype(&mut self, at: u16, text: &str) {
+        let id = self.minted[at as usize];
+        let units: Vec<u16> = text.encode_utf16().collect();
+        if let Some(field) = self.snapshot.fields.iter_mut().find(|f| f.id == id) {
+            field.revision += 1;
+            field.text = units.into();
+            if let Some(geometry) = field.geometry.as_mut() {
+                Arc::make_mut(geometry).revision = field.revision;
+            }
+        }
+    }
+
+    /// Moves the published selection of the field at `at`.
+    pub(super) fn reselect(&mut self, at: u16, anchor: u32, caret: u32) {
+        let id = self.minted[at as usize];
+        if let Some(field) = self.snapshot.fields.iter_mut().find(|f| f.id == id) {
+            field.selection = crate::text_input::Selection {
+                anchor,
+                caret,
+                ..crate::text_input::Selection::default()
+            };
+        }
+    }
+
     /// Records that the elements in `rows` are clipped by `container` and scroll with `node`.
     pub(super) fn scrolls(&mut self, container: u16, node: NodeId, rows: &[u16]) {
         let row = self.snapshot.scrolls.len() as u16;
-        self.snapshot.scrolls.push(node);
+        self.snapshot
+            .scrolls
+            .push(ScrollView::new(node, container));
         self.entries[container as usize].flags =
             self.entries[container as usize].flags | HitFlags::SCROLL | HitFlags::CLIP;
         for &at in rows {
@@ -274,6 +360,7 @@ fn a_republish_carries_state_forward_rather_than_resetting_it() {
     uia.set_state(toggle_id, State::TOGGLED, true);
     uia.set_value(slider_id, -6.0);
 
+
     // A resize: the same controls in different boxes, with one new element ahead of them so
     // their indices move. The rows carry their own ids, so nothing is re-interned by hand.
     let mut resized = Screen::new();
@@ -285,6 +372,11 @@ fn a_republish_carries_state_forward_rather_than_resetting_it() {
         let at = resized.add(NONE, rect, UiaRole::CheckBox, "carried");
         resized.snapshot.entries[at as usize].id = id;
         resized.entries[at as usize].id = id;
+        // The walk derives model state from the application's own rows, so a publish always
+        // states it; the fixture states what a walk over an unchanged model would.
+        if id == toggle_id {
+            resized.snapshot.state[at as usize] = State::ENABLED | State::TOGGLED;
+        }
     }
     resized.publish(&mut uia);
 
@@ -295,8 +387,37 @@ fn a_republish_carries_state_forward_rather_than_resetting_it() {
         tree.state(toggle_at).has(State::TOGGLED),
         "a resize is not a reset"
     );
-    assert_eq!(tree.value(slider_at), Some(-6.0));
+    assert_eq!(
+        tree.value(slider_at),
+        Some(-6.0),
+        "a value the publish left unstated was dropped"
+    );
     assert_ne!(toggle_at, 0, "and the indices really did move");
+}
+
+/// What the publish states about model state replaces what the tree before it held.
+///
+/// The walk derives enabled, toggled, selected and expanded from the application's own rows,
+/// so a carry would report a switch at the position the user has just flipped it from.
+#[test]
+fn a_publish_states_model_state_rather_than_inheriting_it() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let toggle = screen.add(NONE, (0.0, 0.0, 80.0, 32.0), UiaRole::CheckBox, "bypass");
+    screen.snapshot.state[toggle as usize] = State::ENABLED | State::TOGGLED;
+    screen.publish(&mut uia);
+    let id = screen.control(toggle);
+    assert!(uia.tree().state(0).has(State::TOGGLED));
+
+    let mut next = screen.successor();
+    let at = next.add(NONE, (0.0, 0.0, 80.0, 32.0), UiaRole::CheckBox, "bypass");
+    next.snapshot.entries[at as usize].id = id;
+    next.entries[at as usize].id = id;
+    next.publish(&mut uia);
+    assert!(
+        !uia.tree().state(0).has(State::TOGGLED),
+        "the tree reported the switch at the position it was flipped from"
+    );
 }
 
 #[test]
@@ -546,6 +667,7 @@ fn a_moving_region_changes_its_parts_and_not_the_tree() {
         geometry: Arc::clone(&geometry),
         parts: vec![PartDecl::new(0, "Low band", UiaRole::Slider)],
         values: None,
+        value: None,
     });
     let publish_at = |x: f32| {
         geometry.publish(&[windows_present::Part {
@@ -604,6 +726,7 @@ fn re_joining_a_moving_region_allocates_nothing() {
             PartDecl::new(1, "Mid band", UiaRole::Slider),
         ],
         values: Some(Arc::clone(&levels)),
+        value: None,
     });
     let publish_at = |x: f32| {
         geometry.publish(&[
@@ -672,4 +795,231 @@ fn a_publish_allocates_a_bounded_amount_and_an_idle_window_allocates_none() {
         uia.set_window(Vector2 { x: 1.0, y: 2.0 }, 1.0);
     }
     assert_eq!(allocations() - before, 0);
+}
+
+/// A text change, a selection change and the structure change they arrived with are raised in
+/// the order a client has to read them in: what the value became, then that its text changed,
+/// then that its selection did, then that the tree was replaced.
+///
+/// The values are read at raise time, so the rows carry only where each came from.
+#[test]
+fn a_fields_text_selection_and_structure_events_are_raised_in_that_order() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let field = screen.field(NONE, (0.0, 0.0, 120.0, 24.0), "ab", 8.0);
+    screen.publish(&mut uia);
+    let mut raised = Vec::new();
+    uia.take_pending_for_test(&mut raised);
+    raised.clear();
+
+    screen.retype(field, "abc");
+    screen.reselect(field, 3, 3);
+    screen.publish(&mut uia);
+
+    uia.take_pending_for_test(&mut raised);
+    let id = screen.control(field);
+    assert_eq!(
+        raised,
+        vec![
+            Raise::Property(id, Property::Text, Val::Text(utf16("ab").into())),
+            Raise::text_changed(id),
+            Raise::selection_changed(id),
+            Raise::Structure,
+        ]
+    );
+}
+
+/// A password field publishes no text and no selection, so it owes neither event.
+#[test]
+fn a_password_field_raises_no_text_or_selection_event() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let field = screen.field(NONE, (0.0, 0.0, 120.0, 24.0), "ab", 8.0);
+    screen.snapshot.fields[0].password = true;
+    screen.publish(&mut uia);
+    let mut raised = Vec::new();
+    uia.take_pending_for_test(&mut raised);
+    raised.clear();
+
+    screen.retype(field, "abc");
+    screen.reselect(field, 3, 3);
+    screen.publish(&mut uia);
+
+    uia.take_pending_for_test(&mut raised);
+    assert_eq!(raised, vec![Raise::Structure]);
+}
+
+/// A control's number is what the publish states, not what the tree before it announced.
+///
+/// Without this a slider a client had just written would read back whatever the previous tree
+/// happened to hold, which is a number and therefore indistinguishable from the truth.
+#[test]
+fn a_publish_states_where_a_control_stands() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let slider = screen.slider(NONE, (0.0, 0.0, 100.0, 24.0), Range::new(-24.0, 24.0));
+    screen.snapshot.values.push((slider, 6.0));
+    screen.publish(&mut uia);
+    assert_eq!(uia.tree().value(slider), Some(6.0));
+
+    // A republish that states a different number replaces it rather than carrying the old one.
+    let mut next = screen.successor();
+    let slider = next.slider(NONE, (0.0, 0.0, 100.0, 24.0), Range::new(-24.0, 24.0));
+    next.snapshot.values.push((slider, -3.0));
+    next.publish(&mut uia);
+    assert_eq!(uia.tree().value(slider), Some(-3.0));
+}
+
+/// A pattern with nothing behind it is not advertised.
+///
+/// A graph that reports no number would answer `Minimum` with a failure and `Value` with its
+/// own name, and a client cannot tell either from an answer.
+#[test]
+fn a_pattern_with_no_data_behind_it_is_not_advertised() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let graph = screen.add(NONE, (0.0, 0.0, 100.0, 24.0), UiaRole::Graph, "spectrum");
+    let slider = screen.slider(NONE, (0.0, 24.0, 100.0, 48.0), Range::new(0.0, 1.0));
+    screen.publish(&mut uia);
+
+    let patterns = uia.tree().patterns(graph);
+    assert!(!patterns.has(Patterns::RANGE), "a graph with no bounds offered RangeValue");
+    assert!(!patterns.has(Patterns::VALUE), "a graph with no number offered Value");
+    assert!(uia.tree().patterns(slider).has(Patterns::RANGE));
+    assert!(uia.tree().patterns(slider).has(Patterns::VALUE));
+}
+
+/// Every element carries an automation id, and elements that share a name are still apart.
+#[test]
+fn every_element_is_addressable() {
+    let mut screen = Screen::new();
+    let card = screen.add(NONE, (0.0, 0.0, 100.0, 60.0), UiaRole::Group, "Gain");
+    let inside = screen.add(card, (0.0, 0.0, 20.0, 20.0), UiaRole::Button, "Expand");
+    let other = screen.add(NONE, (0.0, 60.0, 100.0, 120.0), UiaRole::Group, "Gain");
+    let twin = screen.add(other, (0.0, 60.0, 20.0, 80.0), UiaRole::Button, "Expand");
+    let mut seen = Vec::new();
+    derive_keys(&mut screen.snapshot, &mut seen);
+    let tree = Tree::adopt(&screen.snapshot, &[]);
+
+    let key = |at: u16| String::from_utf16_lossy(tree.key(at));
+    assert_eq!(key(card), "gain");
+    assert_eq!(key(inside), "gain.expand");
+    assert_eq!(key(other), "gain#2", "two groups with one name were not told apart");
+    assert_eq!(
+        key(twin), "gain.expand#2",
+        "a control's id must not depend on which of two identical cards it sits in being first"
+    );
+}
+
+/// A scroll container reports how far its content can travel and how much of it is shown.
+#[test]
+fn a_container_reports_what_it_scrolls() {
+    let mut screen = Screen::new();
+    let viewport = screen.add(NONE, (0.0, 0.0, 100.0, 100.0), UiaRole::Group, "chain");
+    screen.snapshot.entries[viewport as usize].flags =
+        screen.snapshot.entries[viewport as usize].flags | ColFlags::SCROLLS;
+    screen.snapshot.scrolls.push(ScrollView {
+        node: NodeId::FIRST,
+        owner: viewport,
+        view: Vector2 { x: 100.0, y: 100.0 },
+        content: Vector2 { x: 100.0, y: 400.0 },
+    });
+    let tree = Tree::adopt(&screen.snapshot, &[]);
+
+    assert!(tree.patterns(viewport).has(Patterns::SCROLL));
+    let (view, offset) = tree.viewport(viewport).expect("the container is a row");
+    assert_eq!(view.travel().y, 300.0);
+    assert_eq!(view.travel().x, 0.0, "an axis with no overflow does not travel");
+    assert_eq!(offset.y, 0.0);
+
+    tree.set_scroll(NodeId::FIRST, Vector2 { x: 0.0, y: 150.0 });
+    assert_eq!(tree.viewport(viewport).expect("still a row").1.y, 150.0);
+}
+
+/// A container's reported position is the tracker's own word, not a copy taken at the publish.
+///
+/// The front thread does not tick while a flick settles, so a copy would leave every rectangle
+/// inside the container at where the content was when the last contact ended.
+#[test]
+fn a_container_reports_where_its_content_is_now() {
+    let mut screen = Screen::new();
+    let viewport = screen.add(NONE, (0.0, 0.0, 100.0, 100.0), UiaRole::Group, "chain");
+    screen.snapshot.scrolls.push(ScrollView {
+        node: NodeId::FIRST,
+        owner: viewport,
+        view: Vector2 { x: 100.0, y: 100.0 },
+        content: Vector2 { x: 100.0, y: 400.0 },
+    });
+    let shadow = Arc::new(AtomicU64::new(0));
+    let tree = Tree::adopt(&screen.snapshot, &[(NodeId::FIRST, Arc::clone(&shadow))]);
+
+    shadow.store(windows_scene::pack_offset(0.0, 90.0), Relaxed);
+    assert_eq!(
+        tree.viewport(viewport).expect("the container is a row").1.y,
+        90.0,
+        "the tree read a copy rather than the tracker's word"
+    );
+}
+
+/// An overlay opening and closing is what a client is told, and a close names the root.
+///
+/// Derived from the published trees, so a menu dismissed by a press outside — which tells the
+/// layer that opened it nothing — still reaches a client.
+#[test]
+fn an_overlay_opening_and_closing_is_raised() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    screen.add(NONE, (0.0, 0.0, 200.0, 40.0), UiaRole::Button, "Pick");
+    screen.publish(&mut uia);
+    let mut raised = Vec::new();
+    uia.take_pending_for_test(&mut raised);
+
+    // The menu arrives as a root of its own, which is the shape a slot root publishes in.
+    let mut open = screen.successor();
+    open.add(NONE, (0.0, 0.0, 200.0, 40.0), UiaRole::Button, "Pick");
+    let menu = open.add(NONE, (0.0, 40.0, 200.0, 120.0), UiaRole::Menu, "");
+    open.snapshot.entries[menu as usize].flags =
+        open.snapshot.entries[menu as usize].flags | ColFlags::OVERLAY;
+    let menu_id = open.control(menu);
+    open.publish(&mut uia);
+    raised.clear();
+    uia.take_pending_for_test(&mut raised);
+    assert!(
+        raised.contains(&Raise::menu_opened(menu_id)),
+        "a menu opened without saying so: {raised:?}"
+    );
+
+    let mut shut = open.successor();
+    shut.add(NONE, (0.0, 0.0, 200.0, 40.0), UiaRole::Button, "Pick");
+    shut.publish(&mut uia);
+    raised.clear();
+    uia.take_pending_for_test(&mut raised);
+    assert!(
+        raised.contains(&Raise::menu_closed(ControlId::NONE)),
+        "a menu closed without saying so: {raised:?}"
+    );
+}
+
+/// An event nobody advised is not raised, and an empty table admits everything.
+///
+/// Two clients advising one event and one of them leaving must not silence it for the other,
+/// which is why the table counts rather than holds a set.
+#[test]
+fn an_event_nobody_advised_is_not_raised() {
+    let advised = events::Advised::default();
+    assert!(advised.wanted_for_test(1), "an empty table admitted nothing");
+
+    advised.added(1);
+    assert!(advised.wanted_for_test(1));
+    assert!(!advised.wanted_for_test(2), "an event nobody asked for was raised");
+
+    advised.added(1);
+    advised.removed(1);
+    assert!(advised.wanted_for_test(1), "one client leaving silenced the other");
+    advised.removed(1);
+    assert!(advised.wanted_for_test(2), "a table emptied again admitted nothing");
+}
+
+fn utf16(text: &str) -> Vec<u16> {
+    text.encode_utf16().collect()
 }

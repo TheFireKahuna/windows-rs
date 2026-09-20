@@ -9,9 +9,10 @@ use crate::bindings::{
     UIA_CustomControlTypeId, UIA_EditControlTypeId, UIA_ExpandCollapsePatternId,
     UIA_GroupControlTypeId, UIA_InvokePatternId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
     UIA_MenuControlTypeId, UIA_MenuItemControlTypeId, UIA_ProgressBarControlTypeId,
-    UIA_RadioButtonControlTypeId, UIA_RangeValuePatternId, UIA_ScrollItemPatternId,
+    UIA_RadioButtonControlTypeId, UIA_RangeValuePatternId, UIA_ScrollItemPatternId, UIA_ScrollPatternId,
     UIA_SelectionItemPatternId, UIA_SelectionPatternId, UIA_SliderControlTypeId,
-    UIA_TextControlTypeId, UIA_TextPatternId, UIA_TogglePatternId, UIA_ValuePatternId,
+    UIA_TextControlTypeId, UIA_TextPatternId, UIA_TogglePatternId, UIA_ToolTipControlTypeId,
+    UIA_ValuePatternId,
     UIA_WindowControlTypeId,
 };
 use crate::widget::UiaRole;
@@ -31,6 +32,7 @@ impl Patterns {
     pub const EXPAND: Self = Self(1 << 6);
     pub const SCROLL_ITEM: Self = Self(1 << 7);
     pub const TEXT: Self = Self(1 << 8);
+    pub const SCROLL: Self = Self(1 << 9);
 
     /// Returns whether every pattern in `other` is in this set.
     #[must_use]
@@ -86,7 +88,7 @@ const P: Patterns = Patterns::NONE;
 /// `UiaRole` is fieldless and its variants carry no explicit discriminant, so a role's
 /// position in that declaration is its index here, and `every_role_has_its_own_row` is what
 /// holds the two orders together.
-static ROWS: [Row; 13] = [
+static ROWS: [Row; 14] = [
     // None — never published; present so the table is total over the enum.
     Row::new(UIA_CustomControlTypeId, "", P, false),
     // A static run publishes its body as a text document, so it can be read, selected and
@@ -155,6 +157,9 @@ static ROWS: [Row; 13] = [
         P.or(Patterns::VALUE).or(Patterns::RANGE),
         true,
     ),
+    // Content, because a description is what a reader is meant to hear; the element it
+    // describes carries the same words as its help text.
+    Row::new(UIA_ToolTipControlTypeId, "tooltip", P, true),
 ];
 
 /// Returns the row for `role`.
@@ -163,23 +168,31 @@ pub fn row(role: UiaRole) -> &'static Row {
     &ROWS[role as usize]
 }
 
-/// Returns the control type `role` reports inside `parent`.
+/// Returns the control type `role` reports inside `parent`, and the name it is spoken by.
 ///
 /// A button is a menu item inside a menu and a list item inside a list, because the same
 /// widget is authored for either container. Every other pairing reports the role's own
 /// control type.
+///
+/// Both together, because they are two statements about one element: reporting the type of a
+/// menu item while calling it a button is what a reader announces, and nothing downstream
+/// would catch the two having been resolved apart.
 #[must_use]
-pub fn control_type_in(role: UiaRole, parent: UiaRole) -> i32 {
+pub fn control_type_in(role: UiaRole, parent: UiaRole) -> (i32, &'static str) {
     match (parent, role) {
-        (UiaRole::Menu, UiaRole::Button) => UIA_MenuItemControlTypeId,
-        (UiaRole::List, UiaRole::Button) => UIA_ListItemControlTypeId,
-        _ => row(role).control_type,
+        (UiaRole::Menu, UiaRole::Button) => (UIA_MenuItemControlTypeId, "menu item"),
+        (UiaRole::List, UiaRole::Button) => (UIA_ListItemControlTypeId, "list item"),
+        _ => {
+            let row = row(role);
+            (row.control_type, row.localized)
+        }
     }
 }
 
 /// The control type a popup reports, which makes a reader announce its title before its
-/// content.
+/// content, and the name it is spoken by.
 pub const DIALOG_CONTROL_TYPE: i32 = UIA_WindowControlTypeId;
+pub const DIALOG_NAME: &str = "dialog";
 
 /// Returns the mask bit standing for automation's pattern `id`, as `GetPatternProvider`
 /// needs it, or [`Patterns::NONE`] for a pattern this stack does not answer.
@@ -194,6 +207,7 @@ pub fn pattern_of(id: i32) -> Patterns {
         UIA_SelectionItemPatternId => Patterns::SELECTION_ITEM,
         UIA_ExpandCollapsePatternId => Patterns::EXPAND,
         UIA_ScrollItemPatternId => Patterns::SCROLL_ITEM,
+        UIA_ScrollPatternId => Patterns::SCROLL,
         UIA_TextPatternId => Patterns::TEXT,
         _ => Patterns::NONE,
     }
@@ -221,6 +235,7 @@ mod tests {
             UiaRole::Menu,
             UiaRole::ProgressBar,
             UiaRole::Graph,
+            UiaRole::ToolTip,
         ];
         assert_eq!(all.len(), ROWS.len(), "a role was added without a row");
         for (at, role) in all.into_iter().enumerate() {
@@ -237,11 +252,11 @@ mod tests {
     fn a_menu_row_is_a_menu_item_and_a_loose_button_is_a_button() {
         assert_eq!(
             control_type_in(UiaRole::Button, UiaRole::Menu),
-            UIA_MenuItemControlTypeId
+            (UIA_MenuItemControlTypeId, "menu item")
         );
         assert_eq!(
             control_type_in(UiaRole::Button, UiaRole::Group),
-            UIA_ButtonControlTypeId
+            (UIA_ButtonControlTypeId, "button")
         );
     }
 

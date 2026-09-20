@@ -25,6 +25,8 @@ pub(crate) struct Walk<'a> {
     pub text: &'a Table,
     pub handlers: &'a HandlerTable,
     pub fields: &'a Slots<CONTROL, field::Row>,
+    /// The overlays standing, so a control with one open on it reports itself expanded.
+    pub overlays: &'a [super::host::Placement],
 }
 
 /// What the walk writes. The automation half is absent on a pass no provider asked for.
@@ -138,10 +140,19 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
     // Pushed after this node's own rows: a viewport's own box is not resolved through its own
     // offset, only its descendants' are.
     if flags & tree::SCROLL != 0 {
+        // The container's own entry, where it published one: `emit_uia` ran a moment ago and
+        // pushed it at this depth, so the scroll pattern hangs on the element the viewport is
+        // rather than on a second one invented for it.
+        let owner = out
+            .hits
+            .uia
+            .last()
+            .filter(|&&(held, _)| held == depth)
+            .map_or(crate::uia::NONE, |&(_, at)| at);
         let at = match out.uia.as_deref_mut() {
             Some(uia) => {
                 let at = uia.scrolls.len() as u16;
-                uia.scrolls.push(node);
+                uia.scrolls.push(crate::uia::ScrollView::new(node, owner));
                 at
             }
             None => crate::uia::NONE,
@@ -204,7 +215,9 @@ fn emit_hit(
 
 /// Emits one node's automation element.
 ///
-/// A node whose control carries no role is skipped and its children reparent past it.
+/// A node whose control carries neither a role nor a name is skipped and its children reparent
+/// past it. A named one with no role is a group, so a name an author wrote is never dropped
+/// on its way to a client.
 fn emit_uia(
     walk: &Walk<'_>,
     out: &mut Out<'_>,
@@ -215,15 +228,26 @@ fn emit_uia(
     control: ControlId,
 ) {
     let Some(row) = walk.controls.get(control) else { return };
-    if row.uia == UiaRole::None {
-        return;
-    }
+    let role = match row.uia {
+        UiaRole::None if row.name.is_some() => UiaRole::Group,
+        UiaRole::None => return,
+        role => role,
+    };
     let decl = HitFlags::from_bits(tree::unpack_decl(node_flags));
-    let name = row
-        .name
-        .as_deref()
-        .or_else(|| row.text.and_then(|key| walk.text.str_of(key)))
-        .unwrap_or_default();
+    let run = row.text.and_then(|key| walk.text.str_of(key));
+    let name = row.name.as_deref().or(run).unwrap_or_default();
+    // A control that is labelled and also shows a run reports that run as its value: a combo
+    // box is named "Output endpoint" and shows the endpoint. Only where the role carries the
+    // value pattern, so a named button interns nothing.
+    let shown = run
+        .filter(|run| {
+            row.name.is_some()
+                && !run.is_empty()
+                && *run != name
+                && crate::uia::roles::row(role)
+                    .patterns
+                    .has(crate::uia::Patterns::VALUE)
+        });
     // Read untracked: this runs inside a flush, and subscribing whatever effect is on the
     // stack would rebuild a screen when a tip changed.
     // A validation message is the help while it stands; the tip is the help otherwise.
@@ -243,12 +267,18 @@ fn emit_uia(
     // The editable body is a row of its own rather than a run in the pool, because the input
     // stack owns the text and automation reads the same UTF-16 buffer it does.
     let field = walk.fields.get(control);
-    let range = row.value.map(|value| Range {
-        min: value.min,
-        max: value.min + value.span,
-        step: f64::from(value.step),
-        vertical: row.front.flags & flag::VERTICAL != 0,
-    });
+    // A control with no span carries no number: every driven control holds a value row, and a
+    // toggle's is the degenerate one its fraction is published through. Reporting that as a
+    // range would advertise `RangeValue` over nothing and announce a switch as a number.
+    let range = row
+        .value
+        .filter(|value| value.span != 0.0)
+        .map(|value| Range {
+            min: value.min,
+            max: value.min + value.span,
+            step: f64::from(value.step),
+            vertical: row.front.flags & flag::VERTICAL != 0,
+        });
     let mut flags = ColFlags::NONE;
     if decl.contains(HitFlags::INTERACTIVE) {
         flags = flags | ColFlags::FOCUSABLE;
@@ -256,20 +286,29 @@ fn emit_uia(
     if field.is_some() {
         flags = flags | ColFlags::FIELD;
     }
-    if node_flags & tree::POPUP != 0 {
-        flags = flags | ColFlags::DIALOG;
+    // The overlay itself, not the control it opened from: a dialog is what a reader announces
+    // title-first, and announcing the button that opens one that way names the wrong thing.
+    if let Some(kind) = row.overlay {
+        flags = flags | ColFlags::OVERLAY;
+        if kind == crate::overlay::Kind::Popup {
+            flags = flags | ColFlags::DIALOG;
+        }
     }
-    if row.uia == UiaRole::Text {
+    if node_flags & tree::SCROLL != 0 {
+        flags = flags | ColFlags::SCROLLS;
+    }
+    if role == UiaRole::Text {
         flags = flags | ColFlags::BODY;
     }
     if range.is_some() {
         flags = flags | ColFlags::RANGED;
     }
+    if shown.is_some() {
+        flags = flags | ColFlags::SHOWN;
+    }
     // Selection the role does not already imply: a list row and a tab answer `SelectionItem`,
     // and a check box and a radio button answer it through their role instead.
-    if row.state == ModelState::Selected
-        && !matches!(row.uia, UiaRole::CheckBox | UiaRole::RadioButton)
-    {
+    if row.selectable && !matches!(role, UiaRole::CheckBox | UiaRole::RadioButton) {
         flags = flags | ColFlags::SELECTS;
     }
     match walk.tree.live_bits(node_flags) {
@@ -287,6 +326,7 @@ fn emit_uia(
     let Out { uia, scratch, .. } = out;
     let uia = uia.as_deref_mut().expect("the caller asked for automation rows");
     let name = uia.intern(name);
+    let shown = shown.map(|run| uia.intern(run));
     let help = has_help.then(|| uia.intern(scratch));
     let at = uia.entries.len() as u16;
     uia.entries.push(Entry {
@@ -299,21 +339,45 @@ fn emit_uia(
         clip,
         scroll,
         flags,
-        role: row.uia,
+        role,
     });
+    // A check box reports the same fact as a toggle and every other role as a selection, so a
+    // reader hears "checked" or "3 of 5" rather than silence.
+    let selected = row.state == ModelState::Selected;
+    let chosen = match (selected, role) {
+        (false, _) => State::default(),
+        (true, UiaRole::CheckBox) => State::TOGGLED,
+        (true, _) => State::SELECTED,
+    };
+    // A control with its flyout standing is expanded, read from the overlay stack rather than
+    // recorded when it opened: the two would otherwise have to be kept in step, and a menu
+    // dismissed by a press outside closes without telling the control it opened from.
+    let expanded = walk
+        .overlays
+        .iter()
+        .any(|placement| placement.invoker == Some(control));
     uia.state.push(match row.state {
-        ModelState::Rest => State::ENABLED,
-        ModelState::Selected => State::ENABLED | State::SELECTED,
-        ModelState::Disabled => State::default(),
-    });
+        ModelState::Disabled => chosen,
+        _ => State::ENABLED | chosen,
+    } | if expanded { State::EXPANDED } else { State::default() });
     if let Some(help) = help {
         uia.helps.push((at, help));
     }
+    if let Some(shown) = shown {
+        uia.shown.push((at, shown));
+    }
     if let Some(key) = row.key {
+        let key = uia.intern(key);
         uia.keys.push((at, key));
     }
     if let Some(range) = range {
         uia.ranges.push((at, range));
+        // Stated at every publish, so a client reads where the control stands rather than
+        // whatever number the tree before it last announced. A control whose number is written
+        // elsewhere states none here, and a `0.0` would be a number rather than its absence.
+        if let Some(number) = row.number {
+            uia.values.push((at, number));
+        }
     }
     if let Some(field) = field {
         uia.fields.push(FieldText {

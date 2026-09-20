@@ -659,6 +659,110 @@ mod tests {
         })
     }
 
+    /// One input method edit revises its own text several times. Only the end of the
+    /// composition compares the value against the one it started from, so the application is
+    /// told once.
+    #[test]
+    fn several_writes_inside_one_composition_are_one_completed_edit() {
+        let mut doc = focused("");
+        edit(&mut doc, |d| d.compose(Some((0, 0))));
+        for (start, end, text) in [(0u32, 0u32, "n"), (0, 1, "ni"), (0, 2, "\u{306b}")] {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            assert!(edit(&mut doc, |d| d.replace(start, end, &units)));
+        }
+        assert!(commits(&doc).is_empty(), "nothing commits mid-composition");
+        edit(&mut doc, |d| d.compose(None));
+        assert_eq!(commits(&doc), ["\u{306b}"]);
+    }
+
+    /// The same three writes outside a composition are three completed edits, which is what
+    /// makes the composition the transaction rather than the write.
+    #[test]
+    fn the_same_writes_outside_a_composition_are_three_completed_edits() {
+        let mut doc = focused("");
+        for (start, end, text) in [(0u32, 0u32, "a"), (1, 1, "b"), (2, 2, "c")] {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            assert!(edit(&mut doc, |d| d.replace(start, end, &units)));
+        }
+        assert_eq!(commits(&doc), ["a", "ab", "abc"]);
+    }
+
+    /// A field unmounted while an input method still holds a composition open commits nothing
+    /// and keeps no storage. Its buffer goes with its row.
+    #[test]
+    fn unmounting_a_field_mid_composition_commits_nothing_and_keeps_no_storage() {
+        let id = ControlId::default();
+        let mut doc = focused("");
+        edit(&mut doc, |d| d.compose(Some((0, 0))));
+        assert!(edit(&mut doc, |d| d.replace(0, 0, &[0x306b])));
+        doc.out.clear();
+
+        doc.forget(id);
+        assert!(commits(&doc).is_empty(), "an unmount is not an edit");
+        assert!(!doc.composing());
+        assert_eq!(doc.focused(), None);
+        assert!(!doc.holds(id));
+        assert!(held(&doc, id).is_empty());
+    }
+
+    /// Focus moving between two fields while both are being typed into keeps each buffer with
+    /// its own field, and each field's completed edit names that field.
+    #[test]
+    fn rapid_input_across_two_fields_keeps_each_buffer_with_its_own_field() {
+        let (first, second) = (ControlId::FIRST, ControlId::default());
+        assert_ne!(first, second, "two fields, two control ids");
+        let mut doc = Doc::default();
+        for id in [first, second] {
+            doc.source(&Source {
+                id,
+                scope: InputScope::Default,
+                based_on: 0,
+                text: Vec::new().into(),
+            });
+        }
+        doc.out.clear();
+
+        doc.focus(Some(first));
+        assert!(edit(&mut doc, |d| d.replace(0, 0, &[97])));
+        doc.focus(Some(second));
+        assert!(edit(&mut doc, |d| d.replace(0, 0, &[98])));
+        doc.focus(Some(first));
+        assert!(edit(&mut doc, |d| d.replace(1, 1, &[99])));
+
+        assert_eq!(held(&doc, first), [97, 99]);
+        assert_eq!(held(&doc, second), [98]);
+        let owned: Vec<(ControlId, String)> = doc
+            .out
+            .iter()
+            .filter_map(|u| u.commit.as_deref().map(|text| (u.id, text.to_owned())))
+            .collect();
+        assert_eq!(
+            owned,
+            [
+                (first, "a".to_owned()),
+                (second, "b".to_owned()),
+                (first, "ac".to_owned())
+            ]
+        );
+    }
+
+    /// A field remounted into the slot a released one held starts from the value its own
+    /// source states, not from whatever the previous occupant was holding.
+    #[test]
+    fn a_remounted_field_starts_from_its_own_source() {
+        let id = ControlId::default();
+        let mut doc = focused("");
+        assert!(edit(&mut doc, |d| d.replace(0, 0, &[97, 98])));
+        doc.forget(id);
+        doc.out.clear();
+
+        doc.source(&source("z", 0));
+        doc.focus(Some(id));
+        assert_eq!(held(&doc, id), [122]);
+        assert_eq!(doc.revision, 0, "and at the revision its source states");
+        assert!(commits(&doc).is_empty());
+    }
+
     #[test]
     fn composition_is_a_transaction_even_with_empty_range() {
         let mut doc = focused("");

@@ -783,7 +783,9 @@ impl Arena {
             return false;
         }
         match self.held(id, desc) {
-            // A tracker expression owns the channel; a set must not displace it.
+            // A tracker expression owns the channel; a set must not displace it. `held` takes
+            // the strongest state over the row's channels, so this covers the composite that
+            // contains a bound axis as well as the axis itself.
             Held::Bound => return false,
             // The shadow is authoritative, so an unchanged value stops here.
             Held::Free if self.chans_eq(id, desc, value) => return false,

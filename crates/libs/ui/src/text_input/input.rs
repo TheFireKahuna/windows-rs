@@ -4,7 +4,7 @@ use super::doc::{Change, Command, Doc, Motion, View};
 use super::session::Session;
 use super::touch::Touch;
 use super::{InputScope, Layout, Source, Update, system};
-use crate::input::{KeyEvent, KeyKind, Report, client_origin};
+use crate::input::{HitView, KeyEvent, KeyKind, Report, client_origin};
 use crate::uia::action::TextAction;
 use core::cell::RefCell;
 use std::rc::Rc;
@@ -41,6 +41,19 @@ impl TextInput {
         self.doc.borrow().focused()
     }
 
+    /// Returns the focused field's box in screen pixels, which is where an occlusion has to
+    /// leave it clear.
+    pub fn focused_box(&self) -> Option<Rect> {
+        let view = self.doc.borrow().view;
+        (view.scale > 0.0).then_some(view.rect)
+    }
+
+    /// Returns the handle a harness reports a docked occlusion through.
+    #[cfg(feature = "test-support")]
+    pub fn occluder(&self) -> super::Occluder {
+        self.touch.occluder()
+    }
+
     /// Republishes the focused field after a system settings change, so the caret redraws
     /// at the new width and blink.
     pub fn settings_changed(&mut self) {
@@ -60,6 +73,10 @@ impl TextInput {
     }
 
     /// Releases a field's storage on unmount, dropping focus with it.
+    ///
+    /// Dropping focus enters TSF, so this is the pass's first call-out and runs after the
+    /// router: the boundary a removed key is offered behind is that the input in front of it
+    /// has been routed, and a retirement running before the router would break it.
     pub fn forget(&mut self, id: ControlId) -> Result<()> {
         if self.focused() == Some(id) {
             self.focus(None)?;
@@ -112,7 +129,7 @@ impl TextInput {
     pub fn reports(
         &mut self,
         reports: &mut Vec<Report>,
-        hits: &HitTable,
+        hits: &HitView,
         scale: f32,
     ) -> Result<()> {
         // Preserve non-text reports. A text-owned key must not subsequently activate an
@@ -134,10 +151,12 @@ impl TextInput {
                         self.touch.show();
                     }
                     // The published view is in screen pixels, so the field's own left edge
-                    // comes from the array the contact resolved against.
-                    let left = hits
-                        .entry(target)
-                        .map_or(0.0, |entry| box_of(hits, entry, false).x0);
+                    // comes from the array the contact resolved against. Read and released
+                    // inside the statement, because the command below can reach a text service.
+                    let left = hits.with(|hits| {
+                        hits.entry(target)
+                            .map_or(0.0, |entry| box_of(hits, entry, false).x0)
+                    });
                     self.doc.borrow_mut().command(Command::Point {
                         x: sample.raw.x - left,
                         extend,
@@ -160,7 +179,7 @@ impl TextInput {
 
     /// Publishes the focused field's box and clip in screen pixels, which is what the store
     /// reports positions from.
-    pub fn geometry(&mut self, hits: &HitTable, scale: f32) {
+    pub fn geometry(&mut self, hits: &HitView, scale: f32) {
         let origin = client_origin(self.hwnd.raw()).unwrap_or_default();
         let screen = |r: Rect| Rect {
             x0: origin.x + r.x0 * scale,
@@ -168,13 +187,16 @@ impl TextInput {
             x1: origin.x + r.x1 * scale,
             y1: origin.y + r.y1 * scale,
         };
-        let view = self
-            .focused()
-            .and_then(|id| hits.entry(id))
-            .map(|entry| View {
-                rect: screen(box_of(hits, entry, false)),
-                clip: screen(box_of(hits, entry, true)),
-                scale,
+        let focused = self.focused();
+        let view = hits
+            .with(|hits| {
+                focused
+                    .and_then(|id| hits.entry(id))
+                    .map(|entry| View {
+                        rect: screen(box_of(hits, entry, false)),
+                        clip: screen(box_of(hits, entry, true)),
+                        scale,
+                    })
             })
             .unwrap_or_default();
         if core::mem::replace(&mut self.doc.borrow_mut().view, view) != view {

@@ -13,6 +13,7 @@ mod touch;
 
 pub(crate) use geometry::{Cluster, Geometry};
 pub(crate) use input::TextInput;
+pub use touch::Occluder;
 
 use std::sync::Arc;
 use windows_scene::ControlId;
@@ -97,9 +98,13 @@ pub(crate) struct Commit {
     pub text: Arc<str>,
 }
 
-/// A reveal request names a live control and the docked occlusion, in client DIPs.
+/// A reveal request names the docked occlusion in client DIPs, and the live control to bring
+/// clear of it.
+///
+/// The control is absent where the occlusion alone changed: the extent a docked occlusion asked
+/// for is owed back whether or not a field still holds focus.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Reveal {
-    pub id: ControlId,
+    pub id: Option<ControlId>,
     pub occlusion: Option<crate::layout::Rect>,
 }

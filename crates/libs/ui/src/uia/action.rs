@@ -25,6 +25,9 @@ pub enum Action {
     /// Brings the element into view. Named by control and resolved by the front thread
     /// against the scroll ancestry the hit array already carries.
     Reveal(ControlId),
+    /// Moves one scroll container's content to an absolute offset in DIPs. Named by the
+    /// container's own control, which is the element the scroll pattern hangs on.
+    ScrollTo(ControlId, f32, f32),
 }
 
 /// One queued editing request. Variable-length, which is why it is not on [`Action`].
@@ -51,7 +54,10 @@ impl Supersedes for Action {
     fn supersedes(&self, queued: &Self) -> bool {
         matches!(
             (self, queued),
-            (Self::SetValue(id, _), Self::SetValue(held, _)) if id == held
+            (Self::SetValue(id, _), Self::SetValue(held, _)) if id == held)
+            || matches!(
+            (self, queued),
+            (Self::ScrollTo(id, ..), Self::ScrollTo(held, ..)) if id == held
         )
     }
 }

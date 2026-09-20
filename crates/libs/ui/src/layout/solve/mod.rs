@@ -41,6 +41,23 @@ pub fn snap(v: f32, scale: f32) -> f32 {
     (v * scale).round() / scale
 }
 
+/// Snaps a trailing edge onto the pixel grid without ever moving it inward.
+///
+/// For a box whose content re-flows against its own width, rounding the far edge to the
+/// nearest pixel is not neutral: a run measured to need 133.56 DIPs published in 133.33 breaks
+/// a second line inside a box one line tall, and nothing about the result reads as a rounding
+/// fault. Rounding to nearest and taking the next pixel where that landed short holds the
+/// content by at most one pixel and needs no tolerance.
+#[must_use]
+fn hold(v: f32, scale: f32) -> f32 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    let px = v * scale;
+    let at = px.round();
+    if at < px { at + 1.0 } else { at }.max(0.0) / scale
+}
+
 /// Solves one root: the window root, or a detached overlay root.
 ///
 /// The root is measured against the window, takes the extent its own declaration asks for,
@@ -548,7 +565,10 @@ impl Solver<'_> {
             (local, self.geom(n).at_w, h)
         };
         let abs = Vector2::new(parent.x + local.x, parent.y + local.y);
-        let rect = self.box_at(abs, w, h);
+        // A run breaks its lines against the box it is published at, and the height solved for
+        // it answers the width that box was asked for. The two have to be the same width.
+        let holds = self.layout(n).preset == Preset::Text;
+        let rect = self.box_at(abs, w, h, holds);
         let held = self.geom(n);
         let flags = &mut self.tree.c.flags[i];
         // A box that is only shown or only hidden keeps its rect, so the bit is what says
@@ -600,12 +620,16 @@ impl Solver<'_> {
     }
 
     /// Returns the snapped box a node of `w` by `h` occupies at `abs`.
-    fn box_at(&self, abs: Vector2, w: f32, h: f32) -> Rect {
+    ///
+    /// `holds` keeps the far edges from rounding inward, for a box whose content re-flows
+    /// against its own width. See [`hold`].
+    fn box_at(&self, abs: Vector2, w: f32, h: f32, holds: bool) -> Rect {
+        let far = if holds { hold } else { snap };
         Rect::new(
             snap(abs.x, self.scale),
             snap(abs.y, self.scale),
-            snap(abs.x + w, self.scale),
-            snap(abs.y + h, self.scale),
+            far(abs.x + w, self.scale),
+            far(abs.y + h, self.scale),
         )
     }
 
@@ -643,7 +667,7 @@ impl Solver<'_> {
         let abs = Vector2::new(parent.x + local.x, parent.y + local.y);
         let held = self.geom(n);
         let (w, h) = if hidden { (0.0, 0.0) } else { (held.at_w, held.at_h) };
-        let rect = self.box_at(abs, w, h);
+        let rect = self.box_at(abs, w, h, self.layout(n).preset == Preset::Text);
         self.publish(n, local, parent, h, rect);
         self.tree.c.flags[n.index()] &= !(tree::MEASURE | tree::DESC | tree::PLACED);
         let mut c = self.first(n);

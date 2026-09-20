@@ -208,6 +208,64 @@ impl Element<'_, Region> {
     pub fn radius(self, radius: Metric) -> Self {
         self.region_radius(Len::from(radius))
     }
+
+    /// Declares what the parts the renderer publishes mean, so pixels inside the region become
+    /// nameable elements.
+    ///
+    /// The renderer owns where a part is and restates it through `geometry` whenever its
+    /// mapping moves; this side owns what it is, which does not move when a rectangle does.
+    /// Declaration order is the order a client reads the parts in, and a part the renderer has
+    /// not published yet is left out rather than reported at the origin.
+    #[must_use]
+    pub fn parts(mut self, geometry: &Arc<RegionParts>, parts: &[crate::uia::PartDecl]) -> Self {
+        let id = self.control_id();
+        let geometry = Arc::clone(geometry);
+        self.host().region_peer(id, move |peer| {
+            peer.geometry = geometry;
+            peer.parts.clear();
+            peer.parts.extend_from_slice(parts);
+        });
+        self
+    }
+
+    /// Binds the slots the region's parts report their numbers from, indexed by `SubId`.
+    ///
+    /// One allocation for the whole region, read at query time, so a band whose gain moves
+    /// while its rectangle does not still reports the number it holds now.
+    #[must_use]
+    pub fn part_values(mut self, values: &Arc<[AtomicU64]>) -> Self {
+        let id = self.control_id();
+        let values = Arc::clone(values);
+        self.host().region_peer(id, move |peer| {
+            peer.values = Some(values);
+        });
+        self
+    }
+
+    /// Binds the slot the region itself reports its number from, and the bounds it moves
+    /// between.
+    ///
+    /// A presented read-out has no control row to hold a value, so its number lives beside the
+    /// tree and is written by whichever thread owns it; the bounds travel with the tree, and
+    /// are stated here because a range pattern that cannot answer `Minimum` is not one. Pair
+    /// it with [`live_region`](Element::live_region) to have a change announced.
+    #[must_use]
+    pub fn reading(mut self, value: &Arc<AtomicU64>, range: crate::widget::Range) -> Self {
+        let id = self.control_id();
+        let value = Arc::clone(value);
+        self.host().region_peer(id, move |peer| {
+            peer.value = Some(value);
+        });
+        if let Some(row) = self.host().control_mut(id) {
+            row.value = Some(crate::widget::ValueRow {
+                min: range.min,
+                span: range.max - range.min,
+                step: range.quantum() as f32,
+                ..crate::widget::ValueRow::default()
+            });
+        }
+        self
+    }
 }
 
 /// Emits this flush's region edits from the solve.

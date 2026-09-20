@@ -23,7 +23,6 @@ pub(crate) const HIDDEN: Bits = 1 << 2;
 pub(crate) const CLIP: Bits = 1 << 3;
 pub(crate) const SCROLL: Bits = 1 << 4;
 pub(crate) const SUSPENDED: Bits = 1 << 5;
-pub(crate) const POPUP: Bits = 1 << 6;
 pub(crate) const RESPONSIVE: Bits = 1 << 7;
 /// This node's own layout input moved.
 pub(crate) const MEASURE: Bits = 1 << 8;
@@ -237,6 +236,7 @@ columns! {
     links: Links = Links::default(),
     flags: Bits = 0,
     channels: u32 = 0,
+    driven: u32 = 0,
     bindings: u32 = NONE,
     side: u32 = NONE,
     inflate: f32 = f32::NAN,
@@ -459,10 +459,10 @@ impl Tree {
         let next = if on { held | bit } else { held & !bit };
         if next != held {
             self.c.flags[n.index()] = next;
-            // `SUSPENDED` and `POPUP` are read by the hit walk alone. A derived sprite takes no
-            // room and the walks skip it, so none of its flags is a layout input: a publisher
-            // may hide one after the solve without asking for another.
-            if bit & (SUSPENDED | POPUP) == 0 && held & DERIVED == 0 {
+            // `SUSPENDED` is read by the hit walk alone. A derived sprite takes no room and
+            // the walks skip it, so none of its flags is a layout input: a publisher may hide
+            // one after the solve without asking for another.
+            if bit & SUSPENDED == 0 && held & DERIVED == 0 {
                 // A hidden subtree was arranged away without being measured, so showing it
                 // takes every node in it again, not only the one whose bit moved.
                 if bit & HIDDEN != 0 && !on {
@@ -547,11 +547,23 @@ impl Tree {
                 self.hits_dirty = true;
             }
             if now.local != was.local {
-                patch.push(Op::Bind {
-                    id,
-                    prop: Prop::Offset,
-                    bind: Bind::Set(Value::Vec2(now.local)),
-                });
+                // A driven channel is not the layout's to write. `Prop::Offset` carries both
+                // axes, and setting it replaces whatever animates `Offset.Y` — which is the
+                // tracker expression a scroll container's content and its thumb ride. The
+                // axis nothing drives is still the layout's, and goes out on its own channel.
+                let driven = self.c.driven[id.index()];
+                let held = |prop: Prop| driven & (1 << prop as u32) != 0;
+                let write = |prop, value| Op::Bind { id, prop, bind: Bind::Set(value) };
+                match (held(Prop::OffsetX), held(Prop::OffsetY)) {
+                    (false, false) => patch.push(write(Prop::Offset, Value::Vec2(now.local))),
+                    (false, true) => {
+                        patch.push(write(Prop::OffsetX, Value::Scalar(now.local.x)));
+                    }
+                    (true, false) => {
+                        patch.push(write(Prop::OffsetY, Value::Scalar(now.local.y)));
+                    }
+                    (true, true) => {}
+                }
             }
             if now.size != was.size {
                 patch.push(Op::Bind {

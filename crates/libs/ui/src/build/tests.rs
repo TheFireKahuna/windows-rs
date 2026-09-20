@@ -53,7 +53,7 @@ use crate::layout::{Align, Len, Preset, scroll};
 use crate::role::{Fill, Metric, Role};
 use crate::signal::Cell;
 use crate::uia::{ColFlags, State};
-use crate::widget::{Intent, Range, UiaRole, What, button, knob, label, text};
+use crate::widget::{Intent, Range, UiaRole, What, box_, button, caption, knob, label, micro, text};
 use windows_numerics::Vector2;
 use windows_scene::{Anim, Bind, ContactKind, ControlId, NodeId, Op, Prop, Value};
 
@@ -678,4 +678,99 @@ fn a_hidden_subtrees_derived_sprites_take_no_pixels() {
     assert_eq!(size(tile), Vector2::zero(), "a hidden ancestor left the tile painting");
     rig.set(shown, false);
     assert!(size(tile).x > 0.0, "showing again did not restore the tile: {:?}", size(tile));
+}
+
+
+/// A run that wraps to more lines takes more room, and what follows it moves down.
+///
+/// The box a run is given and the lines it paints are one statement: a container that kept the
+/// height the run measured before its string changed draws the next child over the run's own
+/// second line, and nothing about the result reads as a layout fault.
+#[test]
+fn a_run_that_rewraps_moves_what_follows_it() {
+    let mut rig = Rig::at(800.0, 600.0, 1.0);
+    let long = Cell::new(false);
+    let mut ids = None;
+    rig.mount(|ui| {
+        let mut run = NodeId::NONE;
+        let mut after = NodeId::NONE;
+        box_(ui)
+            .width(Len::dip(120.0))
+            .stack(|ui| {
+                run = caption(ui, crate::widget::reactive(move |out| {
+                    out.push_str(if long.get() { "Computing the response." } else { "Idle." });
+                }))
+                .node_id();
+                after = micro(ui, "9 sections").node_id();
+            });
+        ids = Some((run, after));
+    });
+    let (run, after) = ids.expect("mounted");
+    let box_of = |n: NodeId| Host::with(|h| h.geom(n).rect);
+    let one = box_of(run).height();
+    let below = box_of(after).y0;
+
+    rig.set(long, true);
+    let two = box_of(run).height();
+    assert!(
+        two > one,
+        "a run that wrapped to more lines kept its old height: {one} then {two}"
+    );
+    assert!(
+        box_of(after).y0 >= below + (two - one),
+        "the run grew and what follows it stayed put: {} then {}",
+        below,
+        box_of(after).y0
+    );
+}
+
+
+/// A run's published box holds the width its height was solved against.
+///
+/// The far edge is snapped onto the pixel grid, and at a fractional scale rounding to nearest
+/// can land a fraction of a DIP inside the extent the run was measured to need. The run then
+/// breaks a second line inside a box one line tall and draws over whatever follows it, which
+/// reads as anything but a rounding fault. 1.5 is where it shows: at 1.0 every DIP is already
+/// a pixel.
+#[test]
+fn a_content_sized_run_is_not_snapped_below_its_own_width() {
+    let mut rig = Rig::at(1000.0, 400.0, 1.5);
+    let mut ids = None;
+    rig.mount(|ui| {
+        let mut run = NodeId::NONE;
+        let mut after = NodeId::NONE;
+        box_(ui)
+            .gap(Metric::SpaceXs)
+            .padding(Metric::SpaceSm)
+            .justify(Align::Center)
+            .grow()
+            .children(|ui| {
+                run = caption(ui, "Computing the response.").node_id();
+                after = micro(ui, "9 sections").node_id();
+            });
+        ids = Some((run, after));
+    });
+    let (run, after) = ids.expect("mounted");
+    Host::with(|h| {
+        let key = h.tree.c.text[run.index()];
+        let class = h.tree.class(run);
+        let widest = h.text.pair(key, class)[1];
+        let box_ = h.geom(run).rect;
+        assert!(
+            box_.width() >= widest,
+            "the box was snapped inside the run's own width: {} for {widest}",
+            box_.width()
+        );
+        // One tile per line, so the count is what the run actually broke into.
+        assert_eq!(
+            h.tree.children(run).count(),
+            1,
+            "the run broke a line the box has no room for"
+        );
+        assert!(
+            h.geom(after).rect.y0 >= box_.y1,
+            "what follows the run starts inside it: {:?} under {box_:?}",
+            h.geom(after).rect
+        );
+    });
 }

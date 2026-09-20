@@ -999,6 +999,81 @@ mod tests {
         inner.release();
     }
 
+    /// Several ACP writes inside one grant leave the document holding the last of them, and
+    /// none of them is echoed back to the sink as an application change.
+    #[test]
+    fn several_acp_writes_in_one_grant_are_not_echoed_back_to_the_sink() {
+        let window = windows_window::Window::new("TSF transaction test")
+            .create()
+            .unwrap();
+        let inner = inner(window.handle());
+        let store = store(&inner);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink: ITextStoreACPSink = Sink {
+            events: events.clone(),
+            changed: Box::new(|| {}),
+            grant: Box::new({
+                let store = store.clone();
+                move |_| {
+                    for (start, end, unit) in [(0i32, 0i32, 110u16), (0, 1, 105), (0, 1, 0x306b)] {
+                        let mut change = TS_TEXTCHANGE::default();
+                        let text = [unit];
+                        unsafe {
+                            (store.vtable().SetText)(
+                                store.as_raw(),
+                                0,
+                                start,
+                                end,
+                                text.as_ptr(),
+                                1,
+                                &mut change,
+                            )
+                        }
+                        .ok()
+                        .unwrap();
+                    }
+                }
+            }),
+        }
+        .into();
+        *inner.sink.borrow_mut() = Some(sink);
+        assert_eq!(request(&store, 6), HRESULT(0));
+        assert_eq!(inner.doc.borrow().text(), [0x306b]);
+        assert_eq!(*events.borrow(), ["grant"], "one grant, and no echo");
+        inner.notify();
+        assert_eq!(
+            events.borrow().iter().filter(|e| **e == "text").count(),
+            0,
+            "a TSF-originated write is already the sink's own knowledge"
+        );
+        inner.release();
+    }
+
+    /// A composition callback naming a view the store never accepted belongs to a text service
+    /// whose composition is over. It moves nothing.
+    #[test]
+    fn a_composition_callback_from_a_view_the_store_does_not_hold_is_ignored() {
+        let window = windows_window::Window::new("TSF composition identity test")
+            .create()
+            .unwrap();
+        let inner = inner(window.handle());
+        let store = store(&inner);
+        let change = inner.doc.borrow_mut().replace(0, 0, &[97]);
+        inner.doc.borrow_mut().emit(change);
+        let before = inner.doc.borrow().revision;
+
+        // The store holds no composition, so no callback identity can match one.
+        let sink: ITfContextOwnerCompositionSink = store.cast().unwrap();
+        let foreign: IUnknown = store.cast().unwrap();
+        assert!(!inner.composing());
+        let ended = unsafe {
+            (sink.vtable().OnEndComposition)(sink.as_raw(), core::mem::transmute_copy(&foreign))
+        };
+        assert!(ended.is_ok());
+        assert!(!inner.composing());
+        assert_eq!(inner.doc.borrow().revision, before, "nothing moved");
+        inner.release();
+    }
     #[test]
     fn invalid_selection_and_unlocked_edit_leave_document_unchanged() {
         let window = windows_window::Window::new("TSF ACP test")

@@ -49,6 +49,15 @@ impl ColFlags {
     pub const FIELD: Self = Self(1 << 8);
     /// Took its name from the run before it, which is what `LabeledBy` reports.
     pub const LABELLED: Self = Self(1 << 9);
+    /// Displays a run that is not its name, which is what `Value` reports: a combo box is
+    /// labelled "Output endpoint" and shows the endpoint.
+    pub const SHOWN: Self = Self(1 << 10);
+    /// Is itself a scroll container, so it answers `Scroll` rather than being resolved through
+    /// one. The row it owns is the one whose `owner` names it.
+    pub const SCROLLS: Self = Self(1 << 11);
+    /// Is an overlay's own root, so its arrival and departure are what a client is told about
+    /// as a menu or a description opening and closing.
+    pub const OVERLAY: Self = Self(1 << 12);
 
     /// Returns whether every bit set in `other` is set here.
     #[must_use]
@@ -103,6 +112,44 @@ pub struct Entry {
     pub scroll: u16,
     pub flags: ColFlags,
     pub role: UiaRole,
+}
+
+/// One scroll container, as automation reports it.
+///
+/// The extents are the solve's, taken on the thread that ran it: a viewport's own box and the
+/// box of the group the tracker moves. Their difference is how far the content can travel,
+/// which is what every property of the scroll pattern is a fraction of.
+#[derive(Copy, Clone, Debug)]
+pub struct ScrollView {
+    pub node: NodeId,
+    /// The entry that is this container, or [`NONE`] where it publishes none.
+    pub owner: u16,
+    /// The viewport's solved extent, in DIPs.
+    pub view: Vector2,
+    /// The content's solved extent, in the same DIPs.
+    pub content: Vector2,
+}
+
+impl ScrollView {
+    /// Declares a container before the solve's extents are known.
+    #[must_use]
+    pub const fn new(node: NodeId, owner: u16) -> Self {
+        Self {
+            node,
+            owner,
+            view: Vector2 { x: 0.0, y: 0.0 },
+            content: Vector2 { x: 0.0, y: 0.0 },
+        }
+    }
+
+    /// Returns how far the content can travel on each axis, never below zero.
+    #[must_use]
+    pub fn travel(self) -> Vector2 {
+        Vector2 {
+            x: (self.content.x - self.view.x).max(0.0),
+            y: (self.content.y - self.view.y).max(0.0),
+        }
+    }
 }
 
 /// One nameable area inside a presentation region.
@@ -178,14 +225,26 @@ pub struct Snapshot {
     pub blob: Vec<u16>,
     /// Help text, sorted by entry index.
     pub helps: Vec<(u16, u32)>,
-    /// The automation-id segment, sorted by entry index.
-    pub keys: Vec<(u16, &'static str)>,
+    /// The automation id, as a pool offset, sorted by entry index.
+    ///
+    /// Every element carries one: an author's own where declared, and one derived from the
+    /// path of named ancestors otherwise, so a client can address a control that shares its
+    /// name with three others.
+    pub keys: Vec<(u16, u32)>,
     /// The bounds a number moves between, sorted by entry index.
     pub ranges: Vec<(u16, Range)>,
+    /// The run a control displays where that is not its name, sorted by entry index.
+    pub shown: Vec<(u16, u32)>,
+    /// Where each of those numbers stands, sorted by entry index.
+    ///
+    /// Published rather than carried, because the control's own row is what a client must
+    /// read back after any write: a tree that adopted its values from the tree before it
+    /// would answer a moved slider with the number it last happened to announce.
+    pub values: Vec<(u16, f64)>,
     pub(crate) fields: Vec<FieldText>,
     /// The scroll containers the rows resolve through, deduplicated, in the order
     /// [`Entry::scroll`] indexes them.
-    pub scrolls: Vec<NodeId>,
+    pub scrolls: Vec<ScrollView>,
     /// The per-entry initial model state, parallel to [`Snapshot::entries`].
     pub state: Vec<State>,
 }
@@ -220,6 +279,8 @@ impl Snapshot {
         self.helps.clear();
         self.keys.clear();
         self.ranges.clear();
+        self.shown.clear();
+        self.values.clear();
         self.fields.clear();
         self.scrolls.clear();
         self.state.clear();
@@ -242,8 +303,9 @@ pub struct Tree {
     /// Sparse columns, each sorted by entry index: help text, the automation-id segment, and
     /// the bounds of a number. Each is a minority, and each would otherwise widen every entry.
     helps: Box<[(u16, u32)]>,
-    keys: Box<[(u16, &'static str)]>,
+    keys: Box<[(u16, u32)]>,
     ranges: Box<[(u16, Range)]>,
+    shown: Box<[(u16, u32)]>,
     /// Sorted by control id, which is what a client's text call holds.
     fields: Box<[FieldText]>,
     /// One word an entry, holding its value as `f64` bits.
@@ -253,9 +315,15 @@ pub struct Tree {
     /// published under its own release-acquire pair, which is [`Versioned`].
     live: Box<[AtomicU64]>,
     state: Box<[AtomicU32]>,
-    /// One packed offset per scroll container, keyed by node. A handful per screen, so the
-    /// lookup a write does is a scan and the lookup a read does is an index.
-    scrolls: Box<[(NodeId, AtomicU64)]>,
+    /// One scroll container per row, each holding the word its own tracker publishes its
+    /// reported position into.
+    ///
+    /// The tracker's word and not a copy of it: a container settling after a flick reports for
+    /// as long as the inertia runs, and the front thread does not tick while it does, so a
+    /// copy would leave every rectangle inside that container at where the content was when
+    /// the last contact ended. A container whose tracker has not arrived holds a word of its
+    /// own, which reads zero.
+    scrolls: Box<[(ScrollView, Arc<AtomicU64>)]>,
     /// The focused control as a packed generational id. Focus is singular, so it is one word,
     /// and an id rather than an index because an index is only meaningful until the next
     /// republish.
@@ -287,6 +355,7 @@ impl Tree {
             helps: Box::default(),
             keys: Box::default(),
             ranges: Box::default(),
+            shown: Box::default(),
             fields: Box::default(),
             live: Box::default(),
             state: Box::default(),
@@ -304,7 +373,7 @@ impl Tree {
     /// [`field`](Self::field) binary-searches them by control id. Runs when layout changed,
     /// never per frame.
     #[must_use]
-    pub fn adopt(snapshot: &Snapshot) -> Self {
+    pub fn adopt(snapshot: &Snapshot, shadows: &[(NodeId, Arc<AtomicU64>)]) -> Self {
         let mut entries = snapshot.entries.clone();
         // Links are `u16` and [`NONE`] is the last of them, so the table stops one row short
         // of that: an element sitting at `NONE` would be reachable as every absent link.
@@ -325,11 +394,21 @@ impl Tree {
                 && snapshot
                     .ranges
                     .windows(2)
+                    .all(|pair| pair[0].0 <= pair[1].0)
+                && snapshot
+                    .values
+                    .windows(2)
                     .all(|pair| pair[0].0 <= pair[1].0),
             "a sparse column reached the adopt out of entry order"
         );
+        let live: Box<[AtomicU64]> = entries.iter().map(|_| AtomicU64::new(NO_VALUE)).collect();
+        for &(at, value) in &snapshot.values {
+            if let Some(word) = live.get(at as usize) {
+                word.store(value.to_bits(), Relaxed);
+            }
+        }
         Self {
-            live: entries.iter().map(|_| AtomicU64::new(NO_VALUE)).collect(),
+            live,
             state: (0..entries.len())
                 .map(|at| AtomicU32::new(snapshot.state.get(at).copied().unwrap_or_default().0))
                 .collect(),
@@ -339,11 +418,18 @@ impl Tree {
             helps: snapshot.helps.clone().into_boxed_slice(),
             keys: snapshot.keys.clone().into_boxed_slice(),
             ranges: snapshot.ranges.clone().into_boxed_slice(),
+            shown: snapshot.shown.clone().into_boxed_slice(),
             fields: fields.into_boxed_slice(),
             scrolls: snapshot
                 .scrolls
                 .iter()
-                .map(|&node| (node, AtomicU64::new(0)))
+                .map(|&view| {
+                    let word = shadows
+                        .iter()
+                        .find(|(node, _)| *node == view.node)
+                        .map_or_else(|| Arc::new(AtomicU64::new(0)), |(_, word)| Arc::clone(word));
+                    (view, word)
+                })
                 .collect(),
             ..Self::empty()
         }
@@ -393,11 +479,22 @@ impl Tree {
         }
     }
 
-    /// Returns the automation-id segment `at` publishes, widened only where a client asks.
+    /// Returns the run `at` displays where that is not its name, which is its value.
     #[must_use]
-    pub fn key(&self, at: u16) -> Option<&'static str> {
-        let found = self.keys.binary_search_by_key(&at, |&(key, _)| key).ok()?;
-        Some(self.keys[found].1)
+    pub fn shown(&self, at: u16) -> &[u16] {
+        match self.shown.binary_search_by_key(&at, |&(key, _)| key) {
+            Ok(found) => self.text(self.shown[found].1),
+            Err(_) => &[],
+        }
+    }
+
+    /// Returns the automation id `at` publishes.
+    #[must_use]
+    pub fn key(&self, at: u16) -> &[u16] {
+        match self.keys.binary_search_by_key(&at, |&(key, _)| key) {
+            Ok(found) => self.text(self.keys[found].1),
+            Err(_) => &[],
+        }
     }
 
     /// Returns the bounds `at` moves between, or `None` where it carries no number.
@@ -429,6 +526,21 @@ impl Tree {
         }
         if entry.flags.has(ColFlags::SELECTS) {
             out = out.or(Patterns::SELECTION_ITEM);
+        }
+        // A pattern with nothing behind it is not advertised: `RangeValue` without bounds
+        // answers every call with a failure, and `Value` without a number, a document or a
+        // displayed run would answer with the element's own name.
+        if !entry.flags.has(ColFlags::RANGED) {
+            out = out.without(Patterns::RANGE);
+        }
+        if entry.flags.has(ColFlags::SCROLLS) {
+            out = out.or(Patterns::SCROLL);
+        }
+        if !entry.flags.has(ColFlags::RANGED)
+            && !entry.flags.has(ColFlags::FIELD)
+            && !entry.flags.has(ColFlags::SHOWN)
+        {
+            out = out.without(Patterns::VALUE);
         }
         out
     }
@@ -544,6 +656,31 @@ impl Tree {
         false
     }
 
+    /// Returns the box every clipping ancestor of `at` admits, in the space
+    /// [`shifted`](Self::shifted) reports, or `None` where nothing clips it.
+    ///
+    /// Each ancestor is taken with its own scroll applied, for the same reason
+    /// [`clipped`](Self::clipped) takes it that way, and terminates for the same reason.
+    /// An empty box comes back where the chain excludes the element outright.
+    #[must_use]
+    pub fn clip_box(&self, at: u16) -> Option<[f32; 4]> {
+        let mut clip = self.at(at)?.clip;
+        let mut held: Option<[f32; 4]> = None;
+        while let Some(entry) = self.at(clip) {
+            let bound = self.shifted(clip);
+            held = Some(held.map_or(bound, |b| {
+                [
+                    b[0].max(bound[0]),
+                    b[1].max(bound[1]),
+                    b[2].min(bound[2]),
+                    b[3].min(bound[3]),
+                ]
+            }));
+            clip = entry.clip;
+        }
+        held
+    }
+
     /// Returns the value at `at`, or `None` where none was written, the value is not finite,
     /// or the index is past the end.
     #[must_use]
@@ -573,8 +710,28 @@ impl Tree {
     /// Stores the offset of the scroll container `node` names. A node the published tree
     /// scrolls nothing by is ignored.
     pub fn set_scroll(&self, node: NodeId, offset: Vector2) {
-        if let Some((_, word)) = self.scrolls.iter().find(|(held, _)| *held == node) {
+        if let Some((_, word)) = self.scrolls.iter().find(|(held, _)| held.node == node) {
             word.store(pack(offset), Relaxed);
+        }
+    }
+
+    /// Returns the container `at` is, and the offset it stands at, or `None` where it is not
+    /// one.
+    #[must_use]
+    pub fn viewport(&self, at: u16) -> Option<(ScrollView, Vector2)> {
+        let (view, word) = self.scrolls.iter().find(|(view, _)| view.owner == at)?;
+        Some((*view, unpack(word.load(Relaxed))))
+    }
+
+    /// Runs `each` over every overlay root in the table, with its control and its role.
+    ///
+    /// The roots are a handful per screen and the scan runs once per publish, which is where a
+    /// client is told what opened and what closed.
+    pub fn overlays(&self, mut each: impl FnMut(ControlId, UiaRole)) {
+        for entry in &*self.entries {
+            if entry.flags.has(ColFlags::OVERLAY) {
+                each(entry.id, entry.role);
+            }
         }
     }
 
@@ -623,19 +780,35 @@ impl Tree {
 
     /// Copies the outgoing tree's live column into this one, by control id.
     ///
-    /// An element the outgoing tree did not hold keeps the state it was built with. A
-    /// republish is a layout change, which disables no control and moves no slider, so
-    /// without this a resize would announce every toggle as reset.
+    /// A value the publish stated stands: the carry fills only the words it left empty, so a
+    /// control whose number the application knows reports that number rather than the one the
+    /// tree before it last announced. A presented read-out states none, and keeps whatever a
+    /// producer wrote.
+    ///
+    /// Model state is **not** carried. The walk derives enabled, toggled, selected and
+    /// expanded from the rows the application holds, so the publish is the whole truth about
+    /// them and the tree before it is stale by definition: carrying would report a switch the
+    /// user has just flipped at the position it was flipped from.
     pub fn carry(&self, from: &Self) {
         for (at, entry) in self.entries.iter().enumerate() {
             let Some(was) = from.index_of(entry.id) else {
                 continue;
             };
-            self.live[at].store(from.live[was as usize].load(Relaxed), Relaxed);
-            self.state[at].store(from.state[was as usize].load(Relaxed), Relaxed);
+            if f64::from_bits(self.live[at].load(Relaxed)).is_nan() {
+                self.live[at].store(from.live[was as usize].load(Relaxed), Relaxed);
+            }
         }
-        for (node, word) in &*self.scrolls {
-            if let Some((_, was)) = from.scrolls.iter().find(|(held, _)| held == node) {
+        for (view, word) in &*self.scrolls {
+            // Only where the two do not already share the tracker's word: a container whose
+            // tracker is bound is live on both sides, and copying would write its own value
+            // back over itself.
+            if let Some((_, was)) = from
+                .scrolls
+                .iter()
+                .find(|(held, held_word)| {
+                    held.node == view.node && !Arc::ptr_eq(held_word, word)
+                })
+            {
                 word.store(was.load(Relaxed), Relaxed);
             }
         }
@@ -645,12 +818,105 @@ impl Tree {
     }
 }
 
+/// Gives every element an automation id, leaving the ones an author declared alone.
+///
+/// A derived id is the dotted path of the element's named ancestors and its own name, slugged,
+/// with an ordinal appended where that path is not unique. Names are what an author already
+/// wrote, so this costs no declaration; the path is what keeps the id of a control inside one
+/// processor card from moving when a card above it is removed, and the ordinal is the fallback
+/// for elements that really are indistinguishable.
+///
+/// Runs on the publish, which happens when layout changed and a client is attached.
+pub fn derive_keys(snapshot: &mut Snapshot, seen: &mut Vec<(String, u32)>) {
+    seen.clear();
+    // One slug per entry, so an ancestor's path is read rather than rebuilt.
+    let mut paths: Vec<String> = Vec::with_capacity(snapshot.entries.len());
+    let mut scratch = String::new();
+    for at in 0..snapshot.entries.len() {
+        let entry = snapshot.entries[at];
+        if let Ok(found) = snapshot
+            .keys
+            .binary_search_by_key(&(at as u16), |&(key, _)| key)
+        {
+            // An author's own id is the whole of it, and it is what descendants build on.
+            let key = snapshot.keys[found].1;
+            paths.push(String::from_utf16_lossy(text_of(&snapshot.blob, key)));
+            continue;
+        }
+        scratch.clear();
+        if entry.parent != NONE
+            && let Some(parent) = paths.get(entry.parent as usize)
+            && !parent.is_empty()
+        {
+            scratch.push_str(parent);
+            scratch.push('.');
+        }
+        // The role's own name where the element has none, and where its name slugs to
+        // nothing: a run reading "—" is a real element, and an id of "#3" addresses it by
+        // nothing at all.
+        let name = String::from_utf16_lossy(text_of(&snapshot.blob, entry.name));
+        let mut leaf = slug(&name);
+        if leaf.is_empty() {
+            leaf = slug(roles::row(entry.role).localized);
+        }
+        scratch.push_str(&leaf);
+        let path = core::mem::take(&mut scratch);
+        let nth = match seen.iter_mut().find(|(held, _)| *held == path) {
+            Some((_, count)) => {
+                *count += 1;
+                *count
+            }
+            None => {
+                seen.push((path.clone(), 1));
+                1
+            }
+        };
+        let id = if nth == 1 {
+            path.clone()
+        } else {
+            format!("{path}#{nth}")
+        };
+        paths.push(path);
+        let offset = snapshot.intern(&id);
+        snapshot.keys.push((at as u16, offset));
+    }
+    snapshot.keys.sort_unstable_by_key(|&(at, _)| at);
+}
+
+/// Returns a lowercase, hyphen-joined form of `text`, which is what an id segment is.
+fn slug(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch.is_alphanumeric() {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// Returns the run at `offset` in a pool that is still being built.
+fn text_of(blob: &[u16], offset: u32) -> &[u16] {
+    let Some(&len) = offset.checked_sub(1).and_then(|at| blob.get(at as usize)) else {
+        return &[];
+    };
+    let at = offset as usize;
+    blob.get(at..at + len as usize).unwrap_or_default()
+}
+
 /// Returns whether `p` is inside `box_`, given as `left, top, right, bottom`.
 fn inside(box_: [f32; 4], p: Point) -> bool {
     p.x >= box_[0] && p.x <= box_[2] && p.y >= box_[1] && p.y <= box_[3]
 }
 
 /// Returns the two coordinates packed into one word, `x` above `y`.
+///
+/// The same layout `windows_scene::pack_offset` writes, because a scroll row holds the word a
+/// tracker publishes into and the two must read each other. `packed_offsets_agree` is what
+/// holds them together.
 const fn pack(v: Vector2) -> u64 {
     ((v.x.to_bits() as u64) << 32) | v.y.to_bits() as u64
 }
@@ -791,6 +1057,17 @@ impl Versioned<Arc<Tree>> {
 mod tests {
     use super::*;
 
+    /// A scroll row holds the word a tracker publishes into, so the two must pack a pair of
+    /// coordinates the same way; disagreeing would put every scrolled rectangle at a position
+    /// read out of the wrong half of a word.
+    #[test]
+    fn packed_offsets_agree() {
+        let at = Vector2 { x: 12.5, y: -3.25 };
+        assert_eq!(pack(at), windows_scene::pack_offset(at.x, at.y));
+        let (x, y) = windows_scene::unpack_offset(pack(at));
+        assert_eq!((x, y), (at.x, at.y));
+    }
+
     fn ids(count: usize) -> Vec<ControlId> {
         let mut authority = windows_scene::Ids::<{ windows_scene::CONTROL }>::default();
         (0..count).map(|_| authority.mint()).collect()
@@ -837,7 +1114,7 @@ mod tests {
     #[test]
     fn siblings_link_in_forward_order() {
         let (snapshot, _) = fan(4);
-        let tree = Tree::adopt(&snapshot);
+        let tree = Tree::adopt(&snapshot, &[]);
 
         let mut walk = Vec::new();
         let mut at = tree.at(0).unwrap().child;
@@ -876,7 +1153,7 @@ mod tests {
             [0.0; 4],
         );
         row(&mut snapshot, id[3], NONE, UiaRole::Menu, "menu", [0.0; 4]);
-        let tree = Tree::adopt(&snapshot);
+        let tree = Tree::adopt(&snapshot, &[]);
 
         let mut walk = vec![0u16];
         while let Some(&at) = walk.last() {
@@ -902,7 +1179,7 @@ mod tests {
     #[test]
     fn a_name_survives_the_round_trip_through_the_pool() {
         let (snapshot, _) = fan(2);
-        let tree = Tree::adopt(&snapshot);
+        let tree = Tree::adopt(&snapshot, &[]);
         let name = |at: u16| String::from_utf16_lossy(tree.text(tree.at(at).unwrap().name));
         assert_eq!(name(0), "root");
         assert_eq!(name(1), "row");
@@ -919,7 +1196,7 @@ mod tests {
         row(&mut snapshot, id[1], 0, UiaRole::Text, "Gain", [0.0; 4]);
         row(&mut snapshot, id[2], 0, UiaRole::Slider, "", [0.0; 4]);
         row(&mut snapshot, id[3], 0, UiaRole::Button, "Reset", [0.0; 4]);
-        let tree = Tree::adopt(&snapshot);
+        let tree = Tree::adopt(&snapshot, &[]);
 
         let name = |at: u16| String::from_utf16_lossy(tree.text(tree.at(at).unwrap().name));
         assert_eq!(name(2), "Gain", "the slider takes the run before it");
@@ -931,7 +1208,7 @@ mod tests {
     #[test]
     fn an_unwritten_value_is_absent_rather_than_zero() {
         let (snapshot, _) = fan(2);
-        let tree = Tree::adopt(&snapshot);
+        let tree = Tree::adopt(&snapshot, &[]);
         assert_eq!(tree.value(0), None, "zero is a value a slider can hold");
         tree.set_value(0, -14.5);
         assert_eq!(tree.value(0), Some(-14.5));
@@ -941,9 +1218,9 @@ mod tests {
     #[test]
     fn a_packed_offset_survives_the_round_trip() {
         let (mut snapshot, _) = fan(2);
-        snapshot.scrolls.push(NodeId::FIRST);
+        snapshot.scrolls.push(ScrollView::new(NodeId::FIRST, NONE));
         snapshot.entries[1].scroll = 0;
-        let tree = Tree::adopt(&snapshot);
+        let tree = Tree::adopt(&snapshot, &[]);
         tree.set_scroll(NodeId::FIRST, Vector2 { x: -3.5, y: 128.25 });
         let back = tree.scroll(1);
         assert_eq!((back.x, back.y), (-3.5, 128.25));
@@ -951,9 +1228,9 @@ mod tests {
     }
 
     #[test]
-    fn carrying_forward_moves_state_to_its_new_index() {
+    fn carrying_forward_moves_an_unstated_value_to_its_new_index() {
         let (was, id) = fan(3);
-        let old = Tree::adopt(&was);
+        let old = Tree::adopt(&was, &[]);
         old.set_value(1, 7.0);
         old.set_state(1, State::TOGGLED, true);
         old.set_focused(42);
@@ -965,11 +1242,14 @@ mod tests {
         row(&mut now, extra, NONE, UiaRole::Text, "output", [0.0; 4]);
         row(&mut now, id[0], NONE, UiaRole::Group, "root", [0.0; 4]);
         row(&mut now, id[1], 1, UiaRole::Button, "row", [0.0; 4]);
-        let new = Tree::adopt(&now);
+        let new = Tree::adopt(&now, &[]);
         new.carry(&old);
 
-        assert_eq!(new.value(2), Some(7.0), "a resize is not a reset");
-        assert!(new.state(2).has(State::TOGGLED));
+        assert_eq!(new.value(2), Some(7.0), "a value the publish left unstated was dropped");
+        assert!(
+            !new.state(2).has(State::TOGGLED),
+            "model state is the publish's to state, and the tree before it is stale"
+        );
         assert_eq!(new.value(0), None, "and what was not held is left alone");
         assert_eq!(new.focused(), 42);
         assert_eq!(new.window().1, 1.5);
@@ -1007,7 +1287,7 @@ mod tests {
         );
         snapshot.entries[1].clip = 0;
         snapshot.entries[2].clip = 0;
-        let tree = Tree::adopt(&snapshot);
+        let tree = Tree::adopt(&snapshot, &[]);
 
         assert_eq!(
             tree.hit(Point { x: 20.0, y: 20.0 }),
@@ -1046,8 +1326,8 @@ mod tests {
         );
         snapshot.entries[1].clip = 0;
         snapshot.entries[1].scroll = 0;
-        snapshot.scrolls.push(NodeId::FIRST);
-        let tree = Tree::adopt(&snapshot);
+        snapshot.scrolls.push(ScrollView::new(NodeId::FIRST, NONE));
+        let tree = Tree::adopt(&snapshot, &[]);
 
         assert_eq!(
             tree.hit(Point { x: 50.0, y: 20.0 }),

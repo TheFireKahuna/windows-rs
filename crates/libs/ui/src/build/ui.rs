@@ -250,6 +250,11 @@ impl<'a> Ui<'a> {
         let control = self
             .host
             .mint_control(super::control::ControlRow::blank(node, scope));
+        // Automation has no control type for a drawn surface, so a region is a graph unless
+        // its author says otherwise: it reports a value and it holds parts.
+        if let Some(row) = self.host.control_mut(control) {
+            row.uia = crate::widget::UiaRole::Graph;
+        }
         self.host.hit(
             node,
             Some(windows_scene::HitDecl {

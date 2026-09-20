@@ -25,7 +25,7 @@ pub(crate) mod action;
 mod events;
 mod provider;
 mod regions;
-mod roles;
+pub(crate) mod roles;
 pub(crate) mod snapshot;
 mod text;
 mod variant;
@@ -34,7 +34,7 @@ pub use action::Action;
 pub use events::{Property, Raise, Val};
 pub use regions::{PartDecl, RegionPeer};
 pub use roles::Patterns;
-pub use snapshot::{ColFlags, Entry, NONE, Part, Snapshot, State, Tree};
+pub use snapshot::{ColFlags, Entry, NONE, Part, ScrollView, Snapshot, State, Tree, derive_keys};
 
 use crate::bindings::{HWND, LPARAM, LRESULT, WPARAM};
 use crate::front::FrontHandle;
@@ -69,6 +69,12 @@ pub struct Uia {
     /// The step each live region last announced, so a value landing on the same step announces
     /// nothing. One row per live region, which is a handful per screen.
     announced: Vec<(ControlId, f64)>,
+    /// What each watched region's number last read, held for its allocation.
+    readings: Vec<(ControlId, f64)>,
+    /// The word each scroll container's tracker reports its position into, as the thread that
+    /// owns the trackers last listed them. Bound into the tree at the publish, so a client
+    /// reads where the content is rather than where it was when the front thread last ticked.
+    trackers: Vec<(NodeId, Arc<AtomicU64>)>,
 }
 
 impl Default for Uia {
@@ -86,6 +92,8 @@ impl Uia {
             current: Arc::new(Tree::empty()),
             pending: events::Pending::default(),
             announced: Vec::new(),
+            readings: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 
@@ -169,8 +177,86 @@ impl Uia {
                 self.pending.push(Raise::selection_changed(field.id));
             }
         }
-        self.adopt(Arc::new(Tree::adopt(snapshot)));
+        self.moved_properties(snapshot);
+        let next = Arc::new(Tree::adopt(snapshot, &self.trackers));
+        self.overlay_events(&next);
+        self.adopt(next);
         self.pending.push(Raise::Structure);
+    }
+
+    /// Queues a property change for every number and every model state the publish moves.
+    ///
+    /// The publish is where these change: the walk derives them from the application's own
+    /// rows, so a switch flipped between two publishes is reported here and nowhere else.
+    /// [`observe`](Self::observe) covers the other direction — a value moving under a gesture,
+    /// between publishes — and drops one equal to what the tree already holds, so a change
+    /// that travels both ways is announced once.
+    ///
+    /// Each carries the value it moved from, because a change reported as empty-to-empty is a
+    /// change from nothing to nothing and is dropped before it reaches a client. An element
+    /// the outgoing tree did not hold is not a change at all.
+    fn moved_properties(&mut self, snapshot: &Snapshot) {
+        for (at, entry) in snapshot.entries.iter().enumerate() {
+            let Some(was_at) = self.current.index_of(entry.id) else {
+                continue;
+            };
+            let at = at as u16;
+            if let Ok(found) = snapshot.values.binary_search_by_key(&at, |&(key, _)| key) {
+                let was = self.current.value(was_at);
+                if was != Some(snapshot.values[found].1) {
+                    let from = was.map_or(Val::Empty, Val::Number);
+                    self.pending
+                        .push(Raise::Property(entry.id, Property::Range, from));
+                }
+            }
+            let now = snapshot.state.get(at as usize).copied().unwrap_or_default();
+            let was = self.current.state(was_at);
+            for (flag, what) in [
+                (State::TOGGLED, Property::Toggle),
+                (State::SELECTED, Property::Selected),
+                (State::EXPANDED, Property::Expanded),
+            ] {
+                let held = was.has(flag);
+                if held == now.has(flag) {
+                    continue;
+                }
+                let from = match what {
+                    Property::Selected => Val::Bool(held),
+                    _ => Val::Int(i32::from(held)),
+                };
+                self.pending.push(Raise::Property(entry.id, what, from));
+            }
+        }
+    }
+
+    /// Queues what opened and what closed, by comparing the outgoing tree's overlays with the
+    /// incoming one's.
+    ///
+    /// Derived from the published trees rather than reported by the layer that opens them: a
+    /// menu dismissed by a press outside closes without telling anyone, and what a client is
+    /// owed is exactly the difference between what it could see and what it can see now.
+    ///
+    /// A close is raised on the fragment root, because the element it would otherwise name has
+    /// gone and a provider for it no longer resolves — which is the form the platform's own
+    /// menu controls raise it in.
+    fn overlay_events(&mut self, next: &Tree) {
+        let (was, now) = (&self.current, next);
+        now.overlays(|id, role| {
+            if was.index_of(id).is_some() {
+                return;
+            }
+            self.pending.push(match role {
+                UiaRole::ToolTip => Raise::tooltip_opened(id),
+                _ => Raise::menu_opened(id),
+            });
+        });
+        let mut closed = false;
+        was.overlays(|id, role| {
+            closed |= role != UiaRole::ToolTip && now.index_of(id).is_none();
+        });
+        if closed {
+            self.pending.push(Raise::menu_closed(ControlId::NONE));
+        }
     }
 
     /// Carries the live column forward and publishes `tree` in its place.
@@ -192,6 +278,16 @@ impl Uia {
     /// every control at the wrong place.
     pub fn set_window(&mut self, origin: Vector2, scale: f32) {
         self.current.set_window(origin, scale);
+    }
+
+    /// Records the word each scroll container's tracker publishes its position into.
+    ///
+    /// Called where the tracker list arrives, and read by the next publish. The tree holds the
+    /// tracker's own word rather than a copy, so a container still settling after a flick
+    /// reports where its content is now.
+    pub fn set_trackers(&mut self, trackers: &[(NodeId, Arc<AtomicU64>)]) {
+        self.trackers.clear();
+        self.trackers.extend(trackers.iter().cloned());
     }
 
     /// Publishes the offset of one scroll container, which its descendants' bounds are resolved
@@ -294,6 +390,22 @@ impl Uia {
     /// so this can sit on the tick unconditionally.
     pub fn sync_regions(&mut self) {
         _ = self.shared.regions.sync();
+        // A presented read-out's number is written by the thread that drew it, so nothing
+        // announces it on the way past. It is announced on the tick instead, quantized, and
+        // only for a region declared live.
+        //
+        // The bound: a read-out that moves while nothing else does announces nothing, because
+        // the front thread does not tick at idle and waking it per frame is the cost this
+        // stack exists to avoid. A client reads the number on demand either way.
+        let mut readings = core::mem::take(&mut self.readings);
+        self.shared.regions.readings(&mut readings);
+        for &(id, value) in &readings {
+            let Some(at) = self.current.index_of(id) else {
+                continue;
+            };
+            self.announce(id, at, value);
+        }
+        self.readings = readings;
     }
 
     /// Forgets everything a control declared: its parts, its bound value, its last announcement
@@ -442,6 +554,12 @@ impl Uia {
     fn part_at_for_test(&self, id: ControlId, x: f32, y: f32) -> Option<u32> {
         let found = self.shared.regions.pick(id, windows_scene::Point { x, y });
         (found != regions::NO_PART).then_some(found)
+    }
+
+    /// Returns what every provider object is minted against, for a test that reaches one by
+    /// control id rather than by walking to it.
+    fn shared_for_test(&self) -> &Arc<Shared> {
+        &self.shared
     }
 
     fn root_for_test(&self) -> crate::bindings::IRawElementProviderSimple {

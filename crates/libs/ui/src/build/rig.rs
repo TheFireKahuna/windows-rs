@@ -222,7 +222,7 @@ impl Frame<'_> {
             h.uia_entries(&mut snapshot);
             h.pending.clear();
         });
-        let tree = Tree::adopt(&snapshot);
+        let tree = Tree::adopt(&snapshot, &[]);
         let at = tree
             .entries()
             .iter()

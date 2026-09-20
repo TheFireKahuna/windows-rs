@@ -11,18 +11,18 @@
 //! turns them into pixels. A region is the one exception: a pick inside one writes the region's
 //! input state directly, because that state is an atomic the present thread reads.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::*};
 
 use windows_core::Result;
 use windows_numerics::Vector2;
-use windows_scene::{ControlId, Env, HitFlags, HitTable, NodeId, unpack_offset};
-use windows_window::{CaptionHit, CaptionState, Handoff, Tick as Frame, Wake, Window};
+use windows_scene::{ControlId, Env, HitFlags, NodeId};
+use windows_window::{CaptionState, Handoff, Tick as Frame, Wake, Window};
 
-use crate::caption;
-use crate::input::{Doorbell, Report, Router, client_origin};
+use crate::input::{Doorbell, HitView, Report, Router, client_origin};
+use super::reentry::Reentry;
 use crate::present::Picks;
 use crate::role::Scope;
 use crate::seam::{AppCensus, FocusOp, InputDown, Row, SceneTally, ToScene};
@@ -41,25 +41,29 @@ pub(super) struct Tick {
     /// back to this tick, so the two do not keep each other alive.
     window: Rc<Window>,
     links: Arc<Links>,
-    bell: Rc<Doorbell>,
     router: Router,
     /// What the window procedure owns and posts to, because those handlers run inside it and
     /// this tick is what forwards them.
     from_pump: Handoffs,
-    /// The hit array as the scene thread last published it. The caption's hit handler reads it
-    /// from the window procedure through the same borrow, fallibly.
-    hits: HitTable,
+    /// The hit array as the scene thread last published it, and the window commands in it.
+    ///
+    /// Shared with the window procedure rather than held here, so the caption's own hit test is
+    /// answered from the one array while a pass is on the stack.
+    view: Rc<HitView>,
     /// Each viewport's live offset, as one atomic word the thread owning the trackers
     /// publishes. Installed on [`hits`](Self::hits) so a hit test resolves scroll without a hop,
     /// and read again where automation publishes the same offsets.
     trackers: Vec<(NodeId, Arc<AtomicU64>)>,
     /// The regions the pointer can be picked inside, with the part copy each is scanned against.
     picks: Picks,
-    /// The window commands, as the scene thread last published them.
-    caption: [Option<ControlId>; 3],
     /// Focus edits the app thread emitted, applied after the router's own tick so a keyboard
     /// move lands on the reports the front table is about to read.
     focus: Vec<FocusOp>,
+    /// Fields whose owner unmounted, retired after the router has run.
+    ///
+    /// Retiring one enters TSF, and no call-out may precede the routing a removed key is
+    /// offered behind. Adopting the batch records them; the pass spends them.
+    retiring: Vec<ControlId>,
     reports: Vec<Report>,
     /// The batch being filled for the scene thread.
     to_scene: Box<ToScene>,
@@ -67,15 +71,15 @@ pub(super) struct Tick {
     /// is: a batch that waited for the next contact would carry that contact's release to the
     /// scene thread late.
     holding: Option<Frame>,
-    /// Set by the window procedure on `WM_SETTINGCHANGE`, so the caret and selection metrics
-    /// are re-read once rather than per tick.
-    settings_changed: bool,
     /// What this thread last told the scene thread the display was.
     sent: Option<Env>,
     /// What the other threads last reported about themselves, for the observer.
     scene: SceneTally,
     app: AppCensus,
     ticks: u64,
+    /// Shaped field geometries adopted so far, for an observer measuring how many fields one
+    /// keystroke reshaped.
+    field_shapes: u64,
     scope: Scope,
     /// Drained per tick and never held, so a provider that asks for nothing allocates nothing.
     uia_actions: Vec<uia::Action>,
@@ -93,11 +97,14 @@ pub(super) struct Handoffs {
     pub(super) resized: Rc<Handoff<(i32, i32)>>,
     pub(super) rescaled: Rc<Handoff<()>>,
     pub(super) nonclient: Rc<Handoff<CaptionState>>,
+    /// Latched by the window procedure on `WM_SETTINGCHANGE`, so the caret and selection
+    /// metrics are re-read once rather than per tick.
+    pub(super) settings: Rc<Cell<bool>>,
     pub(super) wake: Wake,
 }
 
 impl Tick {
-    /// Builds the tick: the doorbell and the router, both on the window's own thread.
+    /// Builds the tick: the router over the doorbell the window procedure already answers to.
     ///
     /// # Errors
     ///
@@ -105,55 +112,45 @@ impl Tick {
     pub(super) fn new(
         window: &Rc<Window>,
         links: &Arc<Links>,
+        bell: &Rc<Doorbell>,
+        view: &Rc<HitView>,
         scope: Scope,
         from_pump: Handoffs,
     ) -> Result<Self> {
-        let bell = Rc::new(Doorbell::new());
-        let router = Router::new(&bell, window, from_pump.wake.clone())?;
+        let router = Router::new(bell, window, from_pump.wake.clone())?;
         Ok(Self {
             window: Rc::clone(window),
             links: Arc::clone(links),
-            bell,
             router,
             from_pump,
-            hits: HitTable::default(),
+            view: Rc::clone(view),
             trackers: Vec::new(),
             picks: Picks::default(),
-            caption: [None; 3],
             focus: Vec::new(),
+            retiring: Vec::new(),
             reports: Vec::new(),
             to_scene: Box::default(),
             holding: None,
-            settings_changed: false,
             sent: None,
             scene: SceneTally::default(),
             app: AppCensus::default(),
             ticks: 0,
+            field_shapes: 0,
             scope,
             uia_actions: Vec::new(),
             text_actions: Vec::new(),
         })
     }
 
-    /// Answers every message but the frame: the settings latch, then the pointer doorbell.
-    pub(super) fn message(&mut self, msg: u32, w: usize, l: isize) -> Option<isize> {
-        if msg == super::WM_SETTINGCHANGE {
-            self.settings_changed = true;
-        }
-        self.bell.wndproc(msg, w, l)
-    }
-
-    /// Resolves a point in the caption band against the one hit array.
-    pub(super) fn caption_hit(&self, x: f32, y: f32) -> CaptionHit {
-        caption::hit(x, y, &self.hits, self.caption)
-    }
-
     /// Runs one input tick.
+    ///
+    /// `phase` is marked serviced once the router has run and text focus has moved, which is
+    /// what a removed key taken by a nested pump is offered to TSF behind.
     ///
     /// # Errors
     ///
     /// The router's own tick, a text action or the caret publication failed.
-    pub(super) fn run(&mut self) -> Result<()> {
+    pub(super) fn run(&mut self, phase: &Reentry) -> Result<()> {
         self.ticks += 1;
         // ⓪ what the scene thread published since the last tick: the array a contact resolves
         // against, and the rows the router and the pick table are declared from. Taken before
@@ -172,39 +169,67 @@ impl Tick {
         let Some(env) = super::env_of(&self.window, self.scope) else {
             return Ok(());
         };
-        // ① input, against the array above.
+        // ① input, against the array above. The array is read for the call and released, so
+        // nothing downstream holds it across a call-out.
         self.reports.clear();
-        self.router.tick(&self.hits, env, &mut self.reports)?;
+        let Self {
+            view,
+            router,
+            reports,
+            ..
+        } = self;
+        view.with(|hits| router.tick(hits, env, reports))?;
         // ② the focus edits the app thread emitted, into the same report list: a keyboard move
         // and a pointer move reach the front table the same way.
         self.apply_focus();
         // A control that stopped being interactive under the focus it holds keeps the ring
         // pointing at something no contact can reach, so focus is dropped rather than stranded.
-        if self.router.focus_mut().current().is_some_and(|id| {
-            self.hits
+        let focused = self.router.focus_mut().current();
+        if focused.is_some_and(|id| {
+            self.view
                 .entry(id)
                 .is_none_or(|e| !e.flags.contains(HitFlags::INTERACTIVE))
         }) {
             self.focus.push(FocusOp::Focus(None));
             self.apply_focus();
         }
+        // From here the pass makes call-outs: TSF, the clipboard, the touch view, automation.
+        // Everything above routed input and moved nothing outside this thread, so a removed key
+        // taken by a nested pump from here on is offered to TSF behind input that has been
+        // routed — which is what the boundary means.
+        phase.serviced();
+        // A field whose owner unmounted gives up its storage, and its focus with it. First,
+        // because the rest of the pass reads what holds focus.
+        let text = &mut self.from_pump.text;
+        for id in self.retiring.drain(..) {
+            text.forget(id)?;
+        }
         // The caret's box, in the same space the array is scanned in, and whatever the editor
         // has to say about it. Both are the input thread's: TSF is pump-bound.
-        let text = &mut self.from_pump.text;
-        text.geometry(&self.hits, env.scale());
-        text.reports(&mut self.reports, &self.hits, env.scale())?;
+        text.geometry(&self.view, env.scale());
+        text.reports(&mut self.reports, &self.view, env.scale())?;
+        // Where a text service opens its own message pump: the notification this delivers is
+        // what a TIP answers by asking for a lock, and it answers on this stack.
+        #[cfg(feature = "test-support")]
+        super::testing::at_call_out();
         text.flush(&mut self.to_scene.fields.updates);
-        if (text.touch.take()
-            || self
-                .reports
-                .iter()
-                .any(|r| matches!(r, Report::FocusChanged { .. })))
-            && let Some(id) = text.focused()
+        // An occlusion that changed is reported whether or not a field still holds focus,
+        // because the extent it asked for is the scroll containers' to give back. A focus move
+        // reports only where there is a field to bring into view.
+        let occluded = text.touch.take();
+        if occluded
+            || (text.focused().is_some()
+                && self
+                    .reports
+                    .iter()
+                    .any(|r| matches!(r, Report::FocusChanged { .. })))
         {
-            let occlusion = text.touch.docked;
-            self.to_scene.reveals.push(Reveal { id, occlusion });
+            self.to_scene.reveals.push(Reveal {
+                id: text.focused(),
+                occlusion: text.touch.docked,
+            });
         }
-        if core::mem::take(&mut self.settings_changed) {
+        if self.from_pump.settings.replace(false) {
             self.from_pump.text.settings_changed();
         }
         // A provider snapshot can precede disable, hide or unmount, so what one asked for is
@@ -212,12 +237,14 @@ impl Tick {
         self.automation();
         // ③ a contact inside a region writes that region's input and bumps its epoch here, on
         // this thread: the present thread reads both, and no other thread is in the way.
-        crate::present::pick(
-            &self.reports,
-            &self.hits,
-            &mut self.picks,
-            &mut self.to_scene.intents,
-        );
+        let Self {
+            view,
+            reports,
+            picks,
+            to_scene,
+            ..
+        } = self;
+        view.with(|hits| crate::present::pick(reports, hits, picks, &mut to_scene.intents));
         // ④ what the scene thread turns into pixels, and the window facts that arrived with it.
         // Appended to the batch this thread holds; handed over only when the spare is back,
         // otherwise carried to the next tick in the order it happened.
@@ -247,7 +274,14 @@ impl Tick {
         };
         self.publish_automation(env);
         // Last, so what an observer is handed is what the whole tick settled on.
-        super::tallies(self.scene, self.app, &self.reports, self.ticks);
+        super::tallies(
+            self.scene,
+            self.app,
+            &self.reports,
+            self.ticks,
+            self.field_shapes,
+            self.from_pump.text.focused_box(),
+        );
         Ok(())
     }
 
@@ -257,7 +291,13 @@ impl Tick {
             return;
         }
         let from = self.router.focus_mut().current();
-        if self.router.focus_mut().apply(&self.focus, &self.hits) {
+        let Self {
+            view,
+            router,
+            focus,
+            ..
+        } = self;
+        if view.with(|hits| router.focus_mut().apply(focus, hits)) {
             let to = self.router.focus_mut().current();
             self.reports.push(Report::FocusChanged { from, to });
         }
@@ -273,15 +313,15 @@ impl Tick {
             self.from_pump.text.tsf.layout_changed();
         }
         if down.hits_changed {
-            self.hits.copy_from(&down.hits);
-            // A fresh array carries no offsets, so the shadows are re-installed on the copy
-            // whether or not the tracker set moved.
-            self.hits.set_shadows(&self.trackers);
+            self.view.replace(&down.hits, &self.trackers);
         }
         if down.trackers_changed {
             self.trackers.clear();
             self.trackers.append(&mut down.trackers);
-            self.hits.set_shadows(&self.trackers);
+            self.view.set_shadows(&self.trackers);
+            // Before the publish below, so the tree this batch carries binds the trackers this
+            // batch declared rather than the ones the batch before it did.
+            self.from_pump.uia.borrow_mut().set_trackers(&self.trackers);
         }
         if down.regions_changed {
             self.picks.sync(&down.regions);
@@ -292,6 +332,7 @@ impl Tick {
         for layout in &down.fields.layouts {
             self.from_pump.text.layout(layout);
         }
+        self.field_shapes += down.fields.layouts.len() as u64;
         let declared = &mut down.declared;
         for (id, decl) in declared.gestures.drain(..) {
             self.router.declare(id, decl);
@@ -300,11 +341,15 @@ impl Tick {
         // including a text source whose owner closed while input waited.
         for id in declared.released.drain(..) {
             self.router.forget(id);
-            _ = self.from_pump.text.forget(id);
+            self.retiring.push(id);
+            self.from_pump.uia.borrow_mut().release(id);
+        }
+        for peer in declared.peers.drain(..) {
+            self.from_pump.uia.borrow_mut().watch_region(peer);
         }
         self.focus.append(&mut declared.focus);
         if declared.caption != [None; 3] {
-            self.caption = declared.caption;
+            self.view.set_caption(declared.caption);
         }
         self.app = declared.census;
         if down.tallies {
@@ -312,6 +357,12 @@ impl Tick {
         }
         if !declared.uia.entries.is_empty() {
             self.from_pump.uia.borrow_mut().publish(&declared.uia);
+        }
+        // After the publish: a control that moved and then republished reports the number the
+        // publish stated, and `set_value` drops one equal to what it already holds.
+        if !declared.intents.is_empty() {
+            self.from_pump.uia.borrow_mut().observe(&declared.intents);
+            declared.intents.clear();
         }
     }
 
@@ -330,7 +381,10 @@ impl Tick {
                 // beside the caret's own.
                 uia::Action::Reveal(id) => {
                     let occlusion = self.from_pump.text.touch.docked;
-                    self.to_scene.reveals.push(Reveal { id, occlusion });
+                    self.to_scene.reveals.push(Reveal {
+                        id: Some(id),
+                        occlusion,
+                    });
                 }
                 action => self.to_scene.automation.push(action),
             }
@@ -345,7 +399,7 @@ impl Tick {
                 | uia::action::TextAction::Select(id, ..) => *id,
             };
             if self
-                .hits
+                .view
                 .entry(target)
                 .is_some_and(|e| e.flags.contains(HitFlags::INTERACTIVE))
             {
@@ -367,12 +421,9 @@ impl Tick {
         if let Some(origin) = client_origin(self.window.hwnd()) {
             uia.set_window(origin, env.scale());
         }
-        for (viewport, shadow) in &self.trackers {
-            // acquire: pairs with the release the tracker's own thread publishes the word with,
-            // so both axes read here belong to one reported position.
-            let (x, y) = unpack_offset(shadow.load(Acquire));
-            uia.set_scroll(*viewport, Vector2 { x, y });
-        }
+        // The renderers' own geometry, joined against what this side says it means. One
+        // acquire load per watched region where nothing moved, so it sits on the tick.
+        uia.sync_regions();
         uia.flush();
     }
 }

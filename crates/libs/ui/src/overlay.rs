@@ -681,7 +681,12 @@ impl Overlays {
         let (blocker, root, scope) = Host::with(|host| {
             let blocker = spec.kind.takes_focus().map(|_| host.mint_blocker());
             let scope = host.intern(host.root_scope());
-            (blocker, host.overlay_root(scope).0, scope)
+            let root = host.overlay_root(scope).0;
+            // The slot root is the element its contents are announced inside: a menu, so its
+            // rows report as menu items, or a description, or a dialog a reader announces
+            // title-first. Without one, a flyout's rows read as loose buttons at the window.
+            host.name_overlay(root, scope, spec.kind, invoker);
+            (blocker, root, scope)
         });
         // Mapped over the blocker rather than asking `takes_focus` again: a focus scope is named
         // by its own first entry in the hit array, and that entry is the blocker, so deriving
@@ -712,6 +717,7 @@ impl Overlays {
             host.overlays.push(Placement {
                 root,
                 blocker,
+                invoker,
                 anchor: spec.anchor,
                 viewport: host.overlay_viewport(spec.viewport),
                 at: Vector2 { x: 0.0, y: 0.0 },

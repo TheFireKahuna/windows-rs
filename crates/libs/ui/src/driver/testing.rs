@@ -6,6 +6,8 @@
 //! Input routing, focus application and animation playback require native driving;
 //! this driver checks declarations and geometry only.
 
+use core::cell::RefCell;
+
 use crate::build::Host;
 use crate::overlay::Overlays;
 use crate::role::Scope;
@@ -33,7 +35,7 @@ pub fn uia_tree() -> Tree {
         h.uia_entries(&mut snapshot);
         h.pending.clear();
     });
-    Tree::adopt(&snapshot)
+    Tree::adopt(&snapshot, &[])
 }
 
 /// Owns the app-side overlay lifecycle for a mounted layout under test.
@@ -91,4 +93,57 @@ impl Drop for LayoutDriver {
         self.root = None;
         self.owner = None;
     }
+}
+
+// ── driving the two paths a nested pump and a docked occlusion take ─────────────
+
+thread_local! {
+    /// What runs where the pass makes its deepest call-out, for a harness that needs a real
+    /// nested pump on a real pass's stack.
+    static AT_CALL_OUT: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+}
+
+/// Installs a function run inside every input pass, at the point a text service's own message
+/// pump opens.
+///
+/// A store-level reentrancy test cannot reach this: the property under test is that the pass
+/// holds nothing a nested pump needs, and only a pass can demonstrate that. Installed on the
+/// window's own thread, before the window runs.
+pub fn on_call_out(f: impl FnMut() + 'static) {
+    AT_CALL_OUT.with(|slot| *slot.borrow_mut() = Some(Box::new(f)));
+}
+
+/// Runs the installed call-out, where one is installed and is not already running.
+pub(super) fn at_call_out() {
+    // Fallibly, so a hook that re-enters the pass is a skipped call rather than a panic inside
+    // the window procedure.
+    _ = AT_CALL_OUT.try_with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut()
+            && let Some(f) = slot.as_mut()
+        {
+            f();
+        }
+    });
+}
+
+pub use crate::text_input::Occluder;
+
+/// The running window's handle, reachable from any thread.
+///
+/// Process-wide rather than thread-local: the system's own occlusion callback arrives on a
+/// pool thread, so a harness reporting one has to be able to do the same.
+static OCCLUDER: std::sync::Mutex<Option<Occluder>> = std::sync::Mutex::new(None);
+
+/// Publishes the running window's occlusion handle. Called once, as the window is built.
+pub(super) fn publish_occluder(occluder: Occluder) {
+    *OCCLUDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(occluder);
+}
+
+/// Returns the running window's occlusion handle, once its window exists.
+#[must_use]
+pub fn occluder() -> Option<Occluder> {
+    OCCLUDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }

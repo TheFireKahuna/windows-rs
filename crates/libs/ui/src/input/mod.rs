@@ -47,6 +47,9 @@ mod doorbell;
 mod focus;
 mod platform;
 
+mod view;
+pub use view::HitView;
+
 pub use coords::{Coords, Pen, PointerSpace, Sample, client_origin};
 pub use doorbell::{
     Doorbell, DoorbellHealth, EventKind, InputEvent, KeyEvent, KeyKind, Mods, PointerEvent,
