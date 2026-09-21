@@ -264,6 +264,51 @@ impl OutputTransform {
         }
     }
 
+    /// Encodes a display-referred colour as the sRGB byte quadruple a platform colour
+    /// carries: a `Windows.UI.Color` on a composition object, a `COLORREF` on a window
+    /// attribute.
+    ///
+    /// Those containers are **SDR-referred and sRGB-encoded**, which is two conversions
+    /// away from the linear extended-range value [`apply`](Self::apply) produces. The
+    /// system reads such a byte back as
+    ///
+    /// ```text
+    /// scRGB = srgb_decode(byte / 255) * (SDR white level / 80)
+    /// ```
+    ///
+    /// so this divides by that same white ratio and then applies the sRGB transfer, and
+    /// the two cancel. The ratio is `encode * white`, which is `1` wherever composition
+    /// is display-referred and `white_nits / 80` on a high-dynamic-range desktop. Writing
+    /// a linear value straight into the byte instead lands it several times off in either
+    /// direction and rotates hue, because the transfer is per channel.
+    ///
+    /// **This is a lossy boundary and the only one in the pipeline.** Eight bits of sRGB
+    /// resolve colour finely enough for anything, but the container is bounded: a
+    /// component above the display's SDR white and a component outside Rec.709 both clamp
+    /// here, and neither can be carried at all. Nothing that has headroom or chroma to
+    /// lose should arrive here — colour reaches the compositor as FP16 surface content.
+    #[must_use]
+    pub fn to_sdr8(&self, c: Scrgb) -> [u8; 4] {
+        let ratio = self.encode * self.white;
+        let oetf = |v: f32| {
+            let v = (v / ratio).clamp(0.0, 1.0);
+            let e = if v <= 0.003_130_8 {
+                12.92 * v
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            };
+            (e * 255.0).round() as u8
+        };
+        [
+            oetf(c.r),
+            oetf(c.g),
+            oetf(c.b),
+            // Alpha is coverage, not light: it is linear in the container too, and the
+            // white level does not apply to it.
+            (c.a.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ]
+    }
+
     /// Returns the brightest of `v`'s channels in the display's primaries, in
     /// presented nits.
     #[inline]
@@ -824,5 +869,98 @@ mod tests {
     fn over_peak_content_is_reported() {
         let out = OutputTransform::for_display(DisplayCapability::Sdr, REFERENCE_WHITE_NITS);
         let _ = out.apply(Radiance::new(900.0, 900.0, 900.0, 1.0));
+    }
+
+    /// Decodes a byte the way the system does, so a round trip is checked against the
+    /// platform's behaviour rather than against this module's own arithmetic.
+    ///
+    /// Measured on a Windows 11 desktop by reading the untouched FP16 composition frame
+    /// under a `CompositionColorBrush`, a `DropShadow` colour and an FP16 surface of the
+    /// same nominal value: byte 128 at an SDR white level of 180 nits composites to
+    /// scRGB 0.4868, and bytes (255, 51, 13) to (2.2559, 0.0746, 0.0091). Both are this
+    /// function to four digits on every channel.
+    fn scrgb(r: f32, g: f32, b: f32) -> Scrgb {
+        Scrgb { r, g, b, a: 1.0 }
+    }
+
+    fn as_system_reads_it(byte: u8, unity: f32) -> f32 {
+        let e = f32::from(byte) / 255.0;
+        let linear = if e <= 0.040_45 {
+            e / 12.92
+        } else {
+            ((e + 0.055) / 1.055).powf(2.4)
+        };
+        linear * unity
+    }
+
+    #[test]
+    fn sdr8_round_trips_through_the_system_decode() {
+        let hdr = OutputTransform::for_display(
+            DisplayCapability::HighDynamicRange {
+                gamut: Gamut::REC709,
+                white_nits: 180.0,
+                peak_nits: 1000.0,
+            },
+            REFERENCE_WHITE_NITS,
+        );
+        // The measured anchors, stated as the values this transform would produce.
+        assert_eq!(hdr.to_sdr8(scrgb(0.4868, 0.4868, 0.4868))[0], 128);
+        assert_eq!(
+            [
+                hdr.to_sdr8(scrgb(2.2559, 0.0746, 0.0091))[0],
+                hdr.to_sdr8(scrgb(2.2559, 0.0746, 0.0091))[1],
+                hdr.to_sdr8(scrgb(2.2559, 0.0746, 0.0091))[2],
+            ],
+            [255, 51, 13]
+        );
+        // Every byte the encoder can emit decodes back to within half a step of what it
+        // was given, on all three desktops.
+        // The scale the system reads a byte against: one wherever composition is
+        // display-referred, and the SDR white level in scRGB units where it is not.
+        for (cap, unity) in [
+            (DisplayCapability::Sdr, 1.0),
+            (
+                DisplayCapability::WideGamut {
+                    gamut: Gamut::REC709,
+                },
+                1.0,
+            ),
+            (
+                DisplayCapability::HighDynamicRange {
+                    gamut: Gamut::REC709,
+                    white_nits: 240.0,
+                    peak_nits: 1000.0,
+                },
+                240.0 / SCRGB_UNITY_NITS,
+            ),
+        ] {
+            let out = OutputTransform::for_display(cap, REFERENCE_WHITE_NITS);
+            for step in 0..=64 {
+                let v = unity * step as f32 / 64.0;
+                let byte = out.to_sdr8(scrgb(v, v, v))[0];
+                let back = as_system_reads_it(byte, unity);
+                // Half an eight-bit step, taken where the transfer is steepest, which is
+                // at the top of the range.
+                let tolerance = unity * 0.5 / 255.0 * 2.4;
+                assert!(
+                    (back - v).abs() <= tolerance,
+                    "{cap:?}: scRGB {v} encoded to {byte}, which the system reads as {back}"
+                );
+            }
+        }
+    }
+
+    /// The two things the container cannot hold, and the one it can.
+    #[test]
+    fn sdr8_clamps_only_what_eight_bits_cannot_carry() {
+        let out = OutputTransform::for_display(DisplayCapability::Sdr, REFERENCE_WHITE_NITS);
+        assert_eq!(out.to_sdr8(Scrgb::TRANSPARENT), [0, 0, 0, 0]);
+        assert_eq!(out.to_sdr8(scrgb(1.0, 1.0, 1.0)), [255, 255, 255, 255]);
+        // Outside Rec.709 and above white: both clamp, and this is the only boundary in
+        // the pipeline where either does.
+        let wild = out.to_sdr8(scrgb(-0.4, 3.0, 0.5));
+        assert_eq!(wild[0], 0);
+        assert_eq!(wild[1], 255);
+        assert!(wild[2] > 180 && wild[2] < 200, "mid grey encoded to {}", wild[2]);
     }
 }

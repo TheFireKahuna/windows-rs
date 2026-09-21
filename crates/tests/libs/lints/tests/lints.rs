@@ -71,15 +71,42 @@ fn no_color_brush() {
         &[
             // Defines the wrapper, which is 1:1 with the platform surface.
             "crates/libs/composition/src/compositor.rs",
-            // The one call site: `mask_brush`'s white coverage source, which carries no
-            // colour.
-            "crates/libs/scene/src/bind.rs",
+            // The one call site: the white a captured shape is stroked and filled with,
+            // which is a coverage source and carries no colour.
+            "crates/libs/scene/src/realize.rs",
         ],
     );
     deny(
         "no_color_brush",
         "an 8-bit colour brush cannot carry a negative component or a value above white; \
          colour reaches the compositor as FP16 surface content",
+        &found,
+    );
+}
+
+#[test]
+fn the_blur_carries_no_colour() {
+    // A `DropShadow` tints its own output through a `Windows.UI.Color`, which is eight
+    // bits, SDR-referred and sRGB-encoded. Measured: byte 255 composites to the display's
+    // SDR white and no further, so a glow authored above white arrives clamped to paper
+    // white with its hue rotated by the per-channel transfer.
+    //
+    // A glow is authored above white. So the blur is an alpha generator: white on an
+    // off-tree sprite, captured, and multiplied against an FP16 cell — the same rule every
+    // other paint follows. The only colour the scene may hand the compositor is opaque
+    // white, which is coverage.
+    let sources = framework();
+    let found: Vec<String> = all(&sources, &["set_color(", "Color::rgba", "Color::rgb"], &[
+        // Defines the wrappers, which are 1:1 with the platform surfaces.
+        "crates/libs/composition/src/",
+    ])
+    .into_iter()
+    .filter(|hit| !hit.contains("Color::rgb(255, 255, 255)"))
+    .collect();
+    deny(
+        "the_blur_carries_no_colour",
+        "an eight-bit Windows.UI.Color is SDR-referred and clamps a glow to paper white; \
+         a blur carries alpha and an FP16 cell carries the colour",
         &found,
     );
 }
@@ -129,21 +156,20 @@ fn no_scrgb_construction() {
     // display transform runs exactly once per colour. Constructing an `Scrgb` by hand
     // skips it.
     //
-    // Three exemptions inside `windows-scene`, each a value that has already been through
-    // the transform or is not a colour:
+    // Two exemptions inside `windows-scene`, each a value that has already been through the
+    // transform or is not a colour:
     //
-    // - `quant.rs` re-materializes a transformed value from its quantized key;
-    // - `cache.rs`'s white is the mask brush's coverage source;
-    // - `backends.rs` builds that same white as a solid.
+    // - `sink.rs` re-materializes a transformed value from its quantized key;
+    // - `realize.rs` builds the opaque white every coverage tile is drawn in, and the
+    //   feathered ladder that varies its alpha, neither of which carries colour.
     //
     // The second assertion below is stricter and covers the widget layer, where a role
     // resolves to authored light and a display-referred colour has no meaning.
     let sources = framework();
     let allow = [
         "crates/libs/color/",
-        "crates/libs/scene/src/quant.rs",
-        "crates/libs/scene/src/cache.rs",
-        "crates/libs/scene/src/backends.rs",
+        "crates/libs/scene/src/sink.rs",
+        "crates/libs/scene/src/realize.rs",
     ];
     // `-> Scrgb {` opens a function that returns one, which is not a construction.
     let found: Vec<String> = all(&sources, &["Scrgb {", "Scrgb::new"], &allow)

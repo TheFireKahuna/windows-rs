@@ -21,7 +21,7 @@ use windows_color::{Radiance, Scrgb};
 use windows_composition::{
     BorderMode, Brush, Color, CompositionBrush, CompositionDrawingSurface,
     CompositionGraphicsDevice, CompositionPath, CompositionPathGeometry, CompositionSurfaceBrush,
-    Compositor, ShadowSource, SpriteVisual, Stretch, StrokeCap, StrokeJoin, Surface, Visual,
+    Compositor, SpriteVisual, Stretch, StrokeCap, StrokeJoin, Surface, Visual,
 };
 use windows_core::{Interface, Result};
 use windows_d2d::{Draw, Extend, GlyphRun, Gpu, Opacity, SceneSurface, Solid, Stop, SurfaceDraw};
@@ -956,6 +956,13 @@ pub struct Ctx<'a> {
     pub generation: Gen,
     pub res: &'a mut Resources,
     pub cache: &'a mut Cache,
+    /// Visuals this realize minted and freed, for the applier to fold into its census.
+    ///
+    /// A glow is three visuals a node did not ask for by name, and the census is where the
+    /// scene's standing cost is read. Counted here rather than in the applier because this
+    /// is the half that knows whether one was built.
+    pub minted: i32,
+    pub freed: i32,
 }
 
 /// The construction that realizes a shape mask.
@@ -1048,19 +1055,24 @@ pub fn realize(
             let chain = ctx.back.compositor.create_mask_brush();
             chain.set_mask(alpha);
             chain.set_source(source);
-            sprite.set_brush(&chain);
             Some(chain)
         }
-        (None, Some(source)) => {
-            sprite.set_brush(source);
-            None
-        }
-        _ => {
-            sprite.clear_brush();
-            None
-        }
+        _ => None,
     };
-    cast_shadow(arena, id, &sprite, halo, &paint, captured, ctx);
+    // Built before it is bound, because the glow needs it twice: as the silhouette its blur
+    // reads, and to decide where the paint goes. A lit node paints through a child of its
+    // own, since a visual's own brush draws under its children.
+    let brush = match (&chain, &source) {
+        (Some(chain), _) => Some(chain.as_brush()),
+        (None, Some(source)) => Some(source.clone()),
+        _ => None,
+    };
+    let lit = cast_glow(arena, id, &sprite, halo, &paint, brush.as_ref(), captured, ctx)?;
+    let target = lit.as_ref().unwrap_or(&sprite);
+    match &brush {
+        Some(brush) => target.set_brush(brush),
+        None => target.clear_brush(),
+    }
 
     let built = ctx.generation;
     if let Some(row) = arena.painted_mut(id) {
@@ -1239,77 +1251,176 @@ fn paint_brush(
     })
 }
 
-/// Casts, or removes, the blur this sprite rides on.
+/// Casts, or removes, the light this node spends past its own silhouette.
 ///
-/// A halo's silhouette is the sprite's own brush alpha, stated explicitly: with no source
-/// policy the platform's default silhouette is a rectangle the size of the visual, which
-/// would square off every rounded box in the tree. A captured glow blurs another node's
-/// subtree instead, and the shadow is cast by *this* sprite rather than by what it captures,
-/// which puts the blurred silhouette under the real stroke. Both land on the same slot, so a
-/// sprite declares one or the other and never both. At zero offset a shadow is a glow.
+/// **The blur carries alpha and never colour.** A `DropShadow` tints its own output through
+/// a `Windows.UI.Color`, which is eight bits, SDR-referred and sRGB-encoded: it holds
+/// nothing above the display's white and nothing outside Rec.709, and a glow is authored
+/// above white in a chromatic role. So the shadow is cast in white on an off-tree sprite,
+/// the halo that leaves it is captured, and the capture masks an FP16 cell drawn at the same
+/// draw choke every other paint goes through. Five objects, and the same rule as the rest of
+/// the crate: the silhouette carries alpha, a float surface carries colour, and a mask brush
+/// multiplies them.
 ///
-/// A blur a channel already animated survives a rebind, because the channels live on the
-/// node: a device loss mid-hover must not snap the halo back to its authored width.
-fn cast_shadow(
+/// The silhouette is whatever the node paints, so a node with no paint yet casts nothing and
+/// the op that brings the paint builds the glow. A captured glow blurs the group it paints
+/// with, which is the same brush.
+///
+/// Returns the sprite the node's paint belongs on: a child while the node is lit, because a
+/// visual's own brush draws *under* its children and the halo has to sit below the paint.
+///
+/// # Errors
+///
+/// Fails if the tint's cell cannot be rasterized.
+fn cast_glow(
     arena: &mut Arena,
     id: NodeId,
     sprite: &SpriteVisual,
     halo: Option<Halo>,
     paint: &Paint,
-    captured: Option<windows_composition::Captured>,
+    silhouette: Option<&CompositionBrush>,
+    group: Option<windows_composition::Captured>,
     ctx: &mut Ctx<'_>,
-) {
-    let state = match (paint, captured) {
-        (Paint::Captured { blur, tint, .. }, Some(capture)) => {
+) -> Result<Option<SpriteVisual>> {
+    let lit = match (paint, halo) {
+        (Paint::Captured { blur, tint, .. }, _) => {
             debug_assert!(halo.is_none(), "a captured glow and a halo on one sprite");
-            let shadow = ctx.back.compositor.create_drop_shadow();
-            shadow.set_blur_radius(*blur);
-            shadow.set_offset(0.0, 0.0, 0.0);
-            // Eight-bit, like every shadow colour, so the authored tint goes through the
-            // display transform here and agrees with the sprite it sits behind.
-            shadow.set_color(narrow(ctx.env.apply(*tint)));
-            shadow.set_mask(&capture.brush);
-            Some(ShadowState {
-                shadow,
-                capture: Some(capture),
-            })
+            Some((*blur, *tint, Vector2::default()))
         }
-        _ => halo.map(|halo| {
-            let shadow = ctx.back.compositor.create_drop_shadow();
-            shadow.set_source(ShadowSource::VisualAlpha);
-            shadow.set_blur_radius(halo.blur);
-            shadow.set_offset(halo.offset.x, halo.offset.y, 0.0);
-            shadow.set_color(narrow(ctx.env.apply(halo.tint)));
-            ShadowState {
-                shadow,
-                capture: None,
-            }
-        }),
+        (_, Some(halo)) => Some((halo.blur, halo.tint, halo.offset)),
+        _ => None,
     };
-    match &state {
-        Some(held) => {
-            sprite.set_shadow(&held.shadow);
-            let blur = PROPS[Prop::BlurRadius as usize].chan;
-            // The first declaration seeds the two channels from what it asked for. After
-            // that the channels outlive the object they drive, so a rebind restates them
-            // rather than resetting to the declaration.
-            if arena.aux(id).is_none_or(|aux| aux.glow.is_none()) {
-                let declared = match (paint, halo) {
-                    (Paint::Captured { blur, .. }, _) => *blur,
-                    (_, Some(halo)) => halo.blur,
-                    _ => 0.0,
-                };
-                arena.set_chan(id, blur, declared);
-                arena.set_chan(id, blur + 1, 1.0);
-            }
-            held.shadow.set_blur_radius(arena.chan(id, blur));
-            held.shadow.set_opacity(arena.chan(id, blur + 1));
+    let Some(((blur, tint, offset), silhouette)) = lit.zip(silhouette) else {
+        unlight(arena, id, sprite, ctx);
+        return Ok(None);
+    };
+    // The draw choke, the same one `Paint::Solid` goes through: the one place in this crate a
+    // scene-referred value becomes a display-referred one.
+    let key = CellKey::Solid(Q::new(ctx.env.apply(tint)));
+    let Some(cell) = ctx
+        .cache
+        .brush(key, ctx.back, ctx.env, ctx.generation)?
+        .map(Brush::as_brush)
+    else {
+        unlight(arena, id, sprite, ctx);
+        return Ok(None);
+    };
+    // A Gaussian is spent by three sigma, and a displaced shadow carries that reach with it.
+    // Fixed at the blur the construction was built for: the captured region is a property
+    // write and the blur is animatable, so a spring overshooting its declaration reaches past
+    // what was allocated for it rather than resizing the capture every frame.
+    let bleed = 3.0 * blur + offset.x.abs().max(offset.y.abs());
+    let size = arena.size(id);
+    let scale = ctx.env.scale();
+
+    // Re-point rather than re-mint wherever the region still fits. A hover restates the
+    // paint, and with it the halo, on a path that must not allocate five composition objects
+    // per pointer move.
+    let fits = arena
+        .aux(id)
+        .and_then(|aux| aux.glow.as_ref())
+        .is_some_and(|glow| glow.bleed == bleed);
+    if fits {
+        let glow = arena
+            .aux(id)
+            .and_then(|aux| aux.glow.as_ref())
+            .expect("the branch above found one");
+        glow.shadow.set_mask(silhouette);
+        glow.shadow.set_offset(offset.x, offset.y, 0.0);
+        glow.brush.set_source(&cell);
+        let target = glow.paint.clone();
+        arena.aux_mut(id).glow.as_mut().expect("the branch above found one").group = group;
+        if let Some(glow) = arena.aux(id).and_then(|aux| aux.glow.as_ref()) {
+            glow.resize(size, scale);
         }
-        None => sprite.clear_shadow(),
+        drive_blur(arena, id, blur, false);
+        return Ok(Some(target));
     }
-    // A sprite casting nothing and carrying no other payload keeps its four-byte absence.
-    if state.is_some() || arena.has_aux(id) {
-        arena.aux_mut(id).glow = state;
+
+    let comp = &ctx.back.compositor;
+    // Paints nothing: the capture below has to hold the halo alone, and a host that drew the
+    // silhouette too would put a second, unblurred copy of it under the real paint.
+    let host = comp.create_sprite_visual();
+    host.set_size(size.x, size.y);
+    let shadow = comp.create_drop_shadow();
+    // White, and never the tint. This is the alpha generator; the colour is the cell below.
+    shadow.set_color(Color::rgb(255, 255, 255));
+    shadow.set_blur_radius(blur);
+    shadow.set_offset(offset.x, offset.y, 0.0);
+    shadow.set_mask(silhouette);
+    host.set_shadow(&shadow);
+
+    let capture = comp.capture_bleeding(&host, bleed, size, scale);
+    let brush = comp.create_mask_brush();
+    brush.set_mask(&capture.brush);
+    brush.set_source(&cell);
+
+    // Both children are stated relative to the node, so the compositor re-derives them from
+    // the one extent it already carries and a resize writes no property for either. A
+    // visual's size is its own plus its relative adjustment of the parent's, which is how the
+    // halo is exactly the node grown by the bleed on all four sides.
+    let whole = Vector2 { x: 1.0, y: 1.0 };
+    let glow_sprite = comp.create_sprite_visual();
+    glow_sprite.set_size(2.0 * bleed, 2.0 * bleed);
+    glow_sprite.set_relative_size_adjustment(whole);
+    glow_sprite.set_offset(-bleed, -bleed, 0.0);
+    glow_sprite.set_brush(&brush);
+    let paint_sprite = comp.create_sprite_visual();
+    paint_sprite.set_relative_size_adjustment(whole);
+    // The host, the halo and the paint. The capture and the two brushes are not visuals and
+    // cost the tree walk nothing.
+    ctx.minted += 3;
+
+    // The node stops painting itself and becomes the host of the two.
+    sprite.clear_brush();
+    let kids = sprite.children();
+    kids.remove_all();
+    kids.insert_at_bottom(&paint_sprite);
+    kids.insert_at_bottom(&glow_sprite);
+
+    let target = paint_sprite.clone();
+    arena.aux_mut(id).glow = Some(ShadowState {
+        host,
+        shadow,
+        capture,
+        group,
+        sprite: glow_sprite,
+        brush,
+        paint: paint_sprite,
+        bleed,
+    });
+    drive_blur(arena, id, blur, true);
+    Ok(Some(target))
+}
+
+/// Writes the two channels the shadow owns onto it.
+///
+/// A fresh construction seeds them from what the declaration asked for. After that the
+/// channels outlive the object they drive, so a rebind restates them rather than resetting to
+/// the declaration: a device loss part way through a hover must not snap the halo back to its
+/// authored width.
+fn drive_blur(arena: &mut Arena, id: NodeId, declared: f32, fresh: bool) {
+    let blur = PROPS[Prop::BlurRadius as usize].chan;
+    if fresh {
+        arena.set_chan(id, blur, declared);
+        arena.set_chan(id, blur + 1, 1.0);
+    }
+    let (radius, opacity) = (arena.chan(id, blur), arena.chan(id, blur + 1));
+    if let Some(glow) = arena.aux(id).and_then(|aux| aux.glow.as_ref()) {
+        glow.shadow.set_blur_radius(radius);
+        glow.shadow.set_opacity(opacity);
+    }
+}
+
+/// Drops a node's glow and gives it its own brush slot back.
+///
+/// The two children go with it: a node that stopped casting light paints itself again, and
+/// leaving its paint on a child would keep a visual in the tree for nothing.
+fn unlight(arena: &mut Arena, id: NodeId, sprite: &SpriteVisual, ctx: &mut Ctx<'_>) {
+    if arena.aux(id).is_some_and(|aux| aux.glow.is_some()) {
+        sprite.children().remove_all();
+        arena.aux_mut(id).glow = None;
+        ctx.freed += 3;
     }
 }
 
@@ -1329,13 +1440,6 @@ fn join_of(join: Join) -> StrokeJoin {
         Join::Bevel => StrokeJoin::Bevel,
         Join::Round => StrokeJoin::Round,
     }
-}
-
-/// Narrows display-referred light to the compositor's eight-bit colour, which is what a
-/// shadow slot accepts and nothing wider.
-fn narrow(c: Scrgb) -> Color {
-    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-    Color::rgba(byte(c.r), byte(c.g), byte(c.b), byte(c.a))
 }
 
 /// Clamps a corner profile to what the box can carry, in DIPs.

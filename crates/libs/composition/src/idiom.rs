@@ -51,13 +51,36 @@ impl Compositor {
     /// alignment, because the caller has just declared the surface's size: composition's
     /// own defaults would letterbox it and centre it inside the sprite instead.
     pub fn capture(&self, source: &Visual, size: Vector2, scale: f32) -> Captured {
+        self.capture_bleeding(source, 0.0, size, scale)
+    }
+
+    /// Creates a capture that also reads `bleed` DIPs outside the source's own box on
+    /// every side.
+    ///
+    /// A visual surface reads a region of its source's coordinate space and nothing
+    /// clips that region to the source visual's extent, so a negative origin is legal
+    /// and reads what the source draws outside itself. A shadow is exactly that: it is
+    /// not clipped by the implicit clip a visual's size implies, so a blurred silhouette
+    /// reaches about three sigma past the box that cast it, and a capture taken at the
+    /// box's own extent cuts the halo off square.
+    ///
+    /// The captured region is `size + 2 * bleed` DIPs, so a caller paints it on a sprite
+    /// of that extent offset by `-bleed` to keep the content where an unbled capture put
+    /// it.
+    pub fn capture_bleeding(
+        &self,
+        source: &Visual,
+        bleed: f32,
+        size: Vector2,
+        scale: f32,
+    ) -> Captured {
         let surface = self.create_visual_surface();
         surface.set_source_visual(source);
         let brush = self.create_surface_brush(&surface);
         brush.set_stretch(Stretch::Fill);
         brush.set_alignment_ratio(0.0, 0.0);
         let captured = Captured { surface, brush };
-        captured.resize(size, scale);
+        captured.resize_bleeding(bleed, size, scale);
         captured
     }
 }
@@ -85,10 +108,22 @@ impl Captured {
     /// captures *content*: scaling the source changes nothing about what lands in the
     /// surface, so geometry inside it is scaled by the same factor separately.
     pub fn resize(&self, size: Vector2, scale: f32) {
-        self.surface.set_source_offset(Vector2 { x: 0.0, y: 0.0 });
+        self.resize_bleeding(0.0, size, scale);
+    }
+
+    /// Sets the captured region to `size + 2 * bleed` DIPs, starting `bleed` DIPs outside
+    /// the source's own origin.
+    ///
+    /// The origin goes negative, which reads what the source draws outside its own box —
+    /// see [`Compositor::capture_bleeding`].
+    pub fn resize_bleeding(&self, bleed: f32, size: Vector2, scale: f32) {
+        self.surface.set_source_offset(Vector2 {
+            x: -bleed * scale,
+            y: -bleed * scale,
+        });
         self.surface.set_source_size(Vector2 {
-            x: size.x * scale,
-            y: size.y * scale,
+            x: (size.x + 2.0 * bleed) * scale,
+            y: (size.y + 2.0 * bleed) * scale,
         });
     }
 }

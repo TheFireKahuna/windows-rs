@@ -167,31 +167,6 @@ impl Scrgb {
         a: 0.0,
     };
 
-    /// Encodes for an 8-bit file: a screenshot, or a reference image for a rendering
-    /// parity check.
-    ///
-    /// Encodes an **already-transformed** value, treating `1.0` as white, and clamps
-    /// because 8-bit sRGB is a bounded container. The crate carries **no inverse**:
-    /// nothing produces an [`Ictcp`] or a [`Radiance`] from encoded sRGB, so no colour
-    /// can be authored from an 8-bit display-referred value.
-    #[must_use]
-    pub fn to_srgb8(self) -> [u8; 4] {
-        fn oetf(c: f32) -> u8 {
-            let c = c.clamp(0.0, 1.0);
-            let e = if c <= 0.003_130_8 {
-                12.92 * c
-            } else {
-                1.055 * c.powf(1.0 / 2.4) - 0.055
-            };
-            (e * 255.0).round() as u8
-        }
-        [
-            oetf(self.r),
-            oetf(self.g),
-            oetf(self.b),
-            (self.a.clamp(0.0, 1.0) * 255.0).round() as u8,
-        ]
-    }
 }
 
 #[cfg(test)]
@@ -208,33 +183,6 @@ mod tests {
         assert_eq!(core::mem::offset_of!(Scrgb, g), 4);
         assert_eq!(core::mem::offset_of!(Scrgb, b), 8);
         assert_eq!(core::mem::offset_of!(Scrgb, a), 12);
-    }
-
-    #[test]
-    fn srgb8_encodes_the_expected_anchors() {
-        assert_eq!(Scrgb::TRANSPARENT.to_srgb8(), [0, 0, 0, 0]);
-        let white = Scrgb {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 1.0,
-        };
-        assert_eq!(white.to_srgb8(), [255, 255, 255, 255]);
-        // Above white and outside Rec.709 both clamp at this boundary, and only here.
-        let wild = Scrgb {
-            r: -0.4,
-            g: 3.0,
-            b: 0.5,
-            a: 1.0,
-        };
-        let out = wild.to_srgb8();
-        assert_eq!(out[0], 0);
-        assert_eq!(out[1], 255);
-        assert!(
-            out[2] > 180 && out[2] < 200,
-            "mid grey encoded to {}",
-            out[2]
-        );
     }
 
     #[test]

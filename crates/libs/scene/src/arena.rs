@@ -16,7 +16,7 @@ use core::num::NonZeroU32;
 use windows_composition::{
     Animatable, Captured, CompositionAnimation, CompositionBrush, CompositionGeometricClip,
     CompositionMaskBrush, CompositionPathGeometry, CompositionSpriteShape, DropShadow, Geometry,
-    RectangleClip, ShapeVisual, Visual,
+    RectangleClip, ShapeVisual, SpriteVisual, Visual,
 };
 use windows_numerics::{Vector2, Vector3};
 
@@ -199,14 +199,68 @@ impl ShapeState {
     }
 }
 
-/// The blur a captured glow or a halo rides on.
+/// The blurred light a node casts past its own silhouette.
 ///
-/// `capture` is `None` for a halo, whose silhouette is the sprite's own brush alpha and
-/// therefore already the right size at every extent — the compositor derives it, so there is
-/// nothing here to resize.
+/// **The blur carries alpha and never colour.** A `DropShadow`'s colour is a
+/// `Windows.UI.Color`: eight bits, SDR-referred and sRGB-encoded, so it holds nothing above
+/// the display's white and nothing outside Rec.709 — and a glow is authored above white,
+/// often in a chromatic role. So the shadow is cast in white on an off-tree sprite, that
+/// halo is captured, and the capture masks an FP16 cell. It is the same rule the rest of
+/// this crate follows for every paint: the silhouette carries alpha, a float surface carries
+/// colour, and a mask brush multiplies them.
+///
+/// The five objects are one construction and are built, resized and dropped together.
 pub struct ShadowState {
+    /// The off-tree sprite the blur is cast by.
+    ///
+    /// It paints nothing. The capture has to hold the halo alone: a host that also drew the
+    /// silhouette would put a second, unblurred copy of it under the real paint.
+    pub host: SpriteVisual,
     pub shadow: DropShadow,
-    pub capture: Option<Captured>,
+    /// The halo's alpha, read `bleed` DIPs outside the node's own box on every side.
+    pub capture: Captured,
+    /// The group a [`Paint::Captured`] paints with, and the silhouette this blur reads.
+    /// `None` for a halo, whose silhouette is the node's own brush.
+    ///
+    /// Held here because every captured paint is a lit one, so it costs nothing on a sprite
+    /// that is neither: a capture states its region in the source's own space, and something
+    /// has to restate it when the box it stands for moves.
+    pub group: Option<Captured>,
+    /// The in-tree sprite painting the halo, one child below the node's own paint.
+    ///
+    /// The tree holds it while it is mounted, so this is the construction staying whole
+    /// rather than a second owner: the five objects are built, resized and dropped together,
+    /// and one of them living only in a child collection is how a glow half-survives an
+    /// unlight.
+    #[expect(dead_code, reason = "held so the construction is dropped as one")]
+    pub sprite: SpriteVisual,
+    /// The halo's alpha multiplied by the tint cell. Held so a re-declared tint re-points
+    /// one brush rather than minting the whole construction again.
+    pub brush: CompositionMaskBrush,
+    /// The sprite the node's paint moved to, which is the child above the halo.
+    ///
+    /// A visual's own brush draws *under* its children, so a node that paints itself and
+    /// hosts a halo child would put the halo on top of the paint. A lit node therefore
+    /// paints through a child of its own, and an unlit one keeps its brush where it was.
+    pub paint: SpriteVisual,
+    /// How far past the node's box the capture reads, in DIPs. Fixed at the blur it was
+    /// built for, because the region is a property write and the blur is animatable.
+    pub bleed: f32,
+}
+
+impl ShadowState {
+    /// Restates every extent for a `size` DIP box at `scale`.
+    ///
+    /// Only the two stages that state an absolute extent are here. The halo sprite and the
+    /// paint sprite are sized relative to the node, so the compositor re-derives them from
+    /// the one extent the node already carries and a resize writes nothing for either.
+    pub fn resize(&self, size: Vector2, scale: f32) {
+        self.host.set_size(size.x, size.y);
+        self.capture.resize_bleeding(self.bleed, size, scale);
+        if let Some(group) = &self.group {
+            group.resize(size, scale);
+        }
+    }
 }
 
 /// Everything a node may carry beyond its own visual, behind one head.

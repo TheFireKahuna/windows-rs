@@ -9,7 +9,6 @@
 use crate::bindings::*;
 use crate::dpi::Metrics;
 use core::cell::{Cell, RefCell};
-use windows_color::Scrgb;
 
 /// Describes the title bar the application draws for itself.
 #[derive(Copy, Clone, Debug)]
@@ -174,17 +173,21 @@ pub enum CaptionHit {
 
 /// Selects the one-pixel frame DWM draws around the window.
 ///
-/// [`Solid`](Self::Solid) takes an [`Scrgb`] because a border is display-referred output,
-/// which `OutputTransform::apply` produces.
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// [`Solid`](Self::Solid) takes bytes rather than an [`Scrgb`] because the window attribute
+/// is a `COLORREF`: SDR-referred and sRGB-encoded, which is two conversions away from the
+/// linear extended-range value the pipeline carries. Only the output transform knows both,
+/// so the caller encodes through `OutputTransform::to_sdr8` and this crate states no colour
+/// policy of its own.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BorderColor {
     /// The system's, which follows the user's accent and light/dark choice.
     System,
     /// No border at all. Removed rather than painted over: a border painted in the
     /// backdrop's colour is still a border on a display that renders them differently.
     None,
-    /// A colour from the application's own palette.
-    Solid(Scrgb),
+    /// A colour from the application's own palette, already encoded for the display it is
+    /// about to be shown on.
+    Solid([u8; 4]),
 }
 
 impl BorderColor {
@@ -192,10 +195,9 @@ impl BorderColor {
         match self {
             Self::System => DWMWA_COLOR_DEFAULT,
             Self::None => DWMWA_COLOR_NONE,
-            Self::Solid(c) => {
-                let [r, g, b, _] = c.to_srgb8();
-                // `0x00bbggrr`. Alpha is not carried: DWM composites the border against the
-                // desktop, and a transparent one is `None` rather than a low alpha.
+            // `0x00bbggrr`. Alpha is not carried: DWM composites the border against the
+            // desktop, and a transparent one is `None` rather than a low alpha.
+            Self::Solid([r, g, b, _]) => {
                 u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16)
             }
         }

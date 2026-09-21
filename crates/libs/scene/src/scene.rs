@@ -1030,8 +1030,16 @@ impl Scene {
             generation: self.generation,
             res: &mut self.res,
             cache: &mut self.cache,
+            minted: 0,
+            freed: 0,
         };
-        realize(&mut self.nodes, id, glow.as_ref(), &mut ctx)
+        let realized = realize(&mut self.nodes, id, glow.as_ref(), &mut ctx);
+        self.census.visuals_minted += ctx.minted as u64;
+        self.census.visuals_live = self
+            .census
+            .visuals_live
+            .saturating_add_signed(ctx.minted - ctx.freed);
+        realized
     }
 
     fn op(&mut self, op: Op, patch: &SinkPatch, back: &Backends, env: Env) -> Result<()> {
@@ -1633,8 +1641,8 @@ impl Scene {
         if let Some(shape) = &aux.shape {
             shape.resize(size, scale);
         }
-        if let Some(capture) = aux.glow.as_ref().and_then(|glow| glow.capture.as_ref()) {
-            capture.resize(size, scale);
+        if let Some(glow) = &aux.glow {
+            glow.resize(size, scale);
         }
     }
 
