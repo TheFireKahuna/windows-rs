@@ -145,7 +145,8 @@ impl Ui<'_> {
             ui.text(style, "")
                 .anchor(0.0, 0.0, [Align::Start, Align::Center]);
         });
-        let mut element = element.hit(HitFlags::TEXT, UiaRole::Edit);
+        // Clipped to its own solved box, which the tree restates on every resize.
+        let mut element = element.hit(HitFlags::TEXT, UiaRole::Edit).clip();
         let id = element.control_id();
         element.host().install_field(id, source.into());
         element

@@ -15,8 +15,8 @@ use crate::sink::*;
 use core::num::NonZeroU32;
 use windows_composition::{
     Animatable, Captured, CompositionAnimation, CompositionBrush, CompositionGeometricClip,
-    CompositionMaskBrush, CompositionPathGeometry, CompositionSpriteShape, DropShadow, Geometry,
-    RectangleClip, ShapeVisual, SpriteVisual, Visual,
+    CompositionMaskBrush, CompositionPathGeometry, CompositionSpriteShape, ContainerVisual,
+    DropShadow, Geometry, RectangleClip, ShapeVisual, SpriteVisual, Visual,
 };
 use windows_numerics::{Vector2, Vector3};
 
@@ -209,13 +209,19 @@ impl ShapeState {
 /// this crate follows for every paint: the silhouette carries alpha, a float surface carries
 /// colour, and a mask brush multiplies them.
 ///
-/// The five objects are one construction and are built, resized and dropped together.
+/// Its objects are one construction and are built, resized and dropped together.
 pub struct ShadowState {
-    /// The off-tree sprite the blur is cast by.
+    /// The off-tree root the capture reads, in physical pixels.
     ///
-    /// It paints nothing. The capture has to hold the halo alone: a host that also drew the
+    /// A visual surface captures its source's content and not the source's own transform,
+    /// so the display scale goes on the caster beneath it, as a shape capture puts it on the
+    /// shape.
+    pub host: ContainerVisual,
+    /// The sprite the blur is cast by, sized in DIPs and scaled to physical pixels.
+    ///
+    /// It paints nothing. The capture has to hold the halo alone: a caster that also drew the
     /// silhouette would put a second, unblurred copy of it under the real paint.
-    pub host: SpriteVisual,
+    pub caster: SpriteVisual,
     pub shadow: DropShadow,
     /// The halo's alpha, read `bleed` DIPs outside the node's own box on every side.
     pub capture: Captured,
@@ -229,7 +235,7 @@ pub struct ShadowState {
     /// The in-tree sprite painting the halo, one child below the node's own paint.
     ///
     /// The tree holds it while it is mounted, so this is the construction staying whole
-    /// rather than a second owner: the five objects are built, resized and dropped together,
+    /// rather than a second owner: the construction's objects are built, resized and dropped together,
     /// and one of them living only in a child collection is how a glow half-survives an
     /// unlight.
     #[expect(dead_code, reason = "held so the construction is dropped as one")]
@@ -251,11 +257,17 @@ pub struct ShadowState {
 impl ShadowState {
     /// Restates every extent for a `size` DIP box at `scale`.
     ///
-    /// Only the two stages that state an absolute extent are here. The halo sprite and the
+    /// Only the stages that state an absolute extent are here. The halo sprite and the
     /// paint sprite are sized relative to the node, so the compositor re-derives them from
     /// the one extent the node already carries and a resize writes nothing for either.
     pub fn resize(&self, size: Vector2, scale: f32) {
-        self.host.set_size(size.x, size.y);
+        self.host.set_size(size.x * scale, size.y * scale);
+        self.caster.set_size(size.x, size.y);
+        self.caster.set_scale(Vector3 {
+            x: scale,
+            y: scale,
+            z: 1.0,
+        });
         self.capture.resize_bleeding(self.bleed, size, scale);
         if let Some(group) = &self.group {
             group.resize(size, scale);

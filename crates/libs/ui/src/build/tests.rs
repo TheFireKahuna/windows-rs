@@ -381,6 +381,46 @@ fn a_box_that_moved_is_published_and_one_that_did_not_is_not() {
     assert_eq!(frame.bound(fixed, Prop::Size), None, "an unmoved box restated its size");
 }
 
+/// A clip is restated from the box the solve published, so the last one on the wire is the
+/// one the compositor holds.
+fn last_clip(patch: &windows_scene::SinkPatch, node: NodeId) -> Option<windows_scene::Clip> {
+    patch.ops().iter().rev().find_map(|op| match op {
+        Op::Clip { id, clip } if *id == node => Some(*clip),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_field_clips_to_its_own_box_and_follows_it() {
+    use windows_scene::Clip;
+    let mut rig = Rig::new();
+    let width = Cell::new(120.0f32);
+    let mut field = None;
+    let frame = rig.mount(|ui| {
+        field = Some(
+            crate::widget::field(ui, "12")
+                .layout_from(move |l| l.width = Len::dip(width.get()))
+                .id()
+                .into(),
+        );
+    });
+    let field: NodeId = field.unwrap();
+    let size = Host::with(|h| h.geom(field).size);
+    assert!(size.x > 0.0 && size.y > 0.0);
+    let expected = |size: Vector2| Clip::Rect {
+        l: 0.0,
+        t: 0.0,
+        r: size.x,
+        b: size.y,
+        radius: windows_scene::Corners::default(),
+    };
+    assert_eq!(last_clip(frame.patch(), field), Some(expected(size)), "a field was clipped away");
+    let frame = rig.set(width, 200.0);
+    let size = Host::with(|h| h.geom(field).size);
+    assert_eq!(size.x, 200.0);
+    assert_eq!(last_clip(frame.patch(), field), Some(expected(size)));
+}
+
 #[test]
 fn a_node_carried_by_its_parent_restates_no_offset_of_its_own() {
     let mut rig = Rig::new();

@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use windows_numerics::Vector2;
 use windows_scene::{
-    Anim, Attach, Axes, Bind, CONTROL, Cap, Clip, ControlId, DELAY, DashId, DelayId, Easing, Env,
+    Anim, Attach, Axes, Bind, CONTROL, Cap, ControlId, DELAY, DashId, DelayId, Easing, Env,
     Exit, GEOM, GeomId, GroupId, Halo, HitDecl, Id, Ids, Ink, Iterations, Join, Mask,
     NodeId, NodeKind, Op, Paint, PathVerb, Prop, RAMP, RampId, RegionId, ResOp, RunId, SinkPatch,
     Slots, Span, Spread, SpriteId, StrokeStyle, TRACKER, TrackerId, TrackerOp, Value,
@@ -611,10 +611,6 @@ impl Host {
         self.tree.c.control[at] = control;
         self.tree.c.inflate[at] = inflate;
         self.tree.hits_dirty = true;
-    }
-
-    pub(crate) fn clip(&mut self, id: NodeId, clip: Clip) {
-        self.pending.push(Op::Clip { id, clip });
     }
 
     pub(crate) fn mask(&mut self, id: SpriteId, mask: Mask) {

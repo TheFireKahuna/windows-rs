@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use windows_numerics::Vector2;
 use windows_scene::{
-    Anim, Bind, Clip, ControlId, Corners, Easing, GroupId, Iterations, Mask, NodeId, Paint, Prop,
+    Anim, Bind, ControlId, Corners, Easing, GroupId, Iterations, Mask, NodeId, Paint, Prop,
     SpriteId, Value,
 };
 use windows_text::Rect;
@@ -203,16 +203,6 @@ impl Host {
             },
         );
         self.write_channel(caret.0, Prop::Opacity, Value::Scalar(0.0));
-        self.clip(
-            node,
-            Clip::Rect {
-                l: 0.0,
-                t: 0.0,
-                r: 0.0,
-                b: 0.0,
-                radius: Corners::default(),
-            },
-        );
         self.fields.place(id, Row::new(key, group, style, caret));
         match source {
             TextSource::Static(text) => self.field_source(id, text),

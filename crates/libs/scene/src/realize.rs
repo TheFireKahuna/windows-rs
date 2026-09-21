@@ -1610,7 +1610,7 @@ fn paint_brush(
 /// nothing above the display's white and nothing outside Rec.709, and a glow is authored
 /// above white in a chromatic role. So the shadow is cast in white on an off-tree sprite,
 /// the halo that leaves it is captured, and the capture masks an FP16 cell drawn at the same
-/// draw choke every other paint goes through. Five objects, and the same rule as the rest of
+/// draw choke every other paint goes through. It is the same rule as the rest of
 /// the crate: the silhouette carries alpha, a float surface carries colour, and a mask brush
 /// multiplies them.
 ///
@@ -1690,17 +1690,20 @@ fn cast_glow(
     }
 
     let comp = &ctx.back.compositor;
-    // Paints nothing: the capture below has to hold the halo alone, and a host that drew the
-    // silhouette too would put a second, unblurred copy of it under the real paint.
-    let host = comp.create_sprite_visual();
-    host.set_size(size.x, size.y);
+    // Paints nothing: the capture below has to hold the halo alone, and a caster that drew the
+    // silhouette too would put a second, unblurred copy of it under the real paint. The
+    // capture reads the host in physical pixels, so the caster carries the display scale and
+    // the blur and offset stay in DIPs, where their channels animate them.
+    let host = comp.create_container_visual();
+    let caster = comp.create_sprite_visual();
+    host.children().insert_at_top(&caster);
     let shadow = comp.create_drop_shadow();
     // White, and never the tint. This is the alpha generator; the colour is the cell below.
     shadow.set_color(Color::rgb(255, 255, 255));
     shadow.set_blur_radius(blur);
     shadow.set_offset(offset.x, offset.y, 0.0);
     shadow.set_mask(silhouette);
-    host.set_shadow(&shadow);
+    caster.set_shadow(&shadow);
 
     let capture = comp.capture_bleeding(&host, bleed, size, scale);
     let brush = comp.create_mask_brush();
@@ -1719,9 +1722,9 @@ fn cast_glow(
     glow_sprite.set_brush(&brush);
     let paint_sprite = comp.create_sprite_visual();
     paint_sprite.set_relative_size_adjustment(whole);
-    // The host, the halo and the paint. The capture and the two brushes are not visuals and
-    // cost the tree walk nothing.
-    ctx.minted += 3;
+    // The host, the caster, the halo and the paint. The capture and the two brushes are not
+    // visuals and cost the tree walk nothing.
+    ctx.minted += 4;
 
     // The node stops painting itself and becomes the host of the two.
     sprite.clear_brush();
@@ -1731,8 +1734,9 @@ fn cast_glow(
     kids.insert_at_bottom(&glow_sprite);
 
     let target = paint_sprite.clone();
-    arena.aux_mut(id).glow = Some(ShadowState {
+    let glow = ShadowState {
         host,
+        caster,
         shadow,
         capture,
         group,
@@ -1740,7 +1744,9 @@ fn cast_glow(
         brush,
         paint: paint_sprite,
         bleed,
-    });
+    };
+    glow.resize(size, scale);
+    arena.aux_mut(id).glow = Some(glow);
     drive_blur(arena, id, blur, true);
     Ok(Some(target))
 }
@@ -1772,7 +1778,7 @@ fn unlight(arena: &mut Arena, id: NodeId, sprite: &SpriteVisual, ctx: &mut Ctx<'
     if arena.aux(id).is_some_and(|aux| aux.glow.is_some()) {
         sprite.children().remove_all();
         arena.aux_mut(id).glow = None;
-        ctx.freed += 3;
+        ctx.freed += 4;
     }
 }
 
