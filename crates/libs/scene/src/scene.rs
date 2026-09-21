@@ -10,8 +10,8 @@ use crate::hit::HitTable;
 use crate::hit_entry::{ContactKind, Hit, pack_offset};
 use crate::patch::{Attach, Op, SinkPatch};
 use crate::realize::{
-    Backends, Beneath, BoxKey, Cache, Ctx, GRAIN_ALPHA, GRAIN_CODES, GRAIN_TILE, ResObj,
-    Resources, fit, realize,
+    Backends, Beneath, BoxKey, Cache, Ctx, GRAIN_ALPHA, GRAIN_CODES, GRAIN_STRIPS, GRAIN_TILE,
+    ResObj, Resources, fit, realize,
 };
 use crate::sink::*;
 use core::cell::{Cell, RefCell};
@@ -691,8 +691,8 @@ impl Backdrop {
             place(&sprite, at, size);
             self.sprites.push(sprite);
         }
-        if let Some((quantum, mid)) = grain {
-            self.cut_grain(back, env, quantum, mid)?;
+        if let Some((_, mid)) = grain {
+            self.cut_grain(back, env, mid)?;
         }
         Ok(())
     }
@@ -706,11 +706,11 @@ impl Backdrop {
         &mut self,
         back: &Backends,
         env: Env,
-        quantum: f32,
         mid: windows_color::Scrgb,
     ) -> Result<()> {
         let px = (self.px.0.max(GRAIN_TILE as i32), self.px.1.max(GRAIN_TILE as i32));
-        let Some(surface) = back.raster_grain(px, mid, GRAIN_CODES * quantum)? else {
+        let bands = self.grain_bands(env);
+        let Some(surface) = back.raster_grain(px, mid, &bands)? else {
             return Ok(());
         };
         let sprite = back.compositor.create_sprite_visual();
@@ -726,6 +726,83 @@ impl Backdrop {
         sprite.set_opacity(GRAIN_ALPHA);
         self.grain = Some(sprite);
         Ok(())
+    }
+
+    /// The grain's peak-to-peak amplitude for each horizontal strip, per channel, in
+    /// display-referred light.
+    ///
+    /// A code spans more linear light the higher it sits, so an amplitude picked at one
+    /// level is the right size there and short everywhere brighter — over this ground, by
+    /// half as much again. The step the quantiser takes at the ground's own level is
+    /// therefore read per strip, which is enough because the ground's level follows its
+    /// glows: down a column it moves by about a fifth, across a row by a twentieth.
+    ///
+    /// A strip takes its own **maximum**, because the two errors are not the same. Too much
+    /// grain costs a little more of something already below a code; too little lets a
+    /// contour stand, which is the whole reason the layer is here.
+    fn grain_bands(&self, env: Env) -> Vec<[f32; 3]> {
+        let out = env.output();
+        let Some(base) = self.ladder(&self.spec.base) else {
+            return Vec::new();
+        };
+        let glows: Vec<(Vec<(f32, windows_color::Radiance)>, Vector2, Vector2)> = self
+            .spec
+            .glows
+            .iter()
+            .filter_map(|glow| Some((self.ladder(&glow.stops)?, glow.at, glow.size)))
+            .collect();
+        // The ground's own colour where the window is `at`, as a fraction of it. An
+        // estimate: the compositor samples each layer from a stretched tile and this walks
+        // the stops directly, which agree far closer than an amplitude needs.
+        // Channels rather than a colour: this composites values the transform has already
+        // produced, the way the compositor does, and the only thing read back out of it is
+        // how big a code is at that level.
+        let ground = |at: Vector2| -> [f32; 3] {
+            let base = env.apply(windows_color::Radiance::sample(&base, at.y));
+            let mut v = [base.r, base.g, base.b];
+            for (ladder, centre, size) in &glows {
+                let dx = (at.x - centre.x) / (size.x * 0.5).max(f32::EPSILON);
+                let dy = (at.y - centre.y) / (size.y * 0.5).max(f32::EPSILON);
+                let light = env.apply(windows_color::Radiance::sample(
+                    ladder,
+                    dx.hypot(dy).clamp(0.0, 1.0),
+                ));
+                for (v, s) in v.iter_mut().zip([light.r, light.g, light.b]) {
+                    *v = light.a * s + (1.0 - light.a) * *v;
+                }
+            }
+            v
+        };
+        (0..GRAIN_STRIPS)
+            .map(|strip| {
+                let mut peak = [0.0f32; 3];
+                // The corners and the middle of the strip. A glow lifts hardest over its own
+                // centre and sinks hardest there too, so the extremes of a row are either
+                // under a centre or out at the edges, and both are sampled.
+                for step in 0..=2 {
+                    let y = (strip as f32 + 0.5 * step as f32) / GRAIN_STRIPS as f32;
+                    for column in 0..=4 {
+                        let at = Vector2 {
+                            x: column as f32 / 4.0,
+                            y: y.min(1.0),
+                        };
+                        for (peak, v) in peak.iter_mut().zip(ground(at)) {
+                            *peak = peak.max(v);
+                        }
+                    }
+                }
+                peak.map(|level| GRAIN_CODES * out.quantum_at(level).unwrap_or(0.0))
+            })
+            .collect()
+    }
+
+    /// A layer's stops as fractions, or `None` where it has none to sample.
+    fn ladder(
+        &self,
+        stops: &[(u16, windows_color::Radiance)],
+    ) -> Option<Vec<(f32, windows_color::Radiance)>> {
+        (!stops.is_empty())
+            .then(|| stops.iter().map(|&(at, l)| (stop_fraction(at), l)).collect())
     }
 
     /// Tells the ground how much room it has, and re-cuts the grain where it outgrew its
@@ -746,14 +823,13 @@ impl Backdrop {
         if self.grain.is_none() {
             return Ok(false);
         }
-        let (Some(&(_, mid)), Some(quantum)) =
-            (self.spec.base.first(), env.output().quantum())
+        let (Some(&(_, mid)), Some(_)) = (self.spec.base.first(), env.output().quantum())
         else {
             return Ok(false);
         };
         let mid = env.apply(mid);
         self.grain = None;
-        self.cut_grain(back, env, quantum, mid)?;
+        self.cut_grain(back, env, mid)?;
         Ok(true)
     }
 

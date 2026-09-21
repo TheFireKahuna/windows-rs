@@ -23,6 +23,15 @@
 use crate::matrix::{self, Mat3f};
 use crate::{Gamut, Ictcp, REFERENCE_WHITE_NITS, Radiance, SCRGB_UNITY_NITS, Scrgb, ictcp};
 
+/// Where sRGB's straight segment ends and its power segment begins, in linear light.
+const SRGB_TOE: f32 = 0.003_130_8;
+/// The exponent of that power segment.
+const SRGB_GAMMA: f32 = 2.4;
+/// `SRGB_GAMMA / (255 * 1.055)`: one code of the power segment, before the level's
+/// own factor. The transfer is `1.055 * v^(1/g) - 0.055`, so a code spans
+/// `v^(1 - 1/g) * this`.
+const SRGB_SLOPE: f32 = SRGB_GAMMA / (255.0 * 1.055);
+
 /// Bisection steps for the tone stage's solve for `I`. The axis is `[0, 1]`, so 18
 /// steps put the bracket at 4e-6 — far below anything a display resolves.
 const INTENSITY_STEPS: u32 = 18;
@@ -125,6 +134,29 @@ impl OutputTransform {
     #[must_use]
     pub const fn quantum(self) -> Option<f32> {
         self.quantum
+    }
+
+    /// The linear scRGB step one code spans **at `level`**, or `None` where composition is
+    /// float.
+    ///
+    /// [`quantum`](Self::quantum) is this at the toe, which is where sRGB's transfer is the
+    /// straight segment and the step is the same whatever the level. Above the toe the
+    /// transfer curves and a code spans more — half as much again by the top of a dark
+    /// ladder — so anything sized against the toe alone is **under-amplitude everywhere
+    /// else**. A dither is the caller that cares: its whole job is to be worth a fixed
+    /// number of codes, and codes are what the quantiser counts in.
+    ///
+    /// Negative and above-white levels answer with the toe's step: neither survives the
+    /// container this describes, so there is no step there to report.
+    #[must_use]
+    pub fn quantum_at(self, level: f32) -> Option<f32> {
+        let toe = self.quantum?;
+        if !(level > SRGB_TOE) {
+            return Some(toe);
+        }
+        // d/dv of the sRGB transfer, inverted, per code. The toe's own value falls out of
+        // the same expression at the join, to within a rounding.
+        Some(level.powf(1.0 - 1.0 / SRGB_GAMMA) * SRGB_SLOPE)
     }
 
     /// Reuses the display capability with a newly declared authored content peak.
@@ -984,6 +1016,45 @@ mod tests {
     }
 
     /// The two things the container cannot hold, and the one it can.
+    /// The step a code spans is what a dither is sized against, so it has to be the real
+    /// one at the level in question and not the toe's everywhere.
+    #[test]
+    fn the_quantum_follows_the_transfer_it_describes() {
+        let sdr = OutputTransform::for_display(DisplayCapability::Sdr, REFERENCE_WHITE_NITS);
+        let toe = sdr.quantum().expect("the standard desktop quantises");
+        // Continuous where the two segments of the transfer meet.
+        let join = sdr.quantum_at(0.003_131).expect("still quantises");
+        assert!((join - toe).abs() / toe < 0.02, "{join} against {toe} at the join");
+        // A code spans more, the higher it sits: one step measured against the encode
+        // itself, which is the thing being predicted.
+        for &level in &[0.002_f32, 0.005, 0.02, 0.2, 0.9] {
+            let q = sdr.quantum_at(level).expect("still quantises");
+            let code = |v: f32| {
+                let e = if v <= 0.003_130_8 {
+                    12.92 * v
+                } else {
+                    1.055 * v.powf(1.0 / 2.4) - 0.055
+                };
+                e * 255.0
+            };
+            let measured = code(level + 0.5 * q) - code(level - 0.5 * q);
+            assert!(
+                (measured - 1.0).abs() < 0.05,
+                "at {level} the step spans {measured} codes, not one"
+            );
+        }
+        // Float composition has no quantiser, at any level.
+        let hdr = OutputTransform::for_display(
+            DisplayCapability::HighDynamicRange {
+                gamut: Gamut::REC709,
+                white_nits: 240.0,
+                peak_nits: 1000.0,
+            },
+            REFERENCE_WHITE_NITS,
+        );
+        assert!(hdr.quantum_at(0.2).is_none());
+    }
+
     #[test]
     fn sdr8_clamps_only_what_eight_bits_cannot_carry() {
         let out = OutputTransform::for_display(DisplayCapability::Sdr, REFERENCE_WHITE_NITS);

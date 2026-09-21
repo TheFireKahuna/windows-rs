@@ -248,51 +248,79 @@ impl Backends {
         self.compositor.create_path(path.geometry())
     }
 
-    /// Rasterizes the ground's grain: one screen-sized surface carrying a blue-noise
-    /// tile at one texel per physical pixel.
+    /// Rasterizes the ground's grain: one screen-sized surface carrying a blue-noise tile
+    /// at one texel per physical pixel.
     ///
     /// **It is a dither, and that is why it is screen-sized.** A grain is only a dither
-    /// where one texel lands on one pixel; stretched, resampled or carried on a layer
-    /// that moves, it is texture or it is shimmer. The compositor cannot tile a surface
-    /// brush, so the tile is laid down here by Direct2D and handed over already
-    /// repeated.
+    /// where one texel lands on one pixel; stretched, resampled or carried on a layer that
+    /// moves, it is texture or it is shimmer. The compositor cannot tile a surface brush, so
+    /// the tile is laid down here by Direct2D and handed over already repeated.
     ///
-    /// `mid` is the value the stack beneath was pre-compensated against and `amplitude`
-    /// the peak-to-peak grain, both in display-referred light. The texels carry
-    /// `mid + offset * amplitude / GRAIN_ALPHA`, lifted by the layer's own opacity so
-    /// that compositing scales it back down: source-over gives `dst + a * (c - dst)`, so
-    /// over a stack pre-compensated by `(v - a * mid) / (1 - a)` this composites to
-    /// exactly `v + offset * amplitude`. The compositor has no additive blend and this is
-    /// what stands in for one.
+    /// `mid` is the value the stack beneath was pre-compensated against. `bands` is the
+    /// peak-to-peak grain for each equal horizontal strip of the surface, per channel, in
+    /// display-referred light: a code spans more linear light the higher it sits, so one
+    /// amplitude for the whole window is the right size in one place and short everywhere
+    /// brighter. Stepping it down the window is what keeps it worth the same number of
+    /// codes throughout, and the steps are a tile apart in a quantity that moves by a few
+    /// percent between them.
+    ///
+    /// The texels carry `mid + offset * band / GRAIN_ALPHA`, lifted by the layer's own
+    /// opacity so that compositing scales it back down: source-over gives `dst + a * (c -
+    /// dst)`, so over a stack pre-compensated by `(v - a * mid) / (1 - a)` this composites
+    /// to exactly `v + offset * band`. The compositor has no additive blend and this is what
+    /// stands in for one.
     pub(crate) fn raster_grain(
         &self,
         px: (i32, i32),
         mid: Scrgb,
-        amplitude: f32,
+        bands: &[[f32; 3]],
     ) -> Result<Option<CompositionDrawingSurface>> {
+        if bands.is_empty() {
+            return Ok(None);
+        }
         let tile = grain_tile();
         let side = GRAIN_TILE as u32;
-        let texels: Vec<Scrgb> = tile
-            .iter()
-            .map(|&offset| {
-                let lift = offset * amplitude / GRAIN_ALPHA;
-                Scrgb {
-                    r: mid.r + lift,
-                    g: mid.g + lift,
-                    b: mid.b + lift,
-                    a: 1.0,
-                }
-            })
-            .collect();
-        let source = self.gpu.pixels((side, side), &texels)?;
-        // Nearest and wrap: a filtered grain is a blur of a grain, which is a grain with
-        // its high frequencies spent — the only part of it that was doing any work.
-        let brush = self.gpu.tile(&source, Extend::Wrap, windows_d2d::Interp::Nearest)?;
         let (w, h) = (px.0 as f32, px.1 as f32);
-        // Authored at 96 DPI like every other raster that carries no snapped dimension:
-        // the extent is already in physical pixels and the tile must not be scaled.
+        // One brush per strip, because the amplitude is baked into the texels and the
+        // compositor's only knob on a brush is a transform. Each is sixty-four squared.
+        let mut brushes = Vec::with_capacity(bands.len());
+        for band in bands {
+            let texels: Vec<Scrgb> = tile
+                .iter()
+                .map(|&offset| {
+                    let lift = |c: usize| offset * band[c] / GRAIN_ALPHA;
+                    Scrgb {
+                        r: mid.r + lift(0),
+                        g: mid.g + lift(1),
+                        b: mid.b + lift(2),
+                        a: 1.0,
+                    }
+                })
+                .collect();
+            let source = self.gpu.pixels((side, side), &texels)?;
+            // Nearest and wrap: a filtered grain is a blur of a grain, which is a grain with
+            // its high frequencies spent — the only part of it that was doing any work.
+            brushes.push((
+                self.gpu
+                    .tile(&source, Extend::Wrap, windows_d2d::Interp::Nearest)?,
+                source,
+            ));
+        }
+        // Authored at 96 DPI like every other raster that carries no snapped dimension: the
+        // extent is already in physical pixels and the tile must not be scaled.
         self.rasterize(px, false, Opacity::Opaque, 96.0, |d| {
-            d.fill(windows_d2d::Rect::new(0.0, 0.0, w, h), &brush);
+            let strips = brushes.len() as f32;
+            for (at, (brush, _)) in brushes.iter().enumerate() {
+                // Whole pixels, and the last strip takes the remainder, so the strips tile
+                // the surface exactly however the height divides.
+                let top = (h * at as f32 / strips).floor();
+                let bottom = if at + 1 == brushes.len() {
+                    h
+                } else {
+                    (h * (at + 1) as f32 / strips).floor()
+                };
+                d.fill(windows_d2d::Rect::new(0.0, top, w, bottom), brush);
+            }
             Ok(())
         })
     }
@@ -600,11 +628,20 @@ static GRAIN_RANKS: &[u8; 2 * GRAIN_CELLS] = include_bytes!("grain.bin");
 
 /// Cells in the tile.
 const GRAIN_CELLS: usize = GRAIN_TILE * GRAIN_TILE;
-#[cfg(test)]
 /// Three sigma of the energy kernel, where the Gaussian is spent.
-const GRAIN_REACH: usize = 5;
 #[cfg(test)]
+const GRAIN_REACH: usize = 5;
+
+/// How many horizontal strips the grain's amplitude is stepped over.
+///
+/// The step a code spans follows the ground's own level, which moves by about a fifth down
+/// a column and a twentieth across a row, so stepping it vertically carries nearly all of
+/// it. Twenty-four puts each step under two percent of an amplitude that is already below
+/// one code.
+pub(crate) const GRAIN_STRIPS: i32 = 24;
+
 /// Edge of that kernel.
+#[cfg(test)]
 const GRAIN_SIDE: usize = 2 * GRAIN_REACH + 1;
 
 #[cfg(test)]
@@ -1805,6 +1842,41 @@ pub fn nine_slice(key: &BoxKey, scale: f32) -> (f32, f32) {
 #[cfg(test)]
 mod grain_tests {
     use super::*;
+
+    /// The grain is worth a fixed number of codes, and that is the claim: an amplitude
+    /// chosen in linear light at one level is short everywhere brighter, so what the
+    /// strips deliver is checked against the transfer they will meet.
+    #[test]
+    fn the_grain_is_worth_the_same_codes_at_every_level() {
+        let sdr = windows_color::OutputTransform::for_display(
+            windows_color::DisplayCapability::Sdr,
+            windows_color::REFERENCE_WHITE_NITS,
+        );
+        let code = |v: f32| {
+            let e = if v <= 0.003_130_8 {
+                12.92 * v
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            };
+            e * 255.0
+        };
+        // Across the range a ground occupies, from its floor to well past its ceiling.
+        for &level in &[0.0009_f32, 0.0024, 0.0052, 0.0100, 0.0200] {
+            let amp = GRAIN_CODES * sdr.quantum_at(level).expect("the desktop quantises");
+            let spans = code(level + 0.5 * amp) - code(level - 0.5 * amp);
+            assert!(
+                (spans - f64::from(GRAIN_CODES) as f32).abs() < 0.1,
+                "at {level} the grain spans {spans} codes, not {GRAIN_CODES}"
+            );
+        }
+        // Sizing it once at the toe is what this replaces, and the gap is the point.
+        let toe = GRAIN_CODES * sdr.quantum().expect("the desktop quantises");
+        let short = code(0.02 + 0.5 * toe) - code(0.02 - 0.5 * toe);
+        assert!(
+            short < 0.75 * GRAIN_CODES,
+            "a toe-sized grain was not short at the top of the range: {short} codes"
+        );
+    }
 
     /// The shipped tile is what the generator produces, and this is what says so. Without
     /// it the blob is a number nobody can check, and the generator is code nobody runs.
