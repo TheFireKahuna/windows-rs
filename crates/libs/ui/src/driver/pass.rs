@@ -744,6 +744,11 @@ impl SceneThread {
     /// from them.
     fn route(&mut self, to: &mut ToScene) -> Result<()> {
         self.up.size = to.size.or(self.up.size);
+        // The ground's grain is the one layer with an extent, and this is where the extent
+        // arrives. Cheap on every size but the ones that outgrow the allocation.
+        if let Some(size) = to.size {
+            self.scene.set_ground_extent(size, &self.back, self.env)?;
+        }
         if let Some(env) = to
             .env
             .map(|e| {

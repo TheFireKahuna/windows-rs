@@ -12,3 +12,4 @@
 *.woff2 binary
 *.dll   binary
 *.pri   binary
+*.bin   binary

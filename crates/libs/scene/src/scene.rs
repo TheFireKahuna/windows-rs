@@ -9,7 +9,10 @@ use crate::arena::*;
 use crate::hit::HitTable;
 use crate::hit_entry::{ContactKind, Hit, pack_offset};
 use crate::patch::{Attach, Op, SinkPatch};
-use crate::realize::{Backends, BoxKey, Cache, Ctx, ResObj, Resources, fit, realize};
+use crate::realize::{
+    Backends, Beneath, BoxKey, Cache, Ctx, GRAIN_ALPHA, GRAIN_CODES, GRAIN_TILE, ResObj,
+    Resources, fit, realize,
+};
 use crate::sink::*;
 use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -617,6 +620,15 @@ pub struct BackdropSpec {
     /// behind the window showing through.
     pub base: Vec<(u16, windows_color::Radiance)>,
     pub glows: Vec<Glow>,
+    /// Whether the ground carries a dither.
+    ///
+    /// A ground is the one surface in a window wide enough for an eight-bit quantiser to
+    /// show: a near-black ramp over a whole window height spans a handful of codes, and
+    /// the flat region between two of them is hundreds of pixels wide. Setting this asks
+    /// the scene for a grain that breaks those contours — on the desktops that have them.
+    /// Where composition is float there is no quantiser and the flag costs nothing, and a
+    /// ground with no opaque base has nothing to correct, so both answer no on their own.
+    pub dither: bool,
 }
 
 /// The window's ground, as one sprite per layer.
@@ -630,11 +642,33 @@ pub struct BackdropSpec {
 struct Backdrop {
     spec: BackdropSpec,
     sprites: Vec<SpriteVisual>,
+    /// The dither, on top of the layers it corrected.
+    grain: Option<SpriteVisual>,
+    /// Physical pixels the grain's surface covers. **Grown and never shrunk**: it is the
+    /// one thing in the ground that carries an extent, so a drag-resize would re-rasterize
+    /// a screen-sized surface per step. Allocated in whole tiles past the window instead,
+    /// and the sprite clips it back to the window.
+    px: (i32, i32),
 }
 
 impl Backdrop {
     fn build(&mut self, back: &Backends, env: Env) -> Result<()> {
         self.sprites.clear();
+        self.grain = None;
+        // The grain and the correction under it are one decision. A float desktop has no
+        // quantiser to break, and a ground with no opaque base is not a convex combination,
+        // so the correction would not compose. Either answer leaves the ground as it was.
+        let grain = self
+            .spec
+            .dither
+            .then(|| env.output().quantum())
+            .flatten()
+            .zip(self.spec.base.first())
+            .map(|(quantum, &(_, mid))| (quantum, env.apply(mid)));
+        let beneath = grain.map(|(_, mid)| Beneath {
+            alpha: GRAIN_ALPHA,
+            mid,
+        });
         let base = (!self.spec.base.is_empty()).then(|| {
             (
                 &self.spec.base[..],
@@ -649,7 +683,7 @@ impl Backdrop {
             .iter()
             .map(|glow| (&glow.stops[..], Spread::Radial, glow.at, glow.size));
         for (stops, spread, at, size) in base.into_iter().chain(glows) {
-            let Some(surface) = back.raster_ramp(stops, spread, env)? else {
+            let Some(surface) = back.raster_ramp(stops, spread, env, beneath)? else {
                 continue;
             };
             let sprite = back.compositor.create_sprite_visual();
@@ -657,7 +691,79 @@ impl Backdrop {
             place(&sprite, at, size);
             self.sprites.push(sprite);
         }
+        if let Some((quantum, mid)) = grain {
+            self.cut_grain(back, env, quantum, mid)?;
+        }
         Ok(())
+    }
+
+    /// Cuts the grain for the extent the ground was last told about.
+    ///
+    /// The sprite tracks the window through its relative size, and its brush paints the
+    /// surface one texel to one pixel from the top left, so an allocation larger than the
+    /// window is simply clipped by the sprite and a smaller window needs no work at all.
+    fn cut_grain(
+        &mut self,
+        back: &Backends,
+        env: Env,
+        quantum: f32,
+        mid: windows_color::Scrgb,
+    ) -> Result<()> {
+        let px = (self.px.0.max(GRAIN_TILE as i32), self.px.1.max(GRAIN_TILE as i32));
+        let Some(surface) = back.raster_grain(px, mid, GRAIN_CODES * quantum)? else {
+            return Ok(());
+        };
+        let sprite = back.compositor.create_sprite_visual();
+        let brush = back.brush(&surface, Stretch::None);
+        // One texel on one PHYSICAL pixel. The sprite's box is in DIPs under a root
+        // carrying the display scale, so a brush left at unit scale paints one texel per
+        // DIP and the grain comes out magnified — resampled, which is a blur of a grain
+        // and not a dither. The same reciprocal a presented region takes, for the same
+        // reason; the surface is already sized in pixels.
+        scale_region(&brush, env);
+        sprite.set_brush(&brush);
+        sprite.set_relative_size_adjustment(Vector2 { x: 1.0, y: 1.0 });
+        sprite.set_opacity(GRAIN_ALPHA);
+        self.grain = Some(sprite);
+        Ok(())
+    }
+
+    /// Tells the ground how much room it has, and re-cuts the grain where it outgrew its
+    /// allocation.
+    ///
+    /// Returns whether anything was rebuilt, so the caller can reseat the band only when
+    /// the tree changed.
+    fn resize(&mut self, px: (i32, i32), back: &Backends, env: Env) -> Result<bool> {
+        // Rounded up to whole tiles, so a drag past the edge re-cuts once per tile rather
+        // than once per pixel, and the grain stays aligned to the same texel grid.
+        let step = GRAIN_TILE as i32;
+        let up = |v: i32| (v.max(1) + step - 1) / step * step;
+        let want = (up(px.0), up(px.1));
+        if want.0 <= self.px.0 && want.1 <= self.px.1 {
+            return Ok(false);
+        }
+        self.px = (self.px.0.max(want.0), self.px.1.max(want.1));
+        if self.grain.is_none() {
+            return Ok(false);
+        }
+        let (Some(&(_, mid)), Some(quantum)) =
+            (self.spec.base.first(), env.output().quantum())
+        else {
+            return Ok(false);
+        };
+        let mid = env.apply(mid);
+        self.grain = None;
+        self.cut_grain(back, env, quantum, mid)?;
+        Ok(true)
+    }
+
+    /// The ground's layers in composite order: the base, its glows, and the grain on top.
+    ///
+    /// The grain is last because it corrects what is under it and nothing else — a layer
+    /// added above it would arrive un-pre-compensated and read `1/16` of the way toward
+    /// the grain's own midpoint.
+    fn layers(&self) -> impl Iterator<Item = &SpriteVisual> {
+        self.sprites.iter().chain(self.grain.as_ref())
     }
 
     /// `index` is into the spec's glows; out of range is ignored rather than panicking.
@@ -824,10 +930,12 @@ impl Scene {
         let mut backdrop = Backdrop {
             spec,
             sprites: Vec::new(),
+            grain: None,
+            px: (0, 0),
         };
         backdrop.build(back, env)?;
         let layers = ground.children();
-        for sprite in &backdrop.sprites {
+        for sprite in backdrop.layers() {
             layers.insert_at_top(sprite);
         }
         Ok(Self {
@@ -1014,7 +1122,7 @@ impl Scene {
     fn reseat_backdrop(&mut self) {
         let layers = self.ground.children();
         layers.remove_all();
-        for sprite in &self.backdrop.sprites {
+        for sprite in self.backdrop.layers() {
             layers.insert_at_top(sprite);
         }
     }
@@ -1705,7 +1813,7 @@ impl Scene {
                 ResObj::Geom(back.compositor.create_path_geometry(&path), path)
             }
             ResOp::Ramp { stops, spread } => {
-                let Some(surface) = back.raster_ramp(patch.stops(stops), spread, env)? else {
+                let Some(surface) = back.raster_ramp(patch.stops(stops), spread, env, None)? else {
                     return Ok(());
                 };
                 let brush = back.brush(&surface, Stretch::Fill);
@@ -2137,6 +2245,28 @@ impl Scene {
         self.backdrop.spec = spec;
         self.backdrop.build(back, env)?;
         self.reseat_backdrop();
+        Ok(())
+    }
+
+    /// Tells the ground the client extent, in DIPs.
+    ///
+    /// Every other layer is stated as a fraction of the window and needs no telling. The
+    /// grain does: it is a dither, so it has to land one texel on one pixel, and that is an
+    /// extent. It is re-cut only where the window outgrew the allocation, so an ordinary
+    /// resize does nothing here at all.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the grain's surface cannot be rasterized.
+    pub fn set_ground_extent(&mut self, size: Vector2, back: &Backends, env: Env) -> Result<()> {
+        let scale = env.scale();
+        let px = (
+            (size.x * scale).ceil() as i32,
+            (size.y * scale).ceil() as i32,
+        );
+        if self.backdrop.resize(px, back, env)? {
+            self.reseat_backdrop();
+        }
         Ok(())
     }
 

@@ -100,14 +100,37 @@ pub struct OutputTransform {
     /// The declared content peak after exposure, in presented nits. Bounds the debug
     /// assertion in [`OutputTransform::apply`].
     peak_limit: f32,
+    /// The linear step one output code spans, where composition quantises at all.
+    quantum: Option<f32>,
 }
 
 impl OutputTransform {
     /// The display gamut this transform targets.
     pub const fn gamut(self) -> Gamut { self.gamut }
 
+    /// The linear scRGB step one code of the display's own quantiser spans, or `None`
+    /// where composition is float and there is no quantiser to break up.
+    ///
+    /// Only the standard-dynamic-range desktop composites in eight bits; the other two
+    /// composite in FP16 scRGB, where a near-black ramp has orders of magnitude more
+    /// codes than it can use. So this is the amplitude a dither is sized against, and
+    /// its absence is the statement that none is needed.
+    ///
+    /// It is the step at the **toe**, where sRGB's transfer is the straight segment
+    /// `12.92 · v` and one code is `1 / (255 · 12.92)` whatever the level. Above the toe
+    /// the transfer curves and a code spans more, up to about 1.5x that across the
+    /// darkest part of a ladder — so a dither sized here is under-amplitude at the top
+    /// of its range by that factor and never over-amplitude at the bottom, which is the
+    /// direction that fails safely.
+    #[must_use]
+    pub const fn quantum(self) -> Option<f32> {
+        self.quantum
+    }
+
     /// Reuses the display capability with a newly declared authored content peak.
     pub fn with_content_peak_nits(mut self, peak: f32) -> Self {
+        // The quantiser is the display's and the content peak is the palette's; neither
+        // moves the other.
         self.peak_limit = peak.max(REFERENCE_WHITE_NITS) * self.exposure;
         self.knee = if self.peak_limit > self.white + self.head { self.white } else { f32::INFINITY };
         self
@@ -124,6 +147,15 @@ impl OutputTransform {
     /// channel. The debug assertion in [`OutputTransform::apply`] reports that case.
     #[must_use]
     pub fn for_display(cap: DisplayCapability, content_peak_nits: f32) -> Self {
+        // Eight-bit composition is the standard-dynamic-range desktop and nothing else.
+        // `1 / (255 * 12.92)` is one code on sRGB's straight segment — see
+        // [`OutputTransform::quantum`].
+        let quantum = match cap {
+            DisplayCapability::Sdr => Some(1.0 / (255.0 * 12.92)),
+            DisplayCapability::WideGamut { .. } | DisplayCapability::HighDynamicRange { .. } => {
+                None
+            }
+        };
         let (exposure, encode, gamut, ceiling) = match cap {
             DisplayCapability::Sdr => (
                 1.0,
@@ -168,6 +200,7 @@ impl OutputTransform {
                 f32::INFINITY
             },
             peak_limit,
+            quantum,
         }
     }
 

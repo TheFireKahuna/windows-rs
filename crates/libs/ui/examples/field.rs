@@ -815,6 +815,8 @@ fn main() -> Result<()> {
                 (quant_stop(1.0), light(2.1, 0.004, ACCENT_HUE)),
             ],
             glows: Vec::new(),
+            // A flat base has no ramp to contour, so there is nothing to break up.
+            dither: false,
         },
         {
             let commits_for_app = commits.clone();
