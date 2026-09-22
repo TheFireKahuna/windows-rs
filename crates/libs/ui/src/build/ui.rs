@@ -360,9 +360,35 @@ impl<'a> Ui<'a> {
         self.switch_on(move || Some(key()), create);
     }
 
+    /// Mounts conditional content with a measured-size compositor slide on entry and exit.
+    ///
+    /// Input is suspended until entry completes. Removal releases layout space immediately;
+    /// the compositor retains an unpickable exit ghost until its animation completes.
+    pub fn when_slide<M>(
+        &mut self,
+        condition: impl Signal<bool, M> + 'static,
+        slide: crate::overlay::Slide,
+        create: impl Fn(&mut Ui<'_>) + 'static,
+    ) {
+        self.switch_with_slide(
+            move || condition.read().then_some(()),
+            Some(slide),
+            move |ui, ()| create(ui),
+        );
+    }
+
     fn switch_on<K: PartialEq + 'static>(
         &mut self,
         key: impl Fn() -> Option<K> + 'static,
+        create: impl Fn(&mut Ui<'_>, &K) + 'static,
+    ) {
+        self.switch_with_slide(key, None, create);
+    }
+
+    fn switch_with_slide<K: PartialEq + 'static>(
+        &mut self,
+        key: impl Fn() -> Option<K> + 'static,
+        slide: Option<crate::overlay::Slide>,
         create: impl Fn(&mut Ui<'_>, &K) + 'static,
     ) {
         let anchor = self.anchor();
@@ -370,10 +396,15 @@ impl<'a> Ui<'a> {
         let mut branch = Branch::<K, Mount>::new();
         self.host.binding(move || {
             branch.set(key(), |key| {
-                let mount = Ui::mount_interned(parent, Some(anchor), scope, control, |ui| {
+                let mut mount = Ui::mount_interned(parent, Some(anchor), scope, control, |ui| {
                     create(ui, key);
                 });
-                Host::with(|host| mount.place(host, parent, Some(anchor)));
+                Host::with(|host| {
+                    mount.place(host, parent, Some(anchor));
+                    if let Some(slide) = slide {
+                        mount.slide(host, slide);
+                    }
+                });
                 mount
             });
         });

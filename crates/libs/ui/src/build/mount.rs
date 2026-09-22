@@ -61,6 +61,13 @@ impl Mount {
         self.exit = exit;
     }
 
+    pub(crate) fn slide(&mut self, host: &mut Host, slide: crate::overlay::Slide) {
+        self.exit = Exit::Slide { by: slide.by, ms: slide.ms, easing: slide.easing };
+        for &node in &self.roots {
+            host.enter_slide(node, slide);
+        }
+    }
+
     /// Returns the node this subtree is rooted at.
     pub fn node(&self) -> NodeId {
         self.roots.first().copied().unwrap_or(NodeId::NONE)

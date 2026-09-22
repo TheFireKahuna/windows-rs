@@ -47,10 +47,7 @@ pub(crate) struct Placement {
     pub entry: Option<Entrance>,
 }
 
-/// An overlay's entrance, which runs once and then leaves the node under ordinary placement.
-///
-/// Held inside the [`Placement`] rather than beside it: the overlay stack is `pub(crate)` and
-/// a parallel vector would fall out of step the first time another layer pushed to one.
+/// Runs an entrance once, then returns the node to ordinary layout placement.
 #[derive(Copy, Clone)]
 pub(crate) struct Entrance {
     pub node: NodeId,
@@ -67,6 +64,10 @@ pub(crate) struct Entrance {
 }
 
 impl Entrance {
+    pub(crate) fn running(self) -> bool {
+        !self.done
+    }
+
     pub(crate) fn new(node: NodeId, slide: crate::overlay::Slide, window: Vector2) -> Self {
         Self {
             node,
@@ -175,6 +176,7 @@ pub struct Host {
     sides: Pool<Side>,
     anchors: Vec<Attachment>,
     pub(crate) overlays: Vec<Placement>,
+    entrances: Vec<Entrance>,
     /// The authored stops of every live ramp, so a theme change re-resolves them.
     ramps: Slots<RAMP, (Vec<super::Stop>, Spread)>,
     scratch_stops: Vec<(u16, windows_color::Radiance)>,
@@ -260,6 +262,7 @@ impl Host {
                 sides: Pool::default(),
                 anchors: Vec::new(),
                 overlays: Vec::new(),
+                entrances: Vec::new(),
                 ramps: Slots::default(),
                 scratch_stops: Vec::new(),
                 text: super::text::Table::default(),
@@ -620,6 +623,7 @@ impl Host {
 
     pub(crate) fn suspend_input(&mut self, id: NodeId, suspended: bool) {
         self.tree.set_flag(id, tree::SUSPENDED, suspended);
+        self.uia_stale.set(true);
     }
 
     /// Records or clears what this node declares about the hit array.
@@ -1336,6 +1340,7 @@ impl Host {
         for at in 0..gathered.len() {
             self.tree.release(gathered[at]);
         }
+        self.entrances.retain(|entry| self.tree.is_live(entry.node));
         gathered.clear();
         self.scratch = gathered;
     }
@@ -1701,54 +1706,55 @@ impl Host {
         }
     }
 
-    /// Slides an overlay in on its first solved box.
-    ///
-    /// Only the first one starts motion; changed geometry afterwards snaps in one event-rate
-    /// write, so a window resize under an open menu does not replay the entrance. A slide that
-    /// starts leaves the node's input suspended: the release is
-    /// [`complete_overlay_entry`](Self::complete_overlay_entry), on the compositor's own report
-    /// that the curve has run, so a press cannot land on a surface still arriving. A snap
-    /// releases here, because there is nothing to wait for.
+    pub(crate) fn enter_slide(&mut self, node: NodeId, slide: crate::overlay::Slide) {
+        self.suspend_input(node, true);
+        self.entrances.push(Entrance::new(node, slide, self.window.get()));
+    }
+
+    /// Publishes conditional and overlay entrances through the same geometry policy.
     fn publish_overlay_entries(&mut self) {
-        let window = self.window.get();
         for at in 0..self.overlays.len() {
-            let Some(entry) = self.overlays[at].entry else {
-                continue;
-            };
-            if entry.done {
-                continue;
-            }
-            let geom = self.tree.c.geom[entry.node.index()];
-            if geom.size.x <= 0.0 || geom.size.y <= 0.0 {
-                continue;
-            }
-            let replaced = entry.window != window || entry.rect.is_some_and(|r| r != geom.rect);
-            if replaced {
-                self.bind(entry.node, Prop::Offset, Bind::Set(Value::Vec2(geom.local)));
-                self.overlays[at].entry = Some(Entrance {
-                    done: true,
-                    ..entry
-                });
-                self.suspend_input(entry.node, false);
-            } else if !entry.started {
-                let from = entry.slide.from(geom.local, geom.size);
-                let frames = self.frames(&[
-                    (0.0, Value::Vec2(from), Easing::Linear),
-                    (1.0, Value::Vec2(geom.local), entry.slide.easing),
-                ]);
-                let anim = Anim::Frames {
-                    frames,
-                    duration_ms: entry.slide.ms,
-                    iterations: Iterations::Count(1),
-                };
-                self.bind(entry.node, Prop::Offset, Bind::Animate(anim));
-                self.overlays[at].entry = Some(Entrance {
-                    rect: Some(geom.rect),
-                    started: true,
-                    ..entry
-                });
+            if let Some(entry) = self.overlays[at].entry {
+                self.overlays[at].entry = Some(self.publish_entry(entry));
             }
         }
+        for at in 0..self.entrances.len() {
+            self.entrances[at] = self.publish_entry(self.entrances[at]);
+        }
+        self.entrances.retain(|entry| !entry.done);
+    }
+
+    fn publish_entry(&mut self, mut entry: Entrance) -> Entrance {
+        if entry.done {
+            return entry;
+        }
+        let geom = self.tree.c.geom[entry.node.index()];
+        if geom.size.x <= 0.0 || geom.size.y <= 0.0 {
+            return entry;
+        }
+        let replaced = entry.started
+            && (entry.window != self.window.get() || entry.rect.is_some_and(|r| r != geom.rect));
+        if replaced {
+            self.bind(entry.node, Prop::Offset, Bind::Set(Value::Vec2(geom.local)));
+            entry.done = true;
+            self.suspend_input(entry.node, false);
+        } else if !entry.started {
+            let from = entry.slide.from(geom.local, geom.size);
+            let frames = self.frames(&[
+                (0.0, Value::Vec2(from), Easing::Linear),
+                (1.0, Value::Vec2(geom.local), entry.slide.easing),
+            ]);
+            let anim = Anim::Frames {
+                frames,
+                duration_ms: entry.slide.ms,
+                iterations: Iterations::Count(1),
+            };
+            self.bind(entry.node, Prop::Offset, Bind::Animate(anim));
+            entry.rect = Some(geom.rect);
+            entry.window = self.window.get();
+            entry.started = true;
+        }
+        entry
     }
 
     /// Ends the entrance the compositor has just finished playing, releasing its hold on input.
@@ -1756,6 +1762,10 @@ impl Host {
     /// Answers for the node the report names and only while its slide is on the compositor, so
     /// a completion for a channel this row never animated moves nothing.
     pub(crate) fn complete_overlay_entry(&mut self, node: NodeId) {
+        if self.entrances.iter().any(|entry| entry.node == node && entry.started) {
+            self.entrances.retain(|entry| entry.node != node);
+            self.suspend_input(node, false);
+        }
         for at in 0..self.overlays.len() {
             let Some(entry) = self.overlays[at].entry else {
                 continue;

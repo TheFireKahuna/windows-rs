@@ -393,11 +393,14 @@ fn overhangs(at: Vector2, size: Vector2, side: Side, window: Vector2) -> bool {
 
 // ── what an overlay is opened with ───────────────────────────────────────────────
 
-/// A popup moves as one compositor group, by a multiple of its measured size.
+/// Moves a subtree as one compositor group, by a multiple of its measured size.
 #[derive(Copy, Clone, PartialEq, Debug)]
-pub(crate) struct Slide {
+pub struct Slide {
+    /// Displacement as a fraction of the solved size.
     pub by: Vector2,
+    /// Duration in milliseconds.
     pub ms: u32,
+    /// Easing applied to the destination keyframe.
     pub easing: Easing,
 }
 
@@ -426,6 +429,7 @@ pub struct Spec {
     anchor: Anchor,
     viewport: Option<[Len; 4]>,
     slide: Option<Slide>,
+    animate_resize: bool,
     dismiss: DismissPolicy,
     /// Played as the subtree is destroyed.
     exit: Exit,
@@ -453,10 +457,17 @@ impl Spec {
             anchor,
             viewport: None,
             slide: None,
+            animate_resize: false,
             dismiss: kind.dismiss(),
             exit: KINDS[kind as usize].2,
             dwelled: false,
         }
+    }
+
+    /// Preserves entry and exit motion when a resize changes the popup condition.
+    #[must_use]
+    pub const fn animate_resize(self) -> Self {
+        Self { animate_resize: true, ..self }
     }
 
     /// Returns the kind this spec opens.
@@ -583,6 +594,7 @@ struct Open {
     /// The window insets its spec named, kept because a resize re-resolves them against the new
     /// client box rather than scaling what they last came to.
     insets: Option<[Len; 4]>,
+    animate_resize: bool,
     /// The declaration that opened it and the callback that reports it closed, for an overlay a
     /// signal declared rather than a gesture.
     binding: Option<(NodeId, Rc<dyn Fn()>)>,
@@ -749,6 +761,7 @@ impl Overlays {
             invoker,
             dwelled: spec.dwelled,
             insets: spec.viewport,
+            animate_resize: spec.animate_resize,
             binding: None,
             typed: None,
             owner,
@@ -761,8 +774,7 @@ impl Overlays {
     /// anything is open.
     pub(crate) fn sync(&mut self, focus: &mut Vec<FocusOp>) -> bool {
         let window = Host::window_size().peek();
-        // A drawer that flipped because the window crossed its threshold keeps the application's
-        // resting intent: it neither slides in nor plays its exit, because nothing was dismissed.
+        // Resize motion belongs to each declaration; intent remains in its signal owner.
         let resized = self.window.replace(window).is_some_and(|was| was != window);
         if resized {
             // The insets are stated against the window, so the box every open overlay is laid
@@ -790,7 +802,7 @@ impl Overlays {
                     // A condition change rather than a dismissal preserves the application's
                     // resting intent, including a drawer closed by a window resize.
                     self.open[depth].binding = None;
-                    if resized {
+                    if resized && !self.open[depth].animate_resize {
                         self.open[depth].mount.set_exit(Exit::None);
                     }
                     self.truncate(depth, focus);
@@ -803,7 +815,7 @@ impl Overlays {
                     closed,
                     ..
                 } if held.is_none() && Host::with(|host| host.tree.is_live(key)) => {
-                    if resized {
+                    if resized && !spec.animate_resize {
                         spec.slide = None;
                     }
                     let id = self.open(focus, spec, move |ui| body(ui));
@@ -898,9 +910,10 @@ impl Overlays {
                 focus.push(FocusOp::Pop(ScopeId(open.generation)));
             }
             _ = Host::try_with(|host| {
-                // A subtree whose input the host already suspended is on its way out for another
-                // reason, and playing an exit over that shows the same content leaving twice.
-                if host.input_suspended(open.mount.node()) {
+                // Entry suspends input too; closing it still plays the exit from its live visual.
+                if host.input_suspended(open.mount.node())
+                    && !host.overlays[depth].entry.is_some_and(Entrance::running)
+                {
                     open.mount.set_exit(Exit::None);
                 }
                 open.mount.retire(host);
@@ -2655,4 +2668,32 @@ mod tests {
             "a resize-driven close was animated as a dismissal"
         );
     }
+    #[test]
+    fn resize_motion_is_preserved_when_requested() {
+        let mut patch = fixture();
+        let mut overlays = Overlays::new();
+        let mut ops = Ops::default();
+        let shown = crate::signal::Cell::new(false);
+        let spec = Spec::popup().slide(size(1.0, 0.0), 200, Easing::Linear).animate_resize();
+        let _mount = mounted(&mut patch, |ui| {
+            button(ui, "Pick").popup_when(shown, spec, || {}, body);
+        });
+        overlays.sync(&mut ops.0);
+        for (width, visible) in [(500.0, true), (600.0, false), (500.0, true)] {
+            patch.clear();
+            Host::with(|host| host.set_window(size(width, 600.0)));
+            shown.set(visible);
+            crate::signal::flush();
+            overlays.sync(&mut ops.0);
+            Host::flush(&mut patch);
+            if visible {
+                assert!(patch.ops().iter().any(|op| matches!(op,
+                    Op::Bind { prop: Prop::Offset, bind: windows_scene::Bind::Animate(_), .. })));
+            } else {
+                assert!(patch.ops().iter().any(|op| matches!(op,
+                    Op::Drop { exit: Exit::Slide { .. }, .. })));
+            }
+        }
+    }
+
 }

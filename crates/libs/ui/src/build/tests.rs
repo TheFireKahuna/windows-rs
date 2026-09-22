@@ -1272,3 +1272,47 @@ fn text_range_reveal_moves_the_field_view_without_moving_its_selection() {
         ))
     });
 }
+
+#[test]
+fn conditional_slide_releases_input_and_retires_during_entry() {
+    let mut patch = fixture();
+    let shown = Cell::new(false);
+    let node = Cell::new(NodeId::NONE);
+    let _mount = Ui::mount_root(|ui| {
+        ui.when_slide(shown, crate::overlay::Slide {
+            by: Vector2 { x: 1.0, y: 0.0 },
+            ms: 200,
+            easing: windows_scene::Easing::Linear,
+        }, move |ui| node.set(boxed(ui, 360.0, 240.0)));
+    });
+    Host::flush(&mut patch);
+    for complete in [true, false, true] {
+        patch.clear();
+        shown.set(true);
+        crate::signal::flush();
+        Host::flush(&mut patch);
+        let id = node.get();
+        assert!(patch.ops().iter().any(|op| matches!(op,
+            Op::Bind { id: target, prop: Prop::Offset, bind: Bind::Animate(Anim::Frames { .. }) }
+            if *target == id)));
+        assert!(Host::with(|h| h.input_suspended(id)));
+        patch.clear();
+        Host::flush(&mut patch);
+        assert!(patch.ops().is_empty());
+        if complete {
+            Host::with(|h| {
+                h.uia_published();
+                h.complete_overlay_entry(id);
+                assert!(h.uia_stale());
+            });
+            assert!(!Host::with(|h| h.input_suspended(id)));
+        }
+        shown.set(false);
+        crate::signal::flush();
+        Host::flush(&mut patch);
+        assert!(patch.ops().iter().any(|op| matches!(op,
+            Op::Drop { id: target, exit: windows_scene::Exit::Slide { .. }, .. } if *target == id)));
+        assert!(!Host::with(|h| h.tree.is_live(id)));
+        Host::with(|h| h.complete_overlay_entry(id));
+    }
+}
