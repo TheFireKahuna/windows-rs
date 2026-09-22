@@ -493,10 +493,13 @@ fn resolved(a: &At) -> (i32, &'static str) {
     if a.part == NO_PART && entry.flags.has(ColFlags::DIALOG) {
         return (roles::DIALOG_CONTROL_TYPE, roles::DIALOG_NAME);
     }
-    let parent = a
-        .tree
-        .at(entry.parent)
-        .map_or(UiaRole::None, |parent| parent.role);
+    let mut parent_at = entry.parent;
+    let mut parent = UiaRole::None;
+    while let Some(entry) = a.tree.at(parent_at) {
+        parent = entry.role;
+        if parent != UiaRole::Group { break; }
+        parent_at = entry.parent;
+    }
     roles::control_type_in(a.role(), parent)
 }
 
@@ -804,7 +807,11 @@ vtable! {
         // Nothing here hosts a foreign fragment root, and a null array is the documented
         // answer rather than an error.
         fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> { Ok(core::ptr::null_mut()) }
-        fn SetFocus(&self) -> Result<()> { self.command(Action::Focus) }
+        fn SetFocus(&self) -> Result<()> {
+            if !self.at()?.flag(S::ENABLED) { return Err(disabled()); }
+            if !self.at()?.bit(F::FOCUSABLE) { return Err(invalid()); }
+            self.command(Action::Focus)
+        }
         fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> { root_of(&self.this) }
     }
     IRawElementProviderSimple_Impl for Root_Impl {
@@ -873,12 +880,12 @@ vtable! {
         fn GetSelection(&self) -> Result<*mut SAFEARRAY> { selection(&self.this) }
         // A container never holds more than one selected item.
         fn CanSelectMultiple(&self) -> Result<BOOL> { Ok(BOOL::from(false)) }
-        fn IsSelectionRequired(&self) -> Result<BOOL> { Ok(BOOL::from(false)) }
+        fn IsSelectionRequired(&self) -> Result<BOOL> { Ok(BOOL::from(self.at()?.bit(F::SELECTION_REQUIRED))) }
     }
     IRangeValueProvider_Impl for Element_Impl {
         fn SetValue(&self, value: f64) -> Result<()> { set_number(&self.this, value) }
         fn Value(&self) -> Result<f64> { self.at()?.number() }
-        fn IsReadOnly(&self) -> Result<BOOL> { Ok(BOOL::from(!self.at()?.flag(S::ENABLED))) }
+        fn IsReadOnly(&self) -> Result<BOOL> { Ok(BOOL::from(read_only(&self.this)?)) }
         fn Maximum(&self) -> Result<f64> { Ok(bounds(&self.this)?.max) }
         fn Minimum(&self) -> Result<f64> { Ok(bounds(&self.this)?.min) }
         fn LargeChange(&self) -> Result<f64> { let r = bounds(&self.this)?; Ok((r.max - r.min) * LARGE_FRACTION) }
@@ -1008,7 +1015,7 @@ fn expand_state(element: &Element) -> Result<ExpandCollapseState> {
 /// Returns the container whose selection this element is one of.
 fn container(element: &Element) -> Result<IRawElementProviderSimple> {
     let at = element.at()?;
-    let parent = at.tree.at(at.entry().parent).ok_or_else(none)?;
+    let parent = at.tree.at(at.tree.selection_container(at.at)).ok_or_else(none)?;
     Ok(at.shared.object(parent.id, NO_PART))
 }
 
@@ -1016,14 +1023,38 @@ fn container(element: &Element) -> Result<IRawElementProviderSimple> {
 /// needs no republish.
 fn selection(element: &Element) -> Result<*mut SAFEARRAY> {
     let at = element.at()?;
-    let selected: Vec<_> = children(&at.tree, at.at)
-        .filter(|&child| at.tree.state(child).has(State::SELECTED))
+    let selected: Vec<_> = descendants(&at.tree, at.at)
+        .filter(|&child| {
+            if !at.tree.state(child).has(State::SELECTED) { return false; }
+            let owner = at.tree.selection_container(child);
+            owner == at.at || (at.role() == UiaRole::ComboBox
+                && at.tree.at(owner).is_some_and(|entry| entry.parent == at.at))
+        })
         .map(|child| {
             at.shared
                 .object(at.tree.entries()[child as usize].id, NO_PART)
         })
         .collect();
     Ok(variant::provider_array(&selected))
+}
+
+/// Visits descendants through semantic links, including detached flyouts owned by a control.
+fn descendants(tree: &Tree, root: u16) -> impl Iterator<Item = u16> + '_ {
+    let mut next = tree.at(root).map_or(NONE, |entry| entry.child);
+    core::iter::from_fn(move || {
+        let out = (next != NONE).then_some(next)?;
+        let entry = tree.at(out)?;
+        next = entry.child;
+        if next == NONE {
+            let mut at = out;
+            while let Some(entry) = tree.at(at) {
+                if entry.next != NONE { next = entry.next; break; }
+                if entry.parent == root { break; }
+                at = entry.parent;
+            }
+        }
+        Some(out)
+    })
 }
 
 /// Returns each child index of the entry at `at`, in sibling order.
@@ -1055,6 +1086,8 @@ fn small_change(range: Range) -> f64 {
 /// Queues a numeric write, refusing one outside the element's own bounds.
 fn set_number(element: &Element, value: f64) -> Result<()> {
     let at = element.at()?;
+    if !at.flag(S::ENABLED) { return Err(disabled()); }
+    if at.bit(F::READ_ONLY) { return Err(invalid()); }
     let range = at.tree.range(at.at).ok_or_else(invalid)?;
     if !value.is_finite() || value < range.min || value > range.max {
         return Err(invalid());
@@ -1072,6 +1105,7 @@ fn set_text(element: &Element, value: &PCWSTR) -> Result<()> {
     if !at.flag(S::ENABLED) {
         return Err(disabled());
     }
+    if at.bit(F::READ_ONLY) { return Err(invalid()); }
     if value.is_null() {
         return Err(invalid());
     }
@@ -1115,7 +1149,7 @@ fn value_text(element: &Element) -> Result<BSTR> {
 fn read_only(element: &Element) -> Result<bool> {
     let at = element.at()?;
     let editable = at.bit(F::RANGED) || at.bit(F::FIELD);
-    Ok(!editable || !at.flag(S::ENABLED))
+    Ok(!editable || at.bit(F::READ_ONLY) || !at.flag(S::ENABLED))
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────────

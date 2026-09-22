@@ -25,7 +25,8 @@ use crate::bindings::{
     UiaClientsAreListening, UiaRaiseAutomationEvent, UiaRaiseAutomationPropertyChangedEvent,
     UiaRaiseStructureChangedEvent,
     UIA_AutomationPropertyChangedEventId,
-    UIA_StructureChangedEventId,};
+    UIA_StructureChangedEventId, UIA_SelectionItem_ElementSelectedEventId,
+    UIA_SelectionItem_ElementRemovedFromSelectionEventId,};
 use std::sync::{Arc, Mutex, PoisonError};
 use windows_core::Interface;
 use windows_scene::ControlId;
@@ -174,6 +175,18 @@ impl Pending {
     pub fn flush(&mut self, shared: &Arc<Shared>, tree: &Tree) {
         if listening() {
             for raise in self.0.drain(..) {
+                if let Raise::Property(id, Property::Selected, Val::Bool(was)) = raise {
+                    if let Some(at) = tree.index_of(id) {
+                        let selected = tree.state(at).has(State::SELECTED);
+                        if selected != was {
+                            let event = if selected { UIA_SelectionItem_ElementSelectedEventId }
+                                else { UIA_SelectionItem_ElementRemovedFromSelectionEventId };
+                            if shared.advised.wanted(event) {
+                                one(&Raise::Event(id, event), shared, tree);
+                            }
+                        }
+                    }
+                }
                 // A property change is advised by its own event id, which is the one automation
                 // names when a client subscribes to any of them.
                 let (_, property, event) = raise.key();

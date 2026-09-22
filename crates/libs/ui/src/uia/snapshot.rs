@@ -58,6 +58,12 @@ impl ColFlags {
     /// Is an overlay's own root, so its arrival and departure are what a client is told about
     /// as a menu or a description opening and closing.
     pub const OVERLAY: Self = Self(1 << 12);
+    /// Publishes a value without accepting writes.
+    pub const READ_ONLY: Self = Self(1 << 13);
+    /// Requires one selected child.
+    pub const SELECTION_REQUIRED: Self = Self(1 << 14);
+    /// Owns a single selection independently of its control type.
+    pub const SELECTION: Self = Self(1 << 15);
 
     /// Returns whether every bit set in `other` is set here.
     #[must_use]
@@ -521,7 +527,12 @@ impl Tree {
             return Patterns::NONE;
         };
         let mut out = roles::row(entry.role).patterns;
-        if !entry.flags.has(ColFlags::EXPANDS) {
+        if entry.flags.has(ColFlags::SELECTION) {
+            out = out.or(Patterns::SELECTION);
+        }
+        if entry.flags.has(ColFlags::EXPANDS) {
+            out = out.or(Patterns::EXPAND);
+        } else {
             out = out.without(Patterns::EXPAND);
         }
         if entry.flags.has(ColFlags::SELECTS) {
@@ -536,6 +547,11 @@ impl Tree {
         if entry.flags.has(ColFlags::SCROLLS) {
             out = out.or(Patterns::SCROLL);
         }
+        if entry.scroll != NONE {
+            out = out.or(Patterns::SCROLL_ITEM);
+        } else {
+            out = out.without(Patterns::SCROLL_ITEM);
+        }
         if !entry.flags.has(ColFlags::RANGED)
             && !entry.flags.has(ColFlags::FIELD)
             && !entry.flags.has(ColFlags::SHOWN)
@@ -543,6 +559,16 @@ impl Tree {
             out = out.without(Patterns::VALUE);
         }
         out
+    }
+
+    /// Finds the nearest ancestor that owns this item's selection.
+    pub fn selection_container(&self, at: u16) -> u16 {
+        let mut parent = self.at(at).map_or(NONE, |entry| entry.parent);
+        while let Some(entry) = self.at(parent) {
+            if self.patterns(parent).has(Patterns::SELECTION) { return parent; }
+            parent = entry.parent;
+        }
+        NONE
     }
 
     /// Returns the sibling before `at`, by walking its parent's child list.
@@ -829,13 +855,14 @@ impl Tree {
 /// Runs on the publish, which happens when layout changed and a client is attached.
 pub fn derive_keys(snapshot: &mut Snapshot, seen: &mut Vec<(String, u32)>) {
     seen.clear();
+    let authored = snapshot.keys.len();
     // One slug per entry, so an ancestor's path is read rather than rebuilt.
     let mut paths: Vec<String> = Vec::with_capacity(snapshot.entries.len());
     let mut scratch = String::new();
     for at in 0..snapshot.entries.len() {
         let entry = snapshot.entries[at];
         if let Ok(found) = snapshot
-            .keys
+            .keys[..authored]
             .binary_search_by_key(&(at as u16), |&(key, _)| key)
         {
             // An author's own id is the whole of it, and it is what descendants build on.
@@ -1184,6 +1211,20 @@ mod tests {
         assert_eq!(name(0), "root");
         assert_eq!(name(1), "row");
         assert!(tree.text(0).is_empty(), "zero names no run");
+    }
+
+    #[test]
+    fn authored_keys_survive_derivation_of_earlier_entries() {
+        let (mut snapshot, _) = fan(6);
+        for (at, key) in [(2, "fixed-two"), (4, "fixed-four")] {
+            let offset = snapshot.intern(key);
+            snapshot.keys.push((at, offset));
+        }
+        derive_keys(&mut snapshot, &mut Vec::new());
+        let tree = Tree::adopt(&snapshot, &[]);
+        assert_eq!(String::from_utf16_lossy(tree.key(2)), "fixed-two");
+        assert_eq!(String::from_utf16_lossy(tree.key(4)), "fixed-four");
+        assert!(snapshot.keys.windows(2).all(|p| p[0].0 < p[1].0));
     }
 
     /// A form row is a label and a control side by side, so the control's name is a sibling

@@ -614,12 +614,92 @@ fn selection_and_disabled_bindings_preserve_each_other() {
 fn a_slider_publishes_the_range_it_runs_over() {
     let mut rig = Rig::new();
     let mut frame = rig.mount(|ui| {
-        knob(ui, Cell::new(0.5), Range::new(0.0, 12.0)).name("Gain");
+        knob(ui, Cell::new(0.5), Range::new(0.0, 12.0).step(0.1)).name("Gain");
     });
     let row = frame.uia("Gain").expect("the knob published no element");
     assert!(row.flags.has(ColFlags::RANGED), "a slider is not ranged");
     let range = row.range.expect("a slider published no bounds");
     assert_eq!((range.min, range.max), (0.0, 12.0));
+    assert_eq!(range.step, 0.1);
+}
+
+#[test]
+fn a_disclosure_dispatches_the_requested_state() {
+    let mut rig = Rig::new();
+    let expanded = Cell::new(false);
+    let mut target = ControlId::NONE;
+    rig.mount(|ui| {
+        target = button(ui, "Details").expanded(expanded)
+            .on_expand(move |open| expanded.set(open)).control_id();
+    });
+    for open in [false, true, true, false, false] {
+        Host::dispatch(&[Intent { target, what: What::Expanded(open) }]);
+        let row = rig.set(expanded, open).uia("Details").unwrap();
+        assert!(row.flags.has(ColFlags::EXPANDS));
+        assert_eq!(row.state.has(State::EXPANDED), open);
+    }
+}
+
+#[test]
+fn numeric_binding_preserves_drag_and_publishes_dynamic_bounds() {
+    let mut rig = Rig::new();
+    let bounds = Cell::new(12.0);
+    let mut target = ControlId::NONE;
+    rig.mount(|ui| {
+        target = ui.node(Preset::Layer).name("Band")
+            .on_drag(crate::gesture::DragDecl::default(), |_| {})
+            .range_value(move || Range::new(-bounds.get(), bounds.get()).step(0.1),
+                crate::widget::ScalarValue { value: 2.0, epoch: 0 })
+            .on_gesture(|_| {}).control_id();
+    });
+    let row = rig.set(bounds, 24.0).uia("Band").unwrap();
+    assert_eq!(row.range.unwrap(), Range::new(-24.0, 24.0).step(0.1));
+    assert!(!row.flags.has(ColFlags::READ_ONLY));
+    Host::with(|host| {
+        let row = host.control(target).unwrap();
+        assert!(row.front.flags & crate::widget::flag::DRAGS != 0);
+        assert!(host.handlers.get(row.handlers).unwrap().drag.is_some());
+    });
+}
+
+#[test]
+fn choice_navigation_crosses_layout_wrappers_and_skips_disabled_items() {
+    let mut rig = Rig::new();
+    let mut ids = [ControlId::NONE; 3];
+    rig.mount(|ui| {
+        ui.node(Preset::Stack).role(UiaRole::Tab).selection(true).children(|ui| {
+            for (at, id) in ids.iter_mut().enumerate() {
+                ui.node(Preset::Row).children(|ui| {
+                    *id = button(ui, "Page").role(UiaRole::TabItem)
+                        .selected(at == 0).disabled(at == 1).control_id();
+                });
+            }
+        });
+    });
+    Host::with(|h| {
+        assert_eq!(h.choice_neighbor(ids[0], 0x27), Some(ids[2]));
+        assert_eq!(h.choice_neighbor(ids[2], 0x27), Some(ids[0]));
+        assert_eq!(h.choice_neighbor(ids[0], 0x25), Some(ids[2]));
+        assert_eq!(h.choice_neighbor(ids[2], 0x24), Some(ids[0]));
+    });
+}
+
+#[test]
+fn explicit_tab_policy_overrides_selection_and_sends_only_changes() {
+    let mut rig = Rig::new();
+    let selected = Cell::new(true);
+    let value = Cell::new(1);
+    let mut id = ControlId::NONE;
+    rig.mount(|ui| {
+        id = button(ui, "Preset").role(UiaRole::RadioButton).selected(selected)
+            .tab_stop(move || value.get() >= 0).control_id();
+    });
+    Host::with(|h| h.focus_ops.clear());
+    rig.set(selected, false);
+    rig.set(value, 2);
+    Host::with(|h| assert!(h.focus_ops.is_empty()));
+    rig.set(value, -1);
+    Host::with(|h| assert_eq!(h.focus_ops, [crate::seam::FocusOp::TabIndex(id, -1)]));
 }
 
 #[test]

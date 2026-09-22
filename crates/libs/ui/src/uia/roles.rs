@@ -13,7 +13,7 @@ use crate::bindings::{
     UIA_SelectionItemPatternId, UIA_SelectionPatternId, UIA_SliderControlTypeId,
     UIA_TextControlTypeId, UIA_TextPatternId, UIA_TogglePatternId, UIA_ToolTipControlTypeId,
     UIA_ValuePatternId,
-    UIA_WindowControlTypeId,
+    UIA_WindowControlTypeId, UIA_TabControlTypeId, UIA_TabItemControlTypeId,
 };
 use crate::widget::UiaRole;
 
@@ -88,7 +88,7 @@ const P: Patterns = Patterns::NONE;
 /// `UiaRole` is fieldless and its variants carry no explicit discriminant, so a role's
 /// position in that declaration is its index here, and `every_role_has_its_own_row` is what
 /// holds the two orders together.
-static ROWS: [Row; 14] = [
+static ROWS: [Row; 16] = [
     // None — never published; present so the table is total over the enum.
     Row::new(UIA_CustomControlTypeId, "", P, false),
     // A static run publishes its body as a text document, so it can be read, selected and
@@ -133,7 +133,7 @@ static ROWS: [Row; 14] = [
     Row::new(
         UIA_ComboBoxControlTypeId,
         "combo box",
-        P.or(Patterns::EXPAND).or(Patterns::VALUE),
+        P.or(Patterns::EXPAND).or(Patterns::VALUE).or(Patterns::SELECTION),
         true,
     ),
     Row::new(
@@ -160,6 +160,8 @@ static ROWS: [Row; 14] = [
     // Content, because a description is what a reader is meant to hear; the element it
     // describes carries the same words as its help text.
     Row::new(UIA_ToolTipControlTypeId, "tooltip", P, true),
+    Row::new(UIA_TabControlTypeId, "tab", Patterns::SELECTION, true),
+    Row::new(UIA_TabItemControlTypeId, "tab item", Patterns::SELECTION_ITEM, true),
 ];
 
 /// Returns the row for `role`.
@@ -180,7 +182,7 @@ pub fn row(role: UiaRole) -> &'static Row {
 #[must_use]
 pub fn control_type_in(role: UiaRole, parent: UiaRole) -> (i32, &'static str) {
     match (parent, role) {
-        (UiaRole::Menu, UiaRole::Button) => (UIA_MenuItemControlTypeId, "menu item"),
+        (UiaRole::Menu, UiaRole::Button | UiaRole::CheckBox | UiaRole::RadioButton) => (UIA_MenuItemControlTypeId, "menu item"),
         (UiaRole::List, UiaRole::Button) => (UIA_ListItemControlTypeId, "list item"),
         _ => {
             let row = row(role);
@@ -236,6 +238,8 @@ mod tests {
             UiaRole::ProgressBar,
             UiaRole::Graph,
             UiaRole::ToolTip,
+            UiaRole::Tab,
+            UiaRole::TabItem,
         ];
         assert_eq!(all.len(), ROWS.len(), "a role was added without a row");
         for (at, role) in all.into_iter().enumerate() {

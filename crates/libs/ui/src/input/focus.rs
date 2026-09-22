@@ -110,11 +110,12 @@ impl FocusRing {
     /// whether any of them moved focus.
     ///
     /// Every op changes exactly one datum, so one read before the loop and one comparison
-    /// after it reports all five.
+    /// after it reports whether the batch moved focus.
     pub(crate) fn apply(&mut self, ops: &[FocusOp], hits: &HitTable) -> bool {
         let before = self.current;
         for op in ops {
             match *op {
+                FocusOp::TabIndex(id, index) => self.set_tab_index(id, index),
                 FocusOp::Push {
                     id,
                     trap,
@@ -231,7 +232,8 @@ impl FocusRing {
                 && !entry.flags.contains(HitFlags::BLOCKER)
             {
                 let index = self.order.get(&entry.id).copied().unwrap_or(0);
-                self.scratch.push((index, entry.id));
+                if index < 0 && self.current != Some(entry.id) { continue; }
+                self.scratch.push((index.max(0), entry.id));
             }
         }
         self.scratch
@@ -341,6 +343,22 @@ mod tests {
         ring.forget(cid(3));
         ring.focus(None);
         assert_eq!(ring.step(&hits, true), Move::To);
+        assert_eq!(ring.current(), Some(cid(1)));
+    }
+
+    #[test]
+    fn a_negative_index_skips_tab_entry_but_can_leave_direct_focus() {
+        let hits = table(&[1, 2, 3]);
+        let mut ring = FocusRing::default();
+        ring.set_tab_index(cid(2), -1);
+        ring.focus(Some(cid(1)));
+        assert_eq!(ring.step(&hits, true), Move::To);
+        assert_eq!(ring.current(), Some(cid(3)));
+        ring.focus(Some(cid(2)));
+        assert_eq!(ring.step(&hits, true), Move::To);
+        assert_eq!(ring.current(), Some(cid(3)));
+        ring.focus(Some(cid(2)));
+        assert_eq!(ring.step(&hits, false), Move::To);
         assert_eq!(ring.current(), Some(cid(1)));
     }
 

@@ -236,7 +236,7 @@ fn slider_row(thumb: NodeId) -> ValueRow {
         rest: 13.0,
         travel: 100.0,
         fraction: 0.5,
-        step: 0.1,
+        step: 4.8,
         revision: 0,
     }
 }
@@ -245,6 +245,21 @@ fn committed(out: &[Intent]) -> usize {
     out.iter()
         .filter(|i| matches!(i.what, What::Scalar { commit: true, .. }))
         .count()
+}
+
+#[test]
+fn native_automation_preserves_explicit_disclosure_states() -> Result<()> {
+    let mut rig = Rig::new("automation expansion")?;
+    let id = rig.ids.mint();
+    rig.adopt(&[(id, ChromeRow::default())], &[], &[])?;
+    let mut out = Vec::new();
+    rig.automation(&[Action::Expand(id, false), Action::Expand(id, true), Action::Expand(id, true)], &mut out)?;
+    assert_eq!(out, [
+        Intent { target: id, what: What::Expanded(false) },
+        Intent { target: id, what: What::Expanded(true) },
+        Intent { target: id, what: What::Expanded(true) },
+    ]);
+    Ok(())
 }
 
 #[test]

@@ -18,6 +18,11 @@ use windows_scene::{
     CONTROL, ControlId, HitDecl, HitEntry, HitFlags, NO_ENTRY, NodeId, SinkPatch, Slots,
 };
 
+fn display_only(row: &ControlRow, handlers: Option<&super::control::Handlers>) -> bool {
+    matches!(row.uia, UiaRole::ProgressBar | UiaRole::Graph)
+        && !handlers.is_some_and(|h| h.click.is_some() || h.scalar.is_some() || h.drag.is_some() || h.flyout.is_some())
+}
+
 /// What the walk reads. Disjoint borrows of the host, so the walk holds no `&mut Host`.
 pub(crate) struct Walk<'a> {
     pub tree: &'a Tree,
@@ -127,11 +132,14 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
     let bounded = flags & tree::CLIP != 0;
     let geom = walk.tree.c.geom[node.index()];
     if flags & tree::HIT != 0 {
-        let decl = HitDecl {
+        let mut decl = HitDecl {
             flags: HitFlags::from_bits(tree::unpack_decl(flags)),
             id: control,
             touch_inflate: Some(walk.tree.c.inflate[node.index()]).filter(|v| !v.is_nan()),
         };
+        if walk.controls.get(control).is_some_and(|row| display_only(row, walk.handlers.get(row.handlers))) {
+            decl.flags = HitFlags::from_bits(decl.flags.bits() & !HitFlags::INTERACTIVE.bits());
+        }
         emit_hit(out, depth, &geom, bounded, flags, decl);
     }
     if out.uia.is_some() {
@@ -276,11 +284,23 @@ fn emit_uia(
         .map(|value| Range {
             min: value.min,
             max: value.min + value.span,
-            step: f64::from(value.step),
+            step: value.step,
             vertical: row.front.flags & flag::VERTICAL != 0,
         });
     let mut flags = ColFlags::NONE;
-    if decl.contains(HitFlags::INTERACTIVE) {
+    if let Some(required) = row.selection {
+        flags = flags | ColFlags::SELECTION;
+        if required { flags = flags | ColFlags::SELECTION_REQUIRED; }
+    }
+    if role == UiaRole::ComboBox || (role == UiaRole::List && row.overlay.is_some()) {
+        flags = flags | ColFlags::SELECTION_REQUIRED;
+    }
+    let handlers = walk.handlers.get(row.handlers);
+    let read_only = field.is_none() && !handlers.is_some_and(|h| h.scalar.is_some());
+    if read_only {
+        flags = flags | ColFlags::READ_ONLY;
+    }
+    if !row.disabled && decl.contains(HitFlags::INTERACTIVE) && !display_only(row, handlers) {
         flags = flags | ColFlags::FOCUSABLE;
     }
     if field.is_some() {
@@ -316,11 +336,18 @@ fn emit_uia(
         tree::LIVE_ASSERTIVE => flags = flags | ColFlags::LIVE_ASSERTIVE,
         _ => {}
     }
-    if walk.handlers.get(row.handlers).is_some_and(|h| h.flyout.is_some()) {
+    if handlers.is_some_and(|h| h.flyout.is_some() || h.expand.is_some()) {
         flags = flags | ColFlags::EXPANDS;
     }
 
-    let parent = out.hits.uia.last().map_or(crate::uia::NONE, |&(_, at)| at);
+    let mut parent = out.hits.uia.last().map_or(crate::uia::NONE, |&(_, at)| at);
+    if row.overlay == Some(crate::overlay::Kind::Flyout) {
+        if let Some(invoker) = walk.overlays.iter().find(|p| p.root == row.node).and_then(|p| p.invoker) {
+            if let Some(at) = out.uia.as_deref().and_then(|uia| uia.entries.iter().position(|e| e.id == invoker)) {
+                parent = at as u16;
+            }
+        }
+    }
     let clip = out.hits.uia_clips.last().map_or(crate::uia::NONE, |&(_, at)| at);
     let scroll = out.hits.scrolls.last().map_or(crate::uia::NONE, |&(_, _, at)| at);
     let Out { uia, scratch, .. } = out;
@@ -355,7 +382,7 @@ fn emit_uia(
     let expanded = walk
         .overlays
         .iter()
-        .any(|placement| placement.invoker == Some(control));
+        .any(|placement| placement.invoker == Some(control)) || row.expanded;
     uia.state.push(match row.state {
         ModelState::Disabled => chosen,
         _ => State::ENABLED | chosen,
@@ -366,7 +393,7 @@ fn emit_uia(
     if let Some(shown) = shown {
         uia.shown.push((at, shown));
     }
-    if let Some(key) = row.key {
+    if let Some(key) = row.key.as_deref() {
         let key = uia.intern(key);
         uia.keys.push((at, key));
     }

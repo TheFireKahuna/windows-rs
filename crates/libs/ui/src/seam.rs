@@ -672,6 +672,8 @@ pub(crate) enum FocusOp {
     },
     Pop(ScopeId),
     Focus(Option<ControlId>),
+    /// Sets a tab position; a negative index permits direct focus only.
+    TabIndex(ControlId, i32),
     /// Moves one step in the tab order.
     Step {
         forward: bool,

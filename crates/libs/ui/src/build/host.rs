@@ -194,6 +194,7 @@ pub struct Host {
     chrome_touched: Vec<ControlId>,
     pub(crate) values: Vec<(ControlId, ValueRow)>,
     pub(crate) gestures: Vec<(ControlId, crate::gesture::GestureDecl)>,
+    pub(crate) focus_ops: Vec<crate::seam::FocusOp>,
     pub(crate) released: Vec<ControlId>,
     /// What a presentation region declares about its own pixels, for automation to join with
     /// the renderer's geometry. One row per region, written as the region is declared.
@@ -266,6 +267,7 @@ impl Host {
                 chrome_touched: Vec::new(),
                 values: Vec::new(),
                 gestures: Vec::new(),
+                focus_ops: Vec::new(),
                 released: Vec::new(),
                 peers: Vec::new(),
                 uia_seen: Vec::new(),
@@ -482,19 +484,25 @@ impl Host {
         scope: u32,
         kind: crate::overlay::Kind,
         invoker: Option<ControlId>,
+        name: Option<&'static str>,
     ) {
         use crate::overlay::Kind;
         let scope = self.scope_at(scope);
         // The control it opened from, so a reader announces "Channel scope menu" rather than
         // an unnamed container. A menu is the one place a control's name belongs to two
         // elements, because the menu is what that control turned into.
-        let named = invoker
-            .and_then(|id| self.control(id))
-            .and_then(|row| row.name.clone());
+        let named = name.map(std::borrow::Cow::Borrowed).or_else(|| {
+            let row = self.control(invoker?)?;
+            row.name.clone().or_else(|| {
+                self.text.str_of(row.text?).map(|text| std::borrow::Cow::Owned(text.to_owned()))
+            })
+        });
+        let combo = invoker.and_then(|id| self.control(id)).is_some_and(|row| row.uia == crate::widget::UiaRole::ComboBox);
         let id = self.mint_control(ControlRow::blank(root, scope));
         self.tree.c.control[root.index()] = id;
         if let Some(row) = self.control_mut(id) {
             row.uia = match kind {
+                Kind::Flyout if combo => crate::widget::UiaRole::List,
                 Kind::Flyout => crate::widget::UiaRole::Menu,
                 Kind::Popup => crate::widget::UiaRole::Group,
                 Kind::Tooltip => crate::widget::UiaRole::ToolTip,
@@ -956,6 +964,11 @@ impl Host {
         };
         let repaint = row.state != next;
         row.state = next;
+        if state == ModelState::Selected && row.tab_stop.is_none()
+            && matches!(row.uia, crate::widget::UiaRole::RadioButton | crate::widget::UiaRole::TabItem)
+        {
+            self.focus_ops.push(crate::seam::FocusOp::TabIndex(id, if on { 0 } else { -1 }));
+        }
         self.uia_stale.set(true);
         if repaint {
             self.repaint_control(id);
@@ -1006,6 +1019,60 @@ impl Host {
         }
     }
 
+    /// Finds the adjacent enabled radio or tab in its owning selection group.
+    pub(crate) fn choice_neighbor(&self, target: ControlId, key: u16) -> Option<ControlId> {
+        use crate::widget::UiaRole;
+        if !matches!(key, 0x23..=0x28) { return None; }
+        let row = self.control(target)?;
+        if !matches!(row.uia, UiaRole::RadioButton | UiaRole::TabItem) || row.disabled {
+            return None;
+        }
+        let mut owner = self.tree.parent(row.node);
+        while !owner.is_none() {
+            if self.control(self.tree.c.control[owner.index()]).is_some_and(|row| {
+                row.selection.is_some() || matches!(row.uia, UiaRole::List | UiaRole::Tab)
+            }) {
+                break;
+            }
+            owner = self.tree.parent(owner);
+        }
+        if owner.is_none() { return None; }
+        let (mut first, mut last, mut before, mut after) = (None, None, None, None);
+        let mut found = false;
+        self.visit_choices(owner, row.uia, &mut |id| {
+            first = first.or(Some(id));
+            if id == target {
+                before = last;
+                found = true;
+            } else if found {
+                after = after.or(Some(id));
+            }
+            last = Some(id);
+        });
+        match key {
+            0x25 | 0x26 => before.or(last),
+            0x27 | 0x28 => after.or(first),
+            0x24 => first,
+            0x23 => last,
+            _ => None,
+        }
+    }
+
+    fn visit_choices(&self, node: NodeId, role: crate::widget::UiaRole, visit: &mut impl FnMut(ControlId)) {
+        for child in self.tree.children(node) {
+            if self.tree.c.flags[child.index()] & (tree::HIDDEN | tree::SUSPENDED | tree::SUNK) != 0 { continue; }
+            let id = self.tree.c.control[child.index()];
+            if let Some(row) = self.control(id) {
+                if row.uia == role {
+                    if !row.disabled { visit(id); }
+                    continue;
+                }
+                if row.selection.is_some() { continue; }
+            }
+            self.visit_choices(child, role, visit);
+        }
+    }
+
     fn handler_for(&mut self, intent: &Intent) -> Option<Box<dyn FnOnce()>> {
         let row = self.control(intent.target)?;
         let handlers = self.handlers.get(row.handlers);
@@ -1019,8 +1086,18 @@ impl Host {
                 None
             }
             What::Tapped => {
-                let call = handlers?.click.clone()?;
-                Some(Box::new(move || call()))
+                let handlers = handlers?;
+                if let Some(call) = handlers.click.clone() {
+                    Some(Box::new(move || call()))
+                } else {
+                    let call = handlers.expand.clone()?;
+                    let expanded = !row.expanded;
+                    Some(Box::new(move || call(expanded)))
+                }
+            }
+            What::Expanded(expanded) => {
+                let call = handlers?.expand.clone()?;
+                Some(Box::new(move || call(expanded)))
             }
             What::Scalar { value, commit, .. } => {
                 let call = handlers?.scalar.clone()?;
@@ -1571,6 +1648,7 @@ impl Host {
         down.regions.append(&mut self.region_ops);
         down.scrolls.append(&mut self.scroll_ops);
         down.declared.gestures.append(&mut self.gestures);
+        down.declared.focus.append(&mut self.focus_ops);
         down.fields.sources.append(&mut self.field_sources);
         down.fields.layouts.append(&mut self.field_layouts);
         down.fields.commits.append(&mut self.field_commits);
@@ -1594,6 +1672,7 @@ impl Host {
             down.chrome.retain(|&(id, _)| live(id));
             down.values.retain(|&(id, _)| live(id));
             down.declared.gestures.retain(|&(id, _)| live(id));
+            down.declared.focus.retain(|op| !matches!(op, crate::seam::FocusOp::TabIndex(id, _) if !live(*id)));
             down.fields.sources.retain(|row| live(row.id));
             down.fields.layouts.retain(|row| live(row.id));
             down.fields.commits.retain(|row| live(row.id));

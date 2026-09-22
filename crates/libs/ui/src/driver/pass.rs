@@ -422,6 +422,14 @@ fn key_intents(
     intents: &mut Vec<Intent>,
 ) {
     for report in reports {
+        if let Report::Key { target: Some(target), event, .. } = *report
+            && event.kind == KeyKind::Down && !event.mods.ctrl && !event.mods.alt
+            && let Some(next) = Host::with(|h| h.choice_neighbor(target, event.key))
+        {
+            focus.push(FocusOp::Focus(Some(next)));
+            intents.push(Intent::invoke_focused(next));
+            continue;
+        }
         let activating = matches!(report, Report::Key { event, .. }
             if event.kind == KeyKind::Down
                 && matches!(event.key, RETURN | SPACE)
@@ -446,6 +454,7 @@ fn key_intents(
                                 | UiaRole::CheckBox
                                 | UiaRole::RadioButton
                                 | UiaRole::ComboBox
+                                | UiaRole::TabItem
                         )
                 })
             })
@@ -898,7 +907,7 @@ mod tests {
             Host::with(|h| {
                 h.controls
                     .iter()
-                    .find(|(_, row)| row.key == Some(name))
+                    .find(|(_, row)| row.key.as_deref() == Some(name))
                     .expect("the control was declared")
                     .0
             })

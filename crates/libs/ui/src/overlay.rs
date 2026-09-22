@@ -421,6 +421,7 @@ impl Slide {
 /// no hover produced.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct Spec {
+    name: Option<&'static str>,
     kind: Kind,
     anchor: Anchor,
     viewport: Option<[Len; 4]>,
@@ -448,6 +449,7 @@ impl Spec {
     const fn of(kind: Kind, anchor: Anchor) -> Self {
         Self {
             kind,
+            name: None,
             anchor,
             viewport: None,
             slide: None,
@@ -461,6 +463,12 @@ impl Spec {
     #[must_use]
     pub const fn kind(self) -> Kind {
         self.kind
+    }
+
+    /// Names the overlay independently of the control that opens it.
+    #[must_use]
+    pub const fn name(self, name: &'static str) -> Self {
+        Self { name: Some(name), ..self }
     }
 
     /// Returns this spec placed by `anchor` instead of the kind's default placement.
@@ -685,7 +693,7 @@ impl Overlays {
             // The slot root is the element its contents are announced inside: a menu, so its
             // rows report as menu items, or a description, or a dialog a reader announces
             // title-first. Without one, a flyout's rows read as loose buttons at the window.
-            host.name_overlay(root, scope, spec.kind, invoker);
+            host.name_overlay(root, scope, spec.kind, invoker, spec.name);
             (blocker, root, scope)
         });
         // Mapped over the blocker rather than asking `takes_focus` again: a focus scope is named
@@ -1058,8 +1066,18 @@ impl Overlays {
             }
         }
         for intent in intents {
-            if intent.what == What::Tapped {
-                self.invoke(intent.target, focus);
+            match intent.what {
+                What::Tapped => self.invoke(intent.target, focus),
+                What::Expanded(expanded) => {
+                    if expanded {
+                        if self.opened_by(intent.target).is_none() {
+                            self.open_flyout(intent.target, Spec::flyout(intent.target), focus);
+                        }
+                    } else if let Some(overlay) = self.opened_by(intent.target) {
+                        self.close(overlay, focus);
+                    }
+                }
+                _ => {}
             }
         }
         // Every crossing and press in the batch has been seen, so at most one target is still
@@ -1844,6 +1862,18 @@ mod tests {
             id = button(ui, "Pick").name("Pick").flyout(body).control_id();
         });
         (mount, id)
+    }
+
+    #[test]
+    fn explicit_expansion_is_idempotent_in_one_batch() {
+        let mut patch = fixture();
+        let (_mount, target) = invoker(&mut patch);
+        let mut overlays = Overlays::new();
+        let mut focus = Vec::new();
+        for (open, depth) in [(false, 0), (true, 1), (true, 1), (false, 0), (false, 0)] {
+            overlays.settle(&[], &[Intent { target, what: What::Expanded(open) }], &mut focus);
+            assert_eq!(overlays.depth(), depth);
+        }
     }
 
     /// Returns the interactive controls of the overlay at `depth`, in tree order.

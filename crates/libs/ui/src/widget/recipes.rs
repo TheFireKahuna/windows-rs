@@ -400,7 +400,8 @@ pub fn segmented_with<'a, T: Copy + PartialEq + 'static>(
         .padding(Len::times(Metric::HairlineW, 2.0))
         .gap(Len::ZERO)
         .align(Align::Stretch)
-        .hit(HitFlags::NONE, UiaRole::List)
+        .hit(HitFlags::NONE, UiaRole::Group)
+        .selection(true)
         .children(move |ui| {
             for &(name, option) in options {
                 let (reads, writes) = (Rc::clone(&choice), Rc::clone(&choice));

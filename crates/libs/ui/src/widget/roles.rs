@@ -191,6 +191,8 @@ pub enum UiaRole {
     /// A hover description. Raised as opened by the overlay layer, and doubling as its
     /// target's help text.
     ToolTip,
+    Tab,
+    TabItem,
 }
 
 /// A resolved component recipe: the three rows a control can show, and its shape.

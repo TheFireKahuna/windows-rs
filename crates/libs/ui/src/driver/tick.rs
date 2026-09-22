@@ -179,6 +179,8 @@ impl Tick {
             ..
         } = self;
         view.with(|hits| router.tick(hits, env, reports))?;
+        // Focus requests must reach this pass's focus application before an idle tick parks.
+        self.automation();
         // ② the focus edits the app thread emitted, into the same report list: a keyboard move
         // and a pointer move reach the front table the same way.
         self.apply_focus();
@@ -234,7 +236,7 @@ impl Tick {
         }
         // A provider snapshot can precede disable, hide or unmount, so what one asked for is
         // executed against the adopted array's eligibility, just like physical input.
-        self.automation();
+        self.text_automation();
         // ③ a contact inside a region writes that region's input and bumps its epoch here, on
         // this thread: the present thread reads both, and no other thread is in the way.
         let Self {
@@ -389,6 +391,10 @@ impl Tick {
                 action => self.to_scene.automation.push(action),
             }
         }
+    }
+
+    /// Applies editor commands after focus and text-service reports have settled.
+    fn text_automation(&mut self) {
         self.from_pump
             .uia
             .borrow()

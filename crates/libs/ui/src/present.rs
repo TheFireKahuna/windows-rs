@@ -260,7 +260,7 @@ impl Element<'_, Region> {
             row.value = Some(crate::widget::ValueRow {
                 min: range.min,
                 span: range.max - range.min,
-                step: range.quantum() as f32,
+                step: range.step,
                 ..crate::widget::ValueRow::default()
             });
         }

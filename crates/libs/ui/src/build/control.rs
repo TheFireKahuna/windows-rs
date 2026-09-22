@@ -33,6 +33,7 @@ pub struct Scalar;
 #[derive(Default)]
 pub(crate) struct Handlers {
     pub click: Option<Rc<dyn Fn()>>,
+    pub expand: Option<Rc<dyn Fn(bool)>>,
     pub scalar: Option<Rc<dyn Fn(Gesturing<f64>)>>,
     pub drag: Option<Rc<dyn Fn(Gesturing<DragUpdate>)>>,
     pub commit: Option<Rc<dyn Fn(&str)>>,
@@ -55,7 +56,7 @@ pub(crate) struct ControlRow {
     pub handlers: u32,
     /// Literal names stay borrowed; generated names are released with the control.
     pub name: Option<Cow<'static, str>>,
-    pub key: Option<&'static str>,
+    pub key: Option<Cow<'static, str>>,
     /// The run automation derives this control's name from where it was given none.
     pub text: Option<MeasureKey>,
     /// Where a gesture publishes its in-flight value for as long as it owns one.
@@ -75,10 +76,13 @@ pub(crate) struct ControlRow {
     /// a row that is not selected still answers `SelectionItem`, or a client enumerating a
     /// list would find only the row already chosen.
     pub selectable: bool,
+    pub selection: Option<bool>,
+    pub tab_stop: Option<bool>,
     pub node: NodeId,
     pub scope: Scope,
     pub state: ModelState,
     pub selected: bool,
+    pub expanded: bool,
     pub disabled: bool,
     pub uia: UiaRole,
 }
@@ -99,10 +103,13 @@ impl ControlRow {
             number: None,
             overlay: None,
             selectable: false,
+            selection: None,
+            tab_stop: None,
             node,
             scope,
             state: ModelState::Rest,
             selected: false,
+            expanded: false,
             disabled: false,
             uia: UiaRole::None,
         }
@@ -343,8 +350,30 @@ impl<K> Element<'_, K> {
         self
     }
 
-    pub fn key(self, key: &'static str) -> Self {
-        self.declare(HitFlags::NONE, |row| row.key = Some(key))
+    pub fn key(self, key: impl Into<Cow<'static, str>>) -> Self {
+        self.declare(HitFlags::UIA, |row| row.key = Some(key.into()))
+            .uia_restale()
+    }
+
+    /// Publishes the disclosure state supplied by its owner.
+    pub fn expanded<M>(mut self, value: impl Signal<bool, M> + 'static) -> Self {
+        let id = self.control_id();
+        self.bind(value, move |host, expanded| {
+            if let Some(row) = host.control_mut(id) {
+                if row.expanded != expanded {
+                    row.expanded = expanded;
+                    host.uia_stale.set(true);
+                }
+            }
+        })
+    }
+
+    /// Handles disclosure requests, toggling on activation when no click handler is registered.
+    /// Pair with `expanded` to publish the owner's state.
+    pub fn on_expand(self, callback: impl Fn(bool) + 'static) -> Self {
+        self.handler(HitFlags::INTERACTIVE | HitFlags::GESTURE, |row| {
+            row.expand.replace(Rc::new(callback)).map(Retired::new)
+        }).uia_restale()
     }
 
     /// States what this element is to automation, where its widget does not already say.
@@ -353,6 +382,25 @@ impl<K> Element<'_, K> {
     /// control the widget set minted, so neither carries a role of its own.
     pub fn role(self, role: UiaRole) -> Self {
         self.hit(HitFlags::UIA, role)
+    }
+
+    /// Declares a single-selection container and whether it requires a selection.
+    pub fn selection(self, required: bool) -> Self {
+        self.declare(HitFlags::UIA, |row| {
+            row.selection = Some(required);
+            if row.uia == UiaRole::None { row.uia = UiaRole::Group; }
+        }).uia_restale()
+    }
+
+    /// Includes this control in tab navigation while preserving direct focus.
+    pub fn tab_stop<M>(mut self, value: impl Signal<bool, M> + 'static) -> Self {
+        let id = self.control_id();
+        self.bind(value, move |host, stop| {
+            let Some(row) = host.control_mut(id) else { return };
+            if row.tab_stop == Some(stop) { return; }
+            row.tab_stop = Some(stop);
+            host.focus_ops.push(crate::seam::FocusOp::TabIndex(id, if stop { 0 } else { -1 }));
+        })
     }
 
     pub fn wash(mut self, wash: Wash) -> Self {
@@ -564,22 +612,39 @@ impl<K> Element<'_, K> {
         };
         if let Some(row) = self.host().control_mut(id) {
             row.front.flags |= bits_of(drive);
-            if let Some(range) = range_of(drive) {
-                row.value = Some(ValueRow {
-                    min: range.min,
-                    span: range.max - range.min,
-                    step: range.quantum(),
-                    ..row.value.unwrap_or_default()
-                });
-            }
         }
         self.host().gestures.push((id, decl));
         self.hit(HitFlags::INTERACTIVE | HitFlags::GESTURE, role)
-            .bind(value, move |host, source| {
-                let fraction = range_of(drive)
-                    .map_or(source.value as f32, |range| range.fraction(source.value));
-                host.publish_fraction(id, fraction, source.value, source.epoch);
-            })
+            .bind_scalar(range_of(drive), value)
+    }
+
+    fn bind_scalar<M, R>(
+        mut self,
+        range: impl Signal<Option<Range>, R> + 'static,
+        value: impl Signal<ScalarValue, M> + 'static,
+    ) -> Self {
+        let id = self.control_id();
+        let write = move |host: &mut Host, (range, source): (Option<Range>, ScalarValue)| {
+            if let Some(row) = host.control_mut(id) && let Some(range) = range {
+                let value = row.value.get_or_insert_with(ValueRow::default);
+                let span = range.max - range.min;
+                let vertical = row.front.flags & flag::VERTICAL != 0;
+                let changed = value.min != range.min || value.span != span
+                    || value.step != range.step || vertical != range.vertical;
+                (value.min, value.span, value.step) = (range.min, span, range.step);
+                row.front.flags = (row.front.flags & !flag::VERTICAL)
+                    | if range.vertical { flag::VERTICAL } else { 0 };
+                if changed { host.uia_stale.set(true); }
+            }
+            let fraction = range.map_or(source.value as f32, |range| range.fraction(source.value));
+            host.publish_fraction(id, fraction, source.value, source.epoch);
+        };
+        if range.is_constant() && value.is_constant() {
+            write(self.host(), (range.read(), value.read()));
+            self
+        } else {
+            self.bind(move || (range.read(), value.read()), write)
+        }
     }
 }
 
@@ -606,6 +671,9 @@ impl<K> Element<'_, K> {
         self.host().surface_selectable(windows_scene::GroupId(node));
         if let Some(row) = self.host().control_mut(id) {
             row.selectable = true;
+            if row.tab_stop.is_none() && matches!(row.uia, UiaRole::RadioButton | UiaRole::TabItem) {
+                self.host().focus_ops.push(crate::seam::FocusOp::TabIndex(id, -1));
+            }
         }
         self.model_state(value, ModelState::Selected)
     }
@@ -614,6 +682,20 @@ impl<K> Element<'_, K> {
 // -- scalars --------------------------------------------------------------------------
 
 impl<'a, K> Element<'a, K> {
+    /// Binds a numeric value for keyboard and automation without replacing pointer gestures.
+    pub fn range_value<M, R>(
+        self,
+        range: impl Signal<Range, R> + 'static,
+        value: impl Signal<ScalarValue, M> + 'static,
+    ) -> Element<'a, Scalar> {
+        let element = self.hit(HitFlags::INTERACTIVE | HitFlags::UIA, UiaRole::Slider);
+        if range.is_constant() {
+            element.bind_scalar(Some(range.read()), value).retype()
+        } else {
+            element.bind_scalar(move || Some(range.read()), value).retype()
+        }
+    }
+
     /// Binds this control's authoritative value and the gesture its drive implies, making it
     /// a scalar.
     ///

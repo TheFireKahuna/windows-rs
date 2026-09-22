@@ -162,12 +162,17 @@ pub struct ValueRow {
     /// Where the value stands, `0..=1`. Seeded by the mount and advanced here: a turned control
     /// has no absolute position on the pointer, so its value accumulates on this thread.
     pub fraction: f32,
-    /// The quantum the fraction snaps to, or zero for a continuous value. Pointer, keyboard,
-    /// automation and rotary updates all snap through it, so none of them can disagree.
-    pub step: f32,
+    /// The increment in application units, or zero for a continuous value.
+    pub step: f64,
     /// The application's source revision. A changed one supersedes a gesture standing on this
     /// control; a repeated one preserves an active gesture's fraction.
     pub revision: u64,
+}
+
+impl ValueRow {
+    fn quantum(&self) -> f32 {
+        crate::widget::Range::new(self.min, self.min + self.span).step(self.step).quantum()
+    }
 }
 
 #[derive(Copy, Clone, Default)]
@@ -206,6 +211,8 @@ pub enum What {
     Hovered(bool),
     /// A press and a release on the same control.
     Tapped,
+    /// Sets the requested disclosure state.
+    Expanded(bool),
     /// A value while it is being moved, and the value it settled on when `commit`.
     Scalar {
         value: f64,
@@ -462,13 +469,15 @@ impl Controls {
                 Action::Invoke(target)
                 | Action::Toggle(target)
                 | Action::Select(target)
-                | Action::Expand(target, _)
                     if self.chrome.get(target).is_some() =>
                 {
                     out.push(Intent {
                         target,
                         what: What::Tapped,
                     });
+                }
+                Action::Expand(target, expanded) if self.chrome.get(target).is_some() => {
+                    out.push(Intent { target, what: What::Expanded(expanded) });
                 }
                 _ => {}
             }
@@ -579,19 +588,19 @@ impl Controls {
                 ..
             } if self.flags(target) & flag::TURN != 0 => {
                 let row = self.value(target);
-                self.settle(target, row.fraction + steps as f32 * row.step, front, out)?;
+                self.settle(target, row.fraction + steps as f32 * row.quantum(), front, out)?;
             }
             Report::Key {
                 target: Some(target),
                 event,
-            } if self.flags(target) & flag::VALUED != 0
+            } if self.value(target).span > 0.0
                 && event.kind == KeyKind::Down
                 && !event.mods.ctrl
                 && !event.mods.alt =>
             {
                 if let Some(&(_, steps)) = KEYS.iter().find(|(vk, _)| *vk == event.key) {
                     let row = self.value(target);
-                    self.settle(target, row.fraction + steps * row.step, front, out)?;
+                    self.settle(target, row.fraction + steps * row.quantum(), front, out)?;
                 }
             }
             // Listed rather than matched with a wildcard, so a new `Report` variant fails to
@@ -704,16 +713,17 @@ impl Controls {
     ) -> Result<()> {
         let row = self.value(id);
         let to = to.clamp(0.0, 1.0);
-        let to = if row.step > 0.0 {
-            (to / row.step).round() * row.step
+        let value = if row.step > 0.0 {
+            row.min + (f64::from(to) * row.span / row.step).round() * row.step
         } else {
-            to
-        };
+            row.min + row.span * f64::from(to)
+        }.clamp(row.min, row.min + row.span);
+        let to = if row.span > 0.0 { ((value - row.min) / row.span) as f32 } else { to };
         self.drive(id, to, how, front)?;
         out.push(Intent {
             target: id,
             what: What::Scalar {
-                value: row.min + row.span * f64::from(to),
+                value,
                 revision: row.revision,
                 commit: how == How::Settled,
             },
