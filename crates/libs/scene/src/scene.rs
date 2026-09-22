@@ -1815,16 +1815,16 @@ impl Scene {
                     iterations,
                     scalar,
                 );
-                self.nodes.start(id, row, &animation, None, Held::Playing);
                 self.census.animations += 1;
                 if !matches!(iterations, Iterations::Count(_)) {
+                    self.nodes.start(id, row, &animation, None, Held::Playing);
                     return Ok(());
                 }
-                // A finite run keeps its animation and subscription until the batch reports,
-                // which queues a completion and requests one tick; the node generation
-                // rejects a completion for a slot that has since been reused.
-                self.motion
-                    .watch(back, PendingKind::Frames(id, prop), move || drop(animation))
+                // The start must occur inside the scoped batch for completion to cover it.
+                let nodes = &mut self.nodes;
+                self.motion.watch(back, PendingKind::Frames(id, prop), || {
+                    nodes.start(id, row, &animation, None, Held::Playing);
+                })
             }
         }
     }
@@ -2179,6 +2179,7 @@ impl Scene {
     /// Only the range appended here is reconciled: `out` may still hold a previous drain's
     /// events, and applying a tracker position twice is not idempotent.
     pub fn drain_events(&mut self, out: &mut Vec<SceneEvent>) {
+        self.retire();
         let from = out.len();
         out.append(&mut self.events.borrow_mut());
         for event in &out[from..] {
@@ -2734,6 +2735,41 @@ mod tests {
             before.animations + 2,
             "one of the two springs never started"
         );
+    }
+
+    #[test]
+    fn finite_keyframes_complete_without_another_patch() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let id = rig.sprite(&mut patch, 40.0);
+        rig.apply(&mut patch);
+        let frames = patch.push_frames(&[
+            (0.0, Value::Scalar(0.0), Easing::Linear),
+            (1.0, Value::Scalar(1.0), Easing::Linear),
+        ]);
+        patch.push(Op::Bind {
+            id,
+            prop: Prop::Opacity,
+            bind: Bind::Animate(Anim::Frames {
+                frames,
+                duration_ms: 20,
+                iterations: Iterations::Count(1),
+            }),
+        });
+        rig.apply(&mut patch);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut events = Vec::new();
+        loop {
+            windows_window::pump();
+            rig.scene.drain_events(&mut events);
+            if events.iter().any(|event| matches!(event,
+                SceneEvent::AnimationCompleted { node, prop: Prop::Opacity } if *node == id)) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "finite keyframes never completed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(rig.scene.motion.pending.is_empty());
     }
 
     #[test]
