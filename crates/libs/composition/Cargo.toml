@@ -27,6 +27,7 @@ windows-numerics = { workspace = true }
 # type is only exported under the crate's `std` feature.
 windows-reference = { workspace = true, features = ["std"] }
 windows-time = { workspace = true }
+windows-future = { workspace = true }
 
 [dependencies.windows-window]
 workspace = true

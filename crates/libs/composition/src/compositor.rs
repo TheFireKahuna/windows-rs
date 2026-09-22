@@ -4,7 +4,50 @@ use super::*;
 #[derive(Clone)]
 pub struct Compositor(pub(crate) bindings::Compositor);
 
+#[cfg(all(test, feature = "system"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_completes_while_spring_targets_keep_changing() -> Result<()> {
+        let _queue = DispatcherQueueController::create_on_current_thread()?;
+        let window = windows_window::Window::new("composition commit test")
+            .size(200, 100).hidden().create()?;
+        let compositor = Compositor::new()?;
+        let target = compositor.create_desktop_window_target(&window, false)?;
+        let root = compositor.create_container_visual();
+        target.set_root(&root);
+        let spring = compositor.create_spring_vector2_animation();
+        spring.set_period(std::time::Duration::from_millis(90));
+        spring.set_damping_ratio(0.9);
+        root.set_size(100.0, 100.0);
+        let commit = compositor.request_commit()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut updates = 0;
+        loop {
+            spring.set_final_value(Vector2::new(100.0 + (updates % 50) as f32, 100.0));
+            root.start_animation("Size", &spring);
+            drop(compositor.request_commit()?);
+            windows_window::pump();
+            updates += 1;
+            if updates > 1 && commit.Status()? == windows_future::AsyncStatus::Completed {
+                commit.GetResults()?;
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "commit did not complete during updates");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        Ok(())
+    }
+}
+
 impl Compositor {
+    /// Requests publication of pending composition changes and returns its completion action.
+    pub fn request_commit(&self) -> Result<windows_future::IAsyncAction> {
+        let compositor: bindings::ICompositor5 = self.0.cast()?;
+        compositor.RequestCommitAsync()
+    }
+
     /// Creates a compositor. A dispatcher queue must exist on the current thread.
     ///
     /// ```no_run

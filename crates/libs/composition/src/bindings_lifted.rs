@@ -1369,6 +1369,16 @@ impl ICompositor5 {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) fn RequestCommitAsync(&self) -> windows_core::Result<windows_future::IAsyncAction> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).RequestCommitAsync)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
 }
 #[repr(C)]
 pub struct ICompositor5_Vtbl {
@@ -1401,6 +1411,11 @@ pub struct ICompositor5_Vtbl {
     CreateSpriteShape: usize,
     pub CreateSpriteShapeWithGeometry: unsafe extern "system" fn(
         *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    CreateViewBox: usize,
+    pub RequestCommitAsync: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
