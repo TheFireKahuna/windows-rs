@@ -289,8 +289,10 @@ impl GroupKey {
 
 struct Mounted {
     spec: RegionSpec,
+    resize_pending: bool,
     group: GroupKey,
     epoch: Arc<Epoch>,
+    observed_epoch: u64,
     input: Arc<RegionInput>,
     frame: Box<dyn Frame>,
     region: PresentationRegion,
@@ -447,6 +449,9 @@ impl Pump {
                 return;
             }
             self.recover();
+            if self.mounted.iter().any(|m| m.resize_pending || m.epoch.seq() != m.observed_epoch) {
+                skip = 0;
+            }
 
             // Measure the interval the display is actually running at, from the clock we
             // are already woken by: no second source, and it follows a mode change on its
@@ -470,7 +475,7 @@ impl Pump {
 
             let drew = self.pass(now, tick);
             if drew {
-                skip = self.tuning.depth.saturating_sub(1);
+                skip = (self.slots.len() as u32).saturating_sub(1);
             }
 
             // A redraw or a mid-flight ease keeps the loop on the display clock; enough
@@ -522,6 +527,7 @@ impl Pump {
         due.clear();
         poisoned.clear();
         for (i, m) in mounted.iter_mut().enumerate() {
+            m.observed_epoch = m.epoch.seq();
             let ctx = GateCtx {
                 extent: m.region.extent(),
                 tick: *tick_count,
@@ -536,6 +542,9 @@ impl Pump {
             }
         }
         if due.is_empty() {
+            for m in mounted.iter_mut() {
+                m.resize_pending = false;
+            }
             self.retire_poisoned();
             return false;
         }
@@ -543,7 +552,15 @@ impl Pump {
         // The frames this pass will draw, at the times they are meant to be shown: one per
         // refresh, starting at the one this wake is for.
         slots.clear();
-        for k in 0..self.tuning.depth {
+        let depth = if mounted.iter().any(|m| m.resize_pending || m.frame.framewise()) {
+            1
+        } else {
+            self.tuning.depth
+        };
+        for m in mounted.iter_mut() {
+            m.resize_pending = false;
+        }
+        for k in 0..depth {
             slots.push(now + u64::from(k) * tick);
         }
 
@@ -671,17 +688,17 @@ impl Pump {
                 Cmd::Resize(key, extent) => {
                     if let Some(m) = self.mounted.iter_mut().find(|m| m.spec.key == key) {
                         m.spec.extent = extent;
-                        // In place: the surface handle survives, so the front thread's
-                        // binding does not move and no other region in the group is
-                        // disturbed. Only the pixel extent it samples changes.
-                        if m.region.resize(extent).is_ok() {
-                            let px = m.region.size_px();
-                            let handle = m.region.surface_handle() as isize;
-                            (self.on_bind)(key, Bound::Surface { handle, px });
-                        }
+                        m.resize_pending = true;
                     }
                 }
                 Cmd::Display(out) => self.out = out,
+            }
+        }
+        for m in &mut self.mounted {
+            if m.resize_pending && m.region.resize(m.spec.extent).is_ok() {
+                let px = m.region.size_px();
+                let handle = m.region.surface_handle() as isize;
+                (self.on_bind)(m.spec.key, Bound::Surface { handle, px });
             }
         }
         if moved {
@@ -719,7 +736,9 @@ impl Pump {
         let raw = region.surface_handle() as isize;
         self.mounted.push(Mounted {
             spec,
+            resize_pending: false,
             group,
+            observed_epoch: epoch.seq(),
             epoch,
             input,
             frame,

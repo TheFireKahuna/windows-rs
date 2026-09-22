@@ -385,6 +385,11 @@ pub trait Frame {
         false
     }
 
+    /// Requests one frame per pass while gate-time resources change between frames.
+    fn framewise(&self) -> bool {
+        false
+    }
+
     /// Drops every cached device resource.
     ///
     /// Called after the region is rebuilt on a new device and before the next
