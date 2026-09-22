@@ -264,6 +264,9 @@ pub(crate) struct Tree {
     pub roots_dirty: bool,
     /// A hover flag, a mount or an unmount rebuilds the array and solves nothing.
     pub hits_dirty: bool,
+    /// The window extent changed since the last flush, so this flush's bounds follow the
+    /// window 1:1: every layout write is a plain set, including under `ANIMATE_LAYOUT`.
+    pub window_resized: bool,
 }
 
 impl Forest for Tree {
@@ -552,7 +555,9 @@ impl Tree {
                 ancestor = self.parent(ancestor);
             }
             let live_clip = animated;
-            animated &= was.size.x.is_finite() && self.c.flags[id.index()] & INITIAL == 0;
+            animated &= was.size.x.is_finite()
+                && self.c.flags[id.index()] & INITIAL == 0
+                && !self.window_resized;
             let write = |prop, value| Op::Bind {
                 id,
                 prop,

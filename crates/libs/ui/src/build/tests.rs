@@ -134,6 +134,38 @@ fn layout_width_changes_animate_the_retained_row_and_its_clip() {
 }
 
 #[test]
+fn a_window_resize_sets_animated_layout_bounds_directly() {
+    let mut patch = fixture();
+    Host::with(|h| h.set_window(Vector2::new(800.0, 600.0)));
+    let width = Cell::new(240.0);
+    let mut pane = NodeId::NONE;
+    let held = Ui::mount_root(|ui| {
+        ui.node(Preset::Row).animate_layout().grow().children(|ui| {
+            ui.node(Preset::Layer).grow();
+            pane = ui.node(Preset::Layer).layout_from(move |l| l.width = Len::dip(width.get()))
+                .id().into();
+        });
+    });
+    Host::flush(&mut patch);
+    for size in [640.0, 900.0, 720.0] {
+        patch.clear();
+        Host::with(|h| h.set_window(Vector2::new(size, 600.0)));
+        Host::flush(&mut patch);
+        assert!(patch.ops().iter().any(|op| matches!(op,
+            Op::Bind { id, prop: Prop::Offset, bind: Bind::Set(_) } if *id == pane
+        )), "a resize published no direct pane offset: {:#?}", patch.ops());
+        assert!(!patch.ops().iter().any(|op| matches!(op, Op::Bind { bind: Bind::Animate(_), .. })));
+    }
+    patch.clear();
+    width.set(0.0);
+    Host::flush(&mut patch);
+    assert!(patch.ops().iter().any(|op| matches!(op,
+        Op::Bind { id, prop: Prop::Size, bind: Bind::Animate(Anim::Spring { tuning: windows_scene::Tuning::Layout, .. }) } if *id == pane
+    )));
+    drop(held);
+}
+
+#[test]
 fn geometry_settles_without_animation_through_the_entire_creation_publication() {
     let mut patch = fixture();
     let mut parent = NodeId::NONE;

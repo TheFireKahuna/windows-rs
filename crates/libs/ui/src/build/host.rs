@@ -377,6 +377,7 @@ impl Host {
     }
 
     pub fn set_window(&mut self, size: Vector2) {
+        self.tree.window_resized |= self.window.get() != size;
         self.window.set(size);
         let root = self.root;
         self.tree.author(root, |l| {
@@ -1455,6 +1456,7 @@ impl Host {
                     }
                 }
             }
+            h.tree.window_resized = false;
             h.pending.env = Some(h.env);
             h.census.flushes += 1;
             core::mem::swap(&mut h.pending, patch);

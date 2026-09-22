@@ -158,6 +158,9 @@ where
                     .and_then(|held| held.clone())
                     .ok_or_else(super::closed)?;
                 Host::install(env, root);
+                // The mount solves against the real client extent, so its first publication
+                // is the window's geometry rather than a zero box the next resize springs out of.
+                Host::with(|h| h.set_window(size));
                 // The shaping engine is the text table's, and the table is the host's: this is
                 // the one seam where the ladder the other thread built is handed over.
                 Host::with(|h| h.text.install(ladder))?;
