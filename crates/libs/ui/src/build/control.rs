@@ -627,6 +627,7 @@ impl<K> Element<'_, K> {
             0,
             "a scalar part cannot also bind its driven property"
         );
+        self.host().tree.c.driven[node.index()] |= claimed(part);
         let Some(row) = self.host().control_mut(owner) else {
             return self;
         };
@@ -871,6 +872,27 @@ impl<S: Signal<bool, M>, M> Signal<ScalarValue, M> for Flag<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_thumb_offset_is_not_overwritten_by_layout() {
+        use crate::build::rig::Rig;
+        let mut rig = Rig::at(800.0, 600.0, 1.0);
+        let mut thumb = NodeId::NONE;
+        let frame = rig.mount(|ui| {
+            ui.scalar(None, Interaction::Press, ScalarValue { value: 1.0, epoch: 1 }, |ui| {
+                thumb = ui.plate(Metric::RadiusPill, Role::Text(Text::Primary), 1.0)
+                    .size(Len::dip(12.0))
+                    .scalar_part(ScalarPart::Thumb { vertical: false })
+                    .node_id();
+            }).width(Len::dip(32.0)).height(Len::dip(18.0)).padding(Len::dip(3.0));
+        });
+        assert!(!frame.patch().ops().iter().any(|op| matches!(op,
+            windows_scene::Op::Bind { id, prop: Prop::Offset | Prop::OffsetX, .. } if *id == thumb
+        )));
+        assert!(frame.patch().ops().iter().any(|op| matches!(op,
+            windows_scene::Op::Bind { id, prop: Prop::OffsetY, .. } if *id == thumb
+        )));
+    }
 
     #[test]
     fn a_drive_states_how_a_pointer_reads_the_value_and_which_way_it_grows() {
