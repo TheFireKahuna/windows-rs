@@ -638,6 +638,8 @@ pub enum Spread {
     Horizontal,
     HorizontalFeathered {
         edge: f32,
+        /// Transparent margin at each side, as a fraction of the box width.
+        inset: f32,
     },
     Vertical,
     VerticalFeathered {
@@ -673,7 +675,7 @@ impl Spread {
     #[must_use]
     pub const fn edge(self) -> Option<f32> {
         match self {
-            Self::VerticalFeathered { edge } | Self::HorizontalFeathered { edge } => Some(edge),
+            Self::VerticalFeathered { edge } | Self::HorizontalFeathered { edge, .. } => Some(edge),
             _ => None,
         }
     }
@@ -1365,7 +1367,7 @@ mod tests {
     fn every_linear_spread_has_two_ends_and_the_centred_ones_have_none() {
         for spread in [
             Spread::Horizontal,
-            Spread::HorizontalFeathered { edge: 0.1 },
+            Spread::HorizontalFeathered { edge: 0.1, inset: 0.0 },
             Spread::Vertical,
             Spread::VerticalFeathered { edge: 0.1 },
             Spread::DiagonalDown,
@@ -1383,7 +1385,7 @@ mod tests {
             .is_none()
         );
         assert_eq!(
-            Spread::HorizontalFeathered { edge: 0.25 }.edge(),
+            Spread::HorizontalFeathered { edge: 0.25, inset: 0.0 }.edge(),
             Some(0.25)
         );
         assert_eq!(Spread::Horizontal.edge(), None);

@@ -386,9 +386,13 @@ impl Backends {
         // the display's is: it carries no snapped dimension and is stretched to fill.
         self.rasterize(px, false, Opacity::Translucent, 96.0, |d| {
             d.clear(Scrgb::TRANSPARENT);
+            let inset = match spread {
+                Spread::HorizontalFeathered { inset, .. } => inset.clamp(0.0, 0.5),
+                _ => 0.0,
+            };
             let feather = match spread.edge() {
                 Some(edge) if edge > 0.0 => Some(self.gpu.ramp(
-                    &feather(edge.clamp(0.0, 0.5)),
+                    &feather(edge.clamp(0.0, 0.5 - inset), inset),
                     Vector2 { x: 0.5, y: 0.0 },
                     Vector2 { x: w - 0.5, y: 0.0 },
                     Extend::Clamp,
@@ -821,7 +825,7 @@ fn grain_peak<const HIGH: bool>(v: &[f32]) -> usize {
 ///
 /// Zero slope at either end avoids a visible seam into the full-strength body, and the
 /// coverage is authored directly so colour resampling cannot widen it.
-fn feather(edge: f32) -> Vec<Stop> {
+fn feather(edge: f32, inset: f32) -> Vec<Stop> {
     const STEPS: usize = 16;
     let mut stops = Vec::with_capacity(2 * (STEPS + 1));
     for at in 0..=STEPS {
@@ -832,11 +836,11 @@ fn feather(edge: f32) -> Vec<Stop> {
             ..WHITE
         };
         stops.push(Stop {
-            at: edge * t,
+            at: inset + edge * t,
             color,
         });
         stops.push(Stop {
-            at: 1.0 - edge * t,
+            at: 1.0 - inset - edge * t,
             color,
         });
     }
@@ -2324,7 +2328,7 @@ mod tests {
 
     #[test]
     fn a_feather_ladder_rises_and_falls_and_stays_within_the_ramp() {
-        let stops = feather(0.25);
+        let stops = feather(0.25, 0.0);
         assert!(stops.windows(2).all(|pair| pair[0].at <= pair[1].at));
         assert_eq!(stops.first().unwrap().at, 0.0);
         assert_eq!(stops.last().unwrap().at, 1.0);
@@ -2332,5 +2336,18 @@ mod tests {
         assert_eq!(stops.last().unwrap().color.a, 0.0);
         // Full strength in the body, with zero slope at either tip.
         assert!(stops.iter().any(|stop| stop.color.a >= 1.0));
+    }
+
+    #[test]
+    fn an_inset_feather_keeps_a_short_transition_and_a_full_strength_body() {
+        let stops = feather(4.0 / 480.0, 2.0 / 480.0);
+        assert_eq!(stops.first().unwrap().at, 2.0 / 480.0);
+        assert_eq!(stops.last().unwrap().at, 1.0 - 2.0 / 480.0);
+        assert_eq!(stops.first().unwrap().color.a, 0.0);
+        assert_eq!(stops.last().unwrap().color.a, 0.0);
+        let body: Vec<_> = stops.iter().filter(|stop| stop.color.a == 1.0).collect();
+        assert_eq!(body.len(), 2);
+        assert!((body[0].at - 6.0 / 480.0).abs() < 1e-7);
+        assert!((body[1].at - (1.0 - 6.0 / 480.0)).abs() < 1e-7);
     }
 }
