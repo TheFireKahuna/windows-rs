@@ -623,6 +623,41 @@ fn a_slider_publishes_the_range_it_runs_over() {
 }
 
 #[test]
+fn stock_slider_centres_its_thumb_on_the_rail_in_both_orientations() {
+    use crate::widget::{ScalarPart, SliderStyle, slider};
+    for scale in [1.0, 1.5, 2.0] {
+        for vertical in [false, true] {
+            let mut rig = Rig::at(800.0, 600.0, scale);
+            let mut node = NodeId::NONE;
+            rig.mount(|ui| {
+                let range = Range { vertical, ..Range::new(-12.0, 12.0) };
+                node = slider(ui, 0.0, range, SliderStyle::default())
+                    .width(Len::dip(if vertical { 30.0 } else { 300.0 }))
+                    .height(Len::dip(if vertical { 300.0 } else { 30.0 }))
+                    .id().into();
+            });
+            Host::with(|host| {
+                let row = host.control(host.control_of(node)).unwrap();
+                let value = row.value.unwrap();
+                let thumb = value.parts.iter().find_map(|&(node, part)| {
+                    matches!(part, ScalarPart::Thumb { .. }).then_some(host.geom(node))
+                }).unwrap();
+                let own = host.geom(node);
+                let centre = if vertical {
+                    thumb.local.x + thumb.size.x * 0.5
+                } else {
+                    thumb.local.y + thumb.size.y * 0.5
+                };
+                let expected = if vertical { own.size.x } else { own.size.y } * 0.5;
+                assert!((centre - expected).abs() < 0.51 / scale,
+                    "vertical={vertical}, scale={scale}: thumb {centre}, rail {expected}");
+            });
+            assert!(rig.flush().patch().ops().is_empty());
+        }
+    }
+}
+
+#[test]
 fn a_live_region_states_how_it_announces() {
     let mut rig = Rig::new();
     let mut frame = rig.mount(|ui| {

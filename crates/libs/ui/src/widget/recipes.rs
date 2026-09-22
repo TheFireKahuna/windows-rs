@@ -473,12 +473,14 @@ pub fn slider_source<'a, M>(
                 (inputs.size.x, inputs.size.y * 0.5)
             };
             let half = crate::role::metric(style.thumb, inputs.scope) * 0.55;
+            let inset = crate::role::metric(style.thumb, inputs.scope) * 0.5;
+            let position = |fraction| inset + (length - 2.0 * inset).max(0.0) * fraction;
             for (out, from, to) in [
-                (rail, at(0.0, mid), at(length, mid)),
+                (rail, at(position(0.0), mid), at(position(1.0), mid)),
                 (
                     mark,
-                    at(length * origin, mid - half),
-                    at(length * origin, mid + half),
+                    at(position(origin), mid - half),
+                    at(position(origin), mid + half),
                 ),
             ] {
                 out.push(PathVerb::Segment { from, to });
@@ -487,7 +489,6 @@ pub fn slider_source<'a, M>(
     );
     let (pad_x, pad_y) = axes(vertical, Len::times(style.thumb, 0.5), Len::ZERO);
     let (w, h) = axes(vertical, Len::pct(1.0), style.height.into());
-    let (rail_w, rail_h) = axes(vertical, Len::pct(1.0), style.rail.into());
     let slider = ui.scalar(
         Some(Chrome::new(roles::OPTION[0], Metric::RadiusPill)),
         Interaction::Slide(range),
@@ -496,10 +497,7 @@ pub fn slider_source<'a, M>(
             // A layer gives every child the whole box, so the rail, the trail and the origin mark
             // stack without a grid of one track to hold them.
             ui.node(Preset::Layer).children(move |ui| {
-                ui.plate(Metric::Radius, Role::Fill(Fill::Pressed), 1.0)
-                    .width(rail_w)
-                    .height(rail_h)
-                    .align_self(Align::Center);
+                ui.path(rail).stroke(Role::Fill(Fill::Pressed), style.rail);
                 let trail = ui.path(rail).probed(extent);
                 let trail = match style.ramp {
                     Some(ramp) => trail.stroke_ramp(ramp, style.rail),
@@ -511,13 +509,18 @@ pub fn slider_source<'a, M>(
                 if style.origin.is_some() && style.mark_origin {
                     ui.path(mark).ink_stroke(Metric::HairlineW).strength(0.15);
                 }
-            });
+            }).size(Len::pct(1.0));
             ui.plate(Len::times(style.thumb, 0.5), Role::Text(Text::Primary), 1.0)
                 .size(style.thumb)
                 .scalar_part(ScalarPart::Thumb { vertical });
         },
     );
-    as_layer(slider).width(w).height(h).padding_xy(pad_x, pad_y)
+    as_layer(slider)
+        .width(w)
+        .height(h)
+        .padding_xy(pad_x, pad_y)
+        .align(if vertical { Align::Center } else { Align::Stretch })
+        .justify(if vertical { Align::Stretch } else { Align::Center })
 }
 
 /// A rotary control: a track, and a needle turned by a single-pointer rotation or a dial detent.

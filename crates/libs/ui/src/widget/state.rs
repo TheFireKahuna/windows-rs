@@ -166,8 +166,15 @@ pub struct ValueRow {
     /// automation and rotary updates all snap through it, so none of them can disagree.
     pub step: f32,
     /// The application's source revision. A changed one supersedes a gesture standing on this
-    /// control; a repeated one is a geometry-only update and preserves the pointer's fraction.
+    /// control; a repeated one preserves an active gesture's fraction.
     pub revision: u64,
+}
+
+#[derive(Copy, Clone, Default)]
+struct HeldValue {
+    row: ValueRow,
+    /// Last published fraction, separate from the fraction input advances in `row`.
+    source: f32,
 }
 
 /// What the application is asked to do, raised after the pixels have already moved.
@@ -230,7 +237,7 @@ pub struct Controls {
     /// The stores over the control id family the app thread mints. This side holds no `Ids`
     /// counter, so it can place a row but never mint an id.
     chrome: Slots<CONTROL, ChromeRow>,
-    values: Slots<CONTROL, ValueRow>,
+    values: Slots<CONTROL, HeldValue>,
     hovered: ControlId,
     pressed: ControlId,
     focused: ControlId,
@@ -286,7 +293,8 @@ impl Controls {
     /// `released` is the same patch's retirement list. Publication excludes those ids; adoption
     /// retires them before input can reach a destroyed visual.
     ///
-    /// A geometry-only update preserves the pointer's fraction. A changed revision adopts the
+    /// An unchanged source preserves the pointer's fraction through layout. An idle control
+    /// adopts a changed source even within the same revision. A changed revision adopts the
     /// application's value and supersedes a gesture standing on it, so another control or a
     /// document load reaches this control through the same front-side writer as a pointer.
     ///
@@ -316,14 +324,16 @@ impl Controls {
         }
         for &(id, mut row) in values {
             let held = self.value(id);
-            if self.values.get(id).is_some() && held.revision == row.revision {
+            let source = row.fraction;
+            if self.values.get(id).is_some_and(|v|
+                held.revision == row.revision && (self.grabbed == id || v.source == source)) {
                 row.fraction = held.fraction;
-            } else if self.grabbed == id {
+            } else if self.grabbed == id && held.revision != row.revision {
                 self.grabbed = ControlId::NONE;
                 (self.superseded, self.superseded_at) = (id, row.revision);
             }
             let moved = (held.rest, held.travel, held.parts) != (row.rest, row.travel, row.parts);
-            self.values.place(id, row);
+            self.values.place(id, HeldValue { row, source });
             if moved {
                 self.bind_trails(row, front)?;
             }
@@ -759,8 +769,8 @@ impl Controls {
         let Some(row) = self.values.get_mut(id) else {
             return Ok(());
         };
-        row.fraction = fraction;
-        let row = *row;
+        row.row.fraction = fraction;
+        let row = row.row;
         for (node, part) in row.parts {
             for (prop, to) in part
                 .channels(fraction, row.rest, row.travel)
@@ -893,7 +903,7 @@ impl Controls {
     ///
     /// A zero row has zero span, so a value read off it is the range floor and moves no part.
     fn value(&self, id: ControlId) -> ValueRow {
-        self.values.get(id).copied().unwrap_or_default()
+        self.values.get(id).map(|v| v.row).unwrap_or_default()
     }
 }
 

@@ -248,6 +248,25 @@ fn committed(out: &[Intent]) -> usize {
 }
 
 #[test]
+fn native_an_idle_scalar_adopts_another_controls_edit_in_the_same_document() -> Result<()> {
+    let mut rig = Rig::new("shared scalar source")?;
+    let thumb = rig.node()?;
+    let id = rig.ids.mint();
+    let row = slider_row(thumb);
+    rig.adopt(&[], &[(id, row)], &[])?;
+    let edited = ValueRow { fraction: 0.75, ..row };
+    rig.adopt(&[], &[(id, edited)], &[])?;
+    assert_eq!(rig.controls.value(id).fraction, 0.75);
+
+    let mut out = Vec::new();
+    rig.automation(&[Action::SetValue(id, -24.0)], &mut out)?;
+    rig.adopt(&[], &[(id, ValueRow { travel: 200.0, ..edited })], &[])?;
+    assert_eq!(rig.controls.value(id).fraction, 0.0,
+        "unchanged source values must preserve a pending input through layout");
+    Ok(())
+}
+
+#[test]
 fn native_one_writer_carries_every_value_and_a_changed_revision_supersedes_a_gesture() -> Result<()>
 {
     let mut rig = Rig::new("scalar ownership")?;
