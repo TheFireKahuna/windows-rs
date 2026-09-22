@@ -936,15 +936,30 @@ impl Host {
     ///
     /// Recorded whether or not there is anything to repaint: a control with no chrome row
     /// still has an automation peer that reports checked, selected or unavailable.
-    pub(crate) fn set_state(&mut self, id: ControlId, state: Option<ModelState>) {
-        let next = state.unwrap_or(ModelState::Rest);
+    pub(crate) fn set_state(&mut self, id: ControlId, state: ModelState, on: bool) {
         let Some(row) = self.control_mut(id) else { return };
-        if row.state == next {
+        let held = match state {
+            ModelState::Selected => &mut row.selected,
+            ModelState::Disabled => &mut row.disabled,
+            ModelState::Rest => return,
+        };
+        if *held == on {
             return;
         }
+        *held = on;
+        let next = if row.disabled {
+            ModelState::Disabled
+        } else if row.selected {
+            ModelState::Selected
+        } else {
+            ModelState::Rest
+        };
+        let repaint = row.state != next;
         row.state = next;
         self.uia_stale.set(true);
-        self.repaint_control(id);
+        if repaint {
+            self.repaint_control(id);
+        }
     }
 
     /// Runs `edit` on the automation peer of the region `id` names, adding a row on first use.

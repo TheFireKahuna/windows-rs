@@ -78,6 +78,8 @@ pub(crate) struct ControlRow {
     pub node: NodeId,
     pub scope: Scope,
     pub state: ModelState,
+    pub selected: bool,
+    pub disabled: bool,
     pub uia: UiaRole,
 }
 
@@ -100,6 +102,8 @@ impl ControlRow {
             node,
             scope,
             state: ModelState::Rest,
+            selected: false,
+            disabled: false,
             uia: UiaRole::None,
         }
     }
@@ -588,7 +592,7 @@ impl<K> Element<'_, K> {
     fn model_state<M>(mut self, value: impl Signal<bool, M> + 'static, state: ModelState) -> Self {
         let id = self.control_id();
         self.bind(value, move |host, on| {
-            host.set_state(id, Some(if on { state } else { ModelState::Rest }));
+            host.set_state(id, state, on);
         })
     }
 

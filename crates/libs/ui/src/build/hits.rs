@@ -343,7 +343,7 @@ fn emit_uia(
     });
     // A check box reports the same fact as a toggle and every other role as a selection, so a
     // reader hears "checked" or "3 of 5" rather than silence.
-    let selected = row.state == ModelState::Selected;
+    let selected = row.selected;
     let chosen = match (selected, role) {
         (false, _) => State::default(),
         (true, UiaRole::CheckBox) => State::TOGGLED,

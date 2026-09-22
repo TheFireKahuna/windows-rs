@@ -579,6 +579,38 @@ fn a_disabled_control_keeps_its_entry_and_states_that_it_is_disabled() {
 }
 
 #[test]
+fn selection_and_disabled_bindings_preserve_each_other() {
+    for disabled_first in [false, true] {
+        let mut rig = Rig::new();
+        let selected = Cell::new(true);
+        let disabled = Cell::new(false);
+        let mut frame = rig.mount(|ui| {
+            let item = button(ui, "Channel").name("Channel").role(UiaRole::CheckBox);
+            if disabled_first {
+                item.disabled(disabled).selected(selected);
+            } else {
+                item.selected(selected).disabled(disabled);
+            }
+        });
+        let row = frame.uia("Channel").unwrap();
+        assert!(row.state.has(State::ENABLED));
+        assert!(row.state.has(State::TOGGLED));
+        let row = rig.set(disabled, true).uia("Channel").unwrap();
+        assert!(!row.state.has(State::ENABLED));
+        assert!(row.state.has(State::TOGGLED));
+        let row = rig.set(selected, false).uia("Channel").unwrap();
+        assert!(!row.state.has(State::ENABLED));
+        assert!(!row.state.has(State::TOGGLED));
+        let row = rig.set(selected, true).uia("Channel").unwrap();
+        assert!(!row.state.has(State::ENABLED));
+        assert!(row.state.has(State::TOGGLED));
+        let row = rig.set(disabled, false).uia("Channel").unwrap();
+        assert!(row.state.has(State::ENABLED));
+        assert!(row.state.has(State::TOGGLED));
+    }
+}
+
+#[test]
 fn a_slider_publishes_the_range_it_runs_over() {
     let mut rig = Rig::new();
     let mut frame = rig.mount(|ui| {

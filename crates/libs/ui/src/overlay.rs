@@ -1070,12 +1070,9 @@ impl Overlays {
     /// Opens the flyout `target` declared, or closes the one it already has open, so a picker's
     /// own button shuts it.
     ///
-    /// A control **inside** an open flyout that declares no flyout of its own is a terminal
-    /// choice — a menu option — so invoking it closes the flyout it was chosen from, and every
-    /// submenu above it. A press *outside* cannot arrive here: a [`Kind::Flyout`] contributes a
-    /// blocker, and a press on that blocker is consumed as a dismiss rather than a tap. A
-    /// [`Kind::Popup`] is left alone, because a button in a dialog is not a choice **from** the
-    /// dialog and closing it would dismiss the dialog on its first control.
+    /// Check boxes keep the flyout open for additional toggles. Other controls without
+    /// a child flyout close the choice stack after their handlers run. Outside presses
+    /// reach the flyout's blocker; popup commands leave their containing popup open.
     fn invoke(&mut self, target: ControlId, focus: &mut Vec<FocusOp>) {
         if let Some(overlay) = self.opened_by(target) {
             self.close(overlay, focus);
@@ -1083,6 +1080,9 @@ impl Overlays {
         }
         if Host::with(|host| host.flyout_of(target)).is_some() {
             self.open_flyout(target, Spec::flyout(target), focus);
+            return;
+        }
+        if Host::with(|host| host.control(target).is_some_and(|row| row.uia == crate::widget::UiaRole::CheckBox)) {
             return;
         }
         // Recorded rather than performed: the flyout's body **owns** the handler this intent
@@ -1775,6 +1775,37 @@ mod tests {
             button(ui, "Alpha").name("Alpha");
             button(ui, "Beta").name("Beta");
         });
+    }
+
+    #[test]
+    fn check_choices_keep_the_flyout_open_until_a_command_is_invoked() {
+        let mut patch = fixture();
+        let (_mount, anchor) = invoker(&mut patch);
+        let mut overlays = Overlays::new();
+        let mut focus = Vec::new();
+        let calls = Rc::new(core::cell::Cell::new(0));
+        let recorded = calls.clone();
+        overlays.open(&mut focus, Spec::flyout(anchor), move |ui| {
+            let calls = recorded.clone();
+            flyout(ui).stack(|ui| {
+                button(ui, "Checked").role(crate::widget::UiaRole::CheckBox)
+                    .selected(true).on_click(move || calls.set(calls.get() + 1));
+                button(ui, "Done");
+            });
+        });
+        let rows = rows_of(&overlays, 0);
+        assert_eq!(rows.len(), 2);
+        for expected in 1..=2 {
+            let intent = Intent::invoke_focused(rows[0]);
+            overlays.settle(&[], &[intent], &mut focus);
+            Host::dispatch(&[intent]);
+            overlays.after_dispatch(&mut focus);
+            assert_eq!(calls.get(), expected);
+            assert_eq!(overlays.depth(), 1);
+        }
+        overlays.settle(&[], &[Intent::invoke_focused(rows[1])], &mut focus);
+        overlays.after_dispatch(&mut focus);
+        assert!(overlays.is_empty());
     }
 
     /// Mounts `declare` under the window root and flushes, so its controls exist.
