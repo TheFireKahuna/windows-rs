@@ -169,7 +169,7 @@ impl Shared {
         self.objects
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|&((id, _), _)| id.is_none() || tree.index_of(id).is_some());
+            .retain(|&((id, part), _)| id.is_none() || element_index(tree, id, part).is_some());
     }
 
     /// Drops every provider object minted for this window.
@@ -216,6 +216,8 @@ implement_decl! {
     impl Element as pub Element_Impl: [
         IRawElementProviderSimple,
         IRawElementProviderFragment,
+        IWindowProvider,
+        ITransformProvider,
         IInvokeProvider,
         IToggleProvider,
         IValueProvider,
@@ -225,7 +227,7 @@ implement_decl! {
         IExpandCollapseProvider,
         IScrollItemProvider,
         IScrollProvider,
-        ITextProvider
+        ITextProvider2
     ]
 }
 
@@ -246,6 +248,59 @@ pub struct At {
     pub part: u32,
 }
 
+/// Resolves an element or its collapsed-combo choice in `tree`.
+fn element_index(tree: &Tree, id: ControlId, part: u32) -> Option<u16> {
+    let at = tree.index_of(id)?;
+    if part != NO_PART
+        && tree.at(at)?.role == UiaRole::ComboBox
+        && (tree.state(at).has(S::EXPANDED) || tree.choice(at).is_none_or(|c| c.0 != part))
+    {
+        return None;
+    }
+    Some(at)
+}
+
+#[test]
+fn combo_choice_cache_tracks_only_the_published_option() {
+    use super::tests::{Screen, listening};
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let combo = screen.add(NONE, (0.0, 0.0, 100.0, 24.0), UiaRole::ComboBox, "Choice");
+    let name = screen.snapshot.intern("Option");
+    screen.snapshot.choices.push((combo, 0, name));
+    screen.publish(&mut uia);
+    let id = screen.control(combo);
+    let shared = Arc::clone(uia.shared_for_test());
+    let _owner = shared.object(id, NO_PART);
+    let retired = shared.object(id, 0);
+    let count = || {
+        shared
+            .objects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((owner, _), _)| *owner == id)
+            .count()
+    };
+    for key in 1..64 {
+        screen.snapshot.choices[0].1 = key;
+        screen.publish(&mut uia);
+        uia.flush();
+        let _choice = shared.object(id, key);
+        assert_eq!(count(), 2);
+    }
+    let mut value = VARIANT::default();
+    // SAFETY: the retired interface is counted and `value` is writable for the call.
+    let result = unsafe {
+        (retired.vtable().GetPropertyValue)(retired.as_raw(), UIA_NamePropertyId, &raw mut value)
+    };
+    assert_eq!(result, gone().code());
+    screen.snapshot.state[combo as usize] = S::ENABLED | S::EXPANDED;
+    screen.publish(&mut uia);
+    uia.flush();
+    assert_eq!(count(), 1);
+}
+
 impl Element {
     /// Returns the shared state, or `UIA_E_ELEMENTNOTAVAILABLE` once the window has gone.
     pub fn shared(&self) -> Result<Arc<Shared>> {
@@ -262,7 +317,7 @@ impl Element {
     pub fn at(&self) -> Result<At> {
         let shared = self.shared()?;
         let tree = tree_of(&shared);
-        let at = tree.index_of(self.id).ok_or_else(gone)?;
+        let at = element_index(&tree, self.id, self.part).ok_or_else(gone)?;
         Ok(At {
             shared,
             tree,
@@ -318,7 +373,17 @@ impl At {
     /// row carried out of the list entirely answers an empty rectangle at its own corner, which
     /// is what `IsOffscreen` says in numbers.
     pub(super) fn rect(&self) -> UiaRect {
-        self.screen(self.clipped(self.unclipped_box()))
+        if self.part == NO_PART {
+            let [left, top, width, height] = self.tree.bounds(self.at);
+            UiaRect {
+                left,
+                top,
+                width,
+                height,
+            }
+        } else {
+            self.screen(self.clipped(self.unclipped_box()))
+        }
     }
 
     /// Returns the element's box before any clip, in DIPs, with its scroll ancestry applied and
@@ -374,8 +439,15 @@ impl At {
             .flatten()
     }
 
+    fn choice(&self) -> bool {
+        self.part != NO_PART && self.entry().role == UiaRole::ComboBox
+    }
+
     /// Returns the element's accessible name, which for a part is the part's own.
     fn name(&self) -> Vec<u16> {
+        if self.choice() {
+            return self.tree.choice(self.at).unwrap().1.to_vec();
+        }
         match self.part() {
             Some(part) => wide(part.name),
             None => self.tree.text(self.entry().name).to_vec(),
@@ -384,16 +456,25 @@ impl At {
 
     /// Returns whether a flag of the element's live state is set.
     fn flag(&self, flag: State) -> bool {
+        if self.choice() && flag == S::SELECTED {
+            return true;
+        }
         self.tree.state(self.at).has(flag)
     }
 
     /// Returns whether a structural bit of the element's entry is set.
     fn bit(&self, bit: ColFlags) -> bool {
+        if self.choice() {
+            return bit == F::READ_ONLY;
+        }
         self.entry().flags.has(bit)
     }
 
     /// Returns whether this element holds keyboard focus.
-    fn focused(&self) -> bool {
+    pub(super) fn focused(&self) -> bool {
+        if self.choice() {
+            return false;
+        }
         self.tree.focused() == packed(self.entry().id)
     }
 
@@ -446,7 +527,7 @@ impl At {
 ///
 /// A region part answers from the same rows: its name and role come from the part, and every
 /// structural property reads the region's entry, which is where a part sits.
-const PROPERTIES: [(i32, fn(&At) -> VARIANT); 19] = [
+const PROPERTIES: [(i32, fn(&At) -> VARIANT); 20] = [
     (UIA_NamePropertyId, |a| vw(&a.name())),
     (UIA_HelpTextPropertyId, |a| vw(a.tree.help(a.at))),
     (UIA_ControlTypePropertyId, |a| vi(control_type(a))),
@@ -472,6 +553,11 @@ const PROPERTIES: [(i32, fn(&At) -> VARIANT); 19] = [
     (UIA_LabeledByPropertyId, labelled_by),
     (UIA_BoundingRectanglePropertyId, bounding_rectangle),
     (UIA_FrameworkIdPropertyId, |_| vw(&wide(FRAMEWORK))),
+    (UIA_OrientationPropertyId, |a| {
+        vi(a.tree
+            .range(a.at)
+            .map_or(0, |r| if r.vertical { 2 } else { 1 }))
+    }),
 ];
 
 /// Returns the control type this element reports, resolved against its parent's role.
@@ -489,6 +575,9 @@ fn control_type(a: &At) -> i32 {
 /// widget is authored for either container. A popup reports a window, which makes a reader
 /// announce its title before its content.
 fn resolved(a: &At) -> (i32, &'static str) {
+    if a.choice() {
+        return (UIA_ListItemControlTypeId, "list item");
+    }
     let entry = a.entry();
     if a.part == NO_PART && entry.flags.has(ColFlags::DIALOG) {
         return (roles::DIALOG_CONTROL_TYPE, roles::DIALOG_NAME);
@@ -497,7 +586,9 @@ fn resolved(a: &At) -> (i32, &'static str) {
     let mut parent = UiaRole::None;
     while let Some(entry) = a.tree.at(parent_at) {
         parent = entry.role;
-        if parent != UiaRole::Group { break; }
+        if parent != UiaRole::Group {
+            break;
+        }
         parent_at = entry.parent;
     }
     roles::control_type_in(a.role(), parent)
@@ -535,9 +626,12 @@ fn set_place(a: &At) -> (VARIANT, VARIANT) {
     }
     let mut place = 0;
     let mut size = 0;
-    for child in children(&a.tree, entry.parent) {
-        let Some(sibling) = a.tree.at(child) else { continue };
-        if sibling.role != entry.role {
+    let owner = a.tree.selection_container(a.at);
+    for child in a.tree.descendants(owner) {
+        let Some(sibling) = a.tree.at(child) else {
+            continue;
+        };
+        if sibling.role != entry.role || a.tree.selection_container(child) != owner {
             continue;
         }
         size += 1;
@@ -579,14 +673,13 @@ const fn live_setting(flags: ColFlags) -> i32 {
 }
 
 /// Answers `id` from the property table, or `VT_EMPTY` for one this stack does not publish.
-fn property(element: &Element, id: PROPERTYID) -> VARIANT {
-    let (Ok(at), Some(&(_, answer))) = (
-        element.at(),
-        PROPERTIES.iter().find(|&&(held, _)| held == id),
-    ) else {
-        return variant::empty();
-    };
-    answer(&at)
+/// Returns `UIA_E_ELEMENTNOTAVAILABLE` when the element has unmounted.
+fn property(element: &Element, id: PROPERTYID) -> Result<VARIANT> {
+    let at = element.at()?;
+    Ok(PROPERTIES
+        .iter()
+        .find(|&&(held, _)| held == id)
+        .map_or_else(variant::empty, |&(_, answer)| answer(&at)))
 }
 
 /// Answers the properties the window itself carries. The root is not in the table, so it
@@ -610,11 +703,17 @@ fn root_property(id: PROPERTYID) -> VARIANT {
 fn pattern(element: &Element, id: PATTERNID) -> Result<IUnknown> {
     let at = element.at()?;
     let wanted = roles::pattern_of(id);
-    let held = match at.part() {
+    let mut held = match at.part() {
         // A part answers its own role's patterns, not its region's.
         Some(part) => roles::row(part.role).patterns,
         None => at.tree.patterns(at.at),
     };
+    if at.choice() {
+        held = Patterns::SELECTION_ITEM;
+    }
+    if at.part == NO_PART && at.bit(F::DIALOG) {
+        held = held.or(Patterns::WINDOW).or(Patterns::TRANSFORM);
+    }
     if wanted == Patterns::NONE || !held.has(wanted) {
         return Err(none());
     }
@@ -630,6 +729,26 @@ fn pattern(element: &Element, id: PATTERNID) -> Result<IUnknown> {
 fn navigate(element: &Element, direction: NavigateDirection) -> Result<IRawElementProviderSimple> {
     let at = element.at()?;
     let entry = at.entry();
+    if at.choice() {
+        return match direction {
+            NavigateDirection_Parent => Ok(at.shared.object(entry.id, NO_PART)),
+            NavigateDirection_NextSibling => at
+                .tree
+                .at(entry.child)
+                .map(|e| at.shared.object(e.id, NO_PART))
+                .ok_or_else(none),
+            _ => Err(none()),
+        };
+    }
+    if !at.flag(S::EXPANDED)
+        && at.role() == UiaRole::ComboBox
+        && (direction == NavigateDirection_FirstChild
+            || direction == NavigateDirection_LastChild && entry.child == NONE)
+    {
+        if let Some((key, _)) = at.tree.choice(at.at) {
+            return Ok(at.shared.object(entry.id, key));
+        }
+    }
     if at.part != NO_PART {
         // A part's parent is its region and its siblings are the region's other parts; it has
         // no children of its own, because its contents are pixels.
@@ -672,6 +791,15 @@ fn navigate(element: &Element, direction: NavigateDirection) -> Result<IRawEleme
         NavigateDirection_NextSibling => entry.next,
         _ => at.tree.previous(at.at),
     };
+    if step == NONE && direction == NavigateDirection_PreviousSibling {
+        if let Some(parent) = at.tree.at(entry.parent) {
+            if parent.role == UiaRole::ComboBox && !at.tree.state(entry.parent).has(S::EXPANDED) {
+                if let Some((key, _)) = at.tree.choice(entry.parent) {
+                    return Ok(at.shared.object(parent.id, key));
+                }
+            }
+        }
+    }
     let found = at.tree.at(step).ok_or_else(none)?;
     Ok(at.shared.object(found.id, NO_PART))
 }
@@ -795,7 +923,7 @@ vtable! {
     IRawElementProviderSimple_Impl for Element_Impl {
         fn ProviderOptions(&self) -> Result<ProviderOptions> { Ok(OPTIONS) }
         fn GetPatternProvider(&self, id: PATTERNID) -> Result<IUnknown> { pattern(&self.this, id) }
-        fn GetPropertyValue(&self, id: PROPERTYID) -> Result<VARIANT> { Ok(property(&self.this, id)) }
+        fn GetPropertyValue(&self, id: PROPERTYID) -> Result<VARIANT> { property(&self.this, id) }
         // Only the fragment root has a host: it is the window, and a child claiming one would
         // be announced as a second window.
         fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> { Err(none()) }
@@ -868,11 +996,9 @@ vtable! {
         fn ExpandCollapseState(&self) -> Result<ExpandCollapseState> { expand_state(&self.this) }
     }
     ISelectionItemProvider_Impl for Element_Impl {
-        fn Select(&self) -> Result<()> { self.command(Action::Select) }
-        // Selection here is single: adding to it is selecting, and no state has nothing
-        // selected, so there is nothing to remove.
-        fn AddToSelection(&self) -> Result<()> { self.command(Action::Select) }
-        fn RemoveFromSelection(&self) -> Result<()> { Err(invalid()) }
+        fn Select(&self) -> Result<()> { select_item(&self.this, super::action::SelectionChange::Select) }
+        fn AddToSelection(&self) -> Result<()> { select_item(&self.this, super::action::SelectionChange::Add) }
+        fn RemoveFromSelection(&self) -> Result<()> { select_item(&self.this, super::action::SelectionChange::Remove) }
         fn IsSelected(&self) -> Result<BOOL> { Ok(BOOL::from(self.at()?.flag(S::SELECTED))) }
         fn SelectionContainer(&self) -> Result<IRawElementProviderSimple> { container(&self.this) }
     }
@@ -979,14 +1105,16 @@ fn scroll_to(element: &Element, x: f64, y: f64) -> Result<()> {
 fn scroll_by(element: &Element, x: ScrollAmount, y: ScrollAmount) -> Result<()> {
     let (view, offset) = viewport(element)?;
     let travel = view.travel();
-    let axis = |amount: ScrollAmount, page: f32, travel: f32, at: f32| match amount {
-        ScrollAmount_LargeDecrement => at - page,
-        ScrollAmount_LargeIncrement => at + page,
-        ScrollAmount_SmallDecrement => at - page * SMALL_STEP,
-        ScrollAmount_SmallIncrement => at + page * SMALL_STEP,
-        _ => at,
-    }
-    .clamp(0.0, travel);
+    let axis = |amount: ScrollAmount, page: f32, travel: f32, at: f32| {
+        match amount {
+            ScrollAmount_LargeDecrement => at - page,
+            ScrollAmount_LargeIncrement => at + page,
+            ScrollAmount_SmallDecrement => at - page * SMALL_STEP,
+            ScrollAmount_SmallIncrement => at + page * SMALL_STEP,
+            _ => at,
+        }
+        .clamp(0.0, travel)
+    };
     let to = Vector2 {
         x: axis(x, view.view.x, travel.x, offset.x),
         y: axis(y, view.view.y, travel.y, offset.y),
@@ -1015,20 +1143,71 @@ fn expand_state(element: &Element) -> Result<ExpandCollapseState> {
 /// Returns the container whose selection this element is one of.
 fn container(element: &Element) -> Result<IRawElementProviderSimple> {
     let at = element.at()?;
-    let parent = at.tree.at(at.tree.selection_container(at.at)).ok_or_else(none)?;
+    if at.choice() {
+        return Ok(at.shared.object(element.id, NO_PART));
+    }
+    let parent = at
+        .tree
+        .at(at.tree.selection_container(at.at))
+        .ok_or_else(none)?;
     Ok(at.shared.object(parent.id, NO_PART))
+}
+
+fn select_item(element: &Element, change: super::action::SelectionChange) -> Result<()> {
+    use super::action::SelectionChange;
+    let at = element.at()?;
+    if !at.flag(S::ENABLED) {
+        return Err(disabled());
+    }
+    let selected = at.flag(S::SELECTED);
+    if selected == (change != SelectionChange::Remove) {
+        return Ok(());
+    }
+    if at.choice() {
+        return Err(invalid());
+    }
+    let owner = at.tree.selection_container(at.at);
+    if change == SelectionChange::Remove
+        && at
+            .tree
+            .at(owner)
+            .is_some_and(|entry| entry.flags.has(F::SELECTION_REQUIRED))
+    {
+        return Err(invalid());
+    }
+    if change == SelectionChange::Add
+        && at.tree.descendants(owner).any(|child| {
+            at.tree.selection_container(child) == owner && at.tree.state(child).has(S::SELECTED)
+        })
+    {
+        return Err(invalid());
+    }
+    at.shared.act(Action::Select(element.id, change));
+    Ok(())
 }
 
 /// Returns the container's selected children, read from the live column so a selection change
 /// needs no republish.
 fn selection(element: &Element) -> Result<*mut SAFEARRAY> {
     let at = element.at()?;
-    let selected: Vec<_> = descendants(&at.tree, at.at)
+    if at.role() == UiaRole::ComboBox && !at.flag(S::EXPANDED) {
+        if let Some((key, _)) = at.tree.choice(at.at) {
+            return Ok(variant::provider_array(&[at
+                .shared
+                .object(element.id, key)]));
+        }
+    }
+    let selected: Vec<_> = at
+        .tree
+        .descendants(at.at)
         .filter(|&child| {
-            if !at.tree.state(child).has(State::SELECTED) { return false; }
+            if !at.tree.state(child).has(State::SELECTED) {
+                return false;
+            }
             let owner = at.tree.selection_container(child);
-            owner == at.at || (at.role() == UiaRole::ComboBox
-                && at.tree.at(owner).is_some_and(|entry| entry.parent == at.at))
+            owner == at.at
+                || (at.role() == UiaRole::ComboBox
+                    && at.tree.at(owner).is_some_and(|entry| entry.parent == at.at))
         })
         .map(|child| {
             at.shared
@@ -1036,35 +1215,6 @@ fn selection(element: &Element) -> Result<*mut SAFEARRAY> {
         })
         .collect();
     Ok(variant::provider_array(&selected))
-}
-
-/// Visits descendants through semantic links, including detached flyouts owned by a control.
-fn descendants(tree: &Tree, root: u16) -> impl Iterator<Item = u16> + '_ {
-    let mut next = tree.at(root).map_or(NONE, |entry| entry.child);
-    core::iter::from_fn(move || {
-        let out = (next != NONE).then_some(next)?;
-        let entry = tree.at(out)?;
-        next = entry.child;
-        if next == NONE {
-            let mut at = out;
-            while let Some(entry) = tree.at(at) {
-                if entry.next != NONE { next = entry.next; break; }
-                if entry.parent == root { break; }
-                at = entry.parent;
-            }
-        }
-        Some(out)
-    })
-}
-
-/// Returns each child index of the entry at `at`, in sibling order.
-fn children(tree: &Tree, at: u16) -> impl Iterator<Item = u16> + '_ {
-    let mut next = tree.at(at).map_or(NONE, |entry| entry.child);
-    core::iter::from_fn(move || {
-        let out = (next != NONE).then_some(next)?;
-        next = tree.at(out).map_or(NONE, |entry| entry.next);
-        Some(out)
-    })
 }
 
 /// Returns the element's numeric bounds, or the empty error where it carries none.
@@ -1086,8 +1236,12 @@ fn small_change(range: Range) -> f64 {
 /// Queues a numeric write, refusing one outside the element's own bounds.
 fn set_number(element: &Element, value: f64) -> Result<()> {
     let at = element.at()?;
-    if !at.flag(S::ENABLED) { return Err(disabled()); }
-    if at.bit(F::READ_ONLY) { return Err(invalid()); }
+    if !at.flag(S::ENABLED) {
+        return Err(disabled());
+    }
+    if at.bit(F::READ_ONLY) {
+        return Err(invalid());
+    }
     let range = at.tree.range(at.at).ok_or_else(invalid)?;
     if !value.is_finite() || value < range.min || value > range.max {
         return Err(invalid());
@@ -1105,7 +1259,9 @@ fn set_text(element: &Element, value: &PCWSTR) -> Result<()> {
     if !at.flag(S::ENABLED) {
         return Err(disabled());
     }
-    if at.bit(F::READ_ONLY) { return Err(invalid()); }
+    if at.bit(F::READ_ONLY) {
+        return Err(invalid());
+    }
     if value.is_null() {
         return Err(invalid());
     }
@@ -1141,6 +1297,9 @@ fn value_text(element: &Element) -> Result<BSTR> {
     }
     if let Some(range) = at.tree.range(at.at) {
         return Ok(BSTR::from(formatted(at.number()?, range.step)));
+    }
+    if let Some((_, name)) = at.tree.choice(at.at) {
+        return Ok(variant::bstr(name));
     }
     Ok(variant::bstr(at.tree.shown(at.at)))
 }
@@ -1267,4 +1426,55 @@ pub fn get_object(shared: &Arc<Shared>, w: WPARAM, l: LPARAM) -> Option<LRESULT>
     // SAFETY: the handle names a window this process owns, and `object` holds a reference for
     // the whole call — `UiaReturnRawElementProvider` takes its own.
     Some(unsafe { UiaReturnRawElementProvider(shared.window(), w, l, object.as_raw()) })
+}
+
+/// Resolves a mounted popup before answering its fixed window capabilities.
+fn dialog(element: &Element) -> Result<At> {
+    let at = element.at()?;
+    if at.part != NO_PART || !at.bit(F::DIALOG) {
+        return Err(invalid());
+    }
+    Ok(at)
+}
+
+vtable! {
+    IWindowProvider_Impl for Element_Impl {
+        fn Close(&self) -> Result<()> {
+            let at = dialog(&self.this)?;
+            at.shared.act(Action::CloseWindow(at.entry().id));
+            Ok(())
+        }
+        fn SetVisualState(&self, state: WindowVisualState) -> Result<()> {
+            dialog(&self.this)?;
+            if state == WindowVisualState_Normal { Ok(()) } else { Err(invalid()) }
+        }
+        fn WaitForInputIdle(&self, milliseconds: i32) -> Result<BOOL> {
+            dialog(&self.this)?;
+            if milliseconds < 0 { return Err(invalid()); }
+            // SAFETY: the pseudo-handle identifies this process; the timeout is nonnegative.
+            match unsafe { WaitForInputIdle(GetCurrentProcess(), milliseconds as u32) } {
+                0 => Ok(true.into()),
+                258 => Ok(false.into()),
+                _ => Err(Error::from_thread()),
+            }
+        }
+        fn CanMaximize(&self) -> Result<BOOL> { dialog(&self.this).map(|_| false.into()) }
+        fn CanMinimize(&self) -> Result<BOOL> { dialog(&self.this).map(|_| false.into()) }
+        fn IsModal(&self) -> Result<BOOL> { dialog(&self.this).map(|_| true.into()) }
+        fn IsTopmost(&self) -> Result<BOOL> { dialog(&self.this).map(|_| false.into()) }
+        fn WindowVisualState(&self) -> Result<WindowVisualState> { dialog(&self.this).map(|_| WindowVisualState_Normal) }
+        fn WindowInteractionState(&self) -> Result<WindowInteractionState> {
+            let at = dialog(&self.this)?;
+            let blocked = at.tree.entries().iter().skip(at.at as usize + 1).any(|e| e.flags.has(F::DIALOG));
+            Ok(if blocked { WindowInteractionState_BlockedByModalWindow } else { WindowInteractionState_ReadyForUserInteraction })
+        }
+    }
+    ITransformProvider_Impl for Element_Impl {
+        fn Move(&self, _: f64, _: f64) -> Result<()> { dialog(&self.this)?; Err(invalid()) }
+        fn Resize(&self, _: f64, _: f64) -> Result<()> { dialog(&self.this)?; Err(invalid()) }
+        fn Rotate(&self, _: f64) -> Result<()> { dialog(&self.this)?; Err(invalid()) }
+        fn CanMove(&self) -> Result<BOOL> { dialog(&self.this).map(|_| false.into()) }
+        fn CanResize(&self) -> Result<BOOL> { dialog(&self.this).map(|_| false.into()) }
+        fn CanRotate(&self) -> Result<BOOL> { dialog(&self.this).map(|_| false.into()) }
+    }
 }

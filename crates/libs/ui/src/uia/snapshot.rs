@@ -241,6 +241,7 @@ pub struct Snapshot {
     pub ranges: Vec<(u16, Range)>,
     /// The run a control displays where that is not its name, sorted by entry index.
     pub shown: Vec<(u16, u32)>,
+    pub choices: Vec<(u16, u32, u32)>,
     /// Where each of those numbers stands, sorted by entry index.
     ///
     /// Published rather than carried, because the control's own row is what a client must
@@ -248,6 +249,7 @@ pub struct Snapshot {
     /// would answer a moved slider with the number it last happened to announce.
     pub values: Vec<(u16, f64)>,
     pub(crate) fields: Vec<FieldText>,
+    pub(crate) text_geometry: Vec<(u16, Arc<Geometry>)>,
     /// The scroll containers the rows resolve through, deduplicated, in the order
     /// [`Entry::scroll`] indexes them.
     pub scrolls: Vec<ScrollView>,
@@ -286,8 +288,10 @@ impl Snapshot {
         self.keys.clear();
         self.ranges.clear();
         self.shown.clear();
+        self.choices.clear();
         self.values.clear();
         self.fields.clear();
+        self.text_geometry.clear();
         self.scrolls.clear();
         self.state.clear();
     }
@@ -312,8 +316,10 @@ pub struct Tree {
     keys: Box<[(u16, u32)]>,
     ranges: Box<[(u16, Range)]>,
     shown: Box<[(u16, u32)]>,
+    choices: Box<[(u16, u32, u32)]>,
     /// Sorted by control id, which is what a client's text call holds.
     fields: Box<[FieldText]>,
+    text_geometry: Box<[(u16, Arc<Geometry>)]>,
     /// One word an entry, holding its value as `f64` bits.
     ///
     /// Relaxed throughout: each word stands alone, with no other datum ordered against it, so
@@ -362,7 +368,9 @@ impl Tree {
             keys: Box::default(),
             ranges: Box::default(),
             shown: Box::default(),
+            choices: Box::default(),
             fields: Box::default(),
+            text_geometry: Box::default(),
             live: Box::default(),
             state: Box::default(),
             scrolls: Box::default(),
@@ -425,7 +433,9 @@ impl Tree {
             keys: snapshot.keys.clone().into_boxed_slice(),
             ranges: snapshot.ranges.clone().into_boxed_slice(),
             shown: snapshot.shown.clone().into_boxed_slice(),
+            choices: snapshot.choices.clone().into_boxed_slice(),
             fields: fields.into_boxed_slice(),
+            text_geometry: snapshot.text_geometry.clone().into_boxed_slice(),
             scrolls: snapshot
                 .scrolls
                 .iter()
@@ -439,6 +449,21 @@ impl Tree {
                 .collect(),
             ..Self::empty()
         }
+    }
+
+    /// Returns the selected option key and name for a combo box.
+    pub fn choice(&self, at: u16) -> Option<(u32, &[u16])> {
+        let found = self.choices.binary_search_by_key(&at, |row| row.0).ok()?;
+        let (_, key, name) = self.choices[found];
+        Some((key, self.text(name)))
+    }
+
+    pub(crate) fn text_geometry(&self, at: u16) -> Option<&Arc<Geometry>> {
+        let found = self
+            .text_geometry
+            .binary_search_by_key(&at, |row| row.0)
+            .ok()?;
+        Some(&self.text_geometry[found].1)
     }
 
     /// Returns every published element, in the order a scan reads it.
@@ -555,17 +580,44 @@ impl Tree {
         if !entry.flags.has(ColFlags::RANGED)
             && !entry.flags.has(ColFlags::FIELD)
             && !entry.flags.has(ColFlags::SHOWN)
+            && self.choice(at).is_none()
         {
             out = out.without(Patterns::VALUE);
         }
         out
     }
 
+    /// Visits descendants through semantic links, including detached flyouts owned by a control.
+    pub fn descendants(&self, root: u16) -> impl Iterator<Item = u16> + '_ {
+        let mut next = self.at(root).map_or(NONE, |entry| entry.child);
+        core::iter::from_fn(move || {
+            let out = (next != NONE).then_some(next)?;
+            let entry = self.at(out)?;
+            next = entry.child;
+            if next == NONE {
+                let mut at = out;
+                while let Some(entry) = self.at(at) {
+                    if entry.next != NONE {
+                        next = entry.next;
+                        break;
+                    }
+                    if entry.parent == root {
+                        break;
+                    }
+                    at = entry.parent;
+                }
+            }
+            Some(out)
+        })
+    }
+
     /// Finds the nearest ancestor that owns this item's selection.
     pub fn selection_container(&self, at: u16) -> u16 {
         let mut parent = self.at(at).map_or(NONE, |entry| entry.parent);
         while let Some(entry) = self.at(parent) {
-            if self.patterns(parent).has(Patterns::SELECTION) { return parent; }
+            if self.patterns(parent).has(Patterns::SELECTION) {
+                return parent;
+            }
             parent = entry.parent;
         }
         NONE
@@ -680,6 +732,89 @@ impl Tree {
             clip = entry.clip;
         }
         false
+    }
+
+    /// Returns the clipped element rectangle in physical screen pixels.
+    pub fn bounds(&self, at: u16) -> [f64; 4] {
+        self.bounds_at(at, &[])
+    }
+
+    /// Resolves bounds through supplied scroll positions, falling back to the live trackers.
+    pub fn bounds_at(&self, at: u16, positions: &[(NodeId, Vector2)]) -> [f64; 4] {
+        let shifted = |at| {
+            let Some(entry) = self.at(at) else {
+                return [0.0; 4];
+            };
+            let by = self
+                .scrolls
+                .get(entry.scroll as usize)
+                .and_then(|(view, _)| {
+                    positions
+                        .iter()
+                        .find(|(node, _)| *node == view.node)
+                        .map(|(_, by)| *by)
+                })
+                .unwrap_or_else(|| self.scroll(at));
+            [
+                entry.box_[0] - by.x,
+                entry.box_[1] - by.y,
+                entry.box_[2] - by.x,
+                entry.box_[3] - by.y,
+            ]
+        };
+        let original = shifted(at);
+        let mut b = original;
+        let mut clip = self.at(at).map_or(NONE, |e| e.clip);
+        while let Some(e) = self.at(clip) {
+            let c = shifted(clip);
+            b = [
+                b[0].max(c[0]),
+                b[1].max(c[1]),
+                b[2].min(c[2]),
+                b[3].min(c[3]),
+            ];
+            clip = e.clip;
+        }
+        if b[2] <= b[0] || b[3] <= b[1] {
+            b = [original[0], original[1], original[0], original[1]];
+        }
+        let (origin, scale) = self.window();
+        [
+            f64::from(origin.x + b[0] * scale),
+            f64::from(origin.y + b[1] * scale),
+            f64::from((b[2] - b[0]) * scale),
+            f64::from((b[3] - b[1]) * scale),
+        ]
+    }
+
+    pub fn positions_changed(&self, positions: &[(NodeId, Vector2)]) -> bool {
+        self.scrolls.iter().any(|(view, word)| {
+            positions
+                .iter()
+                .find(|(node, _)| *node == view.node)
+                .is_none_or(|(_, position)| *position != unpack(word.load(Relaxed)))
+        })
+    }
+
+    pub fn positions(&self, out: &mut Vec<(NodeId, Vector2)>) {
+        out.clear();
+        out.extend(
+            self.scrolls
+                .iter()
+                .map(|(view, word)| (view.node, unpack(word.load(Relaxed)))),
+        );
+    }
+
+    /// Iterates the immediate children in fragment order; `NONE` names the window.
+    pub fn children(&self, parent: u16) -> impl Iterator<Item = u16> + '_ {
+        let mut next = self
+            .at(parent)
+            .map_or(if self.is_empty() { NONE } else { 0 }, |e| e.child);
+        std::iter::from_fn(move || {
+            let at = (next != NONE).then_some(next)?;
+            next = self.entries[at as usize].next;
+            Some(at)
+        })
     }
 
     /// Returns the box every clipping ancestor of `at` admits, in the space
@@ -831,9 +966,7 @@ impl Tree {
             if let Some((_, was)) = from
                 .scrolls
                 .iter()
-                .find(|(held, held_word)| {
-                    held.node == view.node && !Arc::ptr_eq(held_word, word)
-                })
+                .find(|(held, held_word)| held.node == view.node && !Arc::ptr_eq(held_word, word))
             {
                 word.store(was.load(Relaxed), Relaxed);
             }
@@ -861,9 +994,8 @@ pub fn derive_keys(snapshot: &mut Snapshot, seen: &mut Vec<(String, u32)>) {
     let mut scratch = String::new();
     for at in 0..snapshot.entries.len() {
         let entry = snapshot.entries[at];
-        if let Ok(found) = snapshot
-            .keys[..authored]
-            .binary_search_by_key(&(at as u16), |&(key, _)| key)
+        if let Ok(found) =
+            snapshot.keys[..authored].binary_search_by_key(&(at as u16), |&(key, _)| key)
         {
             // An author's own id is the whole of it, and it is what descendants build on.
             let key = snapshot.keys[found].1;
@@ -1286,7 +1418,11 @@ mod tests {
         let new = Tree::adopt(&now, &[]);
         new.carry(&old);
 
-        assert_eq!(new.value(2), Some(7.0), "a value the publish left unstated was dropped");
+        assert_eq!(
+            new.value(2),
+            Some(7.0),
+            "a value the publish left unstated was dropped"
+        );
         assert!(
             !new.state(2).has(State::TOGGLED),
             "model state is the publish's to state, and the tree before it is stale"

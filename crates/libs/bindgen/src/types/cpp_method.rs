@@ -404,6 +404,12 @@ impl CppMethod {
                 } else {
                     quote! { #result.write(core::mem::transmute(ok__)); }
                 };
+                // An absent interface must overwrite the caller's uninitialized out-parameter.
+                let clear_result = if last_param.deref().is_interface() {
+                    quote! { #result.write(core::ptr::null_mut()); }
+                } else {
+                    quote! {}
+                };
 
                 quote! {
                     match #parent_impl::#name(this, #(#invoke_args,)*) {
@@ -412,7 +418,10 @@ impl CppMethod {
                             #write_result
                             windows_core::HRESULT(0)
                         }
-                        Err(err) => err.into()
+                        Err(err) => {
+                            #clear_result
+                            err.into()
+                        }
                     }
                 }
             }

@@ -107,4 +107,6 @@ pub(crate) struct Commit {
 pub(crate) struct Reveal {
     pub id: Option<ControlId>,
     pub occlusion: Option<crate::layout::Rect>,
+    pub align_top: Option<bool>,
+    pub span: Option<(f32, f32)>,
 }

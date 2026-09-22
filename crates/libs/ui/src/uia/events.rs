@@ -15,18 +15,7 @@ use super::provider::{Shared, packed};
 use super::snapshot::{ColFlags, State, Tree};
 use super::variant;
 use crate::VARIANT;
-use crate::bindings::{
-    StructureChangeType_ChildrenBulkAdded, UIA_AutomationFocusChangedEventId,
-    UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_Invoke_InvokedEventId,
-    UIA_LiveRegionChangedEventId, UIA_MenuClosedEventId, UIA_MenuOpenedEventId,
-    UIA_RangeValueValuePropertyId, UIA_SelectionItemIsSelectedPropertyId,
-    UIA_Text_TextChangedEventId, UIA_Text_TextSelectionChangedEventId,
-    UIA_ToggleToggleStatePropertyId, UIA_ToolTipOpenedEventId, UIA_ValueValuePropertyId,
-    UiaClientsAreListening, UiaRaiseAutomationEvent, UiaRaiseAutomationPropertyChangedEvent,
-    UiaRaiseStructureChangedEvent,
-    UIA_AutomationPropertyChangedEventId,
-    UIA_StructureChangedEventId, UIA_SelectionItem_ElementSelectedEventId,
-    UIA_SelectionItem_ElementRemovedFromSelectionEventId,};
+use crate::bindings::*;
 use std::sync::{Arc, Mutex, PoisonError};
 use windows_core::Interface;
 use windows_scene::ControlId;
@@ -34,6 +23,7 @@ use windows_scene::ControlId;
 /// What a row reports as the property that changed.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Property {
+    Native(i32),
     /// `RangeValue.Value`, as a double.
     Range,
     /// `Toggle.ToggleState`, as the enumeration's integer.
@@ -54,7 +44,7 @@ pub enum Property {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Raise {
     /// The tree was replaced. One event for the whole change, not one per element.
-    Structure,
+    Structure(ControlId, StructureChangeType),
     Event(ControlId, i32),
     Property(ControlId, Property, Val),
 }
@@ -89,7 +79,7 @@ impl Raise {
     /// change, and the event id where it is a plain event.
     fn key(&self) -> (ControlId, Option<Property>, i32) {
         match *self {
-            Self::Structure => (ControlId::NONE, None, UIA_StructureChangedEventId),
+            Self::Structure(id, _) => (id, None, UIA_StructureChangedEventId),
             Self::Event(id, event) => (id, None, event),
             Self::Property(id, what, _) => (id, Some(what), 0),
         }
@@ -103,6 +93,7 @@ pub enum Val {
     Number(f64),
     Int(i32),
     Bool(bool),
+    Rect([f64; 4]),
     /// UTF-16 already, because that is what the snapshot holds and what a `BSTR` takes.
     Text(Arc<[u16]>),
 }
@@ -114,6 +105,7 @@ impl Val {
             Self::Number(v) => variant::r8(v),
             Self::Int(v) => variant::i4(v),
             Self::Bool(v) => variant::bool(v),
+            Self::Rect(v) => variant::rect_property(&v),
             Self::Text(ref v) => variant::wide(v),
         }
     }
@@ -123,6 +115,7 @@ impl Val {
 fn now(what: Property, tree: &Tree, id: ControlId, at: u16) -> Val {
     let state = tree.state(at);
     match what {
+        Property::Native(property) => native(property, tree, at),
         Property::Range => tree.value(at).map_or(Val::Empty, Val::Number),
         Property::Toggle => Val::Int(i32::from(state.has(State::TOGGLED))),
         Property::Selected => Val::Bool(state.has(State::SELECTED)),
@@ -136,6 +129,7 @@ fn now(what: Property, tree: &Tree, id: ControlId, at: u16) -> Val {
 /// Returns the automation property id `what` is raised under.
 const fn property_id(what: Property) -> i32 {
     match what {
+        Property::Native(property) => property,
         Property::Range => UIA_RangeValueValuePropertyId,
         Property::Toggle => UIA_ToggleToggleStatePropertyId,
         Property::Selected => UIA_SelectionItemIsSelectedPropertyId,
@@ -179,24 +173,16 @@ impl Pending {
                     if let Some(at) = tree.index_of(id) {
                         let selected = tree.state(at).has(State::SELECTED);
                         if selected != was {
-                            let event = if selected { UIA_SelectionItem_ElementSelectedEventId }
-                                else { UIA_SelectionItem_ElementRemovedFromSelectionEventId };
-                            if shared.advised.wanted(event) {
-                                one(&Raise::Event(id, event), shared, tree);
-                            }
+                            let event = if selected {
+                                UIA_SelectionItem_ElementSelectedEventId
+                            } else {
+                                UIA_SelectionItem_ElementRemovedFromSelectionEventId
+                            };
+                            one(&Raise::Event(id, event), shared, tree);
                         }
                     }
                 }
-                // A property change is advised by its own event id, which is the one automation
-                // names when a client subscribes to any of them.
-                let (_, property, event) = raise.key();
-                let event = match property {
-                    Some(_) => UIA_AutomationPropertyChangedEventId,
-                    None => event,
-                };
-                if shared.advised.wanted(event) {
-                    one(&raise, shared, tree);
-                }
+                one(&raise, shared, tree);
             }
         }
         self.0.clear();
@@ -209,26 +195,24 @@ impl Pending {
     }
 }
 
-/// Raises one queued row.
-fn one(raise: &Raise, shared: &Arc<Shared>, tree: &Tree) {
-    let (id, _, event) = raise.key();
+/// Raises one subscribed event against the published tree.
+pub(super) fn one(raise: &Raise, shared: &Arc<Shared>, tree: &Tree) {
+    let (id, property, event) = raise.key();
+    let advised = if property.is_some() {
+        UIA_AutomationPropertyChangedEventId
+    } else {
+        event
+    };
+    if !shared.advised.wanted(advised) {
+        return;
+    }
     let Some(provider) = super::provider::provider_for(shared, id) else {
         return;
     };
     match *raise {
-        // Raised on the fragment root as a bulk change: the table is replaced wholesale, so
-        // there is no per-element diff to describe. A null runtime id of length zero names the
-        // root itself, which is the form a bulk change takes.
-        //
-        // SAFETY: `provider` is a provider object alive for the call, and the null runtime id
-        // is the documented argument for a change that names no one element.
-        Raise::Structure => unsafe {
-            _ = UiaRaiseStructureChangedEvent(
-                provider.as_raw(),
-                StructureChangeType_ChildrenBulkAdded,
-                core::ptr::null_mut(),
-                0,
-            );
+        // SAFETY: bulk and invalidation events identify the provider's children and take no runtime id.
+        Raise::Structure(_, kind) => unsafe {
+            _ = UiaRaiseStructureChangedEvent(provider.as_raw(), kind, core::ptr::null_mut(), 0);
         },
         // SAFETY: `provider` is a provider object alive for the call, and `event` is one of
         // the event id constants the constructors above write.
@@ -239,6 +223,10 @@ fn one(raise: &Raise, shared: &Arc<Shared>, tree: &Tree) {
             let Some(at) = tree.index_of(id) else {
                 return;
             };
+            let value = now(what, tree, id, at);
+            if *was == value {
+                return;
+            }
             // SAFETY: `provider` is alive for the call, both variants carry the type this
             // property is reported as, and each owns whatever allocation it holds until the
             // call returns, which is where they are dropped.
@@ -247,7 +235,7 @@ fn one(raise: &Raise, shared: &Arc<Shared>, tree: &Tree) {
                     provider.as_raw(),
                     property_id(what),
                     was.variant(),
-                    now(what, tree, id, at).variant(),
+                    value.variant(),
                 );
             }
         }
@@ -256,14 +244,8 @@ fn one(raise: &Raise, shared: &Arc<Shared>, tree: &Tree) {
 
 /// What clients have subscribed to, as a count per event id.
 ///
-/// Automation tells a fragment root which events a client is listening for, and a raise for an
-/// event nobody asked for is work that ends in the platform dropping it. Counts rather than a
-/// set, because two clients may advise the same event and the first to leave must not silence
-/// it for the second.
-///
-/// Empty means "nothing has said", which is not the same as "nothing is wanted": a client that
-/// never advises still receives what it asked automation for by other means, so an empty table
-/// admits everything.
+/// Counts explicit subscriptions independently for each event. An event absent from the
+/// table has no subscription information; a zero count suppresses only that event.
 #[derive(Default)]
 pub struct Advised(Mutex<Vec<(i32, u32)>>);
 
@@ -282,9 +264,6 @@ impl Advised {
         let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(at) = held.iter().position(|(id, _)| *id == event) {
             held[at].1 = held[at].1.saturating_sub(1);
-            if held[at].1 == 0 {
-                held.swap_remove(at);
-            }
         }
     }
 
@@ -297,7 +276,9 @@ impl Advised {
     /// Returns whether `event` is worth raising.
     fn wanted(&self, event: i32) -> bool {
         let held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        held.is_empty() || held.iter().any(|&(id, count)| id == event && count > 0)
+        held.iter()
+            .find(|&&(id, _)| id == event)
+            .is_none_or(|&(_, count)| count > 0)
     }
 }
 
@@ -324,4 +305,80 @@ pub fn is_live(tree: &Tree, at: u16) -> bool {
 #[must_use]
 pub fn packed_focus(id: Option<ControlId>) -> u64 {
     id.map_or(u64::MAX, packed)
+}
+
+/// Reads the native property payload from the same published columns as the provider.
+pub(super) fn native(property: i32, tree: &Tree, at: u16) -> Val {
+    let Some(entry) = tree.at(at) else {
+        return Val::Empty;
+    };
+    let enabled = tree.state(at).has(State::ENABLED);
+    let read_only = !(entry.flags.has(ColFlags::FIELD) || entry.flags.has(ColFlags::RANGED))
+        || entry.flags.has(ColFlags::READ_ONLY)
+        || !enabled;
+    match property {
+        UIA_ValueValuePropertyId => tree
+            .choice(at)
+            .map_or(Val::Empty, |(_, name)| Val::Text(name.into())),
+        UIA_NamePropertyId => Val::Text(tree.text(entry.name).into()),
+        UIA_HelpTextPropertyId => Val::Text(tree.help(at).into()),
+        UIA_IsEnabledPropertyId => Val::Bool(enabled),
+        UIA_IsKeyboardFocusablePropertyId => Val::Bool(entry.flags.has(ColFlags::FOCUSABLE)),
+        UIA_IsOffscreenPropertyId => Val::Bool(tree.clipped(at)),
+        UIA_BoundingRectanglePropertyId => Val::Rect(tree.bounds(at)),
+        UIA_ValueIsReadOnlyPropertyId | UIA_RangeValueIsReadOnlyPropertyId => Val::Bool(read_only),
+        UIA_OrientationPropertyId => {
+            Val::Int(tree.range(at).map_or(0, |r| if r.vertical { 2 } else { 1 }))
+        }
+        UIA_RangeValueMinimumPropertyId => {
+            tree.range(at).map_or(Val::Empty, |r| Val::Number(r.min))
+        }
+        UIA_RangeValueMaximumPropertyId => {
+            tree.range(at).map_or(Val::Empty, |r| Val::Number(r.max))
+        }
+        UIA_RangeValueSmallChangePropertyId => tree.range(at).map_or(Val::Empty, |r| {
+            Val::Number(if r.step > 0.0 {
+                r.step
+            } else {
+                (r.max - r.min) * 0.01
+            })
+        }),
+        UIA_RangeValueLargeChangePropertyId => tree
+            .range(at)
+            .map_or(Val::Empty, |r| Val::Number((r.max - r.min) * 0.1)),
+        _ => {
+            let Some((view, offset)) = tree.viewport(at) else {
+                return Val::Empty;
+            };
+            let travel = view.travel();
+            let (extent, content, travel, offset) = match property {
+                UIA_ScrollHorizontalScrollPercentPropertyId
+                | UIA_ScrollHorizontalViewSizePropertyId
+                | UIA_ScrollHorizontallyScrollablePropertyId => {
+                    (view.view.x, view.content.x, travel.x, offset.x)
+                }
+                _ => (view.view.y, view.content.y, travel.y, offset.y),
+            };
+            match property {
+                UIA_ScrollHorizontalScrollPercentPropertyId
+                | UIA_ScrollVerticalScrollPercentPropertyId => {
+                    Val::Number(f64::from(if travel <= 0.0 {
+                        -1.0
+                    } else {
+                        (offset / travel).clamp(0.0, 1.0) * 100.0
+                    }))
+                }
+                UIA_ScrollHorizontalViewSizePropertyId | UIA_ScrollVerticalViewSizePropertyId => {
+                    Val::Number(f64::from(if content <= 0.0 {
+                        100.0
+                    } else {
+                        (extent / content).clamp(0.0, 1.0) * 100.0
+                    }))
+                }
+                UIA_ScrollHorizontallyScrollablePropertyId
+                | UIA_ScrollVerticallyScrollablePropertyId => Val::Bool(travel > 0.0),
+                _ => Val::Empty,
+            }
+        }
+    }
 }

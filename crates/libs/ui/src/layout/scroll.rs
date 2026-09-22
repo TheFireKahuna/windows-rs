@@ -1409,7 +1409,9 @@ impl ScrollTable {
         {
             let column = (field.x0, field.x1);
             // The span to bring into view, stated in the space of the container being asked.
-            let mut target = (field.y0, field.y1);
+            let mut target = reveal.span.map_or((field.y0, field.y1), |(top, bottom)| {
+                (field.y0 + top, field.y0 + bottom)
+            });
             let mut viewport = field.scroll_src;
             while let Some(at) = self.rows.iter().position(|row| row.of.viewport == viewport) {
                 let hover = self.rows[at].of.hover;
@@ -1428,8 +1430,13 @@ impl ScrollTable {
                 // Against the layout's own maximum, not the extended one: the extent a reveal
                 // asks for is stated afresh each time, so one that no longer needs it gives it
                 // back rather than compounding it.
+                let wanted = match reveal.align_top {
+                    Some(true) => (target.0, target.0 + bottom - view.y0),
+                    Some(false) => (target.1 - (bottom - view.y0), target.1),
+                    None => target,
+                };
                 let step = reveal_step(
-                    target,
+                    wanted,
                     (view.y0, view.y1),
                     bottom,
                     offset.y,
@@ -1442,10 +1449,7 @@ impl ScrollTable {
                 // Where the field comes to rest inside this container, stated in the space the
                 // container itself sits in, which is what the next container out is shown.
                 let top = view.y0 + (target.0 - stands);
-                target = (
-                    top.max(view.y0),
-                    (top + (target.1 - target.0)).min(view.y1),
-                );
+                target = (top.max(view.y0), (top + (target.1 - target.0)).min(view.y1));
                 viewport = view.scroll_src;
             }
         }
@@ -1510,9 +1514,12 @@ impl ScrollTable {
         let Some(thumb) = thumb else {
             return Ok(());
         };
-        front
-            .scene
-            .retarget(thumb.0, Prop::OffsetY, track(tracker, geom.affine()), front.back)
+        front.scene.retarget(
+            thumb.0,
+            Prop::OffsetY,
+            track(tracker, geom.affine()),
+            front.back,
+        )
     }
 
     /// Re-applies the extent of every container whose layout restated its geometry.
@@ -1708,7 +1715,9 @@ fn reveal(row: &mut Live, show: bool, front: &mut Front<'_>) -> Result<()> {
     let Some(bind) = reveal_bind(row, show) else {
         return Ok(());
     };
-    front.scene.retarget(thumb.0, Prop::Opacity, bind, front.back)
+    front
+        .scene
+        .retarget(thumb.0, Prop::Opacity, bind, front.back)
 }
 
 /// Decides what a thumb's opacity channel is bound to, recording the edge it crosses.
@@ -1889,7 +1898,10 @@ mod tests {
     fn a_docked_occlusion_lends_the_content_what_it_took_off_the_viewport() {
         let step = reveal_step((940.0, 980.0), (0.0, 400.0), 150.0, 0.0, TRAVEL).unwrap();
         assert_eq!(step.extra, 250.0, "400 - 150");
-        assert_eq!(step.to, 830.0, "980 - 150, and inside the 850 now reachable");
+        assert_eq!(
+            step.to, 830.0,
+            "980 - 150, and inside the 850 now reachable"
+        );
     }
 
     /// The extent is the occlusion's, so the same occlusion asks for the same extent wherever
@@ -1925,7 +1937,10 @@ mod tests {
     fn an_occlusion_covering_the_whole_viewport_still_rests_against_its_top() {
         let step = reveal_step((940.0, 980.0), (0.0, 400.0), -50.0, 0.0, TRAVEL).unwrap();
         assert_eq!(step.extra, 400.0, "the whole viewport is owed");
-        assert_eq!(step.to, 980.0, "the occluded bottom cannot rise above the top");
+        assert_eq!(
+            step.to, 980.0,
+            "the occluded bottom cannot rise above the top"
+        );
     }
 
     #[test]
@@ -2598,7 +2613,10 @@ mod tests {
         assert!(
             matches!(
                 reveal_bind(live, false),
-                Some(Bind::Animate(Anim::Spring { delay_ms: CONCEAL_MS, .. }))
+                Some(Bind::Animate(Anim::Spring {
+                    delay_ms: CONCEAL_MS,
+                    ..
+                }))
             ),
             "a released grab did not leave the thumb on its hold"
         );

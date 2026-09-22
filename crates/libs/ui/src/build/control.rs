@@ -27,13 +27,13 @@ pub struct Scalar;
 /// One handler per gesture and not one per phase: a gesture is a sequence with exactly one
 /// end, and a handler per phase would let a caller register the moves and forget the release.
 ///
-/// Every field is an `Rc`, because running one is application code and must not hold the
-/// host's borrow: the dispatcher clones the handler out before it calls it, and the overlay
-/// layer clones a description or a flyout body out before it builds one.
+/// Callbacks are cloned out of the host borrow before invocation.
 #[derive(Default)]
 pub(crate) struct Handlers {
     pub click: Option<Rc<dyn Fn()>>,
+    pub choice: Option<(u32, String)>,
     pub expand: Option<Rc<dyn Fn(bool)>>,
+    pub select: Option<Rc<dyn Fn(bool)>>,
     pub scalar: Option<Rc<dyn Fn(Gesturing<f64>)>>,
     pub drag: Option<Rc<dyn Fn(Gesturing<DragUpdate>)>>,
     pub commit: Option<Rc<dyn Fn(&str)>>,
@@ -373,7 +373,8 @@ impl<K> Element<'_, K> {
     pub fn on_expand(self, callback: impl Fn(bool) + 'static) -> Self {
         self.handler(HitFlags::INTERACTIVE | HitFlags::GESTURE, |row| {
             row.expand.replace(Rc::new(callback)).map(Retired::new)
-        }).uia_restale()
+        })
+        .uia_restale()
     }
 
     /// States what this element is to automation, where its widget does not already say.
@@ -385,21 +386,59 @@ impl<K> Element<'_, K> {
     }
 
     /// Declares a single-selection container and whether it requires a selection.
+    /// Optional groups must provide [`Self::on_select`] on each selectable item;
+    /// publication rejects a missing handler. Required groups may use [`Self::on_click`].
     pub fn selection(self, required: bool) -> Self {
         self.declare(HitFlags::UIA, |row| {
             row.selection = Some(required);
-            if row.uia == UiaRole::None { row.uia = UiaRole::Group; }
-        }).uia_restale()
+            if row.uia == UiaRole::None {
+                row.uia = UiaRole::Group;
+            }
+        })
+        .uia_restale()
+    }
+
+    /// Publishes the selected choice while the combo's option list is unmounted.
+    /// The key must identify the option and must not equal `u32::MAX`.
+    pub fn selected_choice<M>(mut self, value: impl Signal<(u32, String), M> + 'static) -> Self {
+        let id = self.control_id();
+        self.bind(value, move |host, choice| {
+            assert_ne!(
+                choice.0,
+                u32::MAX,
+                "the selected choice needs an option key"
+            );
+            host.set_handler(id, |row| {
+                row.choice = Some(choice);
+                None
+            });
+            host.uia_stale.set(true);
+        })
+    }
+
+    /// Handles selection and deselection through the owning model.
+    /// The callback must clear this item's selection when passed `false`.
+    pub fn on_select(self, callback: impl Fn(bool) + 'static) -> Self {
+        self.handler(HitFlags::INTERACTIVE | HitFlags::GESTURE, |row| {
+            row.select.replace(Rc::new(callback)).map(Retired::new)
+        })
     }
 
     /// Includes this control in tab navigation while preserving direct focus.
     pub fn tab_stop<M>(mut self, value: impl Signal<bool, M> + 'static) -> Self {
         let id = self.control_id();
         self.bind(value, move |host, stop| {
-            let Some(row) = host.control_mut(id) else { return };
-            if row.tab_stop == Some(stop) { return; }
+            let Some(row) = host.control_mut(id) else {
+                return;
+            };
+            if row.tab_stop == Some(stop) {
+                return;
+            }
             row.tab_stop = Some(stop);
-            host.focus_ops.push(crate::seam::FocusOp::TabIndex(id, if stop { 0 } else { -1 }));
+            host.focus_ops.push(crate::seam::FocusOp::TabIndex(
+                id,
+                if stop { 0 } else { -1 },
+            ));
         })
     }
 
@@ -526,7 +565,9 @@ impl<K> Element<'_, K> {
         body: impl Fn(&mut Ui<'_>) + 'static,
     ) -> Self {
         self.handler(HitFlags::GESTURE | HitFlags::INTERACTIVE, |row| {
-            row.flyout.replace((align, Rc::new(body))).map(|(_, body)| Retired::new(body))
+            row.flyout
+                .replace((align, Rc::new(body)))
+                .map(|(_, body)| Retired::new(body))
         })
     }
 
@@ -614,10 +655,7 @@ impl<K> Element<'_, K> {
             Interaction::Slide(range) => (UiaRole::Slider, GestureDecl::slider(range.vertical)),
             // A marker that the control is turned. The pivot it rotates about is the
             // input thread's, which is the side that holds the contact and the box.
-            Interaction::Turn(_) => (
-                UiaRole::Slider,
-                GestureDecl::knob(),
-            ),
+            Interaction::Turn(_) => (UiaRole::Slider, GestureDecl::knob()),
         };
         if let Some(row) = self.host().control_mut(id) {
             row.front.flags |= bits_of(drive);
@@ -634,16 +672,22 @@ impl<K> Element<'_, K> {
     ) -> Self {
         let id = self.control_id();
         let write = move |host: &mut Host, (range, source): (Option<Range>, ScalarValue)| {
-            if let Some(row) = host.control_mut(id) && let Some(range) = range {
+            if let Some(row) = host.control_mut(id)
+                && let Some(range) = range
+            {
                 let value = row.value.get_or_insert_with(ValueRow::default);
                 let span = range.max - range.min;
                 let vertical = row.front.flags & flag::VERTICAL != 0;
-                let changed = value.min != range.min || value.span != span
-                    || value.step != range.step || vertical != range.vertical;
+                let changed = value.min != range.min
+                    || value.span != span
+                    || value.step != range.step
+                    || vertical != range.vertical;
                 (value.min, value.span, value.step) = (range.min, span, range.step);
                 row.front.flags = (row.front.flags & !flag::VERTICAL)
                     | if range.vertical { flag::VERTICAL } else { 0 };
-                if changed { host.uia_stale.set(true); }
+                if changed {
+                    host.uia_stale.set(true);
+                }
             }
             let fraction = range.map_or(source.value as f32, |range| range.fraction(source.value));
             host.publish_fraction(id, fraction, source.value, source.epoch);
@@ -674,14 +718,22 @@ impl<K> Element<'_, K> {
         self.model_state(value, ModelState::Disabled)
     }
 
+    /// Applies selected chrome to a command without declaring a selection item.
+    pub fn active<M>(self, value: impl Signal<bool, M> + 'static) -> Self {
+        self.model_state(value, ModelState::Selected)
+    }
+
     pub fn selected<M>(mut self, value: impl Signal<bool, M> + 'static) -> Self {
         let node = self.node_id();
         let id = self.control_id();
         self.host().surface_selectable(windows_scene::GroupId(node));
         if let Some(row) = self.host().control_mut(id) {
             row.selectable = true;
-            if row.tab_stop.is_none() && matches!(row.uia, UiaRole::RadioButton | UiaRole::TabItem) {
-                self.host().focus_ops.push(crate::seam::FocusOp::TabIndex(id, -1));
+            if row.tab_stop.is_none() && matches!(row.uia, UiaRole::RadioButton | UiaRole::TabItem)
+            {
+                self.host()
+                    .focus_ops
+                    .push(crate::seam::FocusOp::TabIndex(id, -1));
             }
         }
         self.model_state(value, ModelState::Selected)
@@ -701,7 +753,9 @@ impl<'a, K> Element<'a, K> {
         if range.is_constant() {
             element.bind_scalar(Some(range.read()), value).retype()
         } else {
-            element.bind_scalar(move || Some(range.read()), value).retype()
+            element
+                .bind_scalar(move || Some(range.read()), value)
+                .retype()
         }
     }
 
@@ -843,8 +897,20 @@ mod tests {
 
     #[test]
     fn a_flag_reads_as_the_fraction_its_control_stands_at() {
-        assert_eq!(Flag(true).read(), ScalarValue { value: 1.0, epoch: 1 });
-        assert_eq!(Flag(false).read(), ScalarValue { value: 0.0, epoch: 0 });
+        assert_eq!(
+            Flag(true).read(),
+            ScalarValue {
+                value: 1.0,
+                epoch: 1
+            }
+        );
+        assert_eq!(
+            Flag(false).read(),
+            ScalarValue {
+                value: 0.0,
+                epoch: 0
+            }
+        );
         // Two states, two revisions: a repeated one says the publication is geometry-only
         // and leaves the front thread's own fraction standing.
         assert_ne!(Flag(true).read().epoch, Flag(false).read().epoch);

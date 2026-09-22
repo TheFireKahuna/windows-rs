@@ -171,7 +171,9 @@ pub struct ValueRow {
 
 impl ValueRow {
     fn quantum(&self) -> f32 {
-        crate::widget::Range::new(self.min, self.min + self.span).step(self.step).quantum()
+        crate::widget::Range::new(self.min, self.min + self.span)
+            .step(self.step)
+            .quantum()
     }
 }
 
@@ -207,12 +209,19 @@ impl Intent {
 /// What an [`Intent`] asks of the application.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum What {
+    Closed,
     /// Entry or exit of an explicitly observed hover scope.
     Hovered(bool),
     /// A press and a release on the same control.
     Tapped,
     /// Sets the requested disclosure state.
     Expanded(bool),
+    Selected(crate::uia::action::SelectionChange),
+    TextReveal {
+        revision: u64,
+        start: u32,
+        end: u32,
+    },
     /// A value while it is being moved, and the value it settled on when `commit`.
     Scalar {
         value: f64,
@@ -332,8 +341,9 @@ impl Controls {
         for &(id, mut row) in values {
             let held = self.value(id);
             let source = row.fraction;
-            if self.values.get(id).is_some_and(|v|
-                held.revision == row.revision && (self.grabbed == id || v.source == source)) {
+            if self.values.get(id).is_some_and(|v| {
+                held.revision == row.revision && (self.grabbed == id || v.source == source)
+            }) {
                 row.fraction = held.fraction;
             } else if self.grabbed == id && held.revision != row.revision {
                 self.grabbed = ControlId::NONE;
@@ -467,9 +477,7 @@ impl Controls {
                         self.settle(target, ((value - row.min) / row.span) as f32, front, out)?;
                     }
                 }
-                Action::Invoke(target)
-                | Action::Toggle(target)
-                | Action::Select(target)
+                Action::Invoke(target) | Action::Toggle(target)
                     if self.chrome.get(target).is_some() =>
                 {
                     out.push(Intent {
@@ -478,7 +486,30 @@ impl Controls {
                     });
                 }
                 Action::Expand(target, expanded) if self.chrome.get(target).is_some() => {
-                    out.push(Intent { target, what: What::Expanded(expanded) });
+                    out.push(Intent {
+                        target,
+                        what: What::Expanded(expanded),
+                    });
+                }
+                Action::Select(target, change) if self.chrome.get(target).is_some() => {
+                    out.push(Intent {
+                        target,
+                        what: What::Selected(change),
+                    });
+                }
+                Action::CloseWindow(target) => out.push(Intent {
+                    target,
+                    what: What::Closed,
+                }),
+                Action::RevealText(target, revision, start, end, _) => {
+                    out.push(Intent {
+                        target,
+                        what: What::TextReveal {
+                            revision,
+                            start,
+                            end,
+                        },
+                    });
                 }
                 _ => {}
             }
@@ -589,7 +620,12 @@ impl Controls {
                 ..
             } if self.flags(target) & flag::TURN != 0 => {
                 let row = self.value(target);
-                self.settle(target, row.fraction + steps as f32 * row.quantum(), front, out)?;
+                self.settle(
+                    target,
+                    row.fraction + steps as f32 * row.quantum(),
+                    front,
+                    out,
+                )?;
             }
             Report::Key {
                 target: Some(target),
@@ -718,8 +754,13 @@ impl Controls {
             row.min + (f64::from(to) * row.span / row.step).round() * row.step
         } else {
             row.min + row.span * f64::from(to)
-        }.clamp(row.min, row.min + row.span);
-        let to = if row.span > 0.0 { ((value - row.min) / row.span) as f32 } else { to };
+        }
+        .clamp(row.min, row.min + row.span);
+        let to = if row.span > 0.0 {
+            ((value - row.min) / row.span) as f32
+        } else {
+            to
+        };
         self.drive(id, to, how, front)?;
         out.push(Intent {
             target: id,
@@ -891,7 +932,9 @@ impl Controls {
         } else {
             // The outline's nine-grid needs a nonzero box before its first reveal.
             for (prop, value) in [(Prop::Offset, at), (Prop::Size, size)] {
-                front.scene.retarget(self.ring, prop, Bind::Set(Value::Vec2(value)), front.back)?;
+                front
+                    .scene
+                    .retarget(self.ring, prop, Bind::Set(Value::Vec2(value)), front.back)?;
             }
             self.ring_shown = true;
             front.spring(self.ring, Prop::Opacity, Value::Scalar(1.0))?;

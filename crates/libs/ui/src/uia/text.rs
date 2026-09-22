@@ -1,4 +1,4 @@
-//! `TextPattern`, over the snapshot's own string pool.
+//! Exposes `TextPattern2` over published text, selection and cluster geometry.
 //!
 //! A surface whose text a user reads, selects and copies but never edits publishes this
 //! pattern rather than an edit field: an edit field hands ownership to TSF and raises a touch
@@ -141,12 +141,14 @@ fn body_of(shared: &Arc<Shared>, tree: &Arc<Tree>, id: ControlId) -> Result<Body
         tree: Arc::clone(tree),
         text: field.map_or_else(|| Arc::from(tree.text(entry.name)), |f| Arc::clone(&f.text)),
         editable: field.is_some(),
-        clusters: field.and_then(|f| {
-            f.geometry
-                .as_ref()
-                .filter(|g| g.revision == f.revision)
-                .cloned()
-        }),
+        clusters: field
+            .and_then(|f| {
+                f.geometry
+                    .as_ref()
+                    .filter(|g| g.revision == f.revision)
+                    .cloned()
+            })
+            .or_else(|| tree.text_geometry(at).cloned()),
         span: (0, 0),
     })
 }
@@ -267,13 +269,37 @@ fn fold(text: &[u16], on: bool) -> Vec<u16> {
 vtable! {
     ITextProvider_Impl for Element_Impl {
         fn DocumentRange(&self) -> Result<ITextRangeProvider> { document_range(&self.this) }
-        // One selection per document, which is what an edit field carries.
-        fn SupportedTextSelection(&self) -> Result<SupportedTextSelection> { Ok(SupportedTextSelection_Single) }
+        fn SupportedTextSelection(&self) -> Result<SupportedTextSelection> {
+            let at = self.this.at()?;
+            Ok(if at.tree.field(self.this.id).is_some_and(|field| !field.password) {
+                SupportedTextSelection_Single
+            } else { SupportedTextSelection_None })
+        }
         fn GetSelection(&self) -> Result<*mut SAFEARRAY> { selection_of(&self.this) }
-        fn GetVisibleRanges(&self) -> Result<*mut SAFEARRAY> { Ok(variant::range_array(&[document_range(&self.this)?])) }
+        fn GetVisibleRanges(&self) -> Result<*mut SAFEARRAY> { visible_ranges(&self.this) }
         // Flat text has no children, so no child can name a range in it.
         fn RangeFromChild(&self, _: Ref<IRawElementProviderSimple>) -> Result<ITextRangeProvider> { Err(none()) }
         fn RangeFromPoint(&self, point: &UiaPoint) -> Result<ITextRangeProvider> { range_from_point(&self.this, point) }
+    }
+    ITextProvider2_Impl for Element_Impl {
+        // No element in this text model owns annotations.
+        fn RangeFromAnnotation(&self, _: Ref<IRawElementProviderSimple>) -> Result<ITextRangeProvider> {
+            self.this.at()?;
+            Err(none())
+        }
+        fn GetCaretRange(&self, active: *mut BOOL) -> Result<ITextRangeProvider> {
+            if active.is_null() {
+                return Err(windows_core::Error::from_hresult(windows_core::HRESULT(0x80004003u32 as i32)));
+            }
+            // SAFETY: COM supplies writable storage for the BOOL out-parameter; null is rejected above.
+            unsafe { *active = BOOL::from(false); }
+            let at = self.this.at()?;
+            let field = at.tree.field(self.this.id).filter(|field| !field.password).ok_or_else(none)?;
+            let caret = field.selection.caret.min(field.text.len() as u32);
+            // SAFETY: `active` is the same checked COM out-parameter.
+            unsafe { *active = BOOL::from(at.focused()); }
+            Ok(Range::new(&at.shared, self.this.id, (caret, caret)).into())
+        }
     }
 }
 
@@ -282,6 +308,67 @@ fn document_range(element: &Element) -> Result<ITextRangeProvider> {
     let at = element.at()?;
     let body = body_of(&at.shared, &at.tree, element.id)?;
     Ok(Range::new(&at.shared, element.id, (0, body.text.len() as u32)).into())
+}
+
+/// Returns contiguous logical ranges whose clusters intersect the field and ancestor clips.
+fn visible_ranges(element: &Element) -> Result<*mut SAFEARRAY> {
+    let at = element.at()?;
+    let body = body_of(&at.shared, &at.tree, element.id)?;
+    let own = at.unclipped_box();
+    let mut out = Vec::new();
+    if let Some(geometry) = body.clusters.as_ref() {
+        let view = geometry.viewport;
+        let clip = at.clipped(if body.editable {
+            [
+                own[0] + view.x,
+                own[1] + view.y,
+                own[0] + view.x + view.w,
+                own[1] + view.y + view.h,
+            ]
+        } else {
+            own
+        });
+        let mut span: Option<(u32, u32)> = None;
+        for cluster in geometry.clusters.iter() {
+            let x = own[0] + geometry.origin.x + cluster.rect.x;
+            let y = own[1] + geometry.origin.y + cluster.rect.y;
+            let visible = clip[2] > clip[0]
+                && clip[3] > clip[1]
+                && x < clip[2]
+                && x + cluster.rect.w > clip[0]
+                && y < clip[3]
+                && y + cluster.rect.h > clip[1];
+            if visible {
+                match span {
+                    Some((start, end)) if end >= cluster.start => {
+                        span = Some((start, end.max(cluster.end)))
+                    }
+                    held => {
+                        if let Some(held) = held {
+                            out.push(Range::new(&at.shared, element.id, held).into());
+                        }
+                        span = Some((cluster.start, cluster.end));
+                    }
+                }
+            } else if let Some(held) = span.take() {
+                out.push(Range::new(&at.shared, element.id, held).into());
+            }
+        }
+        if let Some(span) = span {
+            out.push(Range::new(&at.shared, element.id, span).into());
+        }
+    } else if body.editable {
+        return Err(gone());
+    } else {
+        let rect = at.rect();
+        if rect.width > 0.0 && rect.height > 0.0 {
+            out.push(Range::new(&at.shared, element.id, (0, body.text.len() as u32)).into());
+        }
+    }
+    if out.is_empty() {
+        out.push(Range::new(&at.shared, element.id, (0, 0)).into());
+    }
+    Ok(variant::range_array(&out))
 }
 
 /// Returns the element's selection, which a password field publishes no part of.
@@ -297,10 +384,8 @@ fn selection_of(element: &Element) -> Result<*mut SAFEARRAY> {
 
 /// Returns a degenerate range at the offset under `point`.
 ///
-/// Point-to-offset needs cluster geometry, which belongs to the text engine. A static run
-/// publishes none, and a degenerate range at the start is the documented fallback a client
-/// anchors a walk on; an editable document whose geometry is absent or describes an earlier
-/// revision refuses, for the same reason its character walk does.
+/// Uses the published cluster geometry. Static text without geometry returns its start;
+/// an editable document requires geometry matching its text revision.
 fn range_from_point(element: &Element, point: &UiaPoint) -> Result<ITextRangeProvider> {
     let at = element.at()?;
     let body = body_of(&at.shared, &at.tree, element.id)?;
@@ -342,7 +427,7 @@ vtable! {
         // take away.
         fn AddToSelection(&self) -> Result<()> { Err(none()) }
         fn RemoveFromSelection(&self) -> Result<()> { Err(none()) }
-        fn ScrollIntoView(&self, _: BOOL) -> Result<()> { reveal(&self.this) }
+        fn ScrollIntoView(&self, align_top: BOOL) -> Result<()> { reveal(&self.this, align_top.as_bool()) }
         // Flat text has no embedded objects, so an empty array rather than a null one, which
         // is what a client iterating without a length check expects.
         fn GetChildren(&self) -> Result<*mut SAFEARRAY> { Ok(variant::provider_array(&[])) }
@@ -440,7 +525,7 @@ fn rectangles(range: &Range) -> Result<*mut SAFEARRAY> {
         out.extend_from_slice(&[r.left, r.top, r.width, r.height]);
     };
     let mut out = Vec::new();
-    if !body.editable {
+    if body.clusters.is_none() && !body.editable {
         emit(0.0, 0.0, own[2] - own[0], own[3] - own[1], &mut out);
         return Ok(variant::rect_array(&out));
     }
@@ -452,9 +537,16 @@ fn rectangles(range: &Range) -> Result<*mut SAFEARRAY> {
     }
     out.reserve(boxes.len() * 4);
     for box_ in boxes {
-        let left = (box_.x + clusters.origin.x).max(clusters.viewport.x);
-        let right =
-            (box_.x + box_.w + clusters.origin.x).min(clusters.viewport.x + clusters.viewport.w);
+        let view = if body.editable {
+            (
+                clusters.viewport.x,
+                clusters.viewport.x + clusters.viewport.w,
+            )
+        } else {
+            (0.0, own[2] - own[0])
+        };
+        let left = (box_.x + clusters.origin.x).max(view.0);
+        let right = (box_.x + box_.w + clusters.origin.x).min(view.1);
         let top = box_.y + clusters.origin.y;
         emit(left, top, right, top + box_.h, &mut out);
     }
@@ -535,10 +627,28 @@ fn select(range: &Range) -> Result<()> {
     Ok(())
 }
 
-/// Queues bringing the range's element into view.
-fn reveal(range: &Range) -> Result<()> {
-    let shared = range.shared.upgrade().ok_or_else(gone)?;
-    shared.act(Action::Reveal(range.owner));
+/// Queues revealing this range without changing the document's selection.
+fn reveal(range: &Range, align_top: bool) -> Result<()> {
+    let body = range.body()?;
+    if let Some(field) = body.tree.field(range.owner) {
+        if !field.password {
+            body.shared.act(Action::RevealText(
+                range.owner,
+                field.revision,
+                body.span.0,
+                body.span.1,
+                align_top,
+            ));
+        }
+    } else {
+        body.shared.act(Action::RevealText(
+            range.owner,
+            0,
+            body.span.0,
+            body.span.1,
+            align_top,
+        ));
+    }
     Ok(())
 }
 

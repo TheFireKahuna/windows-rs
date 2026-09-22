@@ -468,7 +468,10 @@ impl Spec {
     /// Names the overlay independently of the control that opens it.
     #[must_use]
     pub const fn name(self, name: &'static str) -> Self {
-        Self { name: Some(name), ..self }
+        Self {
+            name: Some(name),
+            ..self
+        }
     }
 
     /// Returns this spec placed by `anchor` instead of the kind's default placement.
@@ -812,9 +815,10 @@ impl Overlays {
         // A declaration that unmounted takes its overlay with it: nothing will ask for the
         // close, and the cell the closed callback would write may be gone with the page.
         let dead = Host::with(|host| {
-            self.open
-                .iter()
-                .position(|open| open.binding_key().is_some_and(|key| !host.tree.is_live(key)))
+            self.open.iter().position(|open| {
+                open.binding_key()
+                    .is_some_and(|key| !host.tree.is_live(key))
+            })
         });
         if let Some(depth) = dead {
             for open in &mut self.open[depth..] {
@@ -1073,6 +1077,17 @@ impl Overlays {
         for intent in intents {
             match intent.what {
                 What::Tapped => self.invoke(intent.target, focus),
+                What::Closed => {
+                    if let Some(depth) = self.open.iter().position(|open| {
+                        Host::with(|host| host.control_of(open.root)) == intent.target
+                            && open.kind == Kind::Popup
+                    }) {
+                        self.truncate(depth, focus);
+                    }
+                }
+                What::Selected(change) if change != crate::uia::action::SelectionChange::Remove => {
+                    self.invoke(intent.target, focus)
+                }
                 What::Expanded(expanded) => {
                     if expanded {
                         if self.opened_by(intent.target).is_none() {
@@ -1105,7 +1120,10 @@ impl Overlays {
             self.open_flyout(target, Spec::flyout(target), focus);
             return;
         }
-        if Host::with(|host| host.control(target).is_some_and(|row| row.uia == crate::widget::UiaRole::CheckBox)) {
+        if Host::with(|host| {
+            host.control(target)
+                .is_some_and(|row| row.uia == crate::widget::UiaRole::CheckBox)
+        }) {
             return;
         }
         // Recorded rather than performed: the flyout's body **owns** the handler this intent
@@ -1149,7 +1167,10 @@ impl Overlays {
         for event in events {
             match *event {
                 SceneEvent::DelayElapsed(delay) => self.elapsed(delay, focus),
-                SceneEvent::AnimationCompleted { node, prop: Prop::Offset } => {
+                SceneEvent::AnimationCompleted {
+                    node,
+                    prop: Prop::Offset,
+                } => {
                     _ = Host::try_with(|host| host.complete_overlay_entry(node));
                 }
                 _ => {}
@@ -1184,7 +1205,13 @@ impl Overlays {
         self.dwell.showing = None;
         self.dwell.settled = None;
         for open in self.open.drain(..).rev() {
-            let Open { mut mount, blocker, root, owner, .. } = open;
+            let Open {
+                mut mount,
+                blocker,
+                root,
+                owner,
+                ..
+            } = open;
             mount.retire(host);
             if let Some(blocker) = blocker {
                 host.release_control(blocker);
@@ -1192,8 +1219,10 @@ impl Overlays {
             host.unplace(root);
             // Dropped after the borrow: the owner disposes every signal the body created, and
             // a payload of one may hold a mount, whose drop reaches for the host again.
-            host.retired.push(crate::build::binding::Retired::new(owner));
-            host.retired.push(crate::build::binding::Retired::new(mount));
+            host.retired
+                .push(crate::build::binding::Retired::new(owner));
+            host.retired
+                .push(crate::build::binding::Retired::new(mount));
         }
     }
 }
@@ -1600,7 +1629,12 @@ mod tests {
             "the trailing edges did not meet"
         );
         assert_eq!(
-            place(menu, target, under.side(Side::Right).align(Align::Center), WINDOW),
+            place(
+                menu,
+                target,
+                under.side(Side::Right).align(Align::Center),
+                WINDOW
+            ),
             size(160.0, 165.0),
             "a horizontal side aligns on y"
         );
@@ -1816,8 +1850,10 @@ mod tests {
         overlays.open(&mut focus, Spec::flyout(anchor), move |ui| {
             let calls = recorded.clone();
             flyout(ui).stack(|ui| {
-                button(ui, "Checked").role(crate::widget::UiaRole::CheckBox)
-                    .selected(true).on_click(move || calls.set(calls.get() + 1));
+                button(ui, "Checked")
+                    .role(crate::widget::UiaRole::CheckBox)
+                    .selected(true)
+                    .on_click(move || calls.set(calls.get() + 1));
                 button(ui, "Done");
             });
         });
@@ -1881,7 +1917,14 @@ mod tests {
         let mut overlays = Overlays::new();
         let mut focus = Vec::new();
         for (open, depth) in [(false, 0), (true, 1), (true, 1), (false, 0), (false, 0)] {
-            overlays.settle(&[], &[Intent { target, what: What::Expanded(open) }], &mut focus);
+            overlays.settle(
+                &[],
+                &[Intent {
+                    target,
+                    what: What::Expanded(open),
+                }],
+                &mut focus,
+            );
             assert_eq!(overlays.depth(), depth);
         }
     }
@@ -2560,7 +2603,10 @@ mod tests {
         );
 
         overlays.scene(
-            &[SceneEvent::AnimationCompleted { node, prop: Prop::Offset }],
+            &[SceneEvent::AnimationCompleted {
+                node,
+                prop: Prop::Offset,
+            }],
             &mut ops.0,
         );
         assert!(
@@ -2593,7 +2639,10 @@ mod tests {
         shown.set(false);
         crate::signal::flush();
         overlays.sync(&mut ops.0);
-        assert!(overlays.is_empty(), "the declaration did not close its popup");
+        assert!(
+            overlays.is_empty(),
+            "the declaration did not close its popup"
+        );
         Host::flush(&mut patch);
         assert!(
             !patch.ops().iter().any(|op| matches!(

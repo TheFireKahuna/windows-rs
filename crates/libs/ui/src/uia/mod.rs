@@ -36,7 +36,7 @@ pub use regions::{PartDecl, RegionPeer};
 pub use roles::Patterns;
 pub use snapshot::{ColFlags, Entry, NONE, Part, ScrollView, Snapshot, State, Tree, derive_keys};
 
-use crate::bindings::{HWND, LPARAM, LRESULT, WPARAM};
+use crate::bindings::*;
 use crate::front::FrontHandle;
 use crate::widget::{Intent, ModelState, UiaRole, What};
 use provider::Shared;
@@ -75,6 +75,7 @@ pub struct Uia {
     /// owns the trackers last listed them. Bound into the tree at the publish, so a client
     /// reads where the content is rather than where it was when the front thread last ticked.
     trackers: Vec<(NodeId, Arc<AtomicU64>)>,
+    positions: Vec<(NodeId, Vector2)>,
 }
 
 impl Default for Uia {
@@ -94,6 +95,7 @@ impl Uia {
             announced: Vec::new(),
             readings: Vec::new(),
             trackers: Vec::new(),
+            positions: Vec::new(),
         }
     }
 
@@ -177,11 +179,14 @@ impl Uia {
                 self.pending.push(Raise::selection_changed(field.id));
             }
         }
+        self.scroll_changed();
         self.moved_properties(snapshot);
         let next = Arc::new(Tree::adopt(snapshot, &self.trackers));
+        next.carry(&self.current);
+        self.property_events(&next);
+        self.structure_events(&next);
         self.overlay_events(&next);
         self.adopt(next);
-        self.pending.push(Raise::Structure);
     }
 
     /// Queues a property change for every number and every model state the publish moves.
@@ -216,6 +221,11 @@ impl Uia {
                 (State::SELECTED, Property::Selected),
                 (State::EXPANDED, Property::Expanded),
             ] {
+                if what == Property::Selected
+                    && !self.current.patterns(was_at).has(Patterns::SELECTION_ITEM)
+                {
+                    continue;
+                }
                 let held = was.has(flag);
                 if held == now.has(flag) {
                     continue;
@@ -229,30 +239,165 @@ impl Uia {
         }
     }
 
-    /// Queues what opened and what closed, by comparing the outgoing tree's overlays with the
-    /// incoming one's.
+    fn property_events(&mut self, next: &Tree) {
+        for (at, entry) in next.entries().iter().enumerate() {
+            let Some(was) = self.current.index_of(entry.id) else {
+                continue;
+            };
+            let at = at as u16;
+            let before_choice = self.current.choice(was);
+            let after_choice = next.choice(at);
+            if before_choice != after_choice {
+                self.pending.push(Raise::Property(
+                    entry.id,
+                    Property::Native(UIA_ValueValuePropertyId),
+                    before_choice.map_or(Val::Empty, |(_, name)| Val::Text(name.into())),
+                ));
+                self.pending
+                    .push(Raise::Event(entry.id, UIA_Selection_InvalidatedEventId));
+            }
+            for property in [UIA_NamePropertyId, UIA_HelpTextPropertyId] {
+                let before = if property == UIA_NamePropertyId {
+                    self.current.text(self.current.at(was).unwrap().name)
+                } else {
+                    self.current.help(was)
+                };
+                let after = if property == UIA_NamePropertyId {
+                    next.text(entry.name)
+                } else {
+                    next.help(at)
+                };
+                if before != after {
+                    self.pending.push(Raise::Property(
+                        entry.id,
+                        Property::Native(property),
+                        Val::Text(before.into()),
+                    ));
+                }
+            }
+            for property in [
+                UIA_IsEnabledPropertyId,
+                UIA_IsKeyboardFocusablePropertyId,
+                UIA_IsOffscreenPropertyId,
+                UIA_BoundingRectanglePropertyId,
+                UIA_OrientationPropertyId,
+                UIA_ValueIsReadOnlyPropertyId,
+                UIA_RangeValueIsReadOnlyPropertyId,
+                UIA_RangeValueMinimumPropertyId,
+                UIA_RangeValueMaximumPropertyId,
+                UIA_RangeValueSmallChangePropertyId,
+                UIA_RangeValueLargeChangePropertyId,
+                UIA_ScrollHorizontalScrollPercentPropertyId,
+                UIA_ScrollVerticalScrollPercentPropertyId,
+                UIA_ScrollHorizontalViewSizePropertyId,
+                UIA_ScrollVerticalViewSizePropertyId,
+                UIA_ScrollHorizontallyScrollablePropertyId,
+                UIA_ScrollVerticallyScrollablePropertyId,
+            ] {
+                let patterns = next.patterns(at);
+                if property == UIA_ValueIsReadOnlyPropertyId && !patterns.has(Patterns::VALUE)
+                    || property == UIA_RangeValueIsReadOnlyPropertyId
+                        && !patterns.has(Patterns::RANGE)
+                {
+                    continue;
+                }
+                let before = events::native(property, &self.current, was);
+                if before != events::native(property, next, at) {
+                    self.pending.push(Raise::Property(
+                        entry.id,
+                        Property::Native(property),
+                        before,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn structure_events(&mut self, next: &Tree) {
+        for parent in std::iter::once(NONE).chain(0..next.entries().len() as u16) {
+            let id = next.at(parent).map_or(ControlId::NONE, |e| e.id);
+            let old = if id.is_none() {
+                NONE
+            } else {
+                let Some(at) = self.current.index_of(id) else {
+                    continue;
+                };
+                at
+            };
+            fn children(tree: &Tree, root: u16) -> impl Iterator<Item = ControlId> + '_ {
+                tree.children(root).map(|at| tree.entries()[at as usize].id)
+            }
+            let chosen = |tree: &Tree, at| {
+                if tree.state(at).has(State::EXPANDED) {
+                    None
+                } else {
+                    tree.choice(at).map(|c| c.0)
+                }
+            };
+            if chosen(&self.current, old) != chosen(next, parent) {
+                self.pending.push(Raise::Structure(
+                    id,
+                    StructureChangeType_ChildrenInvalidated,
+                ));
+                continue;
+            }
+            if children(&self.current, old).eq(children(next, parent)) {
+                continue;
+            }
+            let added = children(next, parent)
+                .any(|id| !children(&self.current, old).any(|held| held == id));
+            let removed = children(&self.current, old)
+                .any(|id| !children(next, parent).any(|held| held == id));
+            let kind = match (added, removed) {
+                (true, false) => StructureChangeType_ChildrenBulkAdded,
+                (false, true) => StructureChangeType_ChildrenBulkRemoved,
+                (false, false) => StructureChangeType_ChildrenReordered,
+                _ => StructureChangeType_ChildrenInvalidated,
+            };
+            self.pending.push(Raise::Structure(id, kind));
+        }
+    }
+
+    /// Reports overlay changes between the published tree and `next`.
     ///
-    /// Derived from the published trees rather than reported by the layer that opens them: a
-    /// menu dismissed by a press outside closes without telling anyone, and what a client is
-    /// owed is exactly the difference between what it could see and what it can see now.
-    ///
-    /// A close is raised on the fragment root, because the element it would otherwise name has
-    /// gone and a provider for it no longer resolves — which is the form the platform's own
-    /// menu controls raise it in.
+    /// Dialog close is raised before adoption while the published ancestry still resolves.
+    /// Open and root-level menu close events are queued for the adopted tree.
     fn overlay_events(&mut self, next: &Tree) {
         let (was, now) = (&self.current, next);
         now.overlays(|id, role| {
             if was.index_of(id).is_some() {
                 return;
             }
+            let dialog = now
+                .index_of(id)
+                .and_then(|at| now.at(at))
+                .is_some_and(|e| e.flags.has(ColFlags::DIALOG));
             self.pending.push(match role {
+                _ if dialog => Raise::Event(id, UIA_Window_WindowOpenedEventId),
                 UiaRole::ToolTip => Raise::tooltip_opened(id),
                 _ => Raise::menu_opened(id),
             });
         });
         let mut closed = false;
         was.overlays(|id, role| {
-            closed |= role != UiaRole::ToolTip && now.index_of(id).is_none();
+            if now.index_of(id).is_some() {
+                return;
+            }
+            if was
+                .index_of(id)
+                .and_then(|at| was.at(at))
+                .is_some_and(|e| e.flags.has(ColFlags::DIALOG))
+            {
+                if events::listening() {
+                    events::one(
+                        &Raise::Event(id, UIA_Window_WindowClosedEventId),
+                        &self.shared,
+                        was,
+                    );
+                }
+            } else {
+                closed |= matches!(role, UiaRole::Menu | UiaRole::List);
+            }
         });
         if closed {
             self.pending.push(Raise::menu_closed(ControlId::NONE));
@@ -266,8 +411,9 @@ impl Uia {
     /// this a resize would report every toggle as reset.
     fn adopt(&mut self, tree: Arc<Tree>) {
         tree.carry(&self.current);
-        self.shared.evict(&tree);
+
         self.shared.tree.write(|held| *held = Arc::clone(&tree));
+        tree.positions(&mut self.positions);
         self.current = tree;
     }
 
@@ -277,6 +423,16 @@ impl Uia {
     /// reports screen pixels. Call on every move, resize and DPI change: a stale origin reports
     /// every control at the wrong place.
     pub fn set_window(&mut self, origin: Vector2, scale: f32) {
+        if self.current.window() == (origin, scale) {
+            return;
+        }
+        for (at, entry) in self.current.entries().iter().enumerate() {
+            self.pending.push(Raise::Property(
+                entry.id,
+                Property::Native(UIA_BoundingRectanglePropertyId),
+                Val::Rect(self.current.bounds(at as u16)),
+            ));
+        }
         self.current.set_window(origin, scale);
     }
 
@@ -294,6 +450,97 @@ impl Uia {
     /// through. Does nothing for a node the published tree scrolls nothing by.
     pub fn set_scroll(&mut self, node: NodeId, offset: Vector2) {
         self.current.set_scroll(node, offset);
+        self.scroll_changed();
+    }
+
+    /// Validates the text revision and resolves a static range's vertical span.
+    pub(crate) fn reveal_span(
+        &self,
+        id: ControlId,
+        revision: u64,
+        start: u32,
+        end: u32,
+    ) -> Option<Option<(f32, f32)>> {
+        let at = self.current.index_of(id)?;
+        if let Some(field) = self.current.field(id) {
+            return (!field.password
+                && field.revision == revision
+                && start <= end
+                && end <= field.text.len() as u32)
+                .then_some(None);
+        }
+        let Some(geometry) = self.current.text_geometry(at) else {
+            return Some(None);
+        };
+        let span = if start == end {
+            let caret = geometry.caret(crate::text_input::Selection::at(start));
+            Some((caret.y, caret.y + caret.h))
+        } else {
+            geometry
+                .clusters
+                .iter()
+                .filter(|c| c.start < end && c.end > start)
+                .map(|c| (c.rect.y, c.rect.y + c.rect.h))
+                .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+        };
+        Some(span)
+    }
+
+    /// Announces tracker movement after an existing compositor notification.
+    pub(crate) fn scroll_changed(&mut self) {
+        if self.positions.is_empty() || !self.current.positions_changed(&self.positions) {
+            return;
+        }
+        for (at, entry) in self.current.entries().iter().enumerate() {
+            let at = at as u16;
+            let before = self.current.bounds_at(at, &self.positions);
+            let after = self.current.bounds(at);
+            if before != after {
+                self.pending.push(Raise::Property(
+                    entry.id,
+                    Property::Native(UIA_BoundingRectanglePropertyId),
+                    Val::Rect(before),
+                ));
+                let was_off = before[2] == 0.0 || before[3] == 0.0;
+                if was_off != (after[2] == 0.0 || after[3] == 0.0) {
+                    self.pending.push(Raise::Property(
+                        entry.id,
+                        Property::Native(UIA_IsOffscreenPropertyId),
+                        Val::Bool(was_off),
+                    ));
+                }
+            }
+            if let Some((view, offset)) = self.current.viewport(at) {
+                let Some((_, was)) = self.positions.iter().find(|(node, _)| *node == view.node)
+                else {
+                    continue;
+                };
+                let travel = view.travel();
+                for (property, old, new, travel) in [
+                    (
+                        UIA_ScrollHorizontalScrollPercentPropertyId,
+                        was.x,
+                        offset.x,
+                        travel.x,
+                    ),
+                    (
+                        UIA_ScrollVerticalScrollPercentPropertyId,
+                        was.y,
+                        offset.y,
+                        travel.y,
+                    ),
+                ] {
+                    if old != new && travel > 0.0 {
+                        self.pending.push(Raise::Property(
+                            entry.id,
+                            Property::Native(property),
+                            Val::Number(f64::from((old / travel).clamp(0.0, 1.0) * 100.0)),
+                        ));
+                    }
+                }
+            }
+        }
+        self.current.positions(&mut self.positions);
     }
 
     /// Records where a control's value now stands, and queues the property change.
@@ -324,16 +571,32 @@ impl Uia {
         if self.current.state(at).has(flag) == on {
             return;
         }
+        if flag == State::ENABLED {
+            for (pattern, property) in [
+                (Patterns::VALUE, UIA_ValueIsReadOnlyPropertyId),
+                (Patterns::RANGE, UIA_RangeValueIsReadOnlyPropertyId),
+            ] {
+                if self.current.patterns(at).has(pattern) {
+                    self.pending.push(Raise::Property(
+                        id,
+                        Property::Native(property),
+                        events::native(property, &self.current, at),
+                    ));
+                }
+            }
+        }
         self.current.set_state(at, flag, on);
         let what = match flag {
             State::TOGGLED => Property::Toggle,
-            State::SELECTED => Property::Selected,
+            State::SELECTED if self.current.patterns(at).has(Patterns::SELECTION_ITEM) => {
+                Property::Selected
+            }
             State::EXPANDED => Property::Expanded,
-            // `IsEnabled` is not one of the properties this stack raises changes for.
+            State::ENABLED => Property::Native(UIA_IsEnabledPropertyId),
             _ => return,
         };
         let from = match what {
-            Property::Selected => Val::Bool(!on),
+            Property::Selected | Property::Native(_) => Val::Bool(!on),
             _ => Val::Int(i32::from(!on)),
         };
         self.pending.push(Raise::Property(id, what, from));
@@ -487,6 +750,7 @@ impl Uia {
         }
         let shared = Arc::clone(&self.shared);
         self.pending.flush(&shared, &self.current);
+        shared.evict(&self.current);
     }
 
     /// Queues a live-region announcement, quantized to [`LIVE_QUANTUM`] and only when the step
@@ -562,7 +826,7 @@ impl Uia {
         &self.shared
     }
 
-    fn root_for_test(&self) -> crate::bindings::IRawElementProviderSimple {
+    fn root_for_test(&self) -> IRawElementProviderSimple {
         provider::provider_for(&self.shared, ControlId::NONE).expect("the root always resolves")
     }
 }

@@ -14,8 +14,7 @@ use std::sync::Arc;
 use windows_numerics::Vector2;
 use windows_present::{Extent, Queue};
 use windows_scene::{
-    Census, ControlId, Env, HitTable, NodeId, RegionId, SceneEvent, SinkPatch, SpriteId,
-    TrackerId,
+    Census, ControlId, Env, HitTable, NodeId, RegionId, SceneEvent, SinkPatch, SpriteId, TrackerId,
 };
 use windows_window::{CaptionState, Event};
 
@@ -594,6 +593,7 @@ row! {
         && !b.regions_changed
         && b.fields.is_empty()
         && b.scope.is_none()
+        && !b.scroll_changed
         && !b.text_geometry_changed
         && b.declared.is_empty()
         && !b.tallies,
@@ -626,6 +626,7 @@ row! {
         /// Whether a tracker moved under a focused field, which is a layout change TSF must
         /// hear about even though no box was re-solved.
         text_geometry_changed: bool,
+        scroll_changed: bool,
         /// Whether the tallies below moved since the last batch, so the observer reads counts
         /// current to the last apply rather than to the last structural change.
         tallies: bool,

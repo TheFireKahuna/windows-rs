@@ -709,7 +709,10 @@ impl IPresentationFactory_Vtbl {
                         pppresentationmanager.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pppresentationmanager.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -974,7 +977,10 @@ impl IPresentationManager_Vtbl {
                         presentationbuffer.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        presentationbuffer.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -997,7 +1003,10 @@ impl IPresentationManager_Vtbl {
                         presentationsurface.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        presentationsurface.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -1183,7 +1192,10 @@ impl IPresentationManager_Vtbl {
                         nextpresentstatistics.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        nextpresentstatistics.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }

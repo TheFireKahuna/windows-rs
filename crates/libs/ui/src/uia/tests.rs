@@ -4,8 +4,8 @@
 //! A query resolves against a published snapshot, so nothing here needs a compositor, a
 //! message pump or a COM apartment.
 
-use super::*;
 use super::snapshot::FieldText;
+use super::*;
 use crate::counting::allocations;
 use crate::widget::{Range, UiaRole};
 use core::sync::atomic::Ordering::Relaxed;
@@ -204,9 +204,7 @@ impl Screen {
     /// Records that the elements in `rows` are clipped by `container` and scroll with `node`.
     pub(super) fn scrolls(&mut self, container: u16, node: NodeId, rows: &[u16]) {
         let row = self.snapshot.scrolls.len() as u16;
-        self.snapshot
-            .scrolls
-            .push(ScrollView::new(node, container));
+        self.snapshot.scrolls.push(ScrollView::new(node, container));
         self.entries[container as usize].flags =
             self.entries[container as usize].flags | HitFlags::SCROLL | HitFlags::CLIP;
         for &at in rows {
@@ -359,7 +357,6 @@ fn a_republish_carries_state_forward_rather_than_resetting_it() {
     let (toggle_id, slider_id) = (screen.control(toggle), screen.control(slider));
     uia.set_state(toggle_id, State::TOGGLED, true);
     uia.set_value(slider_id, -6.0);
-
 
     // A resize: the same controls in different boxes, with one new element ahead of them so
     // their indices move. The rows carry their own ids, so nothing is re-interned by hand.
@@ -697,7 +694,7 @@ fn a_moving_region_changes_its_parts_and_not_the_tree() {
     );
     uia.take_pending_for_test(&mut raised);
     assert!(
-        !raised.contains(&Raise::Structure),
+        !raised.iter().any(|r| matches!(r, Raise::Structure(..))),
         "so no client is told the window was rebuilt"
     );
 }
@@ -789,7 +786,8 @@ fn a_publish_allocates_a_bounded_amount_and_an_idle_window_allocates_none() {
          element; it cost {cost}"
     );
 
-    // A window that is not laid out again publishes nothing at all.
+    // Repeating unchanged window geometry queues nothing.
+    uia.set_window(Vector2 { x: 1.0, y: 2.0 }, 1.0);
     let before = allocations();
     for _ in 0..64 {
         uia.set_window(Vector2 { x: 1.0, y: 2.0 }, 1.0);
@@ -797,13 +795,9 @@ fn a_publish_allocates_a_bounded_amount_and_an_idle_window_allocates_none() {
     assert_eq!(allocations() - before, 0);
 }
 
-/// A text change, a selection change and the structure change they arrived with are raised in
-/// the order a client has to read them in: what the value became, then that its text changed,
-/// then that its selection did, then that the tree was replaced.
-///
-/// The values are read at raise time, so the rows carry only where each came from.
+/// Text and selection changes preserve fragment topology.
 #[test]
-fn a_fields_text_selection_and_structure_events_are_raised_in_that_order() {
+fn a_fields_text_and_selection_changes_do_not_raise_structure_events() {
     let mut uia = listening();
     let mut screen = Screen::new();
     let field = screen.field(NONE, (0.0, 0.0, 120.0, 24.0), "ab", 8.0);
@@ -824,7 +818,6 @@ fn a_fields_text_selection_and_structure_events_are_raised_in_that_order() {
             Raise::Property(id, Property::Text, Val::Text(utf16("ab").into())),
             Raise::text_changed(id),
             Raise::selection_changed(id),
-            Raise::Structure,
         ]
     );
 }
@@ -846,7 +839,7 @@ fn a_password_field_raises_no_text_or_selection_event() {
     screen.publish(&mut uia);
 
     uia.take_pending_for_test(&mut raised);
-    assert_eq!(raised, vec![Raise::Structure]);
+    assert!(raised.is_empty());
 }
 
 /// A control's number is what the publish states, not what the tree before it announced.
@@ -883,8 +876,14 @@ fn a_pattern_with_no_data_behind_it_is_not_advertised() {
     screen.publish(&mut uia);
 
     let patterns = uia.tree().patterns(graph);
-    assert!(!patterns.has(Patterns::RANGE), "a graph with no bounds offered RangeValue");
-    assert!(!patterns.has(Patterns::VALUE), "a graph with no number offered Value");
+    assert!(
+        !patterns.has(Patterns::RANGE),
+        "a graph with no bounds offered RangeValue"
+    );
+    assert!(
+        !patterns.has(Patterns::VALUE),
+        "a graph with no number offered Value"
+    );
     assert!(uia.tree().patterns(slider).has(Patterns::RANGE));
     assert!(uia.tree().patterns(slider).has(Patterns::VALUE));
 }
@@ -904,9 +903,14 @@ fn every_element_is_addressable() {
     let key = |at: u16| String::from_utf16_lossy(tree.key(at));
     assert_eq!(key(card), "gain");
     assert_eq!(key(inside), "gain.expand");
-    assert_eq!(key(other), "gain#2", "two groups with one name were not told apart");
     assert_eq!(
-        key(twin), "gain.expand#2",
+        key(other),
+        "gain#2",
+        "two groups with one name were not told apart"
+    );
+    assert_eq!(
+        key(twin),
+        "gain.expand#2",
         "a control's id must not depend on which of two identical cards it sits in being first"
     );
 }
@@ -929,7 +933,11 @@ fn a_container_reports_what_it_scrolls() {
     assert!(tree.patterns(viewport).has(Patterns::SCROLL));
     let (view, offset) = tree.viewport(viewport).expect("the container is a row");
     assert_eq!(view.travel().y, 300.0);
-    assert_eq!(view.travel().x, 0.0, "an axis with no overflow does not travel");
+    assert_eq!(
+        view.travel().x,
+        0.0,
+        "an axis with no overflow does not travel"
+    );
     assert_eq!(offset.y, 0.0);
 
     tree.set_scroll(NodeId::FIRST, Vector2 { x: 0.0, y: 150.0 });
@@ -1000,26 +1008,178 @@ fn an_overlay_opening_and_closing_is_raised() {
     );
 }
 
-/// An event nobody advised is not raised, and an empty table admits everything.
+/// Missing subscription information does not suppress an event.
 ///
 /// Two clients advising one event and one of them leaving must not silence it for the other,
 /// which is why the table counts rather than holds a set.
 #[test]
-fn an_event_nobody_advised_is_not_raised() {
+fn only_an_explicitly_unsubscribed_event_is_suppressed() {
     let advised = events::Advised::default();
-    assert!(advised.wanted_for_test(1), "an empty table admitted nothing");
+    assert!(
+        advised.wanted_for_test(1),
+        "an empty table admitted nothing"
+    );
 
     advised.added(1);
     assert!(advised.wanted_for_test(1));
-    assert!(!advised.wanted_for_test(2), "an event nobody asked for was raised");
+    assert!(
+        advised.wanted_for_test(2),
+        "an unknown subscription was treated as absent"
+    );
 
     advised.added(1);
     advised.removed(1);
-    assert!(advised.wanted_for_test(1), "one client leaving silenced the other");
+    assert!(
+        advised.wanted_for_test(1),
+        "one client leaving silenced the other"
+    );
     advised.removed(1);
-    assert!(advised.wanted_for_test(2), "a table emptied again admitted nothing");
+    assert!(!advised.wanted_for_test(1));
+    assert!(advised.wanted_for_test(2));
 }
 
 fn utf16(text: &str) -> Vec<u16> {
     text.encode_utf16().collect()
+}
+
+#[test]
+fn structural_events_distinguish_add_remove_reorder_and_ignore_property_changes() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let parent = screen.add(NONE, (0.0, 0.0, 100.0, 100.0), UiaRole::Group, "Group");
+    let first = screen.add(parent, (0.0, 0.0, 100.0, 24.0), UiaRole::Button, "First");
+    screen.publish(&mut uia);
+    let mut events = Vec::new();
+    uia.take_pending_for_test(&mut events);
+    events.clear();
+    let second = screen.add(parent, (0.0, 24.0, 100.0, 48.0), UiaRole::Button, "Second");
+    screen.publish(&mut uia);
+    uia.take_pending_for_test(&mut events);
+    assert_eq!(
+        events,
+        vec![Raise::Structure(
+            screen.control(parent),
+            StructureChangeType_ChildrenBulkAdded
+        )]
+    );
+    events.clear();
+    screen
+        .snapshot
+        .entries
+        .swap(first as usize, second as usize);
+    screen.publish(&mut uia);
+    uia.take_pending_for_test(&mut events);
+    assert_eq!(
+        events,
+        vec![Raise::Structure(
+            screen.control(parent),
+            StructureChangeType_ChildrenReordered
+        )]
+    );
+    events.clear();
+    screen.snapshot.entries.pop();
+    screen.publish(&mut uia);
+    uia.take_pending_for_test(&mut events);
+    assert_eq!(
+        events,
+        vec![Raise::Structure(
+            screen.control(parent),
+            StructureChangeType_ChildrenBulkRemoved
+        )]
+    );
+    events.clear();
+    screen.snapshot.entries[1].name = screen.snapshot.intern("Renamed");
+    screen.snapshot.entries[1].box_[2] = 80.0;
+    screen.snapshot.state[1] = State::default();
+    screen.publish(&mut uia);
+    uia.take_pending_for_test(&mut events);
+    let id = screen.control(second);
+    assert!(events.contains(&Raise::Property(
+        id,
+        Property::Native(UIA_NamePropertyId),
+        Val::Text(utf16("Second").into())
+    )));
+    assert!(events.contains(&Raise::Property(
+        id,
+        Property::Native(UIA_IsEnabledPropertyId),
+        Val::Bool(true)
+    )));
+    assert!(events.contains(&Raise::Property(
+        id,
+        Property::Native(UIA_BoundingRectanglePropertyId),
+        Val::Rect([0.0, 24.0, 100.0, 24.0])
+    )));
+    assert!(!events.iter().any(|e| matches!(e, Raise::Structure(..))));
+    events.clear();
+    screen.publish(&mut uia);
+    uia.take_pending_for_test(&mut events);
+    assert!(events.is_empty());
+}
+
+#[test]
+fn dialogs_queue_open_but_not_retired_close_or_menu_events() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let dialog = screen.add(NONE, (0.0, 0.0, 100.0, 100.0), UiaRole::Group, "Inspector");
+    screen.snapshot.entries[dialog as usize].flags = ColFlags::OVERLAY | ColFlags::DIALOG;
+    screen.publish(&mut uia);
+    let mut events = Vec::new();
+    uia.take_pending_for_test(&mut events);
+    assert!(events.contains(&Raise::Event(
+        screen.control(dialog),
+        UIA_Window_WindowOpenedEventId
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Raise::Event(_, UIA_MenuOpenedEventId)))
+    );
+    events.clear();
+    screen.snapshot.entries.clear();
+    screen.publish(&mut uia);
+    uia.take_pending_for_test(&mut events);
+    assert!(!events.contains(&Raise::Event(
+        screen.control(dialog),
+        UIA_Window_WindowClosedEventId
+    )));
+    assert!(uia.current.index_of(screen.control(dialog)).is_none());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Raise::Event(_, UIA_MenuClosedEventId)))
+    );
+}
+
+#[test]
+fn tracker_notifications_report_scroll_percent_bounds_and_offscreen_without_structure() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let group = screen.add(NONE, (0.0, 0.0, 100.0, 50.0), UiaRole::Group, "Scroll");
+    let child = screen.add(group, (0.0, 100.0, 100.0, 124.0), UiaRole::Button, "Below");
+    let mut nodes = windows_scene::Ids::<{ windows_scene::NODE }>::default();
+    let node = nodes.mint();
+    screen.scrolls(group, node, &[child]);
+    screen.snapshot.scrolls[0].view = Vector2 { x: 100.0, y: 50.0 };
+    screen.snapshot.scrolls[0].content = Vector2 { x: 100.0, y: 150.0 };
+    screen.publish(&mut uia);
+    let mut events = Vec::new();
+    uia.take_pending_for_test(&mut events);
+    events.clear();
+    uia.set_scroll(node, Vector2 { x: 0.0, y: 100.0 });
+    uia.take_pending_for_test(&mut events);
+    assert!(events.contains(&Raise::Property(
+        screen.control(group),
+        Property::Native(UIA_ScrollVerticalScrollPercentPropertyId),
+        Val::Number(0.0)
+    )));
+    assert!(events.contains(&Raise::Property(
+        screen.control(child),
+        Property::Native(UIA_IsOffscreenPropertyId),
+        Val::Bool(true)
+    )));
+    assert!(!events.iter().any(|e| matches!(e, Raise::Structure(..))));
+    events.clear();
+    uia.scroll_changed();
+    uia.take_pending_for_test(&mut events);
+    assert!(events.is_empty());
 }

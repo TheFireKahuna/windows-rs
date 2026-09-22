@@ -18,10 +18,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use windows_numerics::Vector2;
 use windows_scene::{
-    Anim, Attach, Axes, Bind, CONTROL, Cap, ControlId, DELAY, DashId, DelayId, Easing, Env,
-    Exit, GEOM, GeomId, GroupId, Halo, HitDecl, Id, Ids, Ink, Iterations, Join, Mask,
-    NodeId, NodeKind, Op, Paint, PathVerb, Prop, RAMP, RampId, RegionId, ResOp, RunId, SinkPatch,
-    Slots, Span, Spread, SpriteId, StrokeStyle, TRACKER, TrackerId, TrackerOp, Value,
+    Anim, Attach, Axes, Bind, CONTROL, Cap, ControlId, DELAY, DashId, DelayId, Easing, Env, Exit,
+    GEOM, GeomId, GroupId, Halo, HitDecl, Id, Ids, Ink, Iterations, Join, Mask, NodeId, NodeKind,
+    Op, Paint, PathVerb, Prop, RAMP, RampId, RegionId, ResOp, RunId, SinkPatch, Slots, Span,
+    Spread, SpriteId, StrokeStyle, TRACKER, TrackerId, TrackerOp, Value,
 };
 
 // ── the rows beside the tree ────────────────────────────────────────────────────────
@@ -68,7 +68,14 @@ pub(crate) struct Entrance {
 
 impl Entrance {
     pub(crate) fn new(node: NodeId, slide: crate::overlay::Slide, window: Vector2) -> Self {
-        Self { node, slide, window, rect: None, started: false, done: false }
+        Self {
+            node,
+            slide,
+            window,
+            rect: None,
+            started: false,
+            done: false,
+        }
     }
 }
 
@@ -103,7 +110,10 @@ impl Default for Side {
             probe: None,
             origin: None,
             pivot: None,
-            centre: Vector2 { x: f32::NAN, y: f32::NAN },
+            centre: Vector2 {
+                x: f32::NAN,
+                y: f32::NAN,
+            },
             visual: Visual::Unplaced,
             geometry: tree::NONE,
             scroll: tree::NONE,
@@ -352,7 +362,8 @@ impl Host {
     }
 
     pub fn installed() -> bool {
-        HOST.try_with(|slot| slot.borrow().is_some()).unwrap_or(false)
+        HOST.try_with(|slot| slot.borrow().is_some())
+            .unwrap_or(false)
     }
 
     /// The window's client extent in DIPs, written only from window resize input.
@@ -456,7 +467,12 @@ impl Host {
         // A fresh slot's pair is zero and the link marked only the parent, so a node given no
         // setter of its own would be measured from that zero.
         self.tree.mark(id);
-        self.pending.push(Op::New { id, kind, parent: Attach::Node(parent), after });
+        self.pending.push(Op::New {
+            id,
+            kind,
+            parent: Attach::Node(parent),
+            after,
+        });
         id
     }
 
@@ -494,10 +510,14 @@ impl Host {
         let named = name.map(std::borrow::Cow::Borrowed).or_else(|| {
             let row = self.control(invoker?)?;
             row.name.clone().or_else(|| {
-                self.text.str_of(row.text?).map(|text| std::borrow::Cow::Owned(text.to_owned()))
+                self.text
+                    .str_of(row.text?)
+                    .map(|text| std::borrow::Cow::Owned(text.to_owned()))
             })
         });
-        let combo = invoker.and_then(|id| self.control(id)).is_some_and(|row| row.uia == crate::widget::UiaRole::ComboBox);
+        let combo = invoker
+            .and_then(|id| self.control(id))
+            .is_some_and(|row| row.uia == crate::widget::UiaRole::ComboBox);
         let id = self.mint_control(ControlRow::blank(root, scope));
         self.tree.c.control[root.index()] = id;
         if let Some(row) = self.control_mut(id) {
@@ -527,7 +547,11 @@ impl Host {
     pub(crate) fn visual_rect(&mut self, id: SpriteId, offset: Vector2, size: Vector2) {
         self.side_mut(id.0).visual = Visual::Rect(offset, size);
         if self.tree.c.flags[id.0.index()] & tree::HIDDEN == 0 {
-            self.tree.c.geom[id.0.index()] = Geom { local: offset, size, ..Geom::default() };
+            self.tree.c.geom[id.0.index()] = Geom {
+                local: offset,
+                size,
+                ..Geom::default()
+            };
             self.tree.touch(id.0);
         }
         self.tree.mark(id.0);
@@ -540,7 +564,11 @@ impl Host {
 
     pub(crate) fn place(&mut self, id: NodeId, parent: GroupId, after: Option<NodeId>) {
         self.tree.link(id, parent.0, after);
-        self.pending.push(Op::Move { id, parent: Attach::Node(parent.0), after });
+        self.pending.push(Op::Move {
+            id,
+            parent: Attach::Node(parent.0),
+            after,
+        });
     }
 
     /// Destroys a subtree, handing the scene the box and the clip chain its ghost is mounted
@@ -555,7 +583,10 @@ impl Host {
         self.pending.push(Op::Drop {
             id,
             exit,
-            origin: Vector2 { x: origin.x0, y: origin.y0 },
+            origin: Vector2 {
+                x: origin.x0,
+                y: origin.y0,
+            },
             bounds,
         });
     }
@@ -663,10 +694,18 @@ impl Host {
         } else {
             let id: DashId = self.mint_res();
             let runs = self.pending.push_floats(dashes);
-            self.pending.push(Op::Res { id: id.erased(), op: ResOp::Dash { runs } });
+            self.pending.push(Op::Res {
+                id: id.erased(),
+                op: ResOp::Dash { runs },
+            });
             id
         };
-        StrokeStyle { width, cap, join, dash }
+        StrokeStyle {
+            width,
+            cap,
+            join,
+            dash,
+        }
     }
 
     pub(crate) fn frames(&mut self, frames: &[(f32, Value, Easing)]) -> Span {
@@ -687,7 +726,10 @@ impl Host {
 
     pub(crate) fn set_geometry(&mut self, id: GeomId, verbs: &[PathVerb]) {
         let verbs = self.pending.push_verbs(verbs);
-        self.pending.push(Op::Res { id: id.erased(), op: ResOp::Geom { verbs } });
+        self.pending.push(Op::Res {
+            id: id.erased(),
+            op: ResOp::Geom { verbs },
+        });
     }
 
     pub(crate) fn ramp(&mut self, stops: &[super::Stop], spread: Spread) -> RampId {
@@ -703,10 +745,19 @@ impl Host {
         self.scratch_stops.clear();
         self.scratch_stops.extend(stops.iter().map(|stop| {
             let light = crate::role::resolve(stop.role, scope);
-            (windows_scene::quant_stop(stop.at), light.with_alpha(light.a * stop.strength))
+            (
+                windows_scene::quant_stop(stop.at),
+                light.with_alpha(light.a * stop.strength),
+            )
         }));
         let span = self.pending.push_stops(&self.scratch_stops);
-        self.pending.push(Op::Res { id: id.erased(), op: ResOp::Ramp { stops: span, spread } });
+        self.pending.push(Op::Res {
+            id: id.erased(),
+            op: ResOp::Ramp {
+                stops: span,
+                spread,
+            },
+        });
         self.ramps.place(id, (stops.to_vec(), spread));
     }
 
@@ -715,7 +766,9 @@ impl Host {
     pub(crate) fn relight_ramps(&mut self) {
         let ids: Vec<RampId> = self.ramps.iter().map(|(id, _)| id).collect();
         for id in ids {
-            let Some((stops, spread)) = self.ramps.get(id) else { continue };
+            let Some((stops, spread)) = self.ramps.get(id) else {
+                continue;
+            };
             let (stops, spread) = (stops.clone(), *spread);
             self.set_ramp(id, &stops, spread);
         }
@@ -728,18 +781,28 @@ impl Host {
     }
 
     pub(crate) fn set_run(&mut self, id: RunId, segs: Span, ink: Ink) {
-        self.pending.push(Op::Res { id: id.erased(), op: ResOp::Run { segs, ink } });
+        self.pending.push(Op::Res {
+            id: id.erased(),
+            op: ResOp::Run { segs, ink },
+        });
     }
 
     pub(crate) fn region(&mut self) -> RegionId {
         let id: RegionId = self.mint_res();
-        self.pending.push(Op::Res { id: id.erased(), op: ResOp::Region });
+        self.pending.push(Op::Res {
+            id: id.erased(),
+            op: ResOp::Region,
+        });
         id
     }
 
     pub(crate) fn release<const F: u8>(&mut self, id: Id<F>) {
-        self.res_ids.release(Id::raw(id.index() as u32, id.generation()));
-        self.pending.push(Op::Res { id: id.erased(), op: ResOp::Drop });
+        self.res_ids
+            .release(Id::raw(id.index() as u32, id.generation()));
+        self.pending.push(Op::Res {
+            id: id.erased(),
+            op: ResOp::Drop,
+        });
     }
 
     /// Starts a timed reveal, reported back as `SceneEvent::DelayElapsed`. The wait is a
@@ -766,19 +829,28 @@ impl Host {
     pub(crate) fn create_tracker<O>(&mut self, id: TrackerId<O>, viewport: GroupId, axes: Axes) {
         self.pending.push(Op::Tracker {
             id: id.erased(),
-            op: TrackerOp::Create { viewport, axes, owned: true },
+            op: TrackerOp::Create {
+                viewport,
+                axes,
+                owned: true,
+            },
         });
     }
 
     pub(crate) fn tracker_bounds<O>(&mut self, id: TrackerId<O>, min: Vector2, max: Vector2) {
-        self.pending
-            .push(Op::Tracker { id: id.erased(), op: TrackerOp::Bounds { min, max } });
+        self.pending.push(Op::Tracker {
+            id: id.erased(),
+            op: TrackerOp::Bounds { min, max },
+        });
     }
 
     pub(crate) fn drop_tracker<O>(&mut self, id: TrackerId<O>) {
         let erased = id.erased();
         self.tracker_ids.release(erased.id());
-        self.pending.push(Op::Tracker { id: erased, op: TrackerOp::Drop });
+        self.pending.push(Op::Tracker {
+            id: erased,
+            op: TrackerOp::Drop,
+        });
     }
 
     // ── side rows ───────────────────────────────────────────────────────────────────
@@ -786,7 +858,10 @@ impl Host {
     fn side_mut(&mut self, node: NodeId) -> &mut Side {
         let head = self.tree.c.side[node.index()];
         let at = if head == tree::NONE {
-            let at = self.sides.place(Side { node, ..Side::default() });
+            let at = self.sides.place(Side {
+                node,
+                ..Side::default()
+            });
             self.tree.c.side[node.index()] = at;
             at
         } else {
@@ -855,11 +930,17 @@ impl Host {
     pub(crate) fn overlay_viewport(&self, insets: Option<[Len; 4]>) -> Rect {
         let window = self.window.get();
         let Some([left, top, right, bottom]) = insets else {
-            return Rect { x0: 0.0, y0: 0.0, x1: window.x, y1: window.y };
+            return Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: window.x,
+                y1: window.y,
+            };
         };
         let (class, scope) = (self.tree.class(self.root), self.root_scope());
         let dip = |len: Len, basis: f32| {
-            len.resolve(&self.metrics, class, scope, basis, self.env.scale()).unwrap_or(0.0)
+            len.resolve(&self.metrics, class, scope, basis, self.env.scale())
+                .unwrap_or(0.0)
         };
         let (x0, y0) = (dip(left, window.x), dip(top, window.y));
         Rect {
@@ -920,7 +1001,9 @@ impl Host {
     /// Queues the id for the next fill, which is what bounds the front table; a stale report
     /// there is already a miss through the generational id.
     pub(crate) fn release_control(&mut self, id: ControlId) {
-        let Some(row) = self.controls.take(id) else { return };
+        let Some(row) = self.controls.take(id) else {
+            return;
+        };
         self.control_ids.release(id);
         self.handlers.vacate(row.handlers, &mut self.retired);
         self.fields.take(id);
@@ -945,7 +1028,9 @@ impl Host {
     /// Recorded whether or not there is anything to repaint: a control with no chrome row
     /// still has an automation peer that reports checked, selected or unavailable.
     pub(crate) fn set_state(&mut self, id: ControlId, state: ModelState, on: bool) {
-        let Some(row) = self.control_mut(id) else { return };
+        let Some(row) = self.control_mut(id) else {
+            return;
+        };
         let held = match state {
             ModelState::Selected => &mut row.selected,
             ModelState::Disabled => &mut row.disabled,
@@ -964,10 +1049,15 @@ impl Host {
         };
         let repaint = row.state != next;
         row.state = next;
-        if state == ModelState::Selected && row.tab_stop.is_none()
-            && matches!(row.uia, crate::widget::UiaRole::RadioButton | crate::widget::UiaRole::TabItem)
+        if state == ModelState::Selected
+            && row.tab_stop.is_none()
+            && matches!(
+                row.uia,
+                crate::widget::UiaRole::RadioButton | crate::widget::UiaRole::TabItem
+            )
         {
-            self.focus_ops.push(crate::seam::FocusOp::TabIndex(id, if on { 0 } else { -1 }));
+            self.focus_ops
+                .push(crate::seam::FocusOp::TabIndex(id, if on { 0 } else { -1 }));
         }
         self.uia_stale.set(true);
         if repaint {
@@ -978,22 +1068,38 @@ impl Host {
     /// Runs `edit` on the automation peer of the region `id` names, adding a row on first use.
     ///
     /// One row per region and a handful of regions per screen, so the lookup is a scan.
-    pub(crate) fn region_peer(&mut self, id: ControlId, edit: impl FnOnce(&mut crate::uia::RegionPeer)) {
-        let at = self.peers.iter().position(|peer| peer.id == id).unwrap_or_else(|| {
-            self.peers.push(crate::uia::RegionPeer {
-                id,
-                geometry: std::sync::Arc::new(windows_present::RegionParts::new()),
-                parts: Vec::new(),
-                values: None,
-                value: None,
+    pub(crate) fn region_peer(
+        &mut self,
+        id: ControlId,
+        edit: impl FnOnce(&mut crate::uia::RegionPeer),
+    ) {
+        let at = self
+            .peers
+            .iter()
+            .position(|peer| peer.id == id)
+            .unwrap_or_else(|| {
+                self.peers.push(crate::uia::RegionPeer {
+                    id,
+                    geometry: std::sync::Arc::new(windows_present::RegionParts::new()),
+                    parts: Vec::new(),
+                    values: None,
+                    value: None,
+                });
+                self.peers.len() - 1
             });
-            self.peers.len() - 1
-        });
         edit(&mut self.peers[at]);
     }
 
-    pub(crate) fn publish_fraction(&mut self, id: ControlId, fraction: f32, number: f64, epoch: u64) {
-        let Some(row) = self.control_mut(id) else { return };
+    pub(crate) fn publish_fraction(
+        &mut self,
+        id: ControlId,
+        fraction: f32,
+        number: f64,
+        epoch: u64,
+    ) {
+        let Some(row) = self.control_mut(id) else {
+            return;
+        };
         row.number = Some(number);
         let value = row.value.get_or_insert_with(ValueRow::default);
         value.fraction = fraction;
@@ -1014,29 +1120,41 @@ impl Host {
     /// it is application code and must not hold the borrow.
     pub fn dispatch(intents: &[Intent]) {
         for intent in intents {
-            let Some(call) = Self::with(|h| h.handler_for(intent)) else { continue };
+            let Some(call) = Self::with(|h| h.handler_for(intent)) else {
+                continue;
+            };
             call();
+            if matches!(intent.what, What::Selected(_)) {
+                crate::signal::flush();
+            }
         }
     }
 
     /// Finds the adjacent enabled radio or tab in its owning selection group.
     pub(crate) fn choice_neighbor(&self, target: ControlId, key: u16) -> Option<ControlId> {
         use crate::widget::UiaRole;
-        if !matches!(key, 0x23..=0x28) { return None; }
+        if !matches!(key, 0x23..=0x28) {
+            return None;
+        }
         let row = self.control(target)?;
         if !matches!(row.uia, UiaRole::RadioButton | UiaRole::TabItem) || row.disabled {
             return None;
         }
         let mut owner = self.tree.parent(row.node);
         while !owner.is_none() {
-            if self.control(self.tree.c.control[owner.index()]).is_some_and(|row| {
-                row.selection.is_some() || matches!(row.uia, UiaRole::List | UiaRole::Tab)
-            }) {
+            if self
+                .control(self.tree.c.control[owner.index()])
+                .is_some_and(|row| {
+                    row.selection.is_some() || matches!(row.uia, UiaRole::List | UiaRole::Tab)
+                })
+            {
                 break;
             }
             owner = self.tree.parent(owner);
         }
-        if owner.is_none() { return None; }
+        if owner.is_none() {
+            return None;
+        }
         let (mut first, mut last, mut before, mut after) = (None, None, None, None);
         let mut found = false;
         self.visit_choices(owner, row.uia, &mut |id| {
@@ -1058,16 +1176,28 @@ impl Host {
         }
     }
 
-    fn visit_choices(&self, node: NodeId, role: crate::widget::UiaRole, visit: &mut impl FnMut(ControlId)) {
+    fn visit_choices(
+        &self,
+        node: NodeId,
+        role: crate::widget::UiaRole,
+        visit: &mut impl FnMut(ControlId),
+    ) {
         for child in self.tree.children(node) {
-            if self.tree.c.flags[child.index()] & (tree::HIDDEN | tree::SUSPENDED | tree::SUNK) != 0 { continue; }
+            if self.tree.c.flags[child.index()] & (tree::HIDDEN | tree::SUSPENDED | tree::SUNK) != 0
+            {
+                continue;
+            }
             let id = self.tree.c.control[child.index()];
             if let Some(row) = self.control(id) {
                 if row.uia == role {
-                    if !row.disabled { visit(id); }
+                    if !row.disabled {
+                        visit(id);
+                    }
                     continue;
                 }
-                if row.selection.is_some() { continue; }
+                if row.selection.is_some() {
+                    continue;
+                }
             }
             self.visit_choices(child, role, visit);
         }
@@ -1077,6 +1207,15 @@ impl Host {
         let row = self.control(intent.target)?;
         let handlers = self.handlers.get(row.handlers);
         match intent.what {
+            What::Closed => None,
+            What::TextReveal {
+                revision,
+                start,
+                end,
+            } => {
+                self.field_reveal(intent.target, revision, start, end);
+                None
+            }
             // A hover has no handler: it writes the cell the control observes with, and the
             // graph runs whatever reads it on the next pass.
             What::Hovered(on) => {
@@ -1089,6 +1228,8 @@ impl Host {
                 let handlers = handlers?;
                 if let Some(call) = handlers.click.clone() {
                     Some(Box::new(move || call()))
+                } else if let Some(call) = handlers.select.clone() {
+                    Some(Box::new(move || call(true)))
                 } else {
                     let call = handlers.expand.clone()?;
                     let expanded = !row.expanded;
@@ -1099,10 +1240,54 @@ impl Host {
                 let call = handlers?.expand.clone()?;
                 Some(Box::new(move || call(expanded)))
             }
+            What::Selected(change) => {
+                use crate::uia::action::SelectionChange;
+                use crate::widget::UiaRole;
+                let selected = change != SelectionChange::Remove;
+                if row.disabled || row.selected == selected {
+                    return None;
+                }
+                let mut owner = self.tree.parent(row.node);
+                while !owner.is_none() {
+                    if let Some(group) = self.control(self.tree.c.control[owner.index()]) {
+                        if let Some(required) = group.selection.or_else(|| {
+                            matches!(group.uia, UiaRole::ComboBox | UiaRole::List | UiaRole::Tab)
+                                .then_some(true)
+                        }) {
+                            if !selected && required {
+                                return None;
+                            }
+                            if change == SelectionChange::Add {
+                                let mut occupied = false;
+                                self.visit_choices(owner, row.uia, &mut |id| {
+                                    occupied |= self.control(id).is_some_and(|row| row.selected);
+                                });
+                                if occupied {
+                                    return None;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    owner = self.tree.parent(owner);
+                }
+                let handlers = handlers?;
+                if let Some(call) = handlers.select.clone() {
+                    Some(Box::new(move || call(selected)))
+                } else if selected {
+                    let call = handlers.click.clone()?;
+                    Some(Box::new(move || call()))
+                } else {
+                    None
+                }
+            }
             What::Scalar { value, commit, .. } => {
                 let call = handlers?.scalar.clone()?;
-                let gesturing =
-                    if commit { Gesturing::Committed(value) } else { Gesturing::Moved(value) };
+                let gesturing = if commit {
+                    Gesturing::Committed(value)
+                } else {
+                    Gesturing::Moved(value)
+                };
                 Some(Box::new(move || call(gesturing)))
             }
             What::Canceled(_) => {
@@ -1124,7 +1309,9 @@ impl Host {
             // handler a committed value does, carrying the part's index.
             What::Part(part) => {
                 let call = handlers?.scalar.clone()?;
-                Some(Box::new(move || call(Gesturing::Committed(f64::from(part.0)))))
+                Some(Box::new(move || {
+                    call(Gesturing::Committed(f64::from(part.0)))
+                }))
             }
         }
     }
@@ -1179,7 +1366,9 @@ impl Host {
     }
 
     fn retire_side(&mut self, at: u32) {
-        let Some(side) = self.sides.free(at) else { return };
+        let Some(side) = self.sides.free(at) else {
+            return;
+        };
         if let Some(escape) = side.escape {
             self.retired.push(Retired::new(escape));
         }
@@ -1193,7 +1382,8 @@ impl Host {
             // surface handle behind the brush this side is painting with, so the unmount that
             // closes it must be asked for before the claim on the sink goes.
             if let Some(row) = self.regions.free(side.region) {
-                self.region_ops.push(crate::seam::RegionOp::Drop { sink: row.sink });
+                self.region_ops
+                    .push(crate::seam::RegionOp::Drop { sink: row.sink });
                 self.release(row.sink);
             }
         }
@@ -1202,14 +1392,16 @@ impl Host {
             // that named it, and so is the rail's control: a mount can disappear before its
             // first solve, so a deferred creation is retired too.
             if let Some(row) = self.scrolls.free(side.scroll) {
-                self.scroll_ops
-                    .push(crate::seam::ScrollOp::Drop { viewport: row.front.viewport });
+                self.scroll_ops.push(crate::seam::ScrollOp::Drop {
+                    viewport: row.front.viewport,
+                });
                 self.drop_tracker(row.front.tracker);
                 self.release_control(row.front.grab);
             }
         }
         if side.surface != tree::NONE {
-            self.appearances.release_surface(side.surface, &mut self.pending);
+            self.appearances
+                .release_surface(side.surface, &mut self.pending);
         }
     }
 
@@ -1310,7 +1502,9 @@ impl Host {
     /// Gives every derived sprite its own box and touches it for the encode.
     fn publish_visuals(&mut self) {
         for at in 0..self.sides.slots() {
-            let Some(side) = self.sides.get(at) else { continue };
+            let Some(side) = self.sides.get(at) else {
+                continue;
+            };
             let (node, visual) = (side.node, side.visual);
             let hidden = self.tree.c.flags[node.index()] & (tree::HIDDEN | tree::SUNK) != 0;
             let geom = match visual {
@@ -1318,7 +1512,11 @@ impl Host {
                 // Hidden is no box, by its own bit or an ancestor's: the walks never see a
                 // derived sprite, so this is where it stops taking pixels.
                 _ if hidden => Geom::default(),
-                Visual::Rect(local, size) => Geom { local, size, ..Geom::default() },
+                Visual::Rect(local, size) => Geom {
+                    local,
+                    size,
+                    ..Geom::default()
+                },
                 Visual::Insets([l, t, r, b]) => {
                     let owner = self.tree.parent(node);
                     let box_ = self.tree.c.geom[owner.index()].size;
@@ -1343,11 +1541,16 @@ impl Host {
         match to {
             crate::overlay::AnchorTo::Control(id) => {
                 let node = self.control(id)?.node;
-                self.tree.is_live(node).then(|| self.tree.c.geom[node.index()].rect)
+                self.tree
+                    .is_live(node)
+                    .then(|| self.tree.c.geom[node.index()].rect)
             }
-            crate::overlay::AnchorTo::Point(at) => {
-                Some(Rect { x0: at.x, y0: at.y, x1: at.x, y1: at.y })
-            }
+            crate::overlay::AnchorTo::Point(at) => Some(Rect {
+                x0: at.x,
+                y0: at.y,
+                x1: at.x,
+                y1: at.y,
+            }),
             crate::overlay::AnchorTo::Window => Some(viewport),
         }
     }
@@ -1390,9 +1593,13 @@ impl Host {
     /// different moments.
     fn publish_probes(&mut self) {
         for at in 0..self.sides.slots() {
-            let Some(side) = self.sides.get(at) else { continue };
+            let Some(side) = self.sides.get(at) else {
+                continue;
+            };
             let (node, probe) = (side.node, side.probe);
-            let Some(probe) = probe.filter(|probe| probe.cell().alive()) else { continue };
+            let Some(probe) = probe.filter(|probe| probe.cell().alive()) else {
+                continue;
+            };
             let geom = self.tree.c.geom[node.index()];
             probe.cell().set(Placed {
                 rect: geom.rect,
@@ -1411,12 +1618,16 @@ impl Host {
         let tree = &self.tree;
         self.anchors.retain(|a| tree.is_live(a.node));
         for at in 0..self.sides.slots() {
-            let Some(side) = self.sides.get(at) else { continue };
+            let Some(side) = self.sides.get(at) else {
+                continue;
+            };
             let Some(set) = side.origin else { continue };
             let origin = self.tree.c.geom[side.node.index()];
             // At the class the origin was solved in, so a reader converting a box to metric
             // units divides by the number the solve multiplied by.
-            let scope = self.scope_of(side.node).at_width(self.tree.class(side.node));
+            let scope = self
+                .scope_of(side.node)
+                .at_width(self.tree.class(side.node));
             let (tree, anchors) = (&self.tree, &self.anchors);
             let boxes = || {
                 anchors
@@ -1459,10 +1670,17 @@ impl Host {
     /// its property: writing it would snap the part back to where the application last wrote
     /// it, mid-gesture.
     fn publish_values(&mut self) {
-        let Self { controls, tree, values, .. } = self;
+        let Self {
+            controls,
+            tree,
+            values,
+            ..
+        } = self;
         for (id, row) in controls.iter_mut() {
             let (node, flags) = (row.node, row.front.flags);
-            let Some(value) = row.value.as_mut() else { continue };
+            let Some(value) = row.value.as_mut() else {
+                continue;
+            };
             // The axis the value runs along is the control's own, not the part's: every part
             // of one control reads the same travel.
             let vertical = flags & crate::widget::flag::VERTICAL != 0;
@@ -1494,7 +1712,9 @@ impl Host {
     fn publish_overlay_entries(&mut self) {
         let window = self.window.get();
         for at in 0..self.overlays.len() {
-            let Some(entry) = self.overlays[at].entry else { continue };
+            let Some(entry) = self.overlays[at].entry else {
+                continue;
+            };
             if entry.done {
                 continue;
             }
@@ -1505,7 +1725,10 @@ impl Host {
             let replaced = entry.window != window || entry.rect.is_some_and(|r| r != geom.rect);
             if replaced {
                 self.bind(entry.node, Prop::Offset, Bind::Set(Value::Vec2(geom.local)));
-                self.overlays[at].entry = Some(Entrance { done: true, ..entry });
+                self.overlays[at].entry = Some(Entrance {
+                    done: true,
+                    ..entry
+                });
                 self.suspend_input(entry.node, false);
             } else if !entry.started {
                 let from = entry.slide.from(geom.local, geom.size);
@@ -1519,8 +1742,11 @@ impl Host {
                     iterations: Iterations::Count(1),
                 };
                 self.bind(entry.node, Prop::Offset, Bind::Animate(anim));
-                self.overlays[at].entry =
-                    Some(Entrance { rect: Some(geom.rect), started: true, ..entry });
+                self.overlays[at].entry = Some(Entrance {
+                    rect: Some(geom.rect),
+                    started: true,
+                    ..entry
+                });
             }
         }
     }
@@ -1531,11 +1757,16 @@ impl Host {
     /// a completion for a channel this row never animated moves nothing.
     pub(crate) fn complete_overlay_entry(&mut self, node: NodeId) {
         for at in 0..self.overlays.len() {
-            let Some(entry) = self.overlays[at].entry else { continue };
+            let Some(entry) = self.overlays[at].entry else {
+                continue;
+            };
             if entry.node != node || !entry.started || entry.done {
                 continue;
             }
-            self.overlays[at].entry = Some(Entrance { done: true, ..entry });
+            self.overlays[at].entry = Some(Entrance {
+                done: true,
+                ..entry
+            });
             self.suspend_input(node, false);
         }
     }
@@ -1543,11 +1774,16 @@ impl Host {
     /// Writes the centre of every node that stated one as a fraction of its own box.
     fn publish_pivots(&mut self) {
         for at in 0..self.sides.slots() {
-            let Some(side) = self.sides.get(at) else { continue };
+            let Some(side) = self.sides.get(at) else {
+                continue;
+            };
             let (node, pivot) = (side.node, side.pivot);
             let Some(pivot) = pivot else { continue };
             let size = self.tree.c.geom[node.index()].size;
-            let centre = Vector2 { x: size.x * pivot.x, y: size.y * pivot.y };
+            let centre = Vector2 {
+                x: size.x * pivot.x,
+                y: size.y * pivot.y,
+            };
             // Bitwise, so the unsent `NaN` never compares equal and a real centre always does.
             let sent = side.centre;
             if (centre.x.to_bits(), centre.y.to_bits()) == (sent.x.to_bits(), sent.y.to_bits()) {
@@ -1588,8 +1824,20 @@ impl Host {
             scratch_text,
             ..
         } = self;
-        let walk = hits::Walk { tree, controls, text, handlers, fields, overlays };
-        let mut out = hits::Out { hits, patch: pending, uia, scratch: scratch_text };
+        let walk = hits::Walk {
+            tree,
+            controls,
+            text,
+            handlers,
+            fields,
+            overlays,
+        };
+        let mut out = hits::Out {
+            hits,
+            patch: pending,
+            uia,
+            scratch: scratch_text,
+        };
         hits::begin(&mut out);
         hits::walk(&walk, &mut out, root, 0);
         for placement in overlays.iter() {
@@ -1672,7 +1920,9 @@ impl Host {
             down.chrome.retain(|&(id, _)| live(id));
             down.values.retain(|&(id, _)| live(id));
             down.declared.gestures.retain(|&(id, _)| live(id));
-            down.declared.focus.retain(|op| !matches!(op, crate::seam::FocusOp::TabIndex(id, _) if !live(*id)));
+            down.declared
+                .focus
+                .retain(|op| !matches!(op, crate::seam::FocusOp::TabIndex(id, _) if !live(*id)));
             down.fields.sources.retain(|row| live(row.id));
             down.fields.layouts.retain(|row| live(row.id));
             down.fields.commits.retain(|row| live(row.id));
@@ -1691,7 +1941,6 @@ impl Host {
     pub fn uia_published(&self) {
         self.uia_stale.set(false);
     }
-
 }
 
 /// Fails to compile if the host ever gains a way to be sent. Only `Host` holds a `SinkPatch`,

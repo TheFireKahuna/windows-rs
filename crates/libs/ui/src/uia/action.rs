@@ -13,18 +13,28 @@ use crate::text_input::Selection;
 use std::sync::{Mutex, PoisonError};
 use windows_scene::ControlId;
 
+/// Distinguishes replacement, additive selection and explicit deselection.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SelectionChange {
+    Select,
+    Add,
+    Remove,
+}
+
 /// One queued request. `Copy`: every variant is an id and a scalar.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Action {
     Invoke(ControlId),
     Toggle(ControlId),
-    Select(ControlId),
+    Select(ControlId, SelectionChange),
     Expand(ControlId, bool),
     SetValue(ControlId, f64),
     Focus(ControlId),
+    CloseWindow(ControlId),
     /// Brings the element into view. Named by control and resolved by the front thread
     /// against the scroll ancestry the hit array already carries.
     Reveal(ControlId),
+    RevealText(ControlId, u64, u32, u32, bool),
     /// Moves one scroll container's content to an absolute offset in DIPs. Named by the
     /// container's own control, which is the element the scroll pattern hangs on.
     ScrollTo(ControlId, f32, f32),
@@ -56,9 +66,9 @@ impl Supersedes for Action {
             (self, queued),
             (Self::SetValue(id, _), Self::SetValue(held, _)) if id == held)
             || matches!(
-            (self, queued),
-            (Self::ScrollTo(id, ..), Self::ScrollTo(held, ..)) if id == held
-        )
+                (self, queued),
+                (Self::ScrollTo(id, ..), Self::ScrollTo(held, ..)) if id == held
+            )
     }
 }
 

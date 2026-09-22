@@ -21,8 +21,8 @@ use windows_numerics::Vector2;
 use windows_scene::{ControlId, Env, HitFlags, NodeId};
 use windows_window::{CaptionState, Handoff, Tick as Frame, Wake, Window};
 
-use crate::input::{Doorbell, HitView, Report, Router, client_origin};
 use super::reentry::Reentry;
+use crate::input::{Doorbell, HitView, Report, Router, client_origin};
 use crate::present::Picks;
 use crate::role::Scope;
 use crate::seam::{AppCensus, FocusOp, InputDown, Row, SceneTally, ToScene};
@@ -229,6 +229,8 @@ impl Tick {
             self.to_scene.reveals.push(Reveal {
                 id: text.focused(),
                 occlusion: text.touch.docked,
+                align_top: None,
+                span: None,
             });
         }
         if self.from_pump.settings.replace(false) {
@@ -311,6 +313,9 @@ impl Tick {
         if let Some(scope) = down.scope {
             self.scope = scope;
         }
+        if down.scroll_changed {
+            self.from_pump.uia.borrow_mut().scroll_changed();
+        }
         if down.text_geometry_changed {
             self.from_pump.text.tsf.layout_changed();
         }
@@ -386,7 +391,26 @@ impl Tick {
                     self.to_scene.reveals.push(Reveal {
                         id: Some(id),
                         occlusion,
+                        align_top: None,
+                        span: None,
                     });
+                }
+                uia::Action::RevealText(id, revision, start, end, align_top) => {
+                    let Some(span) = self
+                        .from_pump
+                        .uia
+                        .borrow()
+                        .reveal_span(id, revision, start, end)
+                    else {
+                        continue;
+                    };
+                    self.to_scene.reveals.push(Reveal {
+                        id: Some(id),
+                        occlusion: None,
+                        align_top: Some(align_top),
+                        span,
+                    });
+                    self.to_scene.automation.push(action);
                 }
                 action => self.to_scene.automation.push(action),
             }
@@ -399,6 +423,9 @@ impl Tick {
             .uia
             .borrow()
             .text_actions(&mut self.text_actions);
+        if self.text_actions.is_empty() {
+            return;
+        }
         for action in self.text_actions.drain(..) {
             let target = match &action {
                 uia::action::TextAction::Replace(id, ..)
@@ -412,6 +439,8 @@ impl Tick {
                 self.from_pump.text.automation(action);
             }
         }
+        // Editor commands run after the text-service flush; publish their updates in this tick.
+        self.from_pump.text.flush(&mut self.to_scene.fields.updates);
     }
 
     /// Publishes what the provider answers positional and scroll queries from.

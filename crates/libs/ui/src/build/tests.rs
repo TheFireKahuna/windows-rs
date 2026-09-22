@@ -53,7 +53,9 @@ use crate::layout::{Align, Len, Preset, scroll};
 use crate::role::{Fill, Metric, Role};
 use crate::signal::Cell;
 use crate::uia::{ColFlags, State};
-use crate::widget::{Intent, Range, UiaRole, What, box_, button, caption, knob, label, micro, text};
+use crate::widget::{
+    Intent, Range, UiaRole, What, box_, button, caption, knob, label, micro, text,
+};
 use windows_numerics::Vector2;
 use windows_scene::{Anim, Bind, ContactKind, ControlId, NodeId, Op, Prop, Value};
 
@@ -61,7 +63,11 @@ pub(crate) use super::rig::fixture;
 
 /// A node of a stated size, which is the fixture most claims below need.
 fn boxed(ui: &mut Ui<'_>, w: f32, h: f32) -> NodeId {
-    ui.node(Preset::Layer).width(Len::dip(w)).height(Len::dip(h)).id().into()
+    ui.node(Preset::Layer)
+        .width(Len::dip(w))
+        .height(Len::dip(h))
+        .id()
+        .into()
 }
 
 /// The centre of `node`'s solved box, which is where a contact reaches it.
@@ -89,18 +95,20 @@ fn a_flush_hands_over_what_moved_and_a_settled_tree_hands_over_nothing() {
 #[test]
 fn a_patch_is_stamped_with_the_environment_it_was_solved_under() {
     let mut coarse = Rig::at(800.0, 600.0, 1.0);
-    let stamped = coarse.mount(|ui| {
-        boxed(ui, 100.0, 40.0);
-    })
-    .patch()
-    .env;
+    let stamped = coarse
+        .mount(|ui| {
+            boxed(ui, 100.0, 40.0);
+        })
+        .patch()
+        .env;
     drop(coarse);
     let mut fine = Rig::at(800.0, 600.0, 2.0);
-    let other = fine.mount(|ui| {
-        boxed(ui, 100.0, 40.0);
-    })
-    .patch()
-    .env;
+    let other = fine
+        .mount(|ui| {
+            boxed(ui, 100.0, 40.0);
+        })
+        .patch()
+        .env;
     assert!(stamped.is_some() && other.is_some());
     assert_ne!(stamped, other, "two scales stamped the same environment");
 }
@@ -150,7 +158,10 @@ fn a_plate_declared_before_the_body_stays_beneath_the_bodys_first_child() {
     let (plated, child): (NodeId, NodeId) = (plated.unwrap(), child.unwrap());
     let order: Vec<NodeId> = Host::with(|h| h.tree.children(plated).collect());
     assert_eq!(order.len(), 2, "one plate and one child: {order:?}");
-    assert_eq!(order[1], child, "the body's first child sat beneath the plate");
+    assert_eq!(
+        order[1], child,
+        "the body's first child sat beneath the plate"
+    );
 }
 
 #[test]
@@ -221,7 +232,11 @@ fn two_adjacent_branches_keep_their_order_across_being_empty() {
             .into_iter()
             .filter_map(|(name, on)| on.then_some(name))
             .collect();
-        assert_eq!(rig.set(second, b).runs(), want, "the branches swapped order");
+        assert_eq!(
+            rig.set(second, b).runs(),
+            want,
+            "the branches swapped order"
+        );
     }
 }
 
@@ -241,7 +256,11 @@ fn a_keyed_list_moves_survivors_rather_than_reminting_them() {
     rig.flush();
     let before = Host::with(|h| h.live_nodes());
     let frame = rig.set(keys, [3, 1, 2]);
-    assert_eq!(Host::with(|h| h.live_nodes()), before, "a survivor was reminted");
+    assert_eq!(
+        Host::with(|h| h.live_nodes()),
+        before,
+        "a survivor was reminted"
+    );
     assert_eq!(frame.ops(Kind::New), 0, "a reorder minted a visual");
     assert!(frame.ops(Kind::Move) > 0, "a reorder moved nothing");
 }
@@ -259,7 +278,11 @@ fn a_constant_writes_the_record_and_installs_no_writer() {
     rig.mount(|ui| {
         ui.node(Preset::Layer).opacity(0.25);
     });
-    assert_eq!(crate::signal::live_nodes(), before, "a constant installed a graph node");
+    assert_eq!(
+        crate::signal::live_nodes(),
+        before,
+        "a constant installed a graph node"
+    );
 }
 
 #[test]
@@ -296,7 +319,10 @@ fn repeating_a_singleton_handler_replaces_it() {
     });
     let control: NodeId = control.unwrap();
     let target = Host::with(|h| h.control_of(control));
-    Host::dispatch(&[Intent { target, what: What::Tapped }]);
+    Host::dispatch(&[Intent {
+        target,
+        what: What::Tapped,
+    }]);
     assert_eq!(count.get(), 10, "the displaced handler still ran");
 }
 
@@ -306,7 +332,13 @@ fn a_geometry_channel_snaps_and_a_chrome_channel_springs() {
     let alpha = Cell::new(0.5f32);
     let mut node = None;
     rig.mount(|ui| {
-        node = Some(ui.node(Preset::Layer).width(Len::dip(40.0)).opacity(alpha).id().into());
+        node = Some(
+            ui.node(Preset::Layer)
+                .width(Len::dip(40.0))
+                .opacity(alpha)
+                .id()
+                .into(),
+        );
     });
     let node: NodeId = node.unwrap();
     // The first write of any channel snaps, so the spring is what the second one carries.
@@ -338,8 +370,16 @@ fn retiring_a_subtree_is_one_op_and_reclaims_every_id() {
             }
         });
     });
-    assert_eq!(rig.unmount().ops(Kind::Drop), 1, "a subtree cost more than one op");
-    assert_eq!(Host::with(|h| h.live_nodes()), before, "an id was not reclaimed");
+    assert_eq!(
+        rig.unmount().ops(Kind::Drop),
+        1,
+        "a subtree cost more than one op"
+    );
+    assert_eq!(
+        Host::with(|h| h.live_nodes()),
+        before,
+        "an id was not reclaimed"
+    );
 }
 
 #[test]
@@ -378,7 +418,11 @@ fn a_box_that_moved_is_published_and_one_that_did_not_is_not() {
     let frame = rig.set(width, 140.0);
     let now = Host::with(|h| h.geom(sized).size);
     assert_eq!(frame.bound(sized, Prop::Size), Some(Value::Vec2(now)));
-    assert_eq!(frame.bound(fixed, Prop::Size), None, "an unmoved box restated its size");
+    assert_eq!(
+        frame.bound(fixed, Prop::Size),
+        None,
+        "an unmoved box restated its size"
+    );
 }
 
 /// A clip is restated from the box the solve published, so the last one on the wire is the
@@ -414,7 +458,11 @@ fn a_field_clips_to_its_own_box_and_follows_it() {
         b: size.y,
         radius: windows_scene::Corners::default(),
     };
-    assert_eq!(last_clip(frame.patch(), field), Some(expected(size)), "a field was clipped away");
+    assert_eq!(
+        last_clip(frame.patch(), field),
+        Some(expected(size)),
+        "a field was clipped away"
+    );
     let frame = rig.set(width, 200.0);
     let size = Host::with(|h| h.geom(field).size);
     assert_eq!(size.x, 200.0);
@@ -442,7 +490,10 @@ fn a_node_carried_by_its_parent_restates_no_offset_of_its_own() {
     });
     let (parent, child): (NodeId, NodeId) = (parent.unwrap(), child.unwrap());
     let frame = rig.set(gap, 25.0);
-    assert!(frame.bound(parent, Prop::Offset).is_some(), "the parent did not move");
+    assert!(
+        frame.bound(parent, Prop::Offset).is_some(),
+        "the parent did not move"
+    );
     assert_eq!(
         frame.bound(child, Prop::Offset),
         None,
@@ -531,7 +582,10 @@ fn a_scroll_rail_declares_a_control_and_no_handler_row() {
         .height(Len::times(Metric::RowH, 6.0));
     });
     Host::with(|h| {
-        assert!(h.controls.iter().count() > 0, "the rail declared no control");
+        assert!(
+            h.controls.iter().count() > 0,
+            "the rail declared no control"
+        );
         assert_eq!(h.handlers.placed(), 0, "the rail placed a handler row");
     });
 }
@@ -546,7 +600,10 @@ fn a_control_is_named_by_the_text_its_subtree_laid_out() {
     });
     let row = frame.uia("Apply").expect("the button published no element");
     assert_eq!(row.role, UiaRole::Button);
-    assert!(row.flags.has(ColFlags::FOCUSABLE), "a button is not focusable");
+    assert!(
+        row.flags.has(ColFlags::FOCUSABLE),
+        "a button is not focusable"
+    );
 }
 
 #[test]
@@ -561,7 +618,11 @@ fn an_element_with_no_role_is_skipped_and_its_children_reparent_past_it() {
         .name("outer");
     });
     let outer = frame.uia("outer").expect("the group published no element");
-    assert_eq!(outer.children, ["inner"], "a bare container took a row of its own");
+    assert_eq!(
+        outer.children,
+        ["inner"],
+        "a bare container took a row of its own"
+    );
 }
 
 #[test]
@@ -575,7 +636,10 @@ fn a_disabled_control_keeps_its_entry_and_states_that_it_is_disabled() {
         .set(off, true)
         .uia("Apply")
         .expect("a disabled control lost its element");
-    assert!(!row.state.has(State::ENABLED), "a disabled control reported enabled");
+    assert!(
+        !row.state.has(State::ENABLED),
+        "a disabled control reported enabled"
+    );
 }
 
 #[test]
@@ -585,7 +649,9 @@ fn selection_and_disabled_bindings_preserve_each_other() {
         let selected = Cell::new(true);
         let disabled = Cell::new(false);
         let mut frame = rig.mount(|ui| {
-            let item = button(ui, "Channel").name("Channel").role(UiaRole::CheckBox);
+            let item = button(ui, "Channel")
+                .name("Channel")
+                .role(UiaRole::CheckBox);
             if disabled_first {
                 item.disabled(disabled).selected(selected);
             } else {
@@ -629,11 +695,16 @@ fn a_disclosure_dispatches_the_requested_state() {
     let expanded = Cell::new(false);
     let mut target = ControlId::NONE;
     rig.mount(|ui| {
-        target = button(ui, "Details").expanded(expanded)
-            .on_expand(move |open| expanded.set(open)).control_id();
+        target = button(ui, "Details")
+            .expanded(expanded)
+            .on_expand(move |open| expanded.set(open))
+            .control_id();
     });
     for open in [false, true, true, false, false] {
-        Host::dispatch(&[Intent { target, what: What::Expanded(open) }]);
+        Host::dispatch(&[Intent {
+            target,
+            what: What::Expanded(open),
+        }]);
         let row = rig.set(expanded, open).uia("Details").unwrap();
         assert!(row.flags.has(ColFlags::EXPANDS));
         assert_eq!(row.state.has(State::EXPANDED), open);
@@ -646,11 +717,19 @@ fn numeric_binding_preserves_drag_and_publishes_dynamic_bounds() {
     let bounds = Cell::new(12.0);
     let mut target = ControlId::NONE;
     rig.mount(|ui| {
-        target = ui.node(Preset::Layer).name("Band")
+        target = ui
+            .node(Preset::Layer)
+            .name("Band")
             .on_drag(crate::gesture::DragDecl::default(), |_| {})
-            .range_value(move || Range::new(-bounds.get(), bounds.get()).step(0.1),
-                crate::widget::ScalarValue { value: 2.0, epoch: 0 })
-            .on_gesture(|_| {}).control_id();
+            .range_value(
+                move || Range::new(-bounds.get(), bounds.get()).step(0.1),
+                crate::widget::ScalarValue {
+                    value: 2.0,
+                    epoch: 0,
+                },
+            )
+            .on_gesture(|_| {})
+            .control_id();
     });
     let row = rig.set(bounds, 24.0).uia("Band").unwrap();
     assert_eq!(row.range.unwrap(), Range::new(-24.0, 24.0).step(0.1));
@@ -667,14 +746,20 @@ fn choice_navigation_crosses_layout_wrappers_and_skips_disabled_items() {
     let mut rig = Rig::new();
     let mut ids = [ControlId::NONE; 3];
     rig.mount(|ui| {
-        ui.node(Preset::Stack).role(UiaRole::Tab).selection(true).children(|ui| {
-            for (at, id) in ids.iter_mut().enumerate() {
-                ui.node(Preset::Row).children(|ui| {
-                    *id = button(ui, "Page").role(UiaRole::TabItem)
-                        .selected(at == 0).disabled(at == 1).control_id();
-                });
-            }
-        });
+        ui.node(Preset::Stack)
+            .role(UiaRole::Tab)
+            .selection(true)
+            .children(|ui| {
+                for (at, id) in ids.iter_mut().enumerate() {
+                    ui.node(Preset::Row).children(|ui| {
+                        *id = button(ui, "Page")
+                            .role(UiaRole::TabItem)
+                            .selected(at == 0)
+                            .disabled(at == 1)
+                            .control_id();
+                    });
+                }
+            });
     });
     Host::with(|h| {
         assert_eq!(h.choice_neighbor(ids[0], 0x27), Some(ids[2]));
@@ -691,8 +776,11 @@ fn explicit_tab_policy_overrides_selection_and_sends_only_changes() {
     let value = Cell::new(1);
     let mut id = ControlId::NONE;
     rig.mount(|ui| {
-        id = button(ui, "Preset").role(UiaRole::RadioButton).selected(selected)
-            .tab_stop(move || value.get() >= 0).control_id();
+        id = button(ui, "Preset")
+            .role(UiaRole::RadioButton)
+            .selected(selected)
+            .tab_stop(move || value.get() >= 0)
+            .control_id();
     });
     Host::with(|h| h.focus_ops.clear());
     rig.set(selected, false);
@@ -710,18 +798,26 @@ fn stock_slider_centres_its_thumb_on_the_rail_in_both_orientations() {
             let mut rig = Rig::at(800.0, 600.0, scale);
             let mut node = NodeId::NONE;
             rig.mount(|ui| {
-                let range = Range { vertical, ..Range::new(-12.0, 12.0) };
+                let range = Range {
+                    vertical,
+                    ..Range::new(-12.0, 12.0)
+                };
                 node = slider(ui, 0.0, range, SliderStyle::default())
                     .width(Len::dip(if vertical { 30.0 } else { 300.0 }))
                     .height(Len::dip(if vertical { 300.0 } else { 30.0 }))
-                    .id().into();
+                    .id()
+                    .into();
             });
             Host::with(|host| {
                 let row = host.control(host.control_of(node)).unwrap();
                 let value = row.value.unwrap();
-                let thumb = value.parts.iter().find_map(|&(node, part)| {
-                    matches!(part, ScalarPart::Thumb { .. }).then_some(host.geom(node))
-                }).unwrap();
+                let thumb = value
+                    .parts
+                    .iter()
+                    .find_map(|&(node, part)| {
+                        matches!(part, ScalarPart::Thumb { .. }).then_some(host.geom(node))
+                    })
+                    .unwrap();
                 let own = host.geom(node);
                 let centre = if vertical {
                     thumb.local.x + thumb.size.x * 0.5
@@ -729,8 +825,10 @@ fn stock_slider_centres_its_thumb_on_the_rail_in_both_orientations() {
                     thumb.local.y + thumb.size.y * 0.5
                 };
                 let expected = if vertical { own.size.x } else { own.size.y } * 0.5;
-                assert!((centre - expected).abs() < 0.51 / scale,
-                    "vertical={vertical}, scale={scale}: thumb {centre}, rail {expected}");
+                assert!(
+                    (centre - expected).abs() < 0.51 / scale,
+                    "vertical={vertical}, scale={scale}: thumb {centre}, rail {expected}"
+                );
             });
             assert!(rig.flush().patch().ops().is_empty());
         }
@@ -747,7 +845,9 @@ fn a_live_region_states_how_it_announces() {
         .name("status")
         .live_region(false);
     });
-    let row = frame.uia("status").expect("the region published no element");
+    let row = frame
+        .uia("status")
+        .expect("the region published no element");
     assert!(
         row.flags.has(ColFlags::LIVE_POLITE),
         "a live region did not state how it announces"
@@ -763,7 +863,9 @@ fn a_text_group_is_named_by_its_run() {
             text(ui, "nothing here");
         });
     });
-    let row = frame.uia("nothing here").expect("the group published no element");
+    let row = frame
+        .uia("nothing here")
+        .expect("the group published no element");
     assert_eq!(row.role, UiaRole::Text);
 }
 
@@ -774,8 +876,14 @@ fn a_selected_control_states_that_it_selects() {
     rig.mount(|ui| {
         button(ui, "Tab").name("Tab").selected(on);
     });
-    let row = rig.set(on, true).uia("Tab").expect("the control lost its element");
-    assert!(row.state.has(State::SELECTED), "a selected control did not report selected");
+    let row = rig
+        .set(on, true)
+        .uia("Tab")
+        .expect("the control lost its element");
+    assert!(
+        row.state.has(State::SELECTED),
+        "a selected control did not report selected"
+    );
     assert!(
         row.flags.has(ColFlags::SELECTS),
         "a selectable control does not answer SelectionItem"
@@ -828,8 +936,14 @@ fn a_node_given_no_setter_is_measured_on_its_first_solve() {
     rig.mount(|ui| ids = Some(tab_fixture(ui, Cell::new(false))));
     let (tab, lbl) = ids.unwrap();
     let (tab, lbl) = Host::with(|h| (h.geom(tab).rect, h.geom(lbl).rect));
-    assert!(tab.width() > 30.0 && tab.height() > 60.0, "the tab is its padding alone: {tab:?}");
-    assert!(lbl.height() > lbl.width() && lbl.width() > 0.0, "the label was not measured: {lbl:?}");
+    assert!(
+        tab.width() > 30.0 && tab.height() > 60.0,
+        "the tab is its padding alone: {tab:?}"
+    );
+    assert!(
+        lbl.height() > lbl.width() && lbl.width() > 0.0,
+        "the label was not measured: {lbl:?}"
+    );
 }
 
 #[test]
@@ -846,8 +960,15 @@ fn a_subtree_hidden_at_mount_takes_its_size_when_shown() {
     let (got, lbl) = Host::with(|h| (h.geom(tab).rect, h.geom(lbl).rect));
     // The second root is mounted beneath the first, so the origin differs and the box is
     // what has to agree.
-    assert_eq!((got.width(), got.height(), got.x1), (expect.width(), expect.height(), expect.x1), "shown from a hidden mount: {got:?} vs {expect:?}");
-    assert!(lbl.width() > 0.0, "the label under it stayed unmeasured: {lbl:?}");
+    assert_eq!(
+        (got.width(), got.height(), got.x1),
+        (expect.width(), expect.height(), expect.x1),
+        "shown from a hidden mount: {got:?} vs {expect:?}"
+    );
+    assert!(
+        lbl.width() > 0.0,
+        "the label under it stayed unmeasured: {lbl:?}"
+    );
 }
 
 #[test]
@@ -860,13 +981,24 @@ fn a_hidden_subtrees_derived_sprites_take_no_pixels() {
     // The line tile under the text leaf carries its own rect, so it is the one to watch.
     let tile = Host::with(|h| h.tree.children(lbl).next()).expect("a line tile");
     let size = |n: NodeId| Host::with(|h| h.geom(n).size);
-    assert!(size(tile).x > 0.0 && size(tile).y > 0.0, "the tile has no ink: {:?}", size(tile));
+    assert!(
+        size(tile).x > 0.0 && size(tile).y > 0.0,
+        "the tile has no ink: {:?}",
+        size(tile)
+    );
     rig.set(shown, true);
-    assert_eq!(size(tile), Vector2::zero(), "a hidden ancestor left the tile painting");
+    assert_eq!(
+        size(tile),
+        Vector2::zero(),
+        "a hidden ancestor left the tile painting"
+    );
     rig.set(shown, false);
-    assert!(size(tile).x > 0.0, "showing again did not restore the tile: {:?}", size(tile));
+    assert!(
+        size(tile).x > 0.0,
+        "showing again did not restore the tile: {:?}",
+        size(tile)
+    );
 }
-
 
 /// A run that wraps to more lines takes more room, and what follows it moves down.
 ///
@@ -881,15 +1013,20 @@ fn a_run_that_rewraps_moves_what_follows_it() {
     rig.mount(|ui| {
         let mut run = NodeId::NONE;
         let mut after = NodeId::NONE;
-        box_(ui)
-            .width(Len::dip(120.0))
-            .stack(|ui| {
-                run = caption(ui, crate::widget::reactive(move |out| {
-                    out.push_str(if long.get() { "Computing the response." } else { "Idle." });
-                }))
-                .node_id();
-                after = micro(ui, "9 sections").node_id();
-            });
+        box_(ui).width(Len::dip(120.0)).stack(|ui| {
+            run = caption(
+                ui,
+                crate::widget::reactive(move |out| {
+                    out.push_str(if long.get() {
+                        "Computing the response."
+                    } else {
+                        "Idle."
+                    });
+                }),
+            )
+            .node_id();
+            after = micro(ui, "9 sections").node_id();
+        });
         ids = Some((run, after));
     });
     let (run, after) = ids.expect("mounted");
@@ -910,7 +1047,6 @@ fn a_run_that_rewraps_moves_what_follows_it() {
         box_of(after).y0
     );
 }
-
 
 /// A run's published box holds the width its height was solved against.
 ///
@@ -959,5 +1095,180 @@ fn a_content_sized_run_is_not_snapped_below_its_own_width() {
             "what follows the run starts inside it: {:?} under {box_:?}",
             h.geom(after).rect
         );
+    });
+}
+
+#[test]
+fn optional_group_dispatches_deselection_and_rechecks_queued_additions() {
+    use crate::uia::action::SelectionChange::{Add, Remove, Select};
+    let mut rig = Rig::new();
+    let chosen = Cell::new(Some(0usize));
+    let mut ids = [ControlId::NONE; 2];
+    rig.mount(|ui| {
+        ui.node(Preset::Stack).selection(false).children(|ui| {
+            for (at, id) in ids.iter_mut().enumerate() {
+                *id = button(ui, format!("Choice {at}"))
+                    .role(UiaRole::RadioButton)
+                    .selected(move || chosen.get() == Some(at))
+                    .on_select(move |selected| chosen.set(selected.then_some(at)))
+                    .control_id();
+            }
+        });
+    });
+    Host::dispatch(&[
+        Intent {
+            target: ids[0],
+            what: What::Selected(Remove),
+        },
+        Intent {
+            target: ids[1],
+            what: What::Selected(Add),
+        },
+        Intent {
+            target: ids[0],
+            what: What::Selected(Add),
+        },
+    ]);
+    assert_eq!(chosen.get(), Some(1));
+    Host::dispatch(&[Intent {
+        target: ids[0],
+        what: What::Selected(Select),
+    }]);
+    assert_eq!(chosen.get(), Some(0));
+    Host::dispatch(&[Intent {
+        target: ids[0],
+        what: What::Selected(Remove),
+    }]);
+    assert_eq!(chosen.get(), None);
+}
+
+#[test]
+fn static_text_reuses_its_pinned_geometry_between_accessibility_publications() {
+    let mut rig = Rig::new();
+    rig.mount(|ui| {
+        text(ui, "Shared geometry");
+    });
+    let mut first = crate::uia::Snapshot::default();
+    let mut second = crate::uia::Snapshot::default();
+    Host::with(|host| {
+        host.uia_entries(&mut first);
+        host.uia_entries(&mut second);
+    });
+    assert_eq!(first.text_geometry.len(), 1);
+    assert!(!first.text_geometry[0].1.clusters.is_empty());
+    assert!(std::sync::Arc::ptr_eq(
+        &first.text_geometry[0].1,
+        &second.text_geometry[0].1
+    ));
+}
+
+#[test]
+#[should_panic(expected = "optional selection items require on_select(bool)")]
+fn optional_group_rejects_click_only_items_through_layout_wrappers() {
+    let mut rig = Rig::new();
+    rig.mount(|ui| {
+        ui.node(Preset::Stack).selection(false).children(|ui| {
+            ui.node(Preset::Row).children(|ui| {
+                button(ui, "Choice").selected(true).on_click(|| {});
+            });
+        });
+    });
+}
+
+#[test]
+fn nested_required_group_keeps_its_click_handler_contract() {
+    let mut rig = Rig::new();
+    rig.mount(|ui| {
+        ui.node(Preset::Stack).selection(false).children(|ui| {
+            ui.node(Preset::Row).selection(true).children(|ui| {
+                button(ui, "Choice").selected(true).on_click(|| {});
+            });
+        });
+    });
+}
+
+#[test]
+fn editable_fields_publish_text_bodies_but_passwords_do_not() {
+    let mut rig = Rig::new();
+    let mut ids = [ControlId::NONE; 2];
+    rig.mount(|ui| {
+        ids[0] = crate::widget::field(ui, "Text").control_id();
+        ids[1] = crate::widget::field(ui, "Secret")
+            .scope(crate::text_input::InputScope::Password)
+            .control_id();
+    });
+    let mut snapshot = crate::uia::Snapshot::default();
+    Host::with(|host| host.uia_entries(&mut snapshot));
+    for (id, body) in ids.into_iter().zip([true, false]) {
+        let entry = snapshot.entries.iter().find(|e| e.id == id).unwrap();
+        assert!(entry.flags.has(ColFlags::FIELD));
+        assert_eq!(entry.flags.has(ColFlags::BODY), body);
+    }
+}
+
+#[test]
+fn text_range_reveal_moves_the_field_view_without_moving_its_selection() {
+    let mut rig = Rig::new();
+    let mut target = ControlId::NONE;
+    rig.mount(|ui| {
+        target = crate::widget::field(ui, "abcdefghijklmnopqrstuvwxyz")
+            .width(Len::dip(80.0))
+            .control_id();
+    });
+    Host::with(|host| {
+        host.field_update(&crate::text_input::Update {
+            id: target,
+            revision: 1,
+            text: Some(
+                "abcdefghijklmnopqrstuvwxyz"
+                    .encode_utf16()
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            selection: crate::text_input::Selection::at(0),
+            composition: None,
+            focused: true,
+            commit: None,
+        })
+    });
+    rig.flush();
+    let (revision, selection, before) = Host::with(|host| {
+        let row = host.fields.get(target).unwrap();
+        (row.revision, row.selection, row.geometry.clone().unwrap())
+    });
+    Host::dispatch(&[Intent {
+        target,
+        what: What::TextReveal {
+            revision,
+            start: 25,
+            end: 25,
+        },
+    }]);
+    rig.flush();
+    Host::with(|host| {
+        let row = host.fields.get(target).unwrap();
+        let after = row.geometry.as_ref().unwrap();
+        assert!(after.origin.x < before.origin.x);
+        let caret = after.caret(crate::text_input::Selection::at(25));
+        let x = after.origin.x + caret.x;
+        assert!(x >= after.viewport.x && x <= after.viewport.x + after.viewport.w);
+        assert_eq!(row.selection, selection);
+        assert!(std::sync::Arc::ptr_eq(&after.clusters, &before.clusters));
+    });
+    let held = Host::with(|host| host.fields.get(target).unwrap().geometry.clone().unwrap());
+    Host::dispatch(&[Intent {
+        target,
+        what: What::TextReveal {
+            revision: revision + 1,
+            start: 0,
+            end: 0,
+        },
+    }]);
+    rig.flush();
+    Host::with(|host| {
+        assert!(std::sync::Arc::ptr_eq(
+            host.fields.get(target).unwrap().geometry.as_ref().unwrap(),
+            &held
+        ))
     });
 }

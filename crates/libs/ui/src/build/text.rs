@@ -82,6 +82,43 @@ pub(crate) enum Fold {
 }
 
 impl Fold {
+    /// Maps logically ordered folded clusters to their enclosing source UTF-16 spans.
+    fn remap(self, source: &str, clusters: &mut [Cluster]) {
+        let mut chars = source
+            .chars()
+            .map(|ch| {
+                let units = ch.len_utf16() as u32;
+                let width = match self {
+                    Self::Caps => ch.to_uppercase().map(|c| c.len_utf16() as u32).sum(),
+                    Self::Mask => 1,
+                    Self::None => units,
+                };
+                (width, units)
+            })
+            .peekable();
+        let (mut drawn, mut source) = (0, 0);
+        let mut offset = |position: u32, trailing: bool| {
+            while let Some(&(width, units)) = chars.peek() {
+                if position < drawn + width {
+                    return source
+                        + if trailing && position > drawn {
+                            units
+                        } else {
+                            0
+                        };
+                }
+                drawn += width;
+                source += units;
+                chars.next();
+            }
+            source
+        };
+        for cluster in clusters {
+            cluster.start = offset(cluster.start, false);
+            cluster.end = offset(cluster.end, true);
+        }
+    }
+
     /// Returns whether `held` is already `text` under this fold.
     ///
     /// Compares against the folded stream rather than folding into a buffer first, so the
@@ -151,6 +188,7 @@ impl Source {
 pub(crate) struct Entry {
     /// The layout, its harvest buffers and its line vector.
     run: ShapedRun,
+    uia: std::cell::OnceCell<std::sync::Arc<crate::text_input::Geometry>>,
     /// The drawn string, needed again whenever the type ramp moves.
     text: Source,
     /// What the author wrote, held only where the fold changed it. `None` on every run whose
@@ -198,6 +236,7 @@ impl Entry {
         engine
             .reshape(&mut self.run, self.text.as_str(), &font, self.style.flow)
             .expect(LAYOUT);
+        self.uia.take();
         self.font = font;
         self.class = class;
         self.stale = false;
@@ -507,6 +546,7 @@ impl Table {
                 .expect(LAYOUT),
         };
         self.entries.insert(Entry {
+            uia: std::cell::OnceCell::new(),
             run,
             text,
             author,
@@ -622,6 +662,28 @@ impl Table {
         Some((entry.node, entry.style.vertical))
     }
 
+    /// Shares the pinned run's hit-test geometry with static text providers.
+    pub(crate) fn uia_geometry(
+        &self,
+        key: MeasureKey,
+    ) -> Option<std::sync::Arc<crate::text_input::Geometry>> {
+        let entry = self.entries.get(key)?;
+        Some(std::sync::Arc::clone(entry.uia.get_or_init(|| {
+            let mut clusters = Vec::new();
+            let (_, _, end) = self
+                .field_view(key, &mut clusters)
+                .expect("the text entry is live");
+            if let Some(author) = entry.author.as_deref() {
+                entry.fold.remap(author, &mut clusters);
+            }
+            std::sync::Arc::new(crate::text_input::Geometry {
+                clusters: clusters.into(),
+                end,
+                ..Default::default()
+            })
+        })))
+    }
+
     /// Brings a run up to date under `class`, fixes it at `w`, and answers whether the glyphs
     /// moved and its coverage is owed.
     ///
@@ -641,6 +703,9 @@ impl Table {
             return false;
         }
         let moved = entry.run.pin(w);
+        if moved {
+            entry.uia.take();
+        }
         entry.pinned = w;
         moved
     }
@@ -971,6 +1036,40 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folded_clusters_preserve_expansions_surrogates_and_combined_spans_without_allocation() {
+        for (fold, text, spans, expected) in [
+            (
+                Fold::Caps,
+                "aß\u{1f600}",
+                [(0, 1), (1, 2), (2, 3), (3, 5)],
+                [(0, 1), (1, 2), (1, 2), (2, 4)],
+            ),
+            (
+                Fold::Mask,
+                "a\u{1f600}bc",
+                [(0, 1), (1, 2), (2, 3), (3, 4)],
+                [(0, 1), (1, 3), (3, 4), (4, 5)],
+            ),
+            (
+                Fold::Caps,
+                "fißxy",
+                [(0, 2), (2, 4), (4, 5), (5, 6)],
+                [(0, 2), (2, 3), (3, 4), (4, 5)],
+            ),
+        ] {
+            let mut clusters = spans.map(|(start, end)| Cluster {
+                start,
+                end,
+                ..Default::default()
+            });
+            let before = crate::counting::allocations();
+            fold.remap(text, &mut clusters);
+            assert_eq!(crate::counting::allocations(), before);
+            assert_eq!(clusters.map(|c| (c.start, c.end)), expected);
+        }
+    }
 
     fn folded(fold: Fold, text: &str) -> String {
         let mut out = String::new();

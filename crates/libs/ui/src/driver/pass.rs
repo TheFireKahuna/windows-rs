@@ -426,8 +426,14 @@ fn key_intents(
     intents: &mut Vec<Intent>,
 ) {
     for report in reports {
-        if let Report::Key { target: Some(target), event, .. } = *report
-            && event.kind == KeyKind::Down && !event.mods.ctrl && !event.mods.alt
+        if let Report::Key {
+            target: Some(target),
+            event,
+            ..
+        } = *report
+            && event.kind == KeyKind::Down
+            && !event.mods.ctrl
+            && !event.mods.alt
             && let Some(next) = Host::with(|h| h.choice_neighbor(target, event.key))
         {
             focus.push(FocusOp::Focus(Some(next)));
@@ -623,6 +629,11 @@ impl Worker for SceneThread {
         // thread.
         self.events.clear();
         self.scene.drain_events(&mut self.events);
+        self.down.scroll_changed |= self.links.uia_listening.load(Acquire)
+            && self
+                .events
+                .iter()
+                .any(|e| matches!(e, SceneEvent::TrackerValues { .. }));
         // ⓪′ what the present thread reported. Before the patch, so a region binds in the pass
         // its handle arrived in: the patch can unmount it, and binding a brush over a handle
         // that is already closing is what the ordering rules out.
@@ -824,8 +835,7 @@ impl SceneThread {
         // knows what a viewport is, and the two never name the same control.
         for action in &to.automation {
             if let crate::uia::Action::ScrollTo(id, x, y) = *action {
-                self.scrolls
-                    .scroll_to(id, Vector2 { x, y }, &mut front)?;
+                self.scrolls.scroll_to(id, Vector2 { x, y }, &mut front)?;
             }
         }
         self.controls

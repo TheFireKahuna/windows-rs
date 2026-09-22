@@ -220,7 +220,10 @@ impl IWeakReferenceSource_Vtbl {
                         weakreference.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        weakreference.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }

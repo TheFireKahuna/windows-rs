@@ -20,7 +20,9 @@ use windows_scene::{
 
 fn display_only(row: &ControlRow, handlers: Option<&super::control::Handlers>) -> bool {
     matches!(row.uia, UiaRole::ProgressBar | UiaRole::Graph)
-        && !handlers.is_some_and(|h| h.click.is_some() || h.scalar.is_some() || h.drag.is_some() || h.flyout.is_some())
+        && !handlers.is_some_and(|h| {
+            h.click.is_some() || h.scalar.is_some() || h.drag.is_some() || h.flyout.is_some()
+        })
 }
 
 /// What the walk reads. Disjoint borrows of the host, so the walk holds no `&mut Host`.
@@ -69,7 +71,6 @@ impl HitBuilder {
         self.uia.retain(|&(at, _)| at < depth);
         self.uia_clips.retain(|&(at, _)| at < depth);
     }
-
 }
 
 /// Clears the ancestry stacks and every output, starting a fresh array.
@@ -129,6 +130,32 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
     }
     out.hits.unwind(depth);
     let control = walk.tree.c.control[node.index()];
+    if let Some(row) = walk.controls.get(control) {
+        let selects = matches!(row.uia, UiaRole::RadioButton | UiaRole::TabItem)
+            || (row.selectable && row.uia != UiaRole::CheckBox);
+        if selects
+            && !walk
+                .handlers
+                .get(row.handlers)
+                .is_some_and(|h| h.select.is_some())
+        {
+            let mut parent = walk.tree.parent(node);
+            while !parent.is_none() {
+                if let Some(group) = walk.controls.get(walk.tree.c.control[parent.index()]) {
+                    assert!(
+                        group.selection != Some(false),
+                        "optional selection items require on_select(bool)"
+                    );
+                    if group.selection.is_some()
+                        || matches!(group.uia, UiaRole::ComboBox | UiaRole::List | UiaRole::Tab)
+                    {
+                        break;
+                    }
+                }
+                parent = walk.tree.parent(parent);
+            }
+        }
+    }
     let bounded = flags & tree::CLIP != 0;
     let geom = walk.tree.c.geom[node.index()];
     if flags & tree::HIT != 0 {
@@ -137,7 +164,11 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
             id: control,
             touch_inflate: Some(walk.tree.c.inflate[node.index()]).filter(|v| !v.is_nan()),
         };
-        if walk.controls.get(control).is_some_and(|row| display_only(row, walk.handlers.get(row.handlers))) {
+        if walk
+            .controls
+            .get(control)
+            .is_some_and(|row| display_only(row, walk.handlers.get(row.handlers)))
+        {
             decl.flags = HitFlags::from_bits(decl.flags.bits() & !HitFlags::INTERACTIVE.bits());
         }
         emit_hit(out, depth, &geom, bounded, flags, decl);
@@ -196,7 +227,10 @@ fn emit_hit(
     let scroll_src = if flags.contains(HitFlags::UNSCROLLED) {
         NodeId::NONE
     } else {
-        out.hits.scrolls.last().map_or(NodeId::NONE, |&(_, id, _)| id)
+        out.hits
+            .scrolls
+            .last()
+            .map_or(NodeId::NONE, |&(_, id, _)| id)
     };
     let at = push_entry(
         out,
@@ -205,9 +239,9 @@ fn emit_hit(
             y0: geom.rect.y0,
             x1: geom.rect.x1,
             y1: geom.rect.y1,
-            touch_inflate: decl.touch_inflate.unwrap_or_else(|| {
-                windows_scene::default_inflation(geom.size.x, geom.size.y)
-            }),
+            touch_inflate: decl
+                .touch_inflate
+                .unwrap_or_else(|| windows_scene::default_inflation(geom.size.x, geom.size.y)),
             clip_parent: out.hits.clips.last().map_or(NO_ENTRY, |&(_, at)| at),
             parent: out.hits.entries.last().map_or(NO_ENTRY, |&(_, at)| at),
             flags,
@@ -235,7 +269,9 @@ fn emit_uia(
     node_flags: tree::Bits,
     control: ControlId,
 ) {
-    let Some(row) = walk.controls.get(control) else { return };
+    let Some(row) = walk.controls.get(control) else {
+        return;
+    };
     let role = match row.uia {
         UiaRole::None if row.name.is_some() => UiaRole::Group,
         UiaRole::None => return,
@@ -247,15 +283,14 @@ fn emit_uia(
     // A control that is labelled and also shows a run reports that run as its value: a combo
     // box is named "Output endpoint" and shows the endpoint. Only where the role carries the
     // value pattern, so a named button interns nothing.
-    let shown = run
-        .filter(|run| {
-            row.name.is_some()
-                && !run.is_empty()
-                && *run != name
-                && crate::uia::roles::row(role)
-                    .patterns
-                    .has(crate::uia::Patterns::VALUE)
-        });
+    let shown = run.filter(|run| {
+        row.name.is_some()
+            && !run.is_empty()
+            && *run != name
+            && crate::uia::roles::row(role)
+                .patterns
+                .has(crate::uia::Patterns::VALUE)
+    });
     // Read untracked: this runs inside a flush, and subscribing whatever effect is on the
     // stack would rebuild a screen when a tip changed.
     // A validation message is the help while it stands; the tip is the help otherwise.
@@ -290,7 +325,9 @@ fn emit_uia(
     let mut flags = ColFlags::NONE;
     if let Some(required) = row.selection {
         flags = flags | ColFlags::SELECTION;
-        if required { flags = flags | ColFlags::SELECTION_REQUIRED; }
+        if required {
+            flags = flags | ColFlags::SELECTION_REQUIRED;
+        }
     }
     if role == UiaRole::ComboBox || (role == UiaRole::List && row.overlay.is_some()) {
         flags = flags | ColFlags::SELECTION_REQUIRED;
@@ -317,7 +354,9 @@ fn emit_uia(
     if node_flags & tree::SCROLL != 0 {
         flags = flags | ColFlags::SCROLLS;
     }
-    if role == UiaRole::Text {
+    if field.map_or(role == UiaRole::Text, |f| {
+        f.scope != crate::text_input::InputScope::Password
+    }) {
         flags = flags | ColFlags::BODY;
     }
     if range.is_some() {
@@ -342,16 +381,35 @@ fn emit_uia(
 
     let mut parent = out.hits.uia.last().map_or(crate::uia::NONE, |&(_, at)| at);
     if row.overlay == Some(crate::overlay::Kind::Flyout) {
-        if let Some(invoker) = walk.overlays.iter().find(|p| p.root == row.node).and_then(|p| p.invoker) {
-            if let Some(at) = out.uia.as_deref().and_then(|uia| uia.entries.iter().position(|e| e.id == invoker)) {
+        if let Some(invoker) = walk
+            .overlays
+            .iter()
+            .find(|p| p.root == row.node)
+            .and_then(|p| p.invoker)
+        {
+            if let Some(at) = out
+                .uia
+                .as_deref()
+                .and_then(|uia| uia.entries.iter().position(|e| e.id == invoker))
+            {
                 parent = at as u16;
             }
         }
     }
-    let clip = out.hits.uia_clips.last().map_or(crate::uia::NONE, |&(_, at)| at);
-    let scroll = out.hits.scrolls.last().map_or(crate::uia::NONE, |&(_, _, at)| at);
+    let clip = out
+        .hits
+        .uia_clips
+        .last()
+        .map_or(crate::uia::NONE, |&(_, at)| at);
+    let scroll = out
+        .hits
+        .scrolls
+        .last()
+        .map_or(crate::uia::NONE, |&(_, _, at)| at);
     let Out { uia, scratch, .. } = out;
-    let uia = uia.as_deref_mut().expect("the caller asked for automation rows");
+    let uia = uia
+        .as_deref_mut()
+        .expect("the caller asked for automation rows");
     let name = uia.intern(name);
     let shown = shown.map(|run| uia.intern(run));
     let help = has_help.then(|| uia.intern(scratch));
@@ -382,11 +440,24 @@ fn emit_uia(
     let expanded = walk
         .overlays
         .iter()
-        .any(|placement| placement.invoker == Some(control)) || row.expanded;
-    uia.state.push(match row.state {
-        ModelState::Disabled => chosen,
-        _ => State::ENABLED | chosen,
-    } | if expanded { State::EXPANDED } else { State::default() });
+        .any(|placement| placement.invoker == Some(control))
+        || row.expanded;
+    uia.state.push(
+        match row.state {
+            ModelState::Disabled => chosen,
+            _ => State::ENABLED | chosen,
+        } | if expanded {
+            State::EXPANDED
+        } else {
+            State::default()
+        },
+    );
+    if role == UiaRole::ComboBox {
+        if let Some((key, name)) = handlers.and_then(|h| h.choice.as_ref()) {
+            let name = uia.intern(name);
+            uia.choices.push((at, *key, name));
+        }
+    }
     if let Some(help) = help {
         uia.helps.push((at, help));
     }
@@ -404,6 +475,11 @@ fn emit_uia(
         // elsewhere states none here, and a `0.0` would be a number rather than its absence.
         if let Some(number) = row.number {
             uia.values.push((at, number));
+        }
+    }
+    if role == UiaRole::Text && row.name.as_deref().is_none_or(|name| run == Some(name)) {
+        if let Some(geometry) = row.text.and_then(|key| walk.text.uia_geometry(key)) {
+            uia.text_geometry.push((at, geometry));
         }
     }
     if let Some(field) = field {

@@ -9,11 +9,11 @@ use crate::bindings::{
     UIA_CustomControlTypeId, UIA_EditControlTypeId, UIA_ExpandCollapsePatternId,
     UIA_GroupControlTypeId, UIA_InvokePatternId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
     UIA_MenuControlTypeId, UIA_MenuItemControlTypeId, UIA_ProgressBarControlTypeId,
-    UIA_RadioButtonControlTypeId, UIA_RangeValuePatternId, UIA_ScrollItemPatternId, UIA_ScrollPatternId,
-    UIA_SelectionItemPatternId, UIA_SelectionPatternId, UIA_SliderControlTypeId,
-    UIA_TextControlTypeId, UIA_TextPatternId, UIA_TogglePatternId, UIA_ToolTipControlTypeId,
-    UIA_ValuePatternId,
-    UIA_WindowControlTypeId, UIA_TabControlTypeId, UIA_TabItemControlTypeId,
+    UIA_RadioButtonControlTypeId, UIA_RangeValuePatternId, UIA_ScrollItemPatternId,
+    UIA_ScrollPatternId, UIA_SelectionItemPatternId, UIA_SelectionPatternId,
+    UIA_SliderControlTypeId, UIA_TabControlTypeId, UIA_TabItemControlTypeId, UIA_TextControlTypeId,
+    UIA_TextPattern2Id, UIA_TextPatternId, UIA_TogglePatternId, UIA_ToolTipControlTypeId,
+    UIA_ValuePatternId, UIA_WindowControlTypeId,
 };
 use crate::widget::UiaRole;
 
@@ -33,6 +33,8 @@ impl Patterns {
     pub const SCROLL_ITEM: Self = Self(1 << 7);
     pub const TEXT: Self = Self(1 << 8);
     pub const SCROLL: Self = Self(1 << 9);
+    pub const WINDOW: Self = Self(1 << 10);
+    pub const TRANSFORM: Self = Self(1 << 11);
 
     /// Returns whether every pattern in `other` is in this set.
     #[must_use]
@@ -133,7 +135,9 @@ static ROWS: [Row; 16] = [
     Row::new(
         UIA_ComboBoxControlTypeId,
         "combo box",
-        P.or(Patterns::EXPAND).or(Patterns::VALUE).or(Patterns::SELECTION),
+        P.or(Patterns::EXPAND)
+            .or(Patterns::VALUE)
+            .or(Patterns::SELECTION),
         true,
     ),
     Row::new(
@@ -161,7 +165,12 @@ static ROWS: [Row; 16] = [
     // describes carries the same words as its help text.
     Row::new(UIA_ToolTipControlTypeId, "tooltip", P, true),
     Row::new(UIA_TabControlTypeId, "tab", Patterns::SELECTION, true),
-    Row::new(UIA_TabItemControlTypeId, "tab item", Patterns::SELECTION_ITEM, true),
+    Row::new(
+        UIA_TabItemControlTypeId,
+        "tab item",
+        Patterns::SELECTION_ITEM,
+        true,
+    ),
 ];
 
 /// Returns the row for `role`.
@@ -182,7 +191,9 @@ pub fn row(role: UiaRole) -> &'static Row {
 #[must_use]
 pub fn control_type_in(role: UiaRole, parent: UiaRole) -> (i32, &'static str) {
     match (parent, role) {
-        (UiaRole::Menu, UiaRole::Button | UiaRole::CheckBox | UiaRole::RadioButton) => (UIA_MenuItemControlTypeId, "menu item"),
+        (UiaRole::Menu, UiaRole::Button | UiaRole::CheckBox | UiaRole::RadioButton) => {
+            (UIA_MenuItemControlTypeId, "menu item")
+        }
         (UiaRole::List, UiaRole::Button) => (UIA_ListItemControlTypeId, "list item"),
         _ => {
             let row = row(role);
@@ -201,6 +212,8 @@ pub const DIALOG_NAME: &str = "dialog";
 #[must_use]
 pub fn pattern_of(id: i32) -> Patterns {
     match id {
+        crate::bindings::UIA_WindowPatternId => Patterns::WINDOW,
+        crate::bindings::UIA_TransformPatternId => Patterns::TRANSFORM,
         UIA_InvokePatternId => Patterns::INVOKE,
         UIA_TogglePatternId => Patterns::TOGGLE,
         UIA_ValuePatternId => Patterns::VALUE,
@@ -210,7 +223,7 @@ pub fn pattern_of(id: i32) -> Patterns {
         UIA_ExpandCollapsePatternId => Patterns::EXPAND,
         UIA_ScrollItemPatternId => Patterns::SCROLL_ITEM,
         UIA_ScrollPatternId => Patterns::SCROLL,
-        UIA_TextPatternId => Patterns::TEXT,
+        UIA_TextPatternId | UIA_TextPattern2Id => Patterns::TEXT,
         _ => Patterns::NONE,
     }
 }

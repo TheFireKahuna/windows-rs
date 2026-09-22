@@ -1,6 +1,7 @@
 windows_core::link!("user32.dll" "system" fn GetAsyncKeyState(vkey : i32) -> i16);
 windows_core::link!("user32.dll" "system" fn GetCapture() -> HWND);
 windows_core::link!("user32.dll" "system" fn GetClientRect(hwnd : HWND, lprect : *mut RECT) -> windows_core::BOOL);
+windows_core::link!("kernel32.dll" "system" fn GetCurrentProcess() -> HANDLE);
 windows_core::link!("user32.dll" "system" fn GetKeyState(nvirtkey : i32) -> i16);
 windows_core::link!("kernel32.dll" "system" fn GetModuleHandleW(lpmodulename : windows_core::PCWSTR) -> HMODULE);
 windows_core::link!("user32.dll" "system" fn GetPointerFrameInfo(pointerid : u32, pointercount : *mut u32, pointerinfo : *mut POINTER_INFO) -> windows_core::BOOL);
@@ -26,6 +27,7 @@ windows_core::link!("uiautomationcore.dll" "system" fn UiaRaiseAutomationEvent(p
 windows_core::link!("uiautomationcore.dll" "system" fn UiaRaiseAutomationPropertyChangedEvent(pprovider : *mut core::ffi::c_void, id : PROPERTYID, oldvalue : VARIANT, newvalue : VARIANT) -> windows_core::HRESULT);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaRaiseStructureChangedEvent(pprovider : *mut core::ffi::c_void, structurechangetype : StructureChangeType, pruntimeid : *mut i32, cruntimeidlen : i32) -> windows_core::HRESULT);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaReturnRawElementProvider(hwnd : HWND, wparam : WPARAM, lparam : LPARAM, el : *mut core::ffi::c_void) -> LRESULT);
+windows_core::link!("user32.dll" "system" fn WaitForInputIdle(hprocess : HANDLE, dwmilliseconds : u32) -> u32);
 pub type CLIPFORMAT = u16;
 pub type COLORREF = u32;
 pub type CONTROLTYPEID = i32;
@@ -4803,7 +4805,10 @@ impl IRawElementProviderFragment_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -4891,7 +4896,10 @@ impl IRawElementProviderFragment_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -4962,7 +4970,10 @@ impl IRawElementProviderFragmentRoot_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -4981,7 +4992,10 @@ impl IRawElementProviderFragmentRoot_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -5073,7 +5087,10 @@ impl IRawElementProviderSimple_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -5115,7 +5132,10 @@ impl IRawElementProviderSimple_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -5631,7 +5651,10 @@ impl ISelectionItemProvider_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -5906,7 +5929,10 @@ impl ITextProvider_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -5926,7 +5952,10 @@ impl ITextProvider_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -5945,7 +5974,10 @@ impl ITextProvider_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -5983,6 +6015,106 @@ impl ITextProvider_Vtbl {
     }
 }
 impl windows_core::RuntimeName for ITextProvider {}
+windows_core::imp::define_interface!(
+    ITextProvider2,
+    ITextProvider2_Vtbl,
+    0x0dc5e6ed_3e16_4bf1_8f9a_a979878bc195
+);
+impl core::ops::Deref for ITextProvider2 {
+    type Target = ITextProvider;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(ITextProvider2, windows_core::IUnknown, ITextProvider);
+#[repr(C)]
+pub struct ITextProvider2_Vtbl {
+    pub base__: ITextProvider_Vtbl,
+    pub RangeFromAnnotation: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetCaretRange: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::BOOL,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+pub trait ITextProvider2_Impl: ITextProvider_Impl {
+    fn RangeFromAnnotation(
+        &self,
+        annotationelement: windows_core::Ref<IRawElementProviderSimple>,
+    ) -> windows_core::Result<ITextRangeProvider>;
+    fn GetCaretRange(
+        &self,
+        isactive: *mut windows_core::BOOL,
+    ) -> windows_core::Result<ITextRangeProvider>;
+}
+impl ITextProvider2_Vtbl {
+    pub const fn new<Identity: ITextProvider2_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn RangeFromAnnotation<
+            Identity: ITextProvider2_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            annotationelement: *mut core::ffi::c_void,
+            pretval: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextProvider2_Impl::RangeFromAnnotation(
+                    this,
+                    core::mem::transmute_copy(&annotationelement),
+                ) {
+                    Ok(ok__) => {
+                        pretval.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
+                }
+            }
+        }
+        unsafe extern "system" fn GetCaretRange<
+            Identity: ITextProvider2_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            isactive: *mut windows_core::BOOL,
+            pretval: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextProvider2_Impl::GetCaretRange(this, core::mem::transmute_copy(&isactive))
+                {
+                    Ok(ok__) => {
+                        pretval.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
+                }
+            }
+        }
+        Self {
+            base__: ITextProvider_Vtbl::new::<Identity, OFFSET>(),
+            RangeFromAnnotation: RangeFromAnnotation::<Identity, OFFSET>,
+            GetCaretRange: GetCaretRange::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<ITextProvider2 as windows_core::Interface>::IID
+            || iid == &<ITextProvider as windows_core::Interface>::IID
+    }
+}
+impl windows_core::RuntimeName for ITextProvider2 {}
 windows_core::imp::define_interface!(
     ITextRangeProvider,
     ITextRangeProvider_Vtbl,
@@ -6136,7 +6268,10 @@ impl ITextRangeProvider_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -6227,7 +6362,10 @@ impl ITextRangeProvider_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -6254,7 +6392,10 @@ impl ITextRangeProvider_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -6315,7 +6456,10 @@ impl ITextRangeProvider_Vtbl {
                         pretval.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        pretval.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -7043,7 +7187,10 @@ impl ITextStoreACP_Vtbl {
                         ppdataobject.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        ppdataobject.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -9637,6 +9784,156 @@ pub struct ITouchCapabilities_Vtbl {
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    ITransformProvider,
+    ITransformProvider_Vtbl,
+    0x6829ddc4_4f91_4ffa_b86f_bd3e2987cb4c
+);
+windows_core::imp::interface_hierarchy!(ITransformProvider, windows_core::IUnknown);
+#[repr(C)]
+pub struct ITransformProvider_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub Move: unsafe extern "system" fn(*mut core::ffi::c_void, f64, f64) -> windows_core::HRESULT,
+    pub Resize:
+        unsafe extern "system" fn(*mut core::ffi::c_void, f64, f64) -> windows_core::HRESULT,
+    pub Rotate: unsafe extern "system" fn(*mut core::ffi::c_void, f64) -> windows_core::HRESULT,
+    pub CanMove: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub CanResize: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub CanRotate: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+}
+pub trait ITransformProvider_Impl: windows_core::IUnknownImpl {
+    fn Move(&self, x: f64, y: f64) -> windows_core::Result<()>;
+    fn Resize(&self, width: f64, height: f64) -> windows_core::Result<()>;
+    fn Rotate(&self, degrees: f64) -> windows_core::Result<()>;
+    fn CanMove(&self) -> windows_core::Result<windows_core::BOOL>;
+    fn CanResize(&self) -> windows_core::Result<windows_core::BOOL>;
+    fn CanRotate(&self) -> windows_core::Result<windows_core::BOOL>;
+}
+impl ITransformProvider_Vtbl {
+    pub const fn new<Identity: ITransformProvider_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn Move<Identity: ITransformProvider_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            x: f64,
+            y: f64,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITransformProvider_Impl::Move(
+                    this,
+                    core::mem::transmute_copy(&x),
+                    core::mem::transmute_copy(&y),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn Resize<Identity: ITransformProvider_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            width: f64,
+            height: f64,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITransformProvider_Impl::Resize(
+                    this,
+                    core::mem::transmute_copy(&width),
+                    core::mem::transmute_copy(&height),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn Rotate<Identity: ITransformProvider_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            degrees: f64,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITransformProvider_Impl::Rotate(this, core::mem::transmute_copy(&degrees)).into()
+            }
+        }
+        unsafe extern "system" fn CanMove<
+            Identity: ITransformProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITransformProvider_Impl::CanMove(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn CanResize<
+            Identity: ITransformProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITransformProvider_Impl::CanResize(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn CanRotate<
+            Identity: ITransformProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITransformProvider_Impl::CanRotate(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        Self {
+            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
+            Move: Move::<Identity, OFFSET>,
+            Resize: Resize::<Identity, OFFSET>,
+            Rotate: Rotate::<Identity, OFFSET>,
+            CanMove: CanMove::<Identity, OFFSET>,
+            CanResize: CanResize::<Identity, OFFSET>,
+            CanRotate: CanRotate::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<ITransformProvider as windows_core::Interface>::IID
+    }
+}
+impl windows_core::RuntimeName for ITransformProvider {}
+windows_core::imp::define_interface!(
     IUIContext,
     IUIContext_Vtbl,
     0xbb5cfacd_5bd8_59d0_a59e_1c17a4d6d243
@@ -9798,6 +10095,234 @@ impl IValueProvider_Vtbl {
     }
 }
 impl windows_core::RuntimeName for IValueProvider {}
+windows_core::imp::define_interface!(
+    IWindowProvider,
+    IWindowProvider_Vtbl,
+    0x987df77b_db06_4d77_8f8a_86a9c3bb90b9
+);
+windows_core::imp::interface_hierarchy!(IWindowProvider, windows_core::IUnknown);
+#[repr(C)]
+pub struct IWindowProvider_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub SetVisualState: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        WindowVisualState,
+    ) -> windows_core::HRESULT,
+    pub Close: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
+    pub WaitForInputIdle: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        i32,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub CanMaximize: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub CanMinimize: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub IsModal: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub WindowVisualState: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut WindowVisualState,
+    ) -> windows_core::HRESULT,
+    pub WindowInteractionState: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut WindowInteractionState,
+    ) -> windows_core::HRESULT,
+    pub IsTopmost: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+}
+pub trait IWindowProvider_Impl: windows_core::IUnknownImpl {
+    fn SetVisualState(&self, state: WindowVisualState) -> windows_core::Result<()>;
+    fn Close(&self) -> windows_core::Result<()>;
+    fn WaitForInputIdle(&self, milliseconds: i32) -> windows_core::Result<windows_core::BOOL>;
+    fn CanMaximize(&self) -> windows_core::Result<windows_core::BOOL>;
+    fn CanMinimize(&self) -> windows_core::Result<windows_core::BOOL>;
+    fn IsModal(&self) -> windows_core::Result<windows_core::BOOL>;
+    fn WindowVisualState(&self) -> windows_core::Result<WindowVisualState>;
+    fn WindowInteractionState(&self) -> windows_core::Result<WindowInteractionState>;
+    fn IsTopmost(&self) -> windows_core::Result<windows_core::BOOL>;
+}
+impl IWindowProvider_Vtbl {
+    pub const fn new<Identity: IWindowProvider_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn SetVisualState<
+            Identity: IWindowProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            state: WindowVisualState,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                IWindowProvider_Impl::SetVisualState(this, core::mem::transmute_copy(&state)).into()
+            }
+        }
+        unsafe extern "system" fn Close<Identity: IWindowProvider_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                IWindowProvider_Impl::Close(this).into()
+            }
+        }
+        unsafe extern "system" fn WaitForInputIdle<
+            Identity: IWindowProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            milliseconds: i32,
+            pretval: *mut windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IWindowProvider_Impl::WaitForInputIdle(
+                    this,
+                    core::mem::transmute_copy(&milliseconds),
+                ) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn CanMaximize<
+            Identity: IWindowProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IWindowProvider_Impl::CanMaximize(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn CanMinimize<
+            Identity: IWindowProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IWindowProvider_Impl::CanMinimize(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn IsModal<Identity: IWindowProvider_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            pretval: *mut windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IWindowProvider_Impl::IsModal(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn WindowVisualState<
+            Identity: IWindowProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut WindowVisualState,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IWindowProvider_Impl::WindowVisualState(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn WindowInteractionState<
+            Identity: IWindowProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut WindowInteractionState,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IWindowProvider_Impl::WindowInteractionState(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn IsTopmost<Identity: IWindowProvider_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            pretval: *mut windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IWindowProvider_Impl::IsTopmost(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        Self {
+            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
+            SetVisualState: SetVisualState::<Identity, OFFSET>,
+            Close: Close::<Identity, OFFSET>,
+            WaitForInputIdle: WaitForInputIdle::<Identity, OFFSET>,
+            CanMaximize: CanMaximize::<Identity, OFFSET>,
+            CanMinimize: CanMinimize::<Identity, OFFSET>,
+            IsModal: IsModal::<Identity, OFFSET>,
+            WindowVisualState: WindowVisualState::<Identity, OFFSET>,
+            WindowInteractionState: WindowInteractionState::<Identity, OFFSET>,
+            IsTopmost: IsTopmost::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<IWindowProvider as windows_core::Interface>::IID
+    }
+}
+impl windows_core::RuntimeName for IWindowProvider {}
 pub type InputScope = i32;
 pub type LPARAM = isize;
 pub type LRESULT = isize;
@@ -11626,4 +12151,14 @@ pub const WM_SETFOCUS: i32 = 7;
 pub const WM_SYSKEYDOWN: i32 = 260;
 pub const WM_SYSKEYUP: i32 = 261;
 pub type WPARAM = usize;
+pub type WindowInteractionState = i32;
+pub const WindowInteractionState_BlockedByModalWindow: WindowInteractionState = 3;
+pub const WindowInteractionState_Closing: WindowInteractionState = 1;
+pub const WindowInteractionState_NotResponding: WindowInteractionState = 4;
+pub const WindowInteractionState_ReadyForUserInteraction: WindowInteractionState = 2;
+pub const WindowInteractionState_Running: WindowInteractionState = 0;
+pub type WindowVisualState = i32;
+pub const WindowVisualState_Maximized: WindowVisualState = 1;
+pub const WindowVisualState_Minimized: WindowVisualState = 2;
+pub const WindowVisualState_Normal: WindowVisualState = 0;
 pub type tagPOINTER_INPUT_TYPE = i32;

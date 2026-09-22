@@ -42,6 +42,7 @@ pub(crate) struct Row {
     /// edit does not continually resize its neighbours, and reveal moves this rather than the
     /// box.
     scroll: f32,
+    reveal: Option<(u32, u32)>,
     /// One caret, one sprite per selection rect, one per composition underline. Pooled, so a
     /// keystroke inside a selection retargets rather than mints.
     caret: SpriteId,
@@ -71,6 +72,7 @@ impl Row {
             callback_revision: None,
             delivered_revision: None,
             scroll: 0.0,
+            reveal: None,
             caret,
             selections: Vec::new(),
             underlines: Vec::new(),
@@ -281,6 +283,9 @@ impl Host {
         if update.revision < row.revision {
             return;
         }
+        if update.revision != row.revision || update.selection != row.selection {
+            row.reveal = None;
+        }
         row.revision = update.revision;
         row.selection = update.selection;
         row.composition.clone_from(&update.composition);
@@ -306,6 +311,21 @@ impl Host {
                 text: Arc::clone(value),
             });
         }
+        self.uia_stale.set(true);
+    }
+
+    pub(crate) fn field_reveal(&mut self, id: ControlId, revision: u64, start: u32, end: u32) {
+        let Some(row) = self.fields.get_mut(id) else {
+            return;
+        };
+        if row.revision != revision
+            || row.scope == InputScope::Password
+            || row.reveal == Some((start, end))
+        {
+            return;
+        }
+        row.reveal = Some((start, end));
+        row.dirty = true;
         self.uia_stale.set(true);
     }
 
@@ -400,13 +420,36 @@ impl Host {
             ..Geometry::default()
         };
         let caret = geometry.caret(row.selection);
+        let target = row.reveal.map_or((caret.x, caret.x), |(start, end)| {
+            if start == end {
+                let x = geometry.caret(Selection::at(start)).x;
+                return (x, x);
+            }
+            geometry.rects(start..end, &mut row.rects);
+            row.rects
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), r| {
+                    (lo.min(r.x), hi.max(r.x + r.w))
+                })
+        });
+        let target = if target.0.is_finite() {
+            target
+        } else {
+            (caret.x, caret.x)
+        };
+        let right = geometry
+            .clusters
+            .iter()
+            .fold(geometry.end.x, |right, cluster| {
+                right.max(cluster.rect.x + cluster.rect.w)
+            });
         // Horizontal reveal stays inside the field clip, and shorter text or a wider box must
         // release scroll it no longer needs.
         row.scroll = row
             .scroll
-            .min(caret.x)
-            .max(caret.x - width)
-            .clamp(0.0, (line.x - width).max(0.0));
+            .max(target.1 - width)
+            .min(target.0)
+            .clamp(0.0, (right - width).max(0.0));
         geometry.origin = Vector2 {
             x: inset - row.scroll,
             y: (box_.y - line.y) * 0.5,
