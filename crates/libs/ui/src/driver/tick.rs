@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::*};
 
 use windows_core::Result;
+
+use windows_window::client_area_animations;
 use windows_numerics::Vector2;
 use windows_scene::{ControlId, Env, HitFlags, NodeId};
 use windows_window::{CaptionState, Handoff, Tick as Frame, Wake, Window};
@@ -129,7 +131,10 @@ impl Tick {
             focus: Vec::new(),
             retiring: Vec::new(),
             reports: Vec::new(),
-            to_scene: Box::default(),
+            to_scene: Box::new(ToScene {
+                springs_enabled: Some(client_area_animations()?),
+                ..ToScene::default()
+            }),
             holding: None,
             sent: None,
             scene: SceneTally::default(),
@@ -224,6 +229,7 @@ impl Tick {
         }
         if self.from_pump.settings.replace(false) {
             self.from_pump.text.settings_changed();
+            self.to_scene.springs_enabled = Some(client_area_animations()?);
         }
         // A provider snapshot can precede disable, hide or unmount, so what one asked for is
         // executed against the adopted array's eligibility, just like physical input.

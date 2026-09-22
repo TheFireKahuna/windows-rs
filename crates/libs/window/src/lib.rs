@@ -20,6 +20,7 @@ mod handoff;
 mod hwnd;
 mod key_filter;
 mod pace;
+mod preferences;
 mod visibility;
 mod window;
 
@@ -46,6 +47,7 @@ pub use handoff::Handoff;
 pub use hwnd::Hwnd;
 pub use key_filter::{KeyFilter, KeyMessage};
 pub use pace::{Pacer, PacerHealth, Tick, WM_FRAME, Wake};
+pub use preferences::client_area_animations;
 pub use visibility::{Visibility, Watch};
 pub use window::{
     Apartment, MoveSize, Window, WindowBuilder, ensure_dispatcher_queue, initialize_sta, pump, quit, run,

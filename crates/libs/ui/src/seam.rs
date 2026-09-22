@@ -550,6 +550,7 @@ row! {
     /// **An appending producer**, as [`Up`] is: a deferred contact is a lost contact.
     ToScene,
     empty: |b| b.reports.is_empty()
+        && b.springs_enabled.is_none()
         && b.intents.is_empty()
         && b.caption.is_none()
         && b.fields.is_empty()
@@ -575,6 +576,8 @@ row! {
         /// Read by `Controls::nonclient`: what the pointer is doing to a window command whose
         /// input the system took.
         caption: Option<CaptionState>,
+        /// Controls whether subsequent compositor springs animate or snap to their targets.
+        springs_enabled: Option<bool>,
         /// The client size in DIPs, where it changed.
         size: Option<Vector2>,
         /// The display the window is on, where it changed.
@@ -942,6 +945,7 @@ mod tests {
         cleared_is_empty(ToScene::default(), |b| {
             b.reports.push(Report::CaptureLost);
         });
+        cleared_is_empty(ToScene::default(), |b| b.springs_enabled = Some(false));
         cleared_is_empty(InputDown::default(), |b| b.hits_changed = true);
     }
 

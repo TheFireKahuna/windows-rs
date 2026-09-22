@@ -339,9 +339,8 @@ pub fn offset_of(fraction: f32, travel: f32, vertical: bool) -> f32 {
 
 /// A bounded scalar mapping, declared by a component and driven on the front thread.
 ///
-/// The first three are what a decorative descendant declares. The last two are minted by the stock
-/// scalar recipes, because they read the control's own solved travel, which no author knows at
-/// construction.
+/// Thumb, trail and fade parts use the control's solved travel. Rotation and offset parts
+/// state their own endpoints.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub enum ScalarPart {
     /// No part: what an empty slot of a control's part array holds.
@@ -368,6 +367,8 @@ pub enum ScalarPart {
     Trail {
         from: f32,
     },
+    /// Fades from transparent to opaque with the control's thumb position.
+    Fade,
 }
 
 impl ScalarPart {
@@ -399,7 +400,7 @@ impl ScalarPart {
                 None,
             ],
             // Driven by a compositor binding onto the thumb's offset, not by a write from here.
-            Self::Trail { .. } => [None, None],
+            Self::Trail { .. } | Self::Fade => [None, None],
         }
     }
 }

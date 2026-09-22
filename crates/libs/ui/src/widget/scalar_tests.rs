@@ -291,6 +291,43 @@ fn native_an_idle_scalar_adopts_another_controls_edit_in_the_same_document() -> 
 }
 
 #[test]
+fn native_toggle_updates_spring_but_mount_resize_and_republication_do_not() -> Result<()> {
+    let mut rig = Rig::new("toggle source motion")?;
+    let thumb = rig.node()?;
+    let track = rig.node()?;
+    let id = rig.ids.mint();
+    let off = ValueRow {
+        parts: [
+            (thumb, ScalarPart::Thumb { vertical: false }),
+            (track, ScalarPart::Fade),
+            (NodeId::NONE, ScalarPart::None),
+            (NodeId::NONE, ScalarPart::None),
+        ],
+        rest: 2.0,
+        travel: 12.0,
+        ..ValueRow::default()
+    };
+    rig.adopt(&[(id, ChromeRow::default())], &[(id, off)], &[])?;
+    assert_eq!(rig.animations(), 1, "mount binds the colour follower without springing");
+    let minted = rig.visuals_minted();
+    let on = ValueRow { fraction: 1.0, revision: 1, ..off };
+    rig.adopt(&[], &[(id, on)], &[])?;
+    assert_eq!(rig.animations(), 2, "a model toggle must start only the thumb spring");
+    rig.adopt(&[], &[(id, on)], &[])?;
+    assert_eq!(rig.animations(), 2, "republication must not restart the spring or follower");
+    rig.adopt(&[], &[(id, off)], &[])?;
+    assert_eq!(rig.animations(), 3, "reversal must retarget only the thumb spring");
+    let resized = ValueRow { travel: 14.0, ..off };
+    rig.adopt(&[], &[(id, resized)], &[])?;
+    assert_eq!(rig.animations(), 4, "resize must rebind the follower and place the thumb directly");
+    rig.scene.set_springs_enabled(false);
+    rig.adopt(&[], &[(id, ValueRow { fraction: 1.0, revision: 1, ..resized })], &[])?;
+    assert_eq!(rig.animations(), 4, "reduced motion must bypass the spring and retain the follower");
+    assert_eq!(rig.visuals_minted(), minted);
+    Ok(())
+}
+
+#[test]
 fn native_one_writer_carries_every_value_and_a_changed_revision_supersedes_a_gesture() -> Result<()>
 {
     let mut rig = Rig::new("scalar ownership")?;

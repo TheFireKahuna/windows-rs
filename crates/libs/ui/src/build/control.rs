@@ -834,11 +834,11 @@ const fn bits_of(drive: Interaction) -> u8 {
 
 /// The channel mask a part drives, which is what a second writer would collide with.
 ///
-/// A trail writes no channel from its mapping — it is driven by a compositor expression onto
-/// the thumb's own offset — so its two trim endpoints are named here rather than derived.
+/// Trail and fade mappings emit no writes; compositor expressions own their channels.
 fn claimed(part: ScalarPart) -> u32 {
     match part {
         ScalarPart::Trail { .. } => (1 << Prop::TrimStart as u32) | (1 << Prop::TrimEnd as u32),
+        ScalarPart::Fade => 1 << Prop::Opacity as u32,
         part => part
             .channels(0.0, 0.0, 1.0)
             .into_iter()

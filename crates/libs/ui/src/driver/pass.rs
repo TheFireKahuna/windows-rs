@@ -770,6 +770,9 @@ impl SceneThread {
     /// Turns the input thread's reports into pixels and records what the app thread must learn
     /// from them.
     fn route(&mut self, to: &mut ToScene) -> Result<()> {
+        if let Some(enabled) = to.springs_enabled {
+            self.scene.set_springs_enabled(enabled);
+        }
         self.up.size = to.size.or(self.up.size);
         // The ground's grain is the one layer with an extent, and this is where the extent
         // arrives. Cheap on every size but the ones that outgrow the allocation.

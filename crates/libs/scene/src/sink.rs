@@ -936,8 +936,7 @@ pub enum Bind {
         axis: TrackerAxis,
         affine: Affine,
     },
-    /// A trim endpoint derived from another visual's animated offset. The clamp lets an
-    /// indicator grow from an origin while sharing exactly one animated position.
+    /// Derives trim or opacity from another visual's animated offset, clamped to a range.
     FollowOffset {
         source: NodeId,
         vertical: bool,

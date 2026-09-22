@@ -148,7 +148,7 @@ const TRACK_EXPR: [&str; 3] = [
     "t.Scale * m + c",
 ];
 
-/// Restricted to trim endpoints, so a slider fill follows the thumb's exact compositor
+/// Restricted to trim and opacity, so a scalar's followers share its exact compositor
 /// position across zero without a second spring and cannot create an offset cycle.
 const FOLLOW_EXPR: [&str; 2] = [
     "Clamp(v.Offset.X * m + c, lo, hi)",
@@ -954,6 +954,7 @@ pub struct Scene {
     /// what a display move invalidated.
     env: Option<Env>,
     motion: Motion,
+    springs_enabled: bool,
     trackers: Slots<TRACKER, TrackerState>,
     events: Rc<RefCell<Vec<SceneEvent>>>,
     hits: HitTable,
@@ -1027,6 +1028,7 @@ impl Scene {
             cache: Cache::default(),
             generation: Gen::default(),
             env: Some(env),
+            springs_enabled: true,
             motion: Motion {
                 templates: Templates::new(back),
                 pending: Vec::new(),
@@ -1045,6 +1047,11 @@ impl Scene {
     #[must_use]
     pub fn hits(&self) -> &HitTable {
         &self.hits
+    }
+
+    /// Makes subsequent spring targets land immediately when animation is disabled.
+    pub fn set_springs_enabled(&mut self, enabled: bool) {
+        self.springs_enabled = enabled;
     }
 
     /// What is under `p` for `contact`, or `None` if nothing is.
@@ -1668,6 +1675,10 @@ impl Scene {
         env: Env,
     ) -> Result<()> {
         let row = desc(prop);
+        let bind = match bind {
+            Bind::Animate(Anim::Spring { to, .. }) if !self.springs_enabled => Bind::Set(to),
+            other => other,
+        };
         // The owner may not exist yet, and what that means differs per owner.
         if !self.nodes.has_owner(id, row.owner) {
             match absent(row.owner) {
@@ -1732,9 +1743,8 @@ impl Scene {
                 affine,
                 clamp,
             } => {
-                // Only a trim endpoint, and never its own source: any other target would let
-                // one visual's offset drive another's and close an expression cycle.
-                if !matches!(prop, Prop::TrimStart | Prop::TrimEnd)
+                // Trim and opacity cannot feed back into the source's offset.
+                if !matches!(prop, Prop::TrimStart | Prop::TrimEnd | Prop::Opacity)
                     || source == id
                     || !affine.m.is_finite()
                     || !affine.c.is_finite()
@@ -2664,6 +2674,29 @@ mod tests {
         assert_eq!(after.props_skipped, before.props_skipped + 1);
         // An op was applied, so the pass is a change even though nothing was written.
         assert!(changed);
+    }
+
+    #[test]
+    fn disabled_springs_snap_app_and_front_targets_and_can_resume() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let id = rig.sprite(&mut patch, 40.0);
+        rig.apply(&mut patch);
+        let spring = |to| Bind::Animate(Anim::Spring {
+            to: Value::Scalar(to), tuning: Tuning::Chrome, delay_ms: 0,
+        });
+        rig.scene.set_springs_enabled(false);
+        let before = rig.scene.census().animations;
+        patch.push(Op::Bind { id, prop: Prop::OffsetX, bind: spring(12.0) });
+        rig.apply(&mut patch);
+        rig.scene.retarget(id, Prop::Opacity, spring(0.4), &rig.back).unwrap();
+        assert_eq!(rig.scene.census().animations, before);
+        assert_eq!(rig.scene.nodes.chan(id, desc(Prop::OffsetX).chan), 12.0);
+        assert_eq!(rig.scene.nodes.chan(id, desc(Prop::Opacity).chan), 0.4);
+        assert_eq!(rig.scene.nodes.held(id, desc(Prop::OffsetX)), Held::Free);
+        rig.scene.set_springs_enabled(true);
+        rig.scene.retarget(id, Prop::Opacity, spring(1.0), &rig.back).unwrap();
+        assert_eq!(rig.scene.census().animations, before + 1);
     }
 
     /// A spring states its wait to the compositor, which measures it, so a held fade costs

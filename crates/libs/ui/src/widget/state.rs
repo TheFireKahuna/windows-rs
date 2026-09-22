@@ -313,6 +313,8 @@ impl Controls {
     /// adopts a changed source even within the same revision. A changed revision adopts the
     /// application's value and supersedes a gesture standing on it, so another control or a
     /// document load reaches this control through the same front-side writer as a pointer.
+    /// Mounted press-only controls spring to changed values. Mounts, geometry corrections,
+    /// sliders and rotary controls adopt their positions immediately.
     ///
     /// Geometry that moved is re-driven and re-bound here. These tables are the only writer of the
     /// properties the router owns, so changed geometry reaches the pixels through this call and no
@@ -339,6 +341,7 @@ impl Controls {
             self.wash(id, front)?;
         }
         for &(id, mut row) in values {
+            let mounted = self.values.get(id).is_some();
             let held = self.value(id);
             let source = row.fraction;
             if self.values.get(id).is_some_and(|v| {
@@ -352,37 +355,54 @@ impl Controls {
             let moved = (held.rest, held.travel, held.parts) != (row.rest, row.travel, row.parts);
             self.values.place(id, HeldValue { row, source });
             if moved {
-                self.bind_trails(row, front)?;
+                self.bind_followers(row, front)?;
             }
             if moved || held.fraction != row.fraction {
-                self.drive(id, row.fraction, How::Carried, front)?;
+                let how = if mounted && !moved && self.flags(id) & flag::VALUED == 0 {
+                    How::Sprung
+                } else {
+                    How::Carried
+                };
+                self.drive(id, row.fraction, how, front)?;
             }
         }
         self.move_ring(front)?;
         self.reveals(front)
     }
 
-    /// Binds each value stroke's trim to its thumb's own animated offset, so the stroke follows
-    /// the spring on the compositor rather than through one write per frame.
-    fn bind_trails(&self, row: ValueRow, front: &mut Front<'_>) -> Result<()> {
-        let thumb = row.parts.iter().find_map(|(node, part)| match part {
+    /// Binds trim and opacity followers to the thumb's compositor offset.
+    fn bind_followers(&self, row: ValueRow, front: &mut Front<'_>) -> Result<()> {
+        let Some((source, vertical)) = row.parts.iter().find_map(|(node, part)| match part {
             ScalarPart::Thumb { vertical } => Some((*node, *vertical)),
             _ => None,
-        });
+        }) else {
+            return Ok(());
+        };
         for (node, part) in row.parts {
-            let (ScalarPart::Trail { from }, Some((source, vertical))) = (part, thumb) else {
-                continue;
+            let targets = match part {
+                ScalarPart::Trail { from } => [
+                    Some((Prop::TrimStart, [0.0, from])),
+                    Some((Prop::TrimEnd, [from, 1.0])),
+                ],
+                ScalarPart::Fade => [Some((Prop::Opacity, [0.0, 1.0])), None],
+                _ => continue,
             };
             let m = if row.travel > 0.0 {
                 1.0 / row.travel
             } else {
                 0.0
             };
-            let affine = Affine {
+            let mut affine = Affine {
                 m,
                 c: -row.rest * m,
             };
-            for (prop, clamp) in [(Prop::TrimStart, [0.0, from]), (Prop::TrimEnd, [from, 1.0])] {
+            if part == ScalarPart::Fade && vertical {
+                affine = Affine {
+                    m: -m,
+                    c: 1.0 + row.rest * m,
+                };
+            }
+            for (prop, clamp) in targets.into_iter().flatten() {
                 let bind = Bind::FollowOffset {
                     source,
                     vertical,
