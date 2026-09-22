@@ -11,7 +11,7 @@
 //! * **scene** — the compositor and the retained tree. A patch is applied when it arrives, a
 //!   report is turned into a retarget when it arrives, and a compositor callback lands through
 //!   this thread's own message queue, which the wait below serves alongside the doorbell. Each
-//!   pass ends a work item, and ending the work item is the publish.
+//!   changed pass requests a compositor commit before servicing the next wake.
 
 use std::cell::Cell;
 use std::ops::ControlFlow;
@@ -51,6 +51,10 @@ trait Worker {
     fn park(&mut self) -> ControlFlow<()>;
     /// Drains every inbox, does one pass, publishes.
     fn pass(&mut self) -> Result<()>;
+    /// Services thread-affine callbacks after a pass, including under continuous input.
+    fn dispatch(&mut self) -> ControlFlow<()> {
+        ControlFlow::Continue(())
+    }
     /// Brings the thread's own state down, on the thread that owns it.
     fn finish(self);
 }
@@ -74,6 +78,9 @@ fn run<W: Worker>(links: &Links, bell: &Ring, mut worker: W) {
         bell.disarm();
         if let Err(e) = worker.pass() {
             links.fail(&e);
+            break;
+        }
+        if worker.dispatch().is_break() {
             break;
         }
         if stopping {
@@ -601,6 +608,13 @@ where
 }
 
 impl Worker for SceneThread {
+    fn dispatch(&mut self) -> ControlFlow<()> {
+        if windows_window::pump() {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    }
     /// Waits on the doorbell, the window's visibility watch and this thread's own message
     /// queue, which is how a compositor callback reaches it. No timer.
     fn park(&mut self) -> ControlFlow<()> {
@@ -624,6 +638,7 @@ impl Worker for SceneThread {
 
     /// One pass: everything that arrived, in the order the seams require.
     fn pass(&mut self) -> Result<()> {
+        let before = *self.scene.census();
         // ⓪ what the compositor reported, before anything else reads it: the thumb reveal
         // below wants tracker phases, and only observed scroll state needs them on the app
         // thread.
@@ -643,13 +658,13 @@ impl Worker for SceneThread {
             env: self.env,
         };
         present::bind(&mut self.regions, &mut front)?;
-        while let Some(mut down) = self.links.down.take() {
+        if let Some(mut down) = self.links.down.take() {
             self.apply(&mut down)?;
             if self.links.down.give(down) {
                 self.links.app_bell.ring();
             }
         }
-        while let Some(mut to) = self.links.to_scene.take() {
+        if let Some(mut to) = self.links.to_scene.take() {
             self.route(&mut to)?;
             if self.links.to_scene.give(to) {
                 self.links.window.post(WM_FRAME, 0, 0);
@@ -666,6 +681,9 @@ impl Worker for SceneThread {
         // of one: a ring for a spare nobody was waiting for is a wake that finds nothing.
         if self.links.up.send(&mut self.up) {
             self.links.app_bell.ring();
+        }
+        if self.scene.census().changed_since(&before) {
+            self.back.request_commit()?;
         }
         Ok(())
     }

@@ -26,6 +26,7 @@ Windows.UI.Composition.Compositor::CreateInstance
 Windows.UI.Composition.ICompositor::{CreateContainerVisual, CreateSpriteVisual, CreateColorBrushWithColor, CreateScopedBatch, CreateScalarKeyFrameAnimation, CreateVector3KeyFrameAnimation, CreateLinearEasingFunction, CreateCubicBezierEasingFunction}
 Windows.UI.Composition.ICompositor2::{CreateAnimationGroup, CreateNineGridBrush, CreateImplicitAnimationCollection}
 Windows.UI.Composition.ICompositor5::{CreateShapeVisual, CreateSpriteShapeWithGeometry, CreateContainerShape, CreateEllipseGeometry}
+Windows.UI.Composition.ICompositor5::RequestCommitAsync
 
 Windows.UI.Composition.CompositionObject
 Windows.UI.Composition.ICompositionObject::{get_Compositor, StartAnimation}

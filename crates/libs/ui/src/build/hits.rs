@@ -158,6 +158,9 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
     }
     let bounded = flags & tree::CLIP != 0;
     let geom = walk.tree.c.geom[node.index()];
+    if bounded && (geom.size.x <= 0.0 || geom.size.y <= 0.0) {
+        return;
+    }
     if flags & tree::HIT != 0 {
         let mut decl = HitDecl {
             flags: HitFlags::from_bits(tree::unpack_decl(flags)),

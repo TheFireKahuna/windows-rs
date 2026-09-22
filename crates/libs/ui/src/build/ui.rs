@@ -779,6 +779,14 @@ impl<'a, K> Element<'a, K> {
         self.flag(tree::CLIP, true)
     }
 
+    /// Springs changed layout bounds in this subtree on the compositor.
+    ///
+    /// Initial geometry snaps. Subsequent solves retarget native springs;
+    /// unchanged bounds and tracker-owned offsets are left alone.
+    pub fn animate_layout(self) -> Self {
+        self.flag(tree::ANIMATE_LAYOUT, true)
+    }
+
     /// Announces a change to this element's content to a listening client.
     ///
     /// `assertive` interrupts whatever the client is reading; otherwise the announcement waits

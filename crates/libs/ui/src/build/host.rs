@@ -52,11 +52,6 @@ pub(crate) struct Placement {
 pub(crate) struct Entrance {
     pub node: NodeId,
     pub slide: crate::overlay::Slide,
-    /// The window box and the rect the entrance was last seen at, so a resize under an open
-    /// menu snaps rather than replaying the slide. The window is the one the overlay opened
-    /// against, which is the box the first publication compares.
-    window: Vector2,
-    rect: Option<Rect>,
     /// Whether the slide is on the compositor. Set when it starts and read to keep the next
     /// publication from binding the same curve again.
     started: bool,
@@ -68,12 +63,10 @@ impl Entrance {
         !self.done
     }
 
-    pub(crate) fn new(node: NodeId, slide: crate::overlay::Slide, window: Vector2) -> Self {
+    pub(crate) fn new(node: NodeId, slide: crate::overlay::Slide) -> Self {
         Self {
             node,
             slide,
-            window,
-            rect: None,
             started: false,
             done: false,
         }
@@ -1455,6 +1448,13 @@ impl Host {
             h.publish_channels();
             h.tree.encode(&mut h.pending);
             h.build_hits(None);
+            for op in h.pending.ops() {
+                if let Op::New { id, .. } = *op {
+                    if h.tree.is_live(id) {
+                        h.tree.c.flags[id.index()] &= !tree::INITIAL;
+                    }
+                }
+            }
             h.pending.env = Some(h.env);
             h.census.flushes += 1;
             core::mem::swap(&mut h.pending, patch);
@@ -1708,7 +1708,7 @@ impl Host {
 
     pub(crate) fn enter_slide(&mut self, node: NodeId, slide: crate::overlay::Slide) {
         self.suspend_input(node, true);
-        self.entrances.push(Entrance::new(node, slide, self.window.get()));
+        self.entrances.push(Entrance::new(node, slide));
     }
 
     /// Publishes conditional and overlay entrances through the same geometry policy.
@@ -1732,27 +1732,26 @@ impl Host {
         if geom.size.x <= 0.0 || geom.size.y <= 0.0 {
             return entry;
         }
-        let replaced = entry.started
-            && (entry.window != self.window.get() || entry.rect.is_some_and(|r| r != geom.rect));
-        if replaced {
-            self.bind(entry.node, Prop::Offset, Bind::Set(Value::Vec2(geom.local)));
-            entry.done = true;
-            self.suspend_input(entry.node, false);
-        } else if !entry.started {
-            let from = entry.slide.from(geom.local, geom.size);
-            let frames = self.frames(&[
-                (0.0, Value::Vec2(from), Easing::Linear),
-                (1.0, Value::Vec2(geom.local), entry.slide.easing),
-            ]);
-            let anim = Anim::Frames {
-                frames,
-                duration_ms: entry.slide.ms,
-                iterations: Iterations::Count(1),
-            };
-            self.bind(entry.node, Prop::Offset, Bind::Animate(anim));
-            entry.rect = Some(geom.rect);
-            entry.window = self.window.get();
+        if !entry.started {
+            for (prop, by) in [(Prop::AnchorX, entry.slide.by.x), (Prop::AnchorY, entry.slide.by.y)] {
+                if by == 0.0 {
+                    continue;
+                }
+                let frames = self.frames(&[
+                    (0.0, Value::Scalar(-by), Easing::Linear),
+                    (1.0, Value::Scalar(0.0), entry.slide.easing),
+                ]);
+                self.bind(entry.node, prop, Bind::Animate(Anim::Frames {
+                    frames,
+                    duration_ms: entry.slide.ms,
+                    iterations: Iterations::Count(1),
+                }));
+            }
             entry.started = true;
+            if entry.slide.by == Vector2::zero() {
+                entry.done = true;
+                self.suspend_input(entry.node, false);
+            }
         }
         entry
     }
@@ -1819,6 +1818,9 @@ impl Host {
     pub(crate) fn build_hits(&mut self, uia: Option<&mut crate::uia::Snapshot>) {
         if !self.tree.hits_dirty && uia.is_none() {
             return;
+        }
+        if self.tree.hits_dirty {
+            self.uia_stale.set(true);
         }
         let root = self.root;
         let window = self.tree.c.geom[root.index()].size;

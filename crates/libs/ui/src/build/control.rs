@@ -836,7 +836,7 @@ const fn bits_of(drive: Interaction) -> u8 {
 /// The channel mask a part drives, which is what a second writer would collide with.
 ///
 /// Trail and fade mappings emit no writes; compositor expressions own their channels.
-fn claimed(part: ScalarPart) -> u32 {
+fn claimed(part: ScalarPart) -> u64 {
     match part {
         ScalarPart::Trail { .. } => (1 << Prop::TrimStart as u32) | (1 << Prop::TrimEnd as u32),
         ScalarPart::Fade => 1 << Prop::Opacity as u32,

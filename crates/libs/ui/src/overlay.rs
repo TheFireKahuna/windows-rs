@@ -404,16 +404,6 @@ pub struct Slide {
     pub easing: Easing,
 }
 
-impl Slide {
-    /// Returns where the entry starts, from the placed local offset and the measured size.
-    #[must_use]
-    pub fn from(self, local: Vector2, size: Vector2) -> Vector2 {
-        Vector2 {
-            x: local.x + self.by.x * size.x,
-            y: local.y + self.by.y * size.y,
-        }
-    }
-}
 
 /// Describes how an overlay opens: its kind, anchor, dismiss policy and exit transition.
 ///
@@ -736,7 +726,6 @@ impl Overlays {
         mount.set_exit(spec.exit);
         Host::with(|host| {
             let node = mount.node();
-            let window = host.window_extent();
             if spec.slide.is_some() {
                 // The entrance holds input on this subtree for as long as the slide plays, so a
                 // press cannot land on a surface that is still arriving.
@@ -749,7 +738,7 @@ impl Overlays {
                 anchor: spec.anchor,
                 viewport: host.overlay_viewport(spec.viewport),
                 at: Vector2 { x: 0.0, y: 0.0 },
-                entry: spec.slide.map(|slide| Entrance::new(node, slide, window)),
+                entry: spec.slide.map(|slide| Entrance::new(node, slide)),
             });
         });
         self.open.push(Open {
@@ -1174,7 +1163,7 @@ impl Overlays {
     /// Applies scene events to the stack: an elapsed dwell, and an entrance the compositor has
     /// finished playing.
     ///
-    /// The entrance is the only animation this stack binds on an overlay root's offset, so the
+    /// The entrance is the only animation this stack binds on an overlay root's anchor, so the
     /// channel the report names is what identifies it.
     pub(crate) fn scene(&mut self, events: &[SceneEvent], focus: &mut Vec<FocusOp>) {
         for event in events {
@@ -1182,7 +1171,7 @@ impl Overlays {
                 SceneEvent::DelayElapsed(delay) => self.elapsed(delay, focus),
                 SceneEvent::AnimationCompleted {
                     node,
-                    prop: Prop::Offset,
+                    prop: Prop::AnchorX | Prop::AnchorY,
                 } => {
                     _ = Host::try_with(|host| host.complete_overlay_entry(node));
                 }
@@ -1770,11 +1759,7 @@ mod tests {
         );
         let slide = spec.slide.expect("a slide");
         assert_eq!(slide.ms, 200);
-        assert_eq!(
-            slide.from(size(10.0, 20.0), size(0.0, 300.0)),
-            size(10.0, 320.0),
-            "the entry did not start one measured size away"
-        );
+        assert_eq!(slide.by, by);
     }
 
     /// A flyout restores focus to the control it was opened from; a modal names none.
@@ -2604,7 +2589,7 @@ mod tests {
                 op,
                 Op::Bind {
                     id,
-                    prop: Prop::Offset,
+                    prop: Prop::AnchorX | Prop::AnchorY,
                     bind: windows_scene::Bind::Animate(windows_scene::Anim::Frames { .. }),
                 } if *id == node
             )),
@@ -2618,7 +2603,7 @@ mod tests {
         overlays.scene(
             &[SceneEvent::AnimationCompleted {
                 node,
-                prop: Prop::Offset,
+                prop: Prop::AnchorX,
             }],
             &mut ops.0,
         );
@@ -2688,7 +2673,7 @@ mod tests {
             Host::flush(&mut patch);
             if visible {
                 assert!(patch.ops().iter().any(|op| matches!(op,
-                    Op::Bind { prop: Prop::Offset, bind: windows_scene::Bind::Animate(_), .. })));
+                    Op::Bind { prop: Prop::AnchorX | Prop::AnchorY, bind: windows_scene::Bind::Animate(_), .. })));
             } else {
                 assert!(patch.ops().iter().any(|op| matches!(op,
                     Op::Drop { exit: Exit::Slide { .. }, .. })));

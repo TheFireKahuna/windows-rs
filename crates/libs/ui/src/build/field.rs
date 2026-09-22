@@ -360,6 +360,8 @@ impl Host {
         let Some(plan) = self.plan_field(id) else {
             return;
         };
+        self.tree.c.driven[plan.node.index()] |=
+            (1 << Prop::OffsetX as u32) | (1 << Prop::OffsetY as u32);
         self.write_channel(plan.node, Prop::Offset, Value::Vec2(plan.geometry.origin));
         self.place_caret(id, plan.caret, plan.line_h, plan.geometry.origin);
         self.decorate(id, &plan.geometry, false);
@@ -390,18 +392,21 @@ impl Host {
             (row.group, row.style)
         };
         let box_ = self.geom(group.0).size;
+        let inset = metric(Metric::SpaceSm, style);
+        let width = (box_.x - inset * 2.0).max(1.0);
         let (node, end) = {
             let Self { fields, text, .. } = self;
             let row = fields.get_mut(id)?;
-            if !core::mem::take(&mut row.dirty) {
+            let resized = row.geometry.as_ref().is_none_or(|g| {
+                g.viewport.w != width || g.viewport.h != box_.y
+            });
+            if !core::mem::take(&mut row.dirty) && !resized {
                 return None;
             }
             let (node, _, end) = text.field_view(row.key, &mut row.clusters)?;
             (node, end)
         };
         let line = self.geom(node).size;
-        let inset = metric(Metric::SpaceSm, style);
-        let width = (box_.x - inset * 2.0).max(1.0);
         let row = self.fields.get_mut(id)?;
         // The cluster table is shared with the geometry published against the same text
         // revision, so a caret move re-publishes the boxes it already handed out.

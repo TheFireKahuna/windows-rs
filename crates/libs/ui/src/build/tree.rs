@@ -8,8 +8,8 @@ use crate::build::text::MeasureKey;
 use crate::layout::{Layout, Rect, WidthClass};
 use windows_numerics::Vector2;
 use windows_scene::{
-    Bind, Clip, ControlId, Corners, Forest, Ids, Links, NO_LINK, NODE, NodeId, Op, Prop,
-    SinkPatch, Value,
+    Anim, Bind, Clip, ControlId, Corners, Forest, Ids, Links, NO_LINK, NODE, NodeId, Op, Prop,
+    SinkPatch, Tuning, Value,
 };
 
 /// Absence in a `u32` head column: no row in the pool it heads.
@@ -55,6 +55,8 @@ pub(crate) const SUNK: Bits = 1 << 25;
 /// Walk B wrote this node's width this pass, so the boxes under it are not where the last
 /// arrange left them even where its own snapped box is. Cleared by the arrange.
 pub(crate) const PLACED: Bits = 1 << 26;
+pub(crate) const ANIMATE_LAYOUT: Bits = 1 << 27;
+pub(crate) const INITIAL: Bits = 1 << 28;
 
 // ── the hit declaration, packed ─────────────────────────────────────────────────────
 
@@ -235,8 +237,8 @@ macro_rules! columns {
 columns! {
     links: Links = Links::default(),
     flags: Bits = 0,
-    channels: u32 = 0,
-    driven: u32 = 0,
+    channels: u64 = 0,
+    driven: u64 = 0,
     bindings: u32 = NONE,
     side: u32 = NONE,
     inflate: f32 = f32::NAN,
@@ -283,6 +285,7 @@ impl Tree {
     pub fn mint(&mut self, scope: u32) -> NodeId {
         let id = self.ids.mint();
         self.c.seat(id.index());
+        self.c.flags[id.index()] |= INITIAL;
         self.c.scope[id.index()] = scope;
         self.hits_dirty = true;
         id
@@ -542,6 +545,23 @@ impl Tree {
             let now = self.c.geom[id.index()];
             let was = self.c.published[id.index()];
             let bounded = self.c.flags[id.index()] & CLIP != 0;
+            let mut ancestor = id;
+            let mut animated = false;
+            while !ancestor.is_none() {
+                animated |= self.c.flags[ancestor.index()] & ANIMATE_LAYOUT != 0;
+                ancestor = self.parent(ancestor);
+            }
+            let live_clip = animated;
+            animated &= was.size.x.is_finite() && self.c.flags[id.index()] & INITIAL == 0;
+            let write = |prop, value| Op::Bind {
+                id,
+                prop,
+                bind: if animated {
+                    Bind::Animate(Anim::Spring { to: value, tuning: Tuning::Layout, delay_ms: 0 })
+                } else {
+                    Bind::Set(value)
+                },
+            };
             // The array holds absolute rects, so a box that moved leaves it stale.
             if now.local != was.local || now.size != was.size {
                 self.hits_dirty = true;
@@ -553,7 +573,6 @@ impl Tree {
                 // axis nothing drives is still the layout's, and goes out on its own channel.
                 let driven = self.c.driven[id.index()];
                 let held = |prop: Prop| driven & (1 << prop as u32) != 0;
-                let write = |prop, value| Op::Bind { id, prop, bind: Bind::Set(value) };
                 match (held(Prop::OffsetX), held(Prop::OffsetY)) {
                     (false, false) => patch.push(write(Prop::Offset, Value::Vec2(now.local))),
                     (false, true) => {
@@ -566,16 +585,14 @@ impl Tree {
                 }
             }
             if now.size != was.size {
-                patch.push(Op::Bind {
-                    id,
-                    prop: Prop::Size,
-                    bind: Bind::Set(Value::Vec2(now.size)),
-                });
+                patch.push(write(Prop::Size, Value::Vec2(now.size)));
             }
             // A clip is declared, not diffed, scene-side, and declaring the absence of one
             // mints a side row on every node that never had one.
-            if bounded != was.bounded || (bounded && now.size != was.size) {
-                let clip = if bounded {
+            if bounded != was.bounded || (bounded && !live_clip && now.size != was.size) {
+                let clip = if bounded && live_clip {
+                    Clip::Bounds
+                } else if bounded {
                     Clip::Rect {
                         l: 0.0,
                         t: 0.0,

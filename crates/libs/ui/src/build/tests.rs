@@ -93,6 +93,75 @@ fn a_flush_hands_over_what_moved_and_a_settled_tree_hands_over_nothing() {
 }
 
 #[test]
+fn layout_width_changes_animate_the_retained_row_and_its_clip() {
+    let mut patch = fixture();
+    let width = Cell::new(240.0);
+    let (mut body, mut pane) = (NodeId::NONE, NodeId::NONE);
+    let held = Ui::mount_root(|ui| {
+        ui.node(Preset::Row).animate_layout().width(Len::dip(800.0)).height(Len::dip(400.0))
+            .children(|ui| {
+                body = ui.node(Preset::Layer).grow().id().into();
+                pane = ui.node(Preset::Layer).clip()
+                    .layout_from(move |l| l.width = Len::dip(width.get()))
+                    .children(|ui| { button(ui, "Pane action"); })
+                    .id().into();
+            });
+    });
+    Host::flush(&mut patch);
+    assert!(!patch.ops().iter().any(|op| matches!(op, Op::Bind { bind: Bind::Animate(_), .. })));
+    assert!(patch.ops().iter().any(|op| matches!(op,
+        Op::Clip { id, clip: windows_scene::Clip::Bounds } if *id == pane
+    )));
+    for target in [0.0, 240.0, 180.0, 0.0] {
+        patch.clear();
+        Host::with(|h| h.uia_published());
+        width.set(target);
+        Host::flush(&mut patch);
+        assert!(Host::with(|h| h.uia_stale()));
+        for (node, prop) in [(body, Prop::Size), (pane, Prop::Offset), (pane, Prop::Size)] {
+            assert!(patch.ops().iter().any(|op| matches!(op,
+                Op::Bind { id, prop: p, bind: Bind::Animate(Anim::Spring { tuning: windows_scene::Tuning::Layout, .. }) }
+                if *id == node && *p == prop
+            )), "missing native {prop:?} animation: {:#?}", patch.ops());
+        }
+        assert!(!patch.ops().iter().any(|op| matches!(op, Op::New { .. } | Op::Drop { .. })));
+        assert_eq!(Host::with(|h| h.geom(body).size.x), 800.0 - target);
+        patch.clear();
+        Host::flush(&mut patch);
+        assert!(patch.ops().is_empty());
+    }
+    drop(held);
+}
+
+#[test]
+fn geometry_settles_without_animation_through_the_entire_creation_publication() {
+    let mut patch = fixture();
+    let mut parent = NodeId::NONE;
+    let held = Ui::mount_root(|ui| {
+        parent = ui.node(Preset::Layer).animate_layout().id().into();
+    });
+    let sprite = Host::with(|h| {
+        let sprite = h.visual(windows_scene::GroupId(parent), None);
+        h.visual_rect(sprite, Vector2::zero(), Vector2::zero());
+        h.tree.touch(sprite.0);
+        h.tree.encode(&mut h.pending);
+        h.visual_rect(sprite, Vector2::zero(), Vector2::new(100.0, 40.0));
+        sprite
+    });
+    Host::flush(&mut patch);
+    assert!(!patch.ops().iter().any(|op| matches!(op,
+        Op::Bind { id, bind: Bind::Animate(_), .. } if *id == sprite.0
+    )));
+    patch.clear();
+    Host::with(|h| h.visual_rect(sprite, Vector2::zero(), Vector2::new(200.0, 40.0)));
+    Host::flush(&mut patch);
+    assert!(patch.ops().iter().any(|op| matches!(op,
+        Op::Bind { id, prop: Prop::Size, bind: Bind::Animate(Anim::Spring { tuning: windows_scene::Tuning::Layout, .. }) } if *id == sprite.0
+    )));
+    drop(held);
+}
+
+#[test]
 fn a_patch_is_stamped_with_the_environment_it_was_solved_under() {
     let mut coarse = Rig::at(800.0, 600.0, 1.0);
     let stamped = coarse
@@ -1293,9 +1362,18 @@ fn conditional_slide_releases_input_and_retires_during_entry() {
         Host::flush(&mut patch);
         let id = node.get();
         assert!(patch.ops().iter().any(|op| matches!(op,
-            Op::Bind { id: target, prop: Prop::Offset, bind: Bind::Animate(Anim::Frames { .. }) }
+            Op::Bind { id: target, prop: Prop::AnchorX, bind: Bind::Animate(Anim::Frames { .. }) }
             if *target == id)));
         assert!(Host::with(|h| h.input_suspended(id)));
+        for width in [800.0, 790.0, 780.0] {
+            patch.clear();
+            Host::with(|h| h.set_window(Vector2 { x: width, y: 600.0 }));
+            Host::flush(&mut patch);
+            assert!(Host::with(|h| h.input_suspended(id)));
+            assert!(!patch.ops().iter().any(|op| matches!(op,
+                Op::Bind { id: target, prop: Prop::AnchorX | Prop::AnchorY, .. } if *target == id)),
+                "resize restarted or canceled the entrance");
+        }
         patch.clear();
         Host::flush(&mut patch);
         assert!(patch.ops().is_empty());
