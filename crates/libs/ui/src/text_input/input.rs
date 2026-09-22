@@ -104,25 +104,7 @@ impl TextInput {
 
     /// Runs one automation write, checked against the revision it was issued at.
     pub fn automation(&mut self, action: TextAction) {
-        let mut doc = self.doc.borrow_mut();
-        let (id, revision) = match &action {
-            TextAction::Replace(id, revision, _) | TextAction::Select(id, revision, _) => {
-                (*id, *revision)
-            }
-        };
-        if doc.focused() != Some(id) || doc.revision != revision || doc.composing() {
-            return;
-        }
-        match action {
-            TextAction::Replace(_, _, text) => {
-                doc.command(Command::All);
-                doc.command(Command::Write(text.into()));
-            }
-            // A password field refuses selection, because the client that placed the range
-            // reads it back and names masked text with it. A write returns nothing.
-            TextAction::Select(..) if doc.scope() == InputScope::Password => (),
-            TextAction::Select(_, _, selection) => doc.command(Command::Select(selection)),
-        }
+        self.doc.borrow_mut().automation(action);
     }
 
     /// Consumes the reports the focused field owns and leaves every other one in place.

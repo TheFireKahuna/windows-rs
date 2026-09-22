@@ -241,6 +241,7 @@ impl UiRuntime {
                 let rescaled = Rc::clone(&rescaled);
                 move |_| rescaled.post(())
             })
+            .hidden()
             .create()?;
         // Shared with the tick, which outlives every stack frame here.
         let window = Rc::new(window);

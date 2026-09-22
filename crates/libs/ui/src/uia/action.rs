@@ -41,7 +41,7 @@ pub enum Action {
 }
 
 /// One queued editing request. Variable-length, which is why it is not on [`Action`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum TextAction {
     Replace(ControlId, u64, Vec<u16>),
     Select(ControlId, u64, Selection),

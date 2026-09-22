@@ -1,22 +1,23 @@
 //! One editable document per window, and one row per mounted field.
 //!
-//! The focused field is the buffer the input STA edits; every other field is the value the
-//! application last published. That row is also the replacement a focused field adopts when
-//! it blurs, so a waiting source is never held twice.
+//! The active buffer holds keyboard and composition edits. Other fields retain their value
+//! and selection in rows, which automation edits without changing the active buffer.
+//! An active field's row also holds the application replacement it adopts on blur.
 
 use super::{Affinity, Geometry, InputScope, Selection, Source, Update};
+use crate::uia::action::TextAction;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use crate::layout::Rect;
 use windows_scene::ControlId;
 
-/// What the application last said a field holds, stripped as input holds it, and the
-/// revision it was based on.
+/// Holds an inactive field's state or the active field's pending application value.
 struct Row {
     id: ControlId,
     scope: InputScope,
     revision: u64,
     text: Arc<[u16]>,
+    selection: Selection,
 }
 
 /// The focused field's box and clip in screen pixels, and the scale a screen point divides
@@ -61,7 +62,7 @@ pub(crate) enum Command {
         forward: bool,
         word: bool,
     },
-    /// Text at the selection: one character, a paste, or an automation write.
+    /// Text at the selection: one character or a paste.
     Write(Arc<[u16]>),
     /// A caret placed at a point, in control-relative DIPs.
     Point {
@@ -70,6 +71,7 @@ pub(crate) enum Command {
     },
     All,
     Select(Selection),
+    Automation(TextAction),
 }
 
 impl Command {
@@ -92,9 +94,9 @@ const UPSTREAM: u8 = 4;
 
 /// The window's text state: one editable buffer, one row per mounted field, one outbox.
 ///
-/// `id` names the field the buffer belongs to, or none while no field has given it one, in
-/// which case every mutation is refused and every read is empty. It outlives focus by
-/// exactly as long as a command is still waiting for shaped geometry.
+/// `id` names the buffer's field. Buffer operations require that identity; row-targeted
+/// automation does not. The buffer can outlive focus while a command awaits geometry or
+/// a composition remains open.
 #[derive(Default)]
 pub(crate) struct Doc {
     pub id: Option<ControlId>,
@@ -175,9 +177,7 @@ impl Doc {
 
     /// Reports whether `selection` is in range and splits no surrogate pair.
     pub fn accepts(&self, selection: Selection) -> bool {
-        [selection.anchor, selection.caret]
-            .into_iter()
-            .all(|at| at <= self.len() && boundary(&self.text, at))
+        accepts(&self.text, selection)
     }
 
     /// ACP edits must preserve their declared offsets. Reject malformed text and ranges
@@ -188,7 +188,7 @@ impl Doc {
             || end > self.len()
             || !boundary(&self.text, start)
             || !boundary(&self.text, end)
-            || char::decode_utf16(text.iter().copied()).any(|c| c.is_err())
+            || !valid_text(text)
             || text.iter().copied().any(is_break)
         {
             return None;
@@ -249,6 +249,40 @@ impl Doc {
         }
         let change = self.run(command);
         self.emit(change);
+    }
+
+    /// Applies one revision-checked automation transaction without moving focus.
+    pub fn automation(&mut self, action: TextAction) {
+        let (id, revision) = match &action {
+            TextAction::Replace(id, revision, _) | TextAction::Select(id, revision, _) => (*id, *revision),
+        };
+        if self.id == Some(id) {
+            self.command(Command::Automation(action));
+            return;
+        }
+        let Some(row) = self.rows.iter_mut().find(|row| row.id == id && row.revision == revision) else {
+            return;
+        };
+        let mut commit = None;
+        let text = match action {
+            TextAction::Replace(_, _, text) => {
+                let text = stripped(&text);
+                if !valid_text(&text) { return; }
+                if *row.text == text { return; }
+                row.revision += 1;
+                row.selection = Selection { affinity: Affinity::Upstream, ..Selection::at(text.len() as u32) };
+                commit = Some(Arc::from(String::from_utf16_lossy(&text)));
+                row.text = text.into();
+                Some(Arc::clone(&row.text))
+            }
+            TextAction::Select(_, _, selection) => {
+                if row.scope == InputScope::Password || !accepts(&row.text, selection) { return; }
+                if row.selection == selection { return; }
+                row.selection = selection;
+                None
+            }
+        };
+        self.publish(id, false, Some((text, commit)));
     }
 
     /// Installs shaped geometry and releases whatever was waiting for it.
@@ -313,6 +347,21 @@ impl Doc {
                 self.place(wanted.caret, Some(wanted.anchor), wanted.affinity);
                 Change::Caret
             }),
+            Command::Automation(action) => {
+                let (id, revision) = match &action {
+                    TextAction::Replace(id, revision, _) | TextAction::Select(id, revision, _) => (*id, *revision),
+                };
+                if self.id != Some(id) || self.revision != revision || self.composing() {
+                    return None;
+                }
+                match action {
+                    TextAction::Replace(_, _, text) => self.replace(0, self.len(), &stripped(&text)),
+                    TextAction::Select(_, _, selection) if self.scope() != InputScope::Password => {
+                        self.run(Command::Select(selection))
+                    }
+                    TextAction::Select(..) => None,
+                }
+            }
         }
     }
 
@@ -386,12 +435,16 @@ impl Doc {
             Some(at) if source.based_on < self.rows[at].revision => return,
             Some(at) => {
                 let row = &mut self.rows[at];
+                if row.text != text {
+                    row.selection = Selection::at(text.len() as u32);
+                }
                 (row.scope, row.revision, row.text) = (source.scope, source.based_on, text);
             }
             None => self.rows.push(Row {
                 id: source.id,
                 scope: source.scope,
                 revision: source.based_on,
+                selection: Selection::at(text.len() as u32),
                 text,
             }),
         }
@@ -452,15 +505,15 @@ impl Doc {
             }
             self.retire();
         }
-        let Some((revision, text)) = id
+        let Some((revision, text, selection)) = id
             .and_then(|id| self.rows.iter().find(|row| row.id == id))
-            .map(|row| (row.revision, Arc::clone(&row.text)))
+            .map(|row| (row.revision, Arc::clone(&row.text), row.selection))
         else {
             return;
         };
         (self.id, self.flags, self.revision) = (id, FOCUSED, revision);
         self.text.extend_from_slice(&text);
-        self.place(self.len(), None, Affinity::Upstream);
+        self.place(selection.caret, Some(selection.anchor), selection.affinity);
         self.emit(Some(Change::Caret));
     }
 
@@ -479,9 +532,10 @@ impl Doc {
     /// the user's, at the revision the user left it at.
     fn retire(&mut self) {
         if let Some(old) = self.id {
-            let (revision, text) = (self.revision, Arc::<[u16]>::from(&self.text[..]));
+            let (revision, text, selection) = (self.revision, Arc::<[u16]>::from(&self.text[..]), self.selection());
             if let Some(row) = self.rows.iter_mut().find(|row| row.id == old) {
                 (row.revision, row.text) = (revision, text);
+                row.selection = selection;
             }
         }
         self.clear();
@@ -514,7 +568,7 @@ impl Doc {
         self.publish(id, true, Some((text, commit)));
     }
 
-    /// Pushes one row onto the outbox, for the focused buffer or for a row echoed back.
+    /// Publishes the active buffer or a stored field through the shared outbox.
     fn publish(
         &mut self,
         id: ControlId,
@@ -532,7 +586,7 @@ impl Doc {
         };
         let selection = match buffered {
             true => self.selection(),
-            false => Selection::at(text.as_ref().map_or(0, |t| t.len() as u32)),
+            false => row.map_or_else(|| Selection::at(0), |row| row.selection),
         };
         self.out.push(Update {
             id,
@@ -559,6 +613,15 @@ fn is_break(unit: u16) -> bool {
 
 fn stripped(text: &[u16]) -> Vec<u16> {
     text.iter().copied().filter(|&u| !is_break(u)).collect()
+}
+
+fn valid_text(text: &[u16]) -> bool {
+    char::decode_utf16(text.iter().copied()).all(|c| c.is_ok())
+}
+
+fn accepts(text: &[u16], selection: Selection) -> bool {
+    [selection.anchor, selection.caret].into_iter()
+        .all(|at| at as usize <= text.len() && boundary(text, at))
 }
 
 /// Reports whether `at` falls between code units rather than inside a surrogate pair.
@@ -919,5 +982,121 @@ mod tests {
         assert!(!echo.focused);
         assert!(echo.commit.is_none());
         assert_eq!(*echo.text.clone().unwrap(), [97, 98]);
+    }
+
+    #[test]
+    fn background_automation_preserves_another_fields_composition() {
+        let mut doc = focused("typing");
+        let active = doc.id.unwrap();
+        let other = ControlId::FIRST;
+        assert_ne!(active, other);
+        doc.source(&Source { id: other, ..source("old", 7) });
+        edit(&mut doc, |d| d.compose(Some((0, 6))));
+        doc.out.clear();
+        doc.automation(TextAction::Replace(other, 7, "new\r\ntext".encode_utf16().collect()));
+        assert_eq!(doc.focused(), Some(active));
+        assert!(doc.composing());
+        assert_eq!(doc.text(), &"typing".encode_utf16().collect::<Vec<_>>());
+        assert_eq!(doc.revision, 0);
+        assert_eq!(commits(&doc), ["newtext"]);
+        assert_eq!(doc.out.len(), 1);
+        assert_eq!(doc.out[0].id, other);
+        assert_eq!(doc.out[0].revision, 8);
+        assert!(!doc.out[0].focused);
+        assert_eq!(doc.out[0].composition, None);
+        doc.source(&Source { id: other, ..source("late", 7) });
+        assert_eq!(held(&doc, other), "newtext".encode_utf16().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn background_selection_survives_echo_and_focus_without_committing() {
+        let mut doc = Doc::default();
+        let id = ControlId::default();
+        doc.source(&source("a😀b", 4));
+        doc.out.clear();
+        let wanted = Selection { anchor: 1, caret: 3, affinity: Affinity::Upstream };
+        doc.automation(TextAction::Select(id, 4, wanted));
+        assert_eq!(doc.focused(), None);
+        assert_eq!(doc.id, None);
+        assert_eq!(doc.out.len(), 1);
+        assert_eq!(doc.out[0].selection, wanted);
+        assert!(doc.out[0].text.is_none());
+        assert!(doc.out[0].commit.is_none());
+        doc.source(&source("a😀b", 4));
+        assert_eq!(doc.out.last().unwrap().selection, wanted);
+        doc.focus(Some(id));
+        assert_eq!(doc.selection(), wanted);
+        assert!(commits(&doc).is_empty());
+    }
+
+    #[test]
+    fn automation_replacement_is_one_transaction_and_preserves_selection_on_rejection() {
+        let mut doc = focused("abc");
+        let id = doc.id.unwrap();
+        doc.command(Command::Select(Selection::at(1)));
+        doc.out.clear();
+        doc.automation(TextAction::Replace(id, 0, vec![0xd800]));
+        assert_eq!(doc.selection(), Selection::at(1));
+        assert!(doc.out.is_empty());
+        doc.automation(TextAction::Replace(id, 0, "xyz".encode_utf16().collect()));
+        assert_eq!(doc.out.len(), 1);
+        assert_eq!(commits(&doc), ["xyz"]);
+        assert_eq!(doc.out[0].revision, 1);
+        assert!(doc.out[0].focused);
+        assert_eq!(doc.out[0].selection.caret, 3);
+    }
+
+    #[test]
+    fn automation_does_not_replace_the_composing_field() {
+        let mut doc = focused("composing");
+        let id = doc.id.unwrap();
+        edit(&mut doc, |d| d.compose(Some((0, 9))));
+        doc.out.clear();
+        let selection = doc.selection();
+        doc.automation(TextAction::Replace(id, 0, vec![]));
+        doc.automation(TextAction::Select(id, 0, Selection::at(0)));
+        assert_eq!(doc.selection(), selection);
+        assert_eq!(doc.text(), &"composing".encode_utf16().collect::<Vec<_>>());
+        assert!(doc.composing());
+        assert!(doc.out.is_empty());
+    }
+
+    #[test]
+    fn queued_automation_rechecks_revision_after_preceding_keyboard_edit() {
+        let mut doc = focused("ab");
+        let id = doc.id.unwrap();
+        doc.command(Command::Erase { forward: false, word: false });
+        assert!(doc.waiting());
+        doc.automation(TextAction::Replace(id, 0, "overwrite".encode_utf16().collect()));
+        assert!(doc.out.is_empty());
+        doc.layout(id, &shaped(0, "ab"));
+        assert_eq!(doc.text(), &[b'a' as u16]);
+        assert_eq!(commits(&doc), ["a"]);
+        assert!(!doc.waiting());
+    }
+
+    #[test]
+    fn automation_rejects_stale_missing_and_invalid_background_edits() {
+        let mut doc = Doc::default();
+        let id = ControlId::default();
+        doc.source(&source("a😀b", 4));
+        doc.out.clear();
+        doc.automation(TextAction::Replace(id, 3, vec![b'x' as u16]));
+        doc.automation(TextAction::Replace(id, 4, vec![0xd800]));
+        doc.automation(TextAction::Replace(ControlId::FIRST, 4, vec![]));
+        doc.automation(TextAction::Select(id, 4, Selection::at(2)));
+        doc.automation(TextAction::Select(id, 4, Selection::at(5)));
+        assert!(doc.out.is_empty());
+        assert_eq!(held(&doc, id), "a😀b".encode_utf16().collect::<Vec<_>>());
+        doc.source(&Source { scope: InputScope::Password, ..source("secret", 4) });
+        doc.out.clear();
+        doc.automation(TextAction::Select(id, 4, Selection::at(1)));
+        assert!(doc.out.is_empty());
+        doc.automation(TextAction::Replace(id, 4, "changed".encode_utf16().collect()));
+        assert_eq!(commits(&doc), ["changed"]);
+        doc.out.clear();
+        doc.forget(id);
+        doc.automation(TextAction::Replace(id, 5, vec![]));
+        assert!(doc.out.is_empty());
     }
 }
