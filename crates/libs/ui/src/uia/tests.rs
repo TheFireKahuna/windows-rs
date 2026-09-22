@@ -221,7 +221,7 @@ impl Screen {
     }
 
     /// Returns the hit table the pointer would route through, over the same walk's entries.
-    fn table(&self) -> HitTable {
+    pub(super) fn table(&self) -> HitTable {
         let mut index: Vec<_> = self
             .entries
             .iter()

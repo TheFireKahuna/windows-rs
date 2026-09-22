@@ -893,6 +893,25 @@ const _: () = assert!(
     "a droppable QUEUE registers a thread-local destructor that fail-fasts at process exit"
 );
 
+/// Initializes a single-threaded COM apartment until the returned guard is dropped.
+///
+/// The guard remains on its creating thread and must outlive its COM objects.
+/// Returns an error if the thread already uses an incompatible apartment.
+pub fn initialize_sta() -> Result<impl Drop> {
+    windows_core::link!("ole32.dll" "system" fn CoInitializeEx(reserved: *const core::ffi::c_void, flags: u32) -> HRESULT);
+    windows_core::link!("ole32.dll" "system" fn CoUninitialize());
+    // SAFETY: the reserved pointer is null; 2 selects COINIT_APARTMENTTHREADED.
+    unsafe { CoInitializeEx(core::ptr::null(), 2) }.ok()?;
+    struct Guard(core::marker::PhantomData<Rc<()>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: the non-Send guard balances successful initialization on its thread.
+            unsafe { CoUninitialize() };
+        }
+    }
+    Ok(Guard(core::marker::PhantomData))
+}
+
 /// Which apartment a thread's dispatcher queue is created in.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Apartment {

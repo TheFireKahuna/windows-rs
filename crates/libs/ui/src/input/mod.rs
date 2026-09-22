@@ -465,10 +465,14 @@ impl Router {
                 self.contacts.release_all(true);
                 self.capture = None;
                 out.push(Report::CaptureLost);
-                let from = self.focus.current();
-                if self.focus.focus(None) {
-                    out.push(Report::FocusChanged { from, to: None });
-                }
+                let from = self.focus.keyboard();
+                self.focus.window_focus(false, hits);
+                self.focus.report(from, out);
+            }
+            EventKind::FocusGained => {
+                let from = self.focus.keyboard();
+                self.focus.window_focus(true, hits);
+                self.focus.report(from, out);
             }
             EventKind::Button => {
                 if let Some((target, _)) = self.contacts.bound(p.id) {
@@ -534,10 +538,9 @@ impl Router {
         let Some(hit) = hits.hit(sample.raw, sample.kind()) else {
             // A press on nothing still takes focus away, so clicking the background dismisses
             // a text caret.
-            let from = self.focus.current();
-            if self.focus.focus(None) {
-                out.push(Report::FocusChanged { from, to: None });
-            }
+            let from = self.focus.keyboard();
+            self.focus.focus(None);
+            self.focus.report(from, out);
             return Ok(());
         };
         // An overlay's blocker consumes the press outright. Nothing under it is pressed, no
@@ -549,13 +552,9 @@ impl Router {
             });
             return Ok(());
         }
-        let from = self.focus.current();
-        if self.focus.focus(Some(hit.id)) {
-            out.push(Report::FocusChanged {
-                from,
-                to: Some(hit.id),
-            });
-        }
+        let from = self.focus.keyboard();
+        self.focus.focus(Some(hit.id));
+        self.focus.report(from, out);
         out.push(Report::Pressed {
             target: hit.id,
             contact: p.id,
@@ -736,17 +735,17 @@ impl Router {
     }
 
     fn key(&mut self, event: KeyEvent, hits: &HitTable, out: &mut Vec<Report>) {
+        if !self.focus.window_focused() {
+            return;
+        }
         // Tab and Esc are taken before any control sees them: focus order has one authority,
         // and an open overlay closes from the keyboard wherever the pointer is.
         if event.kind == KeyKind::Down {
             match event.key as i32 {
                 VK_TAB => {
-                    let from = self.focus.current();
+                    let from = self.focus.keyboard();
                     match self.focus.step(hits, !event.mods.shift) {
-                        Move::To => out.push(Report::FocusChanged {
-                            from,
-                            to: self.focus.current(),
-                        }),
+                        Move::To => self.focus.report(from, out),
                         // Off the end of a scope that does not trap: dismiss it and let the
                         // owner step again outside.
                         Move::Left => out.push(Report::Escape {
@@ -767,7 +766,7 @@ impl Router {
             }
         }
         out.push(Report::Key {
-            target: self.focus.current(),
+            target: self.focus.keyboard(),
             event,
         });
     }
@@ -999,7 +998,7 @@ impl Router {
                 Rotation::Turned { at: Some(at), .. } | Rotation::Clicked { at: Some(at) } => hits
                     .hit(at, ContactKind::Touch)
                     .map(|hit| hit.id),
-                _ => self.focus.current(),
+                _ => self.focus.keyboard(),
             };
             match rotation {
                 Rotation::Turned { degrees, .. } => {

@@ -861,3 +861,34 @@ fn static_text_uses_published_clusters_and_advertises_no_selection() {
     assert_eq!(range_text(&ranges[0]), "ab");
     assert!(!rectangles(&ranges[0]).is_empty());
 }
+
+#[test]
+fn window_focus_round_trip_updates_cached_provider_and_focus_events() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let field = screen.field(NONE, (0.0, 0.0, 120.0, 24.0), "text", 8.0);
+    screen.publish(&mut uia);
+    let id = screen.control(field);
+    let element = super::provider::provider_for(uia.shared_for_test(), id).unwrap();
+    let text = field_text(&uia, id);
+    let mut ring = crate::input::FocusRing::default();
+    let mut raised = Vec::new();
+    ring.focus(Some(id));
+    uia.take_pending_for_test(&mut raised);
+    for active in [false, true, false, true] {
+        raised.clear();
+        ring.window_focus(active, &screen.table());
+        uia.set_focus(ring.keyboard());
+        assert_eq!(caret_range(&text).unwrap().0, active);
+        uia.take_pending_for_test(&mut raised);
+        assert_eq!(
+            raised.iter().filter(|event| **event == super::events::Raise::focus(id)).count(),
+            usize::from(active),
+        );
+        assert_eq!(ring.current(), Some(id));
+        let value = property(&element, crate::bindings::UIA_HasKeyboardFocusPropertyId);
+        assert_eq!(tag(&value), 11);
+        // SAFETY: the checked VT_BOOL tag identifies the initialized boolVal arm.
+        assert_eq!(unsafe { value.Anonymous.Anonymous.Anonymous.boolVal } != 0, active);
+    }
+}

@@ -42,6 +42,8 @@ pub enum EventKind {
     Cancel,
     /// The window lost every contact at once, which is what losing focus does.
     CaptureLost,
+    /// The window gained keyboard focus.
+    FocusGained,
     Wheel,
 }
 
@@ -465,6 +467,7 @@ impl Doorbell {
             // A window that loses focus loses every contact with it, since the input that
             // would have ended them goes elsewhere.
             WM_KILLFOCUS => self.window_event(EventKind::CaptureLost),
+            WM_SETFOCUS => self.window_event(EventKind::FocusGained),
             WM_KEYDOWN | WM_SYSKEYDOWN => self.key(KeyKind::Down, wparam, lparam),
             WM_KEYUP | WM_SYSKEYUP => self.key(KeyKind::Up, wparam, lparam),
             WM_CHAR => self.key(KeyKind::Char, wparam, lparam),
@@ -774,6 +777,24 @@ mod tests {
             repeat: false,
             mods: Mods::default(),
         })
+    }
+
+    #[test]
+    fn native_focus_messages_preserve_order_and_do_not_conflate_capture() {
+        let bell = Doorbell::new();
+        for message in [WM_SETFOCUS, WM_KILLFOCUS, WM_CAPTURECHANGED, WM_SETFOCUS] {
+            assert_eq!(bell.wndproc(message as u32, 0, 0), None);
+        }
+        for kind in [
+            EventKind::FocusGained, EventKind::CaptureLost,
+            EventKind::Cancel, EventKind::FocusGained,
+        ] {
+            let Some(InputEvent::Pointer(event)) = bell.pop() else {
+                panic!("missing focus transition")
+            };
+            assert_eq!(event.kind, kind);
+        }
+        assert!(bell.idle());
     }
 
     #[test]

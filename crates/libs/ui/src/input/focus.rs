@@ -51,10 +51,11 @@ pub enum Move {
     None,
 }
 
-/// Holds the focused control and the stack of scopes that bound navigation.
+/// Retains control focus and its navigation scopes separately from window keyboard focus.
 #[derive(Debug, Default)]
 pub struct FocusRing {
     current: Option<ControlId>,
+    window_focused: bool,
     scopes: Vec<Scope>,
     /// Explicit tab positions, keyed by control. Empty for every screen that does not override
     /// the hit array's order.
@@ -65,10 +66,45 @@ pub struct FocusRing {
 }
 
 impl FocusRing {
-    /// Returns the focused control, or `None` when nothing has focus.
+    /// Returns the remembered control, including while the window lacks keyboard focus.
     #[must_use]
     pub const fn current(&self) -> Option<ControlId> {
         self.current
+    }
+
+    /// Returns the control receiving keyboard input while the window has focus.
+    #[must_use]
+    pub const fn keyboard(&self) -> Option<ControlId> {
+        if self.window_focused {
+            self.current
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn window_focused(&self) -> bool {
+        self.window_focused
+    }
+
+    pub(crate) fn window_focus(&mut self, focused: bool, hits: &HitTable) {
+        self.window_focused = focused;
+        self.validate(hits);
+    }
+
+    pub(crate) fn validate(&mut self, hits: &HitTable) {
+        if self.current.is_some_and(|id| {
+            hits.entry(id)
+                .is_none_or(|entry| !entry.flags.contains(HitFlags::INTERACTIVE))
+        }) {
+            self.current = None;
+        }
+    }
+
+    pub(crate) fn report(&self, from: Option<ControlId>, out: &mut Vec<super::Report>) {
+        let to = self.keyboard();
+        if from != to {
+            out.push(super::Report::FocusChanged { from, to });
+        }
     }
 
     /// Returns the innermost open scope, which `Esc` is delivered to before any control.
@@ -296,6 +332,62 @@ mod tests {
             restore_to,
             from: cid(9),
         });
+    }
+
+    #[test]
+    fn window_focus_preserves_the_control_and_reports_only_keyboard_transitions() {
+        let hits = table(&[1, 2]);
+        let mut ring = FocusRing::default();
+        let mut reports = Vec::new();
+        ring.focus(Some(cid(1)));
+        assert_eq!(ring.keyboard(), None);
+        for (active, from, to) in [
+            (true, None, Some(cid(1))),
+            (false, Some(cid(1)), None),
+            (true, None, Some(cid(1))),
+        ] {
+            assert_eq!(ring.keyboard(), from);
+            ring.window_focus(active, &hits);
+            ring.report(from, &mut reports);
+            assert_eq!(reports.pop(), Some(super::super::Report::FocusChanged { from, to }));
+            assert_eq!(ring.current(), Some(cid(1)));
+            ring.window_focus(active, &hits);
+            ring.report(to, &mut reports);
+            assert!(reports.is_empty());
+        }
+    }
+
+    #[test]
+    fn background_scope_changes_do_not_claim_keyboard_focus() {
+        let hits = table(&[1, 10]);
+        let mut ring = FocusRing::default();
+        let mut reports = Vec::new();
+        ring.focus(Some(cid(1)));
+        push(&mut ring, 1, true, Some(cid(1)));
+        ring.focus(Some(cid(10)));
+        ring.window_focus(true, &hits);
+        ring.window_focus(false, &hits);
+        ring.apply(&[FocusOp::Pop(ScopeId(1))], &hits);
+        ring.report(None, &mut reports);
+        assert!(reports.is_empty());
+        assert_eq!(ring.current(), Some(cid(1)));
+        ring.window_focus(true, &hits);
+        assert_eq!(ring.keyboard(), Some(cid(1)));
+    }
+
+    #[test]
+    fn restoration_rejects_removed_disabled_and_reused_controls() {
+        for hits in [table(&[2]), table_of(&[entry(1, HitFlags::from_bits(0))])] {
+            let mut ring = FocusRing::default();
+            ring.focus(Some(cid(1)));
+            ring.window_focus(true, &hits);
+            assert_eq!(ring.current(), None);
+            assert_eq!(ring.keyboard(), None);
+        }
+        let mut ring = FocusRing::default();
+        ring.focus(Some(ControlId::raw(1, 2)));
+        ring.window_focus(true, &table(&[1]));
+        assert_eq!(ring.keyboard(), None);
     }
 
     #[test]

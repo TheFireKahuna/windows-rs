@@ -48,6 +48,6 @@ pub use key_filter::{KeyFilter, KeyMessage};
 pub use pace::{Pacer, PacerHealth, Tick, WM_FRAME, Wake};
 pub use visibility::{Visibility, Watch};
 pub use window::{
-    Apartment, MoveSize, Window, WindowBuilder, ensure_dispatcher_queue, pump, quit, run,
+    Apartment, MoveSize, Window, WindowBuilder, ensure_dispatcher_queue, initialize_sta, pump, quit, run,
 };
 pub use windows_core::Result;

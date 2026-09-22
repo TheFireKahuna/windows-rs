@@ -184,17 +184,6 @@ impl Tick {
         // ② the focus edits the app thread emitted, into the same report list: a keyboard move
         // and a pointer move reach the front table the same way.
         self.apply_focus();
-        // A control that stopped being interactive under the focus it holds keeps the ring
-        // pointing at something no contact can reach, so focus is dropped rather than stranded.
-        let focused = self.router.focus_mut().current();
-        if focused.is_some_and(|id| {
-            self.view
-                .entry(id)
-                .is_none_or(|e| !e.flags.contains(HitFlags::INTERACTIVE))
-        }) {
-            self.focus.push(FocusOp::Focus(None));
-            self.apply_focus();
-        }
         // From here the pass makes call-outs: TSF, the clipboard, the touch view, automation.
         // Everything above routed input and moved nothing outside this thread, so a removed key
         // taken by a nested pump from here on is offered to TSF behind input that has been
@@ -289,22 +278,18 @@ impl Tick {
         Ok(())
     }
 
-    /// Applies the focus edits held, raising one report where the ring moved.
+    /// Applies pending focus edits and reports the resulting keyboard-focus change.
     fn apply_focus(&mut self) {
-        if self.focus.is_empty() {
-            return;
-        }
-        let from = self.router.focus_mut().current();
+        let from = self.router.focus_mut().keyboard();
         let Self {
-            view,
-            router,
-            focus,
-            ..
+            view, router, focus, reports, ..
         } = self;
-        if view.with(|hits| router.focus_mut().apply(focus, hits)) {
-            let to = self.router.focus_mut().current();
-            self.reports.push(Report::FocusChanged { from, to });
-        }
+        view.with(|hits| {
+            let ring = router.focus_mut();
+            ring.apply(focus, hits);
+            ring.validate(hits);
+            ring.report(from, reports);
+        });
         self.focus.clear();
     }
 
@@ -452,7 +437,7 @@ impl Tick {
             return;
         }
         let mut uia = self.from_pump.uia.borrow_mut();
-        uia.set_focus(self.router.focus_mut().current());
+        uia.set_focus(self.router.focus_mut().keyboard());
         if let Some(origin) = client_origin(self.window.hwnd()) {
             uia.set_window(origin, env.scale());
         }

@@ -166,6 +166,7 @@ impl UiRuntime {
         B: FnOnce() -> Result<Backends> + Send + 'static,
         M: FnOnce(&mut crate::build::Ui<'_>, AppCtx) + Send + 'static,
     {
+        let _apartment = windows_window::initialize_sta()?;
         // The tick, reachable from the window procedure. Empty until everything it needs
         // exists, which is after the window whose handler reaches it. That handler holds a weak
         // reference: the tick owns the window, and two strong ones would be a cycle that never

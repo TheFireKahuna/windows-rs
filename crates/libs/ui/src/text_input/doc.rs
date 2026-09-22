@@ -722,6 +722,21 @@ mod tests {
         })
     }
 
+    #[test]
+    fn blur_and_restore_preserve_text_revision_and_selection() {
+        let mut doc = focused("a\u{1f600}b");
+        doc.place(3, Some(1), Affinity::Upstream);
+        let selection = doc.selection();
+        let revision = doc.revision;
+        doc.focus(None);
+        assert_eq!(doc.focused(), None);
+        doc.focus(Some(ControlId::default()));
+        assert_eq!(doc.text(), "a\u{1f600}b".encode_utf16().collect::<Vec<_>>());
+        assert_eq!(doc.selection(), selection);
+        assert_eq!(doc.revision, revision);
+        assert!(commits(&doc).is_empty());
+    }
+
     /// One input method edit revises its own text several times. Only the end of the
     /// composition compares the value against the one it started from, so the application is
     /// told once.
