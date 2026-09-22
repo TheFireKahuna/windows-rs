@@ -1109,7 +1109,7 @@ impl Host {
         // A cell whose owner has been disposed is skipped: `Cell::set` panics on a disposed
         // handle, and a control's two halves die at different moments.
         if let Some(cell) = live.filter(|cell| cell.alive()) {
-            cell.set(Some(f64::from(fraction)));
+            cell.set(Some(number));
         }
     }
 

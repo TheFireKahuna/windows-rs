@@ -456,10 +456,10 @@ pub fn slider_source<'a, M>(
     // The trim runs along the rail, and a vertical value grows against that direction.
     let at_min = range.fraction(style.origin.unwrap_or(range.min));
     let origin = if vertical { 1.0 - at_min } else { at_min };
-    let [rail, mark] = ui.geometries(
+    let [rail, trail, mark] = ui.geometries(
         crate::build::geometry::Source::Probe(extent),
-        [3; 2],
-        move |inputs, [rail, mark]| {
+        [3; 3],
+        move |inputs, [rail, trail, mark]| {
             let at = |main, cross| {
                 let (x, y) = if vertical {
                     (cross, main)
@@ -478,6 +478,7 @@ pub fn slider_source<'a, M>(
             let position = |fraction| inset + (length - 2.0 * inset).max(0.0) * fraction;
             for (out, from, to) in [
                 (rail, at(position(0.0), mid), at(position(1.0), mid)),
+                (trail, at(position(0.0), mid), at(position(1.0), mid)),
                 (
                     mark,
                     at(position(origin), mid - half),
@@ -499,7 +500,8 @@ pub fn slider_source<'a, M>(
             // stack without a grid of one track to hold them.
             ui.node(Preset::Layer).children(move |ui| {
                 ui.path(rail).stroke(Role::Fill(Fill::Sunken), style.rail);
-                let trail = ui.path(rail).probed(extent);
+                // Composition trim belongs to the geometry; the full rail has its own.
+                let trail = ui.path(trail).probed(extent);
                 let trail = match style.ramp {
                     Some(ramp) => trail.stroke_ramp(ramp, style.rail),
                     None => trail.ink_stroke(style.rail),

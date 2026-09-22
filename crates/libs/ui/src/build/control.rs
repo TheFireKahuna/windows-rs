@@ -775,11 +775,11 @@ impl<'a, K> Element<'a, K> {
 }
 
 impl Element<'_, Scalar> {
-    /// Publishes this control's value while a gesture moves it, and clears `cell` when the
-    /// gesture commits or is canceled.
+    /// Publishes this control's value in its range units as its source or gesture changes.
     ///
     /// The value a pointer, a key or an automation client is moving lives on the front thread
-    /// until the gesture ends, so a readout beside the control reads it here.
+    /// until the gesture ends, so a readout beside the control reads it here. Source echoes
+    /// and cancellation publish the authoritative value through the same cell.
     pub fn live(self, cell: Cell<Option<f64>>) -> Self {
         self.declare(HitFlags::GESTURE, |row| row.live = Some(cell))
     }

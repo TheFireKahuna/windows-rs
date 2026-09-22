@@ -140,9 +140,31 @@ fn a_control_publishes_its_value_into_the_applications_cell() {
     rig.mount(|ui| {
         knob(ui, gain, Range::new(0.0, 4.0)).live(live);
     });
-    assert_eq!(live.get(), Some(0.0625), "the cell did not take the declared value");
+    assert_eq!(live.get(), Some(0.25), "the cell did not take the declared value");
     rig.set(gain, 2.0);
-    assert_eq!(live.get(), Some(0.5), "the cell did not follow the source");
+    assert_eq!(live.get(), Some(2.0), "the cell did not follow the source");
+}
+
+#[test]
+fn a_slider_keeps_its_full_rail_separate_from_the_trimmed_trail() {
+    use windows_scene::{Mask, Op};
+
+    let mut rig = Rig::new();
+    let value = Cell::new(0.0);
+    let frame = rig.mount(|ui| {
+        super::slider_source(
+            ui,
+            move || super::ScalarValue { value: value.get(), epoch: 0 },
+            Range::new(-6.0, 6.0),
+            super::SliderStyle { origin: Some(0.0), mark_origin: false, ..Default::default() },
+        );
+    });
+    let paths: Vec<_> = frame.patch().ops().iter().filter_map(|op| match op {
+        Op::Mask { mask: Mask::Shape { geom, stroke: Some(_) }, .. } => Some(*geom),
+        _ => None,
+    }).collect();
+    assert_eq!(paths.len(), 2);
+    assert_ne!(paths[0], paths[1], "trimming the trail must not trim the full rail");
 }
 
 #[test]
