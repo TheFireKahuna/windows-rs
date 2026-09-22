@@ -1,9 +1,7 @@
 //! The scene: the retained tree, the patch applier, motion, trackers and the ground.
 //!
-//! `Windows.UI.Composition` has no commit method. Changes publish when the thread's
-//! dispatcher queue finishes the current work item, so one pass is one publish and an idle
-//! window publishes nothing because it never passes. Composition objects are therefore
-//! touched only inside a pass.
+//! Composition objects are touched inside scene passes. The driver requests publication
+//! after a pass changes the scene; native animations advance independently of that driver.
 
 use crate::arena::*;
 use crate::hit::HitTable;
@@ -155,12 +153,58 @@ const FOLLOW_EXPR: [&str; 2] = [
     "Clamp(v.Offset.Y * m + c, lo, hi)",
 ];
 
-/// Held once for the process.
-///
-/// Continuity across a retarget is a property of the *target*, because a natural-motion
-/// animation starts from the property's current value and resets its velocity whichever
-/// object drives it — which is also why a spring retargeted per pointer-move never leaves
-/// rest. Six springs and five expressions serve the whole stack.
+/// Retains a native layout spring for one visual property.
+pub(crate) enum LayoutSpring {
+    Scalar(SpringScalarNaturalMotionAnimation),
+    Vec2(SpringVector2NaturalMotionAnimation),
+    Vec3(SpringVector3NaturalMotionAnimation),
+}
+
+impl LayoutSpring {
+    fn new(back: &Backends, slot: u8) -> Self {
+        let period = Duration::from_secs_f32(CHROME_PERIOD);
+        match slot {
+            1 => {
+                let spring = back.compositor.create_spring_scalar_animation();
+                spring.set_damping_ratio(CHROME_DAMPING);
+                spring.set_period(period);
+                Self::Scalar(spring)
+            }
+            2 => {
+                let spring = back.compositor.create_spring_vector2_animation();
+                spring.set_damping_ratio(CHROME_DAMPING);
+                spring.set_period(period);
+                Self::Vec2(spring)
+            }
+            _ => {
+                let spring = back.compositor.create_spring_vector3_animation();
+                spring.set_damping_ratio(CHROME_DAMPING);
+                spring.set_period(period);
+                Self::Vec3(spring)
+            }
+        }
+    }
+
+    fn retarget(&self, to: Value) -> CompositionAnimation {
+        match (self, to) {
+            (Self::Scalar(spring), Value::Scalar(value)) => {
+                spring.set_final_value(value);
+                spring.as_animation()
+            }
+            (Self::Vec2(spring), Value::Vec2(value)) => {
+                spring.set_final_value(value);
+                spring.as_animation()
+            }
+            (Self::Vec3(spring), Value::Vec2(value)) => {
+                spring.set_final_value(v3(value));
+                spring.as_animation()
+            }
+            _ => unreachable!("layout spring and property have matching value kinds"),
+        }
+    }
+}
+
+/// Holds the scene's shared animation templates.
 struct Templates {
     scalar: [SpringScalarNaturalMotionAnimation; 2],
     vec2: [SpringVector2NaturalMotionAnimation; 2],
@@ -211,7 +255,7 @@ impl Templates {
         travel: f32,
         delay: Duration,
     ) -> CompositionAnimation {
-        let at = tuning as usize;
+        let at = usize::from(tuning == Tuning::Scroll);
         let period = Duration::from_secs_f64(f64::from(period_for(tuning, travel)));
         match (slot, to) {
             (1, Value::Scalar(v)) => {
@@ -336,14 +380,11 @@ impl Templates {
 
 /// The spring period for `tuning`.
 ///
-/// The chrome period is scaled by how far the value travels, so a long pill slide is not
-/// instantaneous and a short one is not sluggish; that is why a caller states a tuning and
-/// never a period. The scroll carrier is not scaled: it carries momentum, which does not
-/// depend on how far the content is from a bound.
+/// Chrome scales with travel; layout uses that curve at its base period for every bound.
 fn period_for(tuning: Tuning, travel: f32) -> f32 {
-    let base = SPRING[tuning as usize][0];
+    let base = SPRING[usize::from(tuning == Tuning::Scroll)][0];
     match tuning {
-        Tuning::Scroll => base,
+        Tuning::Scroll | Tuning::Layout => base,
         Tuning::Chrome if !travel.is_finite() => base,
         Tuning::Chrome => base * (travel.abs() / CHROME_REF_TRAVEL).clamp(0.7, 1.4),
     }
@@ -1353,9 +1394,6 @@ impl Scene {
     ///
     /// Recurses over the child chain; the depth it reaches is layout nesting.
     fn destroy(&mut self, id: NodeId) {
-        for child in children(&self.nodes, id.index() as u32).collect::<Vec<_>>() {
-            self.destroy(child);
-        }
         let Some(visual) = self.nodes.visual(id).cloned() else {
             return;
         };
@@ -1371,6 +1409,14 @@ impl Scene {
             let _ = self.content.children().try_remove(&visual);
             let _ = self.overlay.children().try_remove(&visual);
         }
+        self.release_subtree(id);
+    }
+
+    fn release_subtree(&mut self, id: NodeId) {
+        for child in children(&self.nodes, id.index() as u32).collect::<Vec<_>>() {
+            self.release_subtree(child);
+        }
+        // Captures retain the COM tree; releasing arena rows must not remove its children.
         unlink(&mut self.nodes, id.index() as u32);
         self.roots.retain(|root| *root != id);
         self.pending_retain(
@@ -1595,6 +1641,7 @@ impl Scene {
         }
         let next = match clip {
             Clip::None => None,
+            Clip::Bounds => Some(ClipObj::Bounds(back.compositor.create_inset_clip())),
             // Rounded clipping needs no brush slot and no capture: a rectangle clip carries
             // its own radii.
             Clip::Rect { .. } => Some(ClipObj::Rect(back.compositor.create_rectangle_clip())),
@@ -1606,6 +1653,7 @@ impl Scene {
             }),
         };
         match &next {
+            Some(ClipObj::Bounds(clip)) => visual.set_clip(Some(clip)),
             Some(ClipObj::Rect(clip)) => visual.set_clip(Some(clip)),
             Some(ClipObj::Geom(clip)) => visual.set_clip(Some(clip)),
             // Clears only what the *sink* established: a clip-route shape mask writes its
@@ -1718,7 +1766,13 @@ impl Scene {
                     self.reclamp_box_mask(id, back, env)?;
                 }
             }
-            Bind::Animate(anim) => self.animate(id, prop, row, anim, patch, back)?,
+            Bind::Animate(anim) => {
+                self.animate(id, prop, row, anim, patch, back)?;
+                if matches!(prop, Prop::Size | Prop::SizeX | Prop::SizeY) {
+                    self.resize_captures(id, env);
+                    self.reclamp_box_mask(id, back, env)?;
+                }
+            }
             Bind::Track {
                 tracker,
                 axis,
@@ -1784,17 +1838,25 @@ impl Scene {
                 if to.kind() != row.kind() {
                     return Ok(());
                 }
-                // Travel is measured from the shadow, which is the channel's current value
-                // whichever mechanism carries it, so the chrome period scales scene-side and
-                // no call site holds one. Starting also resets the spring's velocity.
+                // The shadow holds the previous target, not a sampled presentation value.
                 let travel = travel(&self.nodes, id, row, to);
-                let animation = self.motion.templates.spring(
-                    row.spring_slot(),
-                    tuning,
-                    to,
-                    travel,
-                    Duration::from_millis(u64::from(delay_ms)),
-                );
+                let animation = if tuning == Tuning::Layout && delay_ms == 0 {
+                    let springs = &mut self.nodes.aux_mut(id).layout_springs;
+                    let index = springs.iter().position(|(held, _)| *held == prop)
+                        .unwrap_or_else(|| {
+                            springs.push((prop, LayoutSpring::new(back, row.spring_slot())));
+                            springs.len() - 1
+                        });
+                    springs[index].1.retarget(to)
+                } else {
+                    self.motion.templates.spring(
+                        row.spring_slot(),
+                        tuning,
+                        to,
+                        travel,
+                        Duration::from_millis(u64::from(delay_ms)),
+                    )
+                };
                 self.nodes
                     .start(id, row, &animation, Some(to), Held::Playing);
                 self.census.animations += 1;
@@ -2522,6 +2584,35 @@ mod tests {
     };
 
     #[test]
+    fn layout_springs_are_retained_per_node_and_property() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let a = rig.sprite(&mut patch, 100.0);
+        let b = rig.sprite(&mut patch, 200.0);
+        rig.apply(&mut patch);
+        for width in 101..141 {
+            for id in [a, b] {
+                for prop in [Prop::Size, Prop::Offset] {
+                    rig.scene.retarget(id, prop, Bind::Animate(Anim::Spring {
+                        to: Value::Vec2(Vector2::new(width as f32, 40.0)),
+                        tuning: Tuning::Layout,
+                        delay_ms: 0,
+                    }), &rig.back).unwrap();
+                }
+                let springs = &rig.scene.nodes.aux(id).unwrap().layout_springs;
+                assert_eq!(springs.len(), 2);
+                assert!(matches!(springs[0].1, LayoutSpring::Vec2(_)));
+                assert!(matches!(springs[1].1, LayoutSpring::Vec3(_)));
+            }
+        }
+        for id in [a, b] {
+            patch.push(Op::Drop { id, exit: Exit::None, origin: Vector2::zero(), bounds: None });
+        }
+        rig.apply(&mut patch);
+        assert_eq!(rig.scene.audit().held, 0);
+    }
+
+    #[test]
     fn a_re_declared_sprite_realizes_nothing_a_second_time() {
         let Some(mut rig) = rig() else { return };
         let mut patch = SinkPatch::default();
@@ -2770,6 +2861,74 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(rig.scene.motion.pending.is_empty());
+    }
+
+    #[test]
+    fn anchor_slide_survives_layout_offset_and_size_writes() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let id = rig.sprite(&mut patch, 40.0);
+        rig.apply(&mut patch);
+        for prop in [Prop::AnchorX, Prop::AnchorY] {
+            let frames = patch.push_frames(&[
+                (0.0, Value::Scalar(-1.0), Easing::Linear),
+                (1.0, Value::Scalar(0.0), Easing::Linear),
+            ]);
+            patch.push(Op::Bind {
+                id, prop,
+                bind: Bind::Animate(Anim::Frames {
+                    frames, duration_ms: 100, iterations: Iterations::Count(1),
+                }),
+            });
+        }
+        rig.apply(&mut patch);
+        for step in 1..20 {
+            for (prop, value) in [
+                (Prop::Offset, Vector2 { x: step as f32, y: 10.0 }),
+                (Prop::Size, Vector2 { x: 40.0 + step as f32, y: 40.0 }),
+            ] {
+                patch.push(Op::Bind { id, prop, bind: Bind::Set(Value::Vec2(value)) });
+            }
+            rig.apply(&mut patch);
+            assert_eq!(rig.scene.motion.pending.len(), 2);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut events = Vec::new();
+        while events.len() < 2 {
+            windows_window::pump();
+            rig.scene.drain_events(&mut events);
+            assert!(std::time::Instant::now() < deadline, "slide completion was lost");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for prop in [Prop::AnchorX, Prop::AnchorY] {
+            assert!(events.iter().any(|event| matches!(event,
+                SceneEvent::AnimationCompleted { node, prop: completed } if *node == id && *completed == prop)));
+        }
+    }
+
+    #[test]
+    fn exit_capture_keeps_descendants_after_arena_retirement() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let root = rig.ids.mint();
+        let child = rig.ids.mint();
+        patch.push(Op::New { id: root, kind: NodeKind::Group, parent: Attach::Window, after: None });
+        patch.push(Op::Bind { id: root, prop: Prop::Size, bind: Bind::Set(Value::Vec2(Vector2 { x: 100.0, y: 100.0 })) });
+        patch.push(Op::New { id: child, kind: NodeKind::Sprite, parent: Attach::Node(root), after: None });
+        rig.apply(&mut patch);
+        let source = rig.scene.nodes.visual(root).unwrap().as_container().unwrap();
+        assert_eq!(source.children().count(), 1);
+        patch.push(Op::Drop {
+            id: root,
+            exit: Exit::Slide { by: Vector2 { x: 1.0, y: 0.0 }, ms: 200, easing: Easing::Linear },
+            origin: Vector2::zero(), bounds: None,
+        });
+        rig.apply(&mut patch);
+        assert!(!rig.scene.nodes.live(root));
+        assert!(!rig.scene.nodes.live(child));
+        assert_eq!(source.children().count(), 1, "the live capture source was dismantled");
+        assert!(rig.scene.motion.pending.iter().any(|p| matches!(p.holds, PendingKind::Ghost(_))));
+        assert!(rig.scene.audit().agrees());
     }
 
     #[test]

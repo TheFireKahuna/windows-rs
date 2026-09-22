@@ -607,15 +607,13 @@ pub struct Halo {
     pub offset: Vector2,
 }
 
-/// There is one clip type.
-///
-/// An inset clip carries no radii, so every rounded clip-to-bounds is a rectangle clip
-/// already, and an inset over a visual of size `(w, h)` *is* a rect the sink's own shadowed
-/// size supplies.
+/// Clips to live visual bounds, an explicit rounded rectangle, or a geometry.
 #[derive(Copy, Clone, PartialEq, Debug, Default)]
 pub enum Clip {
     #[default]
     None,
+    /// Follows the visual's animated size through a zero-inset native clip.
+    Bounds,
     Rect {
         l: f32,
         t: f32,
@@ -838,6 +836,10 @@ pub enum Prop {
     DashOffset,
     BlurRadius,
     ShadowOpacity,
+    /// Horizontal anchor fraction, independent of the layout offset.
+    AnchorX,
+    /// Vertical anchor fraction, independent of the layout offset.
+    AnchorY,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -874,12 +876,13 @@ impl Value {
     }
 }
 
-/// The two tunings. A call site names one; the period and damping stay in the crate, because
-/// neither tuning is derivable from the other.
+/// Selects a shared natural-motion curve and its travel-scaling policy.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Tuning {
     Chrome,
     Scroll,
+    /// Uses the chrome curve without distance scaling for related layout bounds.
+    Layout,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]

@@ -60,6 +60,11 @@ const WHITE: Scrgb = Scrgb {
 };
 
 impl Backends {
+    /// Requests publication of pending composition changes without waiting for completion.
+    pub fn request_commit(&self) -> Result<()> {
+        self.compositor.request_commit().map(drop)
+    }
+
     /// Binds a compositor, a GPU and a font ladder together.
     ///
     /// `gpu` must be the only GPU used with `compositor`: when the compositor realizes a

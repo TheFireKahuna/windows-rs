@@ -16,7 +16,7 @@ use core::num::NonZeroU32;
 use windows_composition::{
     Animatable, Captured, CompositionAnimation, CompositionBrush, CompositionGeometricClip,
     CompositionMaskBrush, CompositionPathGeometry, CompositionSpriteShape, ContainerVisual,
-    DropShadow, Geometry, RectangleClip, ShapeVisual, SpriteVisual, Visual,
+    DropShadow, Geometry, InsetClip, RectangleClip, ShapeVisual, SpriteVisual, Visual,
 };
 use windows_numerics::{Vector2, Vector3};
 
@@ -24,8 +24,8 @@ use windows_numerics::{Vector2, Vector3};
 /// rotation, a centre pair and an opacity.
 pub const CORE_CHANS: u8 = 10;
 /// How many channels its side payloads carry: four clip sides, eight corner radii, a trim
-/// pair, a stroke pair and a shadow pair.
-pub const AUX_CHANS: u8 = 18;
+/// pair, a stroke pair, a shadow pair and an anchor pair.
+pub const AUX_CHANS: u8 = 20;
 /// The absence of a sibling, a parent or a first child.
 pub const NO_LINK: u32 = u32::MAX;
 
@@ -167,6 +167,7 @@ impl<T> Pool<T> {
 /// A rectangle clip carries four animatable sides and eight per-corner radius scalars; a
 /// geometric clip carries a shape and nothing animatable.
 pub enum ClipObj {
+    Bounds(InsetClip),
     Rect(RectangleClip),
     /// Held rather than only set on the visual, so the clip this crate established is
     /// distinguishable from one a shape mask put there.
@@ -281,6 +282,7 @@ impl ShadowState {
 /// absolute across the node and the property table's [`Owner`] selects only the COM object.
 #[derive(Default)]
 pub struct Aux {
+    pub layout_springs: Vec<(Prop, crate::scene::LayoutSpring)>,
     pub chans: [f32; AUX_CHANS as usize],
     pub clip: Option<ClipObj>,
     pub shape: Option<ShapeState>,
@@ -659,7 +661,7 @@ const fn d(path: &'static str, owner: Owner, group: u8, chan: u8, count: u8) -> 
 use Owner::{Clip as C, Shadow as H, Stroke as S, Trim as T, Visual as V};
 
 /// Positional: a row's place here equals its [`Prop`] discriminant.
-pub const PROPS: [PropDesc; 32] = [
+pub const PROPS: [PropDesc; 34] = [
     d("Offset", V, 0, 0, 2),
     d("Offset.X", V, 0, 0, 1),
     d("Offset.Y", V, 0, 1, 1),
@@ -692,10 +694,12 @@ pub const PROPS: [PropDesc; 32] = [
     d("StrokeDashOffset", S, 10, 25, 1),
     d("BlurRadius", H, 11, 26, 1),
     d("Opacity", H, 12, 27, 1),
+    d("AnchorPoint.X", V, 13, 28, 1),
+    d("AnchorPoint.Y", V, 13, 29, 1),
 ];
 
 /// How many property groups the rows cover.
-pub const GROUP_COUNT: usize = 13;
+pub const GROUP_COUNT: usize = 14;
 
 /// How many channels the *composite* of each group takes: the compositor's offset, scale and
 /// centre point are three-vectors and its size is a pair.
@@ -704,7 +708,7 @@ pub const GROUP_COUNT: usize = 13;
 /// and its per-channel rows together — `Offset`, `Offset.X` and `Offset.Y` are one group —
 /// so the group alone cannot say what type a row's animation takes, and indexing this
 /// directly is how a scalar channel comes to be driven by a three-vector spring.
-const COMPOSITE_SLOT: [u8; GROUP_COUNT] = [3, 2, 3, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1];
+const COMPOSITE_SLOT: [u8; GROUP_COUNT] = [3, 2, 3, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1];
 
 /// Every channel's ownership has to fit the one state word.
 const _: () = assert!((CORE_CHANS + AUX_CHANS) as usize * 2 <= u64::BITS as usize);
@@ -856,7 +860,7 @@ impl Arena {
             // The shadow is authoritative, so an unchanged value stops here.
             Held::Free if self.chans_eq(id, desc, value) => return false,
             // The animation would keep writing after this set, so it is stopped first.
-            Held::Playing => self.stop_overlapping(id, desc),
+            Held::Playing => self.stop_overlapping(id, desc, None),
             _ => {}
         }
         self.write_chans(id, desc, value);
@@ -870,15 +874,21 @@ impl Arena {
     /// The compositor treats a composite name and its per-channel names as separate targets,
     /// so an animation left on `Offset.X` keeps that channel while a stop aimed at `Offset`
     /// reaches the other; two disjoint channels are left alone.
-    fn stop_overlapping(&mut self, id: NodeId, desc: &PropDesc) {
+    fn stop_overlapping(&mut self, id: NodeId, desc: &PropDesc, replacing: Option<&str>) {
         for other in &PROPS {
-            if !other.overlaps(desc) || self.held(id, other) != Held::Playing {
+            let composite = self.flags[id.index()] & (1 << (other.group + 1)) != 0;
+            if replacing == Some(other.path)
+                || !other.overlaps(desc)
+                || (other.count > 1) != composite
+                || self.held(id, other) != Held::Playing
+            {
                 continue;
             }
             if let Some(object) = self.animatable(id, other.owner) {
                 object.stop(other.path);
             }
             self.set_held(id, other, Held::Stale);
+            self.flags[id.index()] &= !(1 << (other.group + 1));
         }
     }
 
@@ -900,9 +910,9 @@ impl Arena {
         if self.animatable(id, desc.owner).is_none() {
             return;
         }
-        // The channels this animation is about to own may already be driven under another of
-        // the group's names, and the compositor would keep both.
-        self.stop_overlapping(id, desc);
+        // Replacing the same path samples its live compositor value. Stopping it first
+        // restores the base value; only overlapping aliases need an explicit stop.
+        self.stop_overlapping(id, desc, Some(desc.path));
         let Some(object) = self.animatable(id, desc.owner) else {
             return;
         };
@@ -910,6 +920,9 @@ impl Arena {
         if let Some(value) = to {
             self.write_chans(id, desc, value);
         }
+        let bit = 1 << (desc.group + 1);
+        let flags = &mut self.flags[id.index()];
+        *flags = if desc.count > 1 { *flags | bit } else { *flags & !bit };
         self.set_held(id, desc, held);
     }
 
@@ -933,7 +946,7 @@ impl Arena {
             Owner::Visual => self.visual(id).map(|visual| visual as &dyn AnimatableRef),
             Owner::Clip => match self.aux(id)?.clip.as_ref()? {
                 ClipObj::Rect(clip) => Some(clip),
-                ClipObj::Geom(_) => None,
+                ClipObj::Geom(_) | ClipObj::Bounds(_) => None,
             },
             // The geometry, not the shape: a trim is the geometry's property.
             Owner::Trim => Some(&self.aux(id)?.shape.as_ref()?.geom),
@@ -957,6 +970,7 @@ impl Arena {
         };
         let aux = self.aux(id);
         match group {
+            13 => visual.set_anchor_point(v2(28)),
             0 => visual.set_offset(c(0), c(1), 0.0),
             1 => visual.set_size(c(2), c(3)),
             2 => visual.set_scale(Vector3 {
@@ -1174,7 +1188,7 @@ mod tests {
 
     #[test]
     fn every_row_sits_at_its_own_discriminant() {
-        const ORDER: [Prop; 32] = [
+        const ORDER: [Prop; 34] = [
             Prop::Offset,
             Prop::OffsetX,
             Prop::OffsetY,
@@ -1207,6 +1221,8 @@ mod tests {
             Prop::DashOffset,
             Prop::BlurRadius,
             Prop::ShadowOpacity,
+            Prop::AnchorX,
+            Prop::AnchorY,
         ];
         for (at, prop) in ORDER.iter().enumerate() {
             assert_eq!(
@@ -1372,6 +1388,25 @@ mod tests {
         let sprite = comp.create_sprite_visual();
         arena.place(id, (**sprite).clone(), NodeKind::Sprite);
         (arena, id)
+    }
+
+    #[test]
+    fn retargeting_a_composite_does_not_stop_its_inactive_scalar_aliases() {
+        use windows_composition::Animation;
+        let Some((_queue, comp)) = device() else { return };
+        let (mut arena, id) = one_sprite(&comp);
+        let row = desc(Prop::Size);
+        arena.set(id, Prop::Size, Value::Vec2(Vector2::new(200.0, 100.0)));
+        let spring = comp.create_spring_vector2_animation();
+        for width in [300.0, 180.0, 400.0] {
+            let value = Vector2::new(width, 100.0);
+            spring.set_final_value(value);
+            arena.start(id, row, &spring.as_animation(), Some(Value::Vec2(value)), Held::Playing);
+            arena.stop_overlapping(id, row, Some(row.path));
+            assert_eq!(arena.held(id, row), Held::Playing);
+        }
+        arena.stop_overlapping(id, desc(Prop::SizeX), None);
+        assert_eq!(arena.held(id, row), Held::Stale);
     }
 
     /// The four binding states, through the one setter that honours them.

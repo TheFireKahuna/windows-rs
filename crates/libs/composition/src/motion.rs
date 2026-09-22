@@ -146,8 +146,7 @@ macro_rules! spring {
         ///
         /// Retarget a running spring with `set_final_value(v)` followed by
         /// `start_animation(prop, anim)` on the **same cached object**: that reuses
-        /// released target boxes and carries whatever velocity the property
-        /// already had. A value that must land immediately, with no motion, takes
+        /// released target boxes. A value that must land immediately, with no motion, takes
         /// `stop_animation` plus a plain property set.
         ///
         /// As an implicit animation a spring is **not** handed the target value
@@ -179,8 +178,7 @@ macro_rules! spring {
                 spring.SetPeriod(to_time_span(period)).unwrap();
             }
 
-            /// Sets the value the spring settles at. Assigning it while the spring is
-            /// running is what retargets it.
+            /// Sets the final value sampled by the next animation start.
             ///
             /// Two target boxes are cached and shared by clones of this animation.
             /// Reuse requires exclusive ownership; if Windows retains both, this call
@@ -219,9 +217,7 @@ macro_rules! spring {
             /// Sets the velocity the spring starts with, per second.
             ///
             /// A released gesture continues at the speed the user was moving when its
-            /// velocity measured at release is handed over here. A spring already running
-            /// keeps the property's current velocity when it is retargeted, so this
-            /// applies to the handoff from app-driven motion to the compositor's.
+            /// velocity measured at release is handed over here.
             pub fn set_initial_velocity(&self, velocity: $value) {
                 let motion: bindings::$final_value = self.0.cast().unwrap();
                 motion.SetInitialVelocity(velocity).unwrap();
