@@ -624,12 +624,17 @@ impl Solver<'_> {
     /// `holds` keeps the far edges from rounding inward, for a box whose content re-flows
     /// against its own width. See [`hold`].
     fn box_at(&self, abs: Vector2, w: f32, h: f32, holds: bool) -> Rect {
-        let far = if holds { hold } else { snap };
+        let (x0, y0) = (snap(abs.x, self.scale), snap(abs.y, self.scale));
+        if holds {
+            // Held from the snapped origin: an origin rounded forward would otherwise take up
+            // to half a pixel out of the extent the far edge holds.
+            return Rect::new(x0, y0, hold(x0 + w, self.scale), hold(y0 + h, self.scale));
+        }
         Rect::new(
-            snap(abs.x, self.scale),
-            snap(abs.y, self.scale),
-            far(abs.x + w, self.scale),
-            far(abs.y + h, self.scale),
+            x0,
+            y0,
+            snap(abs.x + w, self.scale),
+            snap(abs.y + h, self.scale),
         )
     }
 

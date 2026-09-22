@@ -264,6 +264,27 @@ fn a_pixel_length_is_one_pixel_at_every_phase_where_a_dip_is_not() {
 }
 
 #[test]
+fn a_text_box_never_publishes_narrower_than_its_extent() {
+    let root = fixture(144.0);
+    let row = node(root, Preset::Row, |l| {
+        l.height = Len::dip(20.0);
+        l.gap = Len::ZERO;
+    });
+    // 15.6 px of lead rounds the run's origin forward by 0.4 px.
+    sized(row, 10.4, 20.0);
+    let run = node(row, Preset::Text, |l| {
+        l.width = Len::dip(59.486);
+        l.height = Len::dip(20.0);
+    });
+    solve();
+    assert!(
+        rect(run).width() >= 59.486,
+        "a run published at {} trims inside its own extent",
+        rect(run).width()
+    );
+}
+
+#[test]
 fn a_node_minted_after_a_solve_reaches_the_next_one() {
     let root = fixture(96.0);
     let mid = node(root, Preset::Stack, |_| {});
