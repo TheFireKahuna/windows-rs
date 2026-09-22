@@ -401,6 +401,9 @@ pub struct Arena {
     painth: Vec<Option<NonZeroU32>>,
     aux: Pool<Aux>,
     painted: Pool<Painted>,
+    /// Groups whose playing animation a set stopped, as `(node, group)`, until the scene
+    /// hands them to the batch that restates them.
+    pub(crate) restate: Vec<(NodeId, u8)>,
 }
 
 impl Forest for Arena {
@@ -815,6 +818,22 @@ impl Arena {
         }
     }
 
+    /// Writes a group's shadow onto its object again, and reports whether it did.
+    ///
+    /// Only where every channel of the group is still [`Held::Free`]: a group a later
+    /// animation or binding took is that writer's, and the shadow already holds its target.
+    pub(crate) fn restate(&self, id: NodeId, group: u8) -> bool {
+        if !self.live(id)
+            || PROPS
+                .iter()
+                .any(|row| row.group == group && self.held(id, row) != Held::Free)
+        {
+            return false;
+        }
+        self.write_group(id, group);
+        true
+    }
+
     fn chans_eq(&self, id: NodeId, desc: &PropDesc, value: Value) -> bool {
         match value {
             Value::Scalar(v) => self.chan(id, desc.chan) == v,
@@ -860,7 +879,12 @@ impl Arena {
             // The shadow is authoritative, so an unchanged value stops here.
             Held::Free if self.chans_eq(id, desc, value) => return false,
             // The animation would keep writing after this set, so it is stopped first.
-            Held::Playing => self.stop_overlapping(id, desc, None),
+            // The compositor settles a stopped animation onto its own last value after the
+            // writes queued beside the stop, so the group is restated once that batch lands.
+            Held::Playing => {
+                self.stop_overlapping(id, desc, None);
+                self.restate.push((id, desc.group));
+            }
             _ => {}
         }
         self.write_chans(id, desc, value);

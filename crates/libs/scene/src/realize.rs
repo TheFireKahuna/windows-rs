@@ -359,8 +359,7 @@ impl Backends {
         // a hundredth of an 8-bit level at the amplitudes a glow is authored with.
         let px = match spread {
             Spread::Horizontal => (256, 1),
-            // Six-DIP feathers in a 480-DIP box need more than two samples.
-            Spread::HorizontalFeathered { .. } => (512, 1),
+            Spread::HorizontalFeathered { edge, .. } => (feather_texels(edge), 1),
             Spread::Vertical => (1, 256),
             // Colour is already resampled at 64 stops, so two texels per interval retain its
             // profile without a redundant vertical dimension.
@@ -825,6 +824,25 @@ fn grain_peak<const HIGH: bool>(v: &[f32]) -> usize {
     }
     unreachable!("the extreme was taken from this slice")
 }
+
+/// How many texels a feathered strip needs across its width for each taper to span
+/// [`FEATHER_TEXELS`] of them.
+///
+/// The strip is stretched over its box, so the taper's texel count is fixed by its fraction
+/// of the box rather than by the box's size.
+fn feather_texels(edge: f32) -> i32 {
+    if edge <= 0.0 {
+        return 512;
+    }
+    ((FEATHER_TEXELS / edge).ceil() as i32).clamp(512, MAX_FEATHER_TEXELS)
+}
+
+/// The texels one taper of a feathered strip spans, so its eased profile survives the stretch.
+const FEATHER_TEXELS: f32 = 16.0;
+
+/// The widest feathered strip: a taper narrower than `FEATHER_TEXELS / MAX_FEATHER_TEXELS` of
+/// its box takes fewer texels.
+const MAX_FEATHER_TEXELS: i32 = 4096;
 
 /// A squared-smoothstep coverage ladder, sixteen intervals per edge.
 ///

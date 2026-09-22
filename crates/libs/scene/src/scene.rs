@@ -406,6 +406,9 @@ enum PendingKind {
         CompositionPropertySet,
     ),
     Frames(NodeId, Prop),
+    /// Groups a set wrote over a stopped animation, as `(node, group)`, restated from the
+    /// shadow once the batch that carried the stop has been applied.
+    Restate(Vec<(NodeId, u8)>),
 }
 
 /// A batch whose completion is the only report that the work it holds has run.
@@ -1153,6 +1156,12 @@ impl Scene {
         for at in 0..patch.ops().len() {
             self.op(patch.ops()[at], patch, back, env)?;
             self.census.ops_applied += 1;
+        }
+        // One empty batch for the whole pass: it completes once the compositor has applied
+        // everything queued above, stops included, and its report restates the groups.
+        if !self.nodes.restate.is_empty() {
+            let groups = core::mem::take(&mut self.nodes.restate);
+            self.motion.watch(back, PendingKind::Restate(groups), || {})?;
         }
         patch.clear();
         Ok(self.census.changed_since(&before))
@@ -2340,6 +2349,7 @@ impl Scene {
         let mut reports = Vec::new();
         let overlay = self.overlay.children();
         let census = &mut self.census;
+        let nodes = &self.nodes;
         self.motion.pending.retain(|pending| {
             if !pending.done.get() {
                 return true;
@@ -2354,6 +2364,11 @@ impl Scene {
                     node: *node,
                     prop: *prop,
                 }),
+                PendingKind::Restate(groups) => {
+                    for &(node, group) in groups {
+                        census.count(nodes.restate(node, group));
+                    }
+                }
             }
             false
         });
@@ -2610,6 +2625,42 @@ mod tests {
         }
         rig.apply(&mut patch);
         assert_eq!(rig.scene.audit().held, 0);
+    }
+
+    #[test]
+    fn a_set_over_a_playing_spring_is_restated_after_its_batch() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let id = rig.sprite(&mut patch, 40.0);
+        rig.apply(&mut patch);
+        let spring = |x: f32| Op::Bind {
+            id,
+            prop: Prop::Offset,
+            bind: Bind::Animate(Anim::Spring {
+                to: Value::Vec2(Vector2::new(x, 0.0)),
+                tuning: Tuning::Layout,
+                delay_ms: 0,
+            }),
+        };
+        patch.push(spring(80.0));
+        rig.apply(&mut patch);
+        patch.push(Op::Bind {
+            id,
+            prop: Prop::Offset,
+            bind: Bind::Set(Value::Vec2(Vector2::new(20.0, 0.0))),
+        });
+        rig.apply(&mut patch);
+        let group = desc(Prop::Offset).group;
+        let queued = rig.scene.motion.pending.iter().filter(|pending| {
+            matches!(&pending.holds, PendingKind::Restate(groups) if groups[..] == [(id, group)])
+        });
+        assert_eq!(queued.count(), 1, "the stopped spring's set was not queued for restating");
+        assert!(rig.scene.nodes.restate.is_empty(), "the pass kept groups it had handed on");
+        assert!(rig.scene.nodes.restate(id, group));
+        // A newer spring owns the group, so its restate is that spring's to settle.
+        patch.push(spring(60.0));
+        rig.apply(&mut patch);
+        assert!(!rig.scene.nodes.restate(id, group));
     }
 
     #[test]
