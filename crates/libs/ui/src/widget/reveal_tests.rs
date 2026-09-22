@@ -13,6 +13,30 @@ fn hover(from: ControlId, to: ControlId) -> Report {
     }
 }
 
+#[test]
+fn native_focus_outline_follows_keyboard_focus_and_hides_for_pointer_and_retirement() -> Result<()> {
+    let mut rig = Rig::new("focus outline")?;
+    let ring = rig.overlay_node()?;
+    rig.controls.set_ring(ring);
+    let (a, b) = (rig.ids.mint(), rig.ids.mint());
+    rig.publish_hits(&[entry(a, 10.0, 20.0, 100.0, 32.0), entry(b, 120.0, 20.0, 100.0, 32.0)])?;
+    rig.adopt(&[(a, ChromeRow::default()), (b, ChromeRow::default())], &[], &[])?;
+    let minted = rig.visuals_minted();
+    let mut out = Vec::with_capacity(16);
+    rig.tick(&[Report::FocusChanged { from: None, to: Some(a) }], &mut out)?;
+    assert!(rig.controls.ring_shown);
+    rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
+    assert!(rig.controls.ring_shown);
+    rig.tick(&[press(b)], &mut out)?;
+    assert!(!rig.controls.ring_shown);
+    rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a) }], &mut out)?;
+    assert!(rig.controls.ring_shown);
+    rig.adopt(&[], &[], &[a])?;
+    assert!(!rig.controls.ring_shown);
+    assert_eq!(rig.visuals_minted(), minted);
+    Ok(())
+}
+
 /// A scope carrying a reveal target, and two children that belong to it.
 struct Scoped {
     scope: ControlId,

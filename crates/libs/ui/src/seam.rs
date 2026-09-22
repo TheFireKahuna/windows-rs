@@ -483,6 +483,7 @@ row! {
         && b.scrolls.is_empty()
         && b.fields.is_empty()
         && b.theme.is_none()
+        && b.focus_outline.is_none()
         && b.declared.is_empty(),
     columns {
         /// Read by `Scene::apply`: the solve as `Bind` ops, the hit array as `Op::Hits`, the
@@ -506,6 +507,8 @@ row! {
         /// A new palette and the backdrop it implies, read by `Scene::set_backdrop` and by
         /// every region's own scope.
         theme: Option<(Scope, windows_scene::BackdropSpec)>,
+        /// The window-owned outline, installed once before interaction.
+        focus_outline: Option<NodeId>,
     }
 }
 
@@ -933,6 +936,7 @@ mod tests {
         cleared_is_empty(Down::default(), |b| {
             b.declared.caption = [Some(ControlId::NONE), None, None];
         });
+        cleared_is_empty(Down::default(), |b| b.focus_outline = Some(NodeId::NONE));
         cleared_is_empty(Up::default(), |b| b.size = Some(Vector2 { x: 8.0, y: 8.0 }));
         cleared_is_empty(ToScene::default(), |b| {
             b.reports.push(Report::CaptureLost);

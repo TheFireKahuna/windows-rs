@@ -62,11 +62,20 @@ impl Rig {
 
     /// Mints a group under the content band and returns it, applied immediately.
     pub fn node(&mut self) -> Result<NodeId> {
+        self.node_in(windows_scene::Attach::Window)
+    }
+
+    /// Mints a detached group in the overlay band.
+    pub fn overlay_node(&mut self) -> Result<NodeId> {
+        self.node_in(windows_scene::Attach::Overlay)
+    }
+
+    fn node_in(&mut self, parent: windows_scene::Attach) -> Result<NodeId> {
         let id = self.nodes.mint();
         self.patch.push(Op::New {
             id,
             kind: NodeKind::Group,
-            parent: windows_scene::Attach::Window,
+            parent,
             after: None,
         });
         self.apply()?;

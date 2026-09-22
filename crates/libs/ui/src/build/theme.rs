@@ -45,7 +45,7 @@ impl Part {
         match self {
             Self::Border => roles.stroke.map(Role::Stroke),
             Self::Fill => roles.fill.map(Role::Fill),
-            Self::Wash => Some(wash_role(wash)),
+            Self::Wash => wash_role(wash),
             Self::Ink => Some(Role::Text(roles.text)),
         }
     }
@@ -55,10 +55,11 @@ impl Part {
 ///
 /// The wash is the interaction light over a control's own base, so it is the foreground ink
 /// or the accent and never a third colour the palette does not author.
-const fn wash_role(wash: Wash) -> Role {
+const fn wash_role(wash: Wash) -> Option<Role> {
     match wash {
-        Wash::Ink => Role::Text(Text::Primary),
-        Wash::Accent => Role::Fill(Fill::Accent),
+        Wash::None => None,
+        Wash::Ink => Some(Role::Text(Text::Primary)),
+        Wash::Accent => Some(Role::Fill(Fill::Accent)),
     }
 }
 
@@ -379,6 +380,27 @@ pub(crate) fn take_theme() -> Option<(Scope, BackdropSpec)> {
 }
 
 impl Host {
+    /// Retains the window's focus outline outside layout and hit testing.
+    pub(crate) fn focus_outline(&mut self) -> NodeId {
+        let id = self.tree.mint(0);
+        self.tree.c.flags[id.index()] |= tree::SPRITE | tree::DERIVED;
+        self.pending.push(windows_scene::Op::New {
+            id,
+            kind: windows_scene::NodeKind::Sprite,
+            parent: windows_scene::Attach::Overlay,
+            after: None,
+        });
+        self.declare_part(
+            id,
+            Part::Ink,
+            PaintSource::Role(Role::Stroke(Stroke::Focus)),
+            PaintMask::Outline { radius: Len::ZERO, width: Len::dip(2.0) },
+            1.0,
+        );
+        self.write_channel(id, Prop::Opacity, Value::Scalar(0.0));
+        id
+    }
+
     pub(crate) fn chrome(&self, id: ControlId) -> Option<Chrome> {
         let node = self.control(id)?.node;
         self.appearances.surface(self.surface_row(node))?.chrome
@@ -518,7 +540,7 @@ impl Host {
             // most of a screen declares no chrome, owns no control and pays nothing.
             let owned = surface.chrome.is_some()
                 && match part {
-                    Part::Wash => owner.is_some(),
+                    Part::Wash => owner.is_some() && surface.wash != Wash::None,
                     part => surface.owns(part),
                 };
             let Some(id) = self.claim_part(row, node, slot, held, owned, after) else {

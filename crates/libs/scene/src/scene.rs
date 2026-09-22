@@ -1332,6 +1332,15 @@ impl Scene {
         }
     }
 
+    /// Raises a detached overlay visual above the other overlays.
+    ///
+    /// `id` must identify a root attached to the overlay band.
+    pub fn raise_overlay(&mut self, id: NodeId) {
+        if self.roots.contains(&id) {
+            self.reparent(id, Attach::Overlay, None);
+        }
+    }
+
     /// Destroys a node *and its subtree*, releasing every resource on the way down, so a
     /// subtree removal is one op and a partial destroy is unrepresentable.
     ///

@@ -110,14 +110,14 @@ pub const TRACK_ON: u8 = 1;
 
 /// The rows a track reads: a slider's groove, a toggle's body, a meter's bed.
 pub const TRACK: [RoleSet; 2] = [
-    RoleSet::new(Some(Fill::Pressed), None, Text::Secondary),
+    RoleSet::new(Some(Fill::Sunken), None, Text::Secondary),
     RoleSet::new(Some(Fill::Accent), None, Text::OnAccent),
 ];
 
 /// The single row a text-editable field reads. Focus is drawn by the window's ring rather than by
 /// a variant.
 pub const FIELD: [RoleSet; 1] = [RoleSet::new(
-    Some(Fill::Pressed),
+    Some(Fill::Sunken),
     Some(Stroke::Default),
     Text::Primary,
 )];
@@ -129,12 +129,8 @@ pub const FIELD: [RoleSet; 1] = [RoleSet::new(
 /// set at the strength of ordinary secondary text they read as three live values.
 pub const OPTION: [RoleSet; 1] = [RoleSet::new(None, None, Text::Tertiary)];
 
-/// The single row a groove reads: a segmented picker's track, and no outline.
-///
-/// [`Fill::Pressed`] is the sunken rung of the surface ladder, which is what a groove is — the
-/// same value a control resolves while it is held down, resolved here as a resting surface rather
-/// than as a state.
-pub const GROOVE: [RoleSet; 1] = [RoleSet::new(Some(Fill::Pressed), None, Text::Secondary)];
+/// Fills a segmented picker's recessed track without an outline.
+pub const GROOVE: [RoleSet; 1] = [RoleSet::new(Some(Fill::Sunken), None, Text::Secondary)];
 
 // ── what a recipe declares ──────────────────────────────────────────────────────────
 
@@ -158,6 +154,8 @@ pub enum Motion {
 /// brush is 8-bit, and no brush interpolates between two FP16 sources.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Wash {
+    /// Leaves transient highlighting to the recipe's retained reveal target.
+    None,
     /// The scope's foreground, at the state's opacity.
     Ink,
     /// The scope's accent fill, at the state's opacity.

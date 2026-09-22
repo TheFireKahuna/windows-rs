@@ -132,8 +132,9 @@ impl Palette for Reference {
         let base = SURFACE_NITS[scope.elevation as usize];
         match role {
             Fill::Surface => light(base, 0.004, ACCENT_HUE),
-            Fill::Hover => light(base * 1.18, 0.004, ACCENT_HUE),
-            Fill::Pressed => light(base * 0.86, 0.004, ACCENT_HUE),
+            Fill::Hover => self.text(Text::Primary, scope).with_alpha(0.012),
+            Fill::Pressed => self.text(Text::Primary, scope).with_alpha(0.008),
+            Fill::Sunken => light(base * 0.86, 0.004, ACCENT_HUE),
             Fill::Selected => light(base * 1.32, 0.010, ACCENT_HUE),
             Fill::Accent => light(72.0, 0.09, ACCENT_HUE),
             Fill::AccentSubtle => light(base * 1.6, 0.03, ACCENT_HUE),

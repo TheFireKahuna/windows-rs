@@ -711,8 +711,13 @@ impl Overlays {
         }
         // The detached owner and the retained records share this creation transaction, which
         // runs outside the host borrow because building the body is application code.
+        let interaction = if spec.kind == Kind::Flyout {
+            invoker.unwrap_or(ControlId::NONE)
+        } else {
+            ControlId::NONE
+        };
         let (owner, mut mount) =
-            Owner::scope(|| Ui::mount_interned(root, None, scope, ControlId::NONE, body));
+            Owner::scope(|| Ui::mount_interned(root, None, scope, interaction, body));
         mount.set_exit(spec.exit);
         Host::with(|host| {
             let node = mount.node();
@@ -1114,8 +1119,13 @@ impl Overlays {
     /// Opens `target`'s declared flyout with `spec`, doing nothing where it declared none.
     fn open_flyout(&mut self, target: ControlId, spec: Spec, focus: &mut Vec<FocusOp>) {
         // Taken out of the host borrow before it runs: building the body is application code.
-        let Some(body) = Host::with(|host| host.flyout_of(target)) else {
+        let Some((align, body)) = Host::with(|host| host.flyout_of(target)) else {
             return;
+        };
+        let spec = if spec.anchor == Anchor::below(target) {
+            spec.anchor(Anchor::below(target).align(align))
+        } else {
+            spec
         };
         _ = self.open(focus, spec, move |ui| body(ui));
     }
@@ -1448,7 +1458,7 @@ impl Host {
     ///
     /// Cloned out, because building the body is application code and must not run under this
     /// borrow.
-    pub(crate) fn flyout_of(&self, control: ControlId) -> Option<Rc<dyn Fn(&mut Ui<'_>)>> {
+    pub(crate) fn flyout_of(&self, control: ControlId) -> Option<(Align, Rc<dyn Fn(&mut Ui<'_>)>)> {
         let row = self.control(control)?;
         self.handlers.get(row.handlers)?.flyout.clone()
     }
@@ -1874,6 +1884,49 @@ mod tests {
             overlays.settle(&[], &[Intent { target, what: What::Expanded(open) }], &mut focus);
             assert_eq!(overlays.depth(), depth);
         }
+    }
+
+    #[test]
+    fn aligned_flyouts_keep_the_invokers_interaction_scope() {
+        let mut patch = fixture();
+        let mut target = ControlId::NONE;
+        let _mount = mounted(&mut patch, |ui| {
+            target = button(ui, "Insert")
+                .interaction_scope()
+                .flyout_aligned(Align::Center, body)
+                .control_id();
+        });
+        let mut overlays = Overlays::new();
+        let mut focus = Vec::new();
+        for what in [What::Tapped, What::Expanded(true)] {
+            overlays.settle(&[], &[Intent { target, what }], &mut focus);
+            Host::with(|host| {
+                assert_eq!(host.overlays.last().unwrap().anchor.align, Align::Center);
+            });
+            let rows = rows_of(&overlays, 0);
+            assert!(!rows.is_empty());
+            Host::with(|host| {
+                for row in rows {
+                    assert_eq!(host.control(row).unwrap().front.scope, target);
+                }
+            });
+            overlays.escape(&mut focus);
+            assert!(overlays.is_empty());
+        }
+
+        let point = Anchor::at(size(60.0, 80.0));
+        overlays.open_flyout(target, Spec::flyout(target).anchor(point), &mut focus);
+        Host::with(|host| assert_eq!(host.overlays.last().unwrap().anchor, point));
+        overlays.escape(&mut focus);
+
+        overlays.open(&mut focus, Spec::popup(), body);
+        let rows = rows_of(&overlays, 0);
+        Host::with(|host| {
+            for row in rows {
+                assert!(host.control(row).unwrap().front.scope.is_none());
+            }
+        });
+        overlays.escape(&mut focus);
     }
 
     /// Returns the interactive controls of the overlay at `depth`, in tree order.

@@ -31,6 +31,36 @@ fn fraction(node: NodeId) -> Option<f32> {
 }
 
 #[test]
+fn chrome_publishes_fractional_washes_and_can_leave_highlighting_to_a_reveal() {
+    use crate::role::{Fill, Role, resolve};
+    use crate::widget::{Wash, button, card};
+
+    let mut rig = Rig::new();
+    let mut controls = Vec::new();
+    let mut scoped = None;
+    rig.mount(|ui| {
+        controls.push(button(ui, "Button").id().into());
+        controls.push(button(ui, "Ghost").ghost().id().into());
+        controls.push(toggle(ui, Cell::new(false)).id().into());
+        scoped = Some(card(ui).interaction_scope().wash(Wash::None).id().into());
+    });
+    Host::with(|h| {
+        for node in controls {
+            let row = h.control(h.control_of(node)).unwrap();
+            assert!(!row.front.wash.0.is_none());
+            assert_eq!(row.front.hover, resolve(Role::Fill(Fill::Hover), row.scope).a);
+            assert_eq!(row.front.press, resolve(Role::Fill(Fill::Pressed), row.scope).a);
+            assert!(row.front.press > 0.0 && row.front.press < row.front.hover);
+            assert!(row.front.hover < 0.03);
+        }
+        let row = h.control(h.control_of(scoped.unwrap())).unwrap();
+        assert!(row.front.wash.0.is_none());
+    });
+    let frame = rig.flush();
+    assert!(frame.patch().ops().is_empty());
+}
+
+#[test]
 fn a_toggles_knob_has_extent_inside_its_track_and_a_flip_publishes_its_fraction() {
     let mut rig = Rig::new();
     let on = Cell::new(false);

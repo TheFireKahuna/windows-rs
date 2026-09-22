@@ -91,6 +91,7 @@ struct App {
     owner: Option<signal::Owner>,
     /// Held for the life of the mount: retiring it unmounts the tree.
     root: Option<Mount>,
+    focus_outline: Option<windows_scene::NodeId>,
     overlays: Overlays,
     /// Focus edits the overlay stack emitted since the last batch went out.
     focus: Vec<FocusOp>,
@@ -165,10 +166,12 @@ where
                 let (owner, root) = signal::Owner::scope(|| {
                     Ui::mount_root(|ui| mount(ui, super::AppCtx { visibility, size }))
                 });
+                let focus_outline = Some(Host::with(Host::focus_outline));
                 Ok(App {
                     links: Arc::clone(&links),
                     owner: Some(owner),
                     root: Some(root),
+                    focus_outline,
                     overlays: Overlays::new(),
                     focus: Vec::new(),
                     uia_intents: Vec::new(),
@@ -343,6 +346,7 @@ impl App {
         // Outside the borrow: `Host::flush` takes the host itself, and taking it twice is the
         // re-entry the borrow panics on.
         Host::flush(&mut down.patch);
+        down.focus_outline = self.focus_outline.take();
         Host::with(|h| {
             h.fill(&mut down);
             if self.links.uia_listening.load(Acquire)
@@ -720,6 +724,9 @@ impl SceneThread {
         let regions_changed = !down.regions.is_empty();
         present::apply(&mut self.regions, &mut down.regions, &mut front)?;
         front.scene.apply(&mut down.patch, front.back, front.env)?;
+        if let Some(outline) = down.focus_outline.take() {
+            self.controls.set_ring(outline);
+        }
         self.controls.adopt(
             &down.chrome,
             &down.values,

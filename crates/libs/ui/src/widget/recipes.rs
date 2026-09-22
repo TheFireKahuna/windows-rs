@@ -498,7 +498,7 @@ pub fn slider_source<'a, M>(
             // A layer gives every child the whole box, so the rail, the trail and the origin mark
             // stack without a grid of one track to hold them.
             ui.node(Preset::Layer).children(move |ui| {
-                ui.path(rail).stroke(Role::Fill(Fill::Pressed), style.rail);
+                ui.path(rail).stroke(Role::Fill(Fill::Sunken), style.rail);
                 let trail = ui.path(rail).probed(extent);
                 let trail = match style.ramp {
                     Some(ramp) => trail.stroke_ramp(ramp, style.rail),

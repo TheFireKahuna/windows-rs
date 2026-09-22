@@ -348,6 +348,7 @@ impl Controls {
                 self.drive(id, row.fraction, How::Carried, front)?;
             }
         }
+        self.move_ring(front)?;
         self.reveals(front)
     }
 
@@ -870,17 +871,28 @@ impl Controls {
         if self.ring.is_none() {
             return Ok(());
         }
+        front.scene.raise_overlay(self.ring);
+        let scroll = if entry.flags.contains(HitFlags::UNSCROLLED) {
+            Vector2::default()
+        } else {
+            front.scene.hits().offset(entry.scroll_src)
+        };
         let at = Vector2 {
-            x: entry.x0,
-            y: entry.y0,
+            x: entry.x0 - scroll.x,
+            y: entry.y0 - scroll.y,
         };
         let size = Vector2 {
             x: entry.x1 - entry.x0,
             y: entry.y1 - entry.y0,
         };
-        front.spring(self.ring, Prop::Offset, Value::Vec2(at))?;
-        front.spring(self.ring, Prop::Size, Value::Vec2(size))?;
-        if !self.ring_shown {
+        if self.ring_shown {
+            front.spring(self.ring, Prop::Offset, Value::Vec2(at))?;
+            front.spring(self.ring, Prop::Size, Value::Vec2(size))?;
+        } else {
+            // The outline's nine-grid needs a nonzero box before its first reveal.
+            for (prop, value) in [(Prop::Offset, at), (Prop::Size, size)] {
+                front.scene.retarget(self.ring, prop, Bind::Set(Value::Vec2(value)), front.back)?;
+            }
             self.ring_shown = true;
             front.spring(self.ring, Prop::Opacity, Value::Scalar(1.0))?;
         }

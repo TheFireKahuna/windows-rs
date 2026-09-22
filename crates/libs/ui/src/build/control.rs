@@ -43,7 +43,7 @@ pub(crate) struct Handlers {
     /// depends on the axis its author stacked them on, so a description below a toolbar
     /// button clears its neighbours and the same one below a rail item lands on the next.
     pub tip: Option<(Rc<TextSource>, Side)>,
-    pub flyout: Option<Rc<dyn Fn(&mut Ui<'_>)>>,
+    pub flyout: Option<(crate::overlay::Align, Rc<dyn Fn(&mut Ui<'_>)>)>,
 }
 
 /// One interactive control. Its index is its slot for the life of its mount.
@@ -516,8 +516,17 @@ impl<K> Element<'_, K> {
     }
 
     pub fn flyout(self, body: impl Fn(&mut Ui<'_>) + 'static) -> Self {
+        self.flyout_aligned(crate::overlay::Align::Start, body)
+    }
+
+    /// Opens a flyout below this control with the declared horizontal alignment.
+    pub fn flyout_aligned(
+        self,
+        align: crate::overlay::Align,
+        body: impl Fn(&mut Ui<'_>) + 'static,
+    ) -> Self {
         self.handler(HitFlags::GESTURE | HitFlags::INTERACTIVE, |row| {
-            row.flyout.replace(Rc::new(body)).map(Retired::new)
+            row.flyout.replace((align, Rc::new(body))).map(|(_, body)| Retired::new(body))
         })
     }
 

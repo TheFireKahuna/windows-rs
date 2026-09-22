@@ -194,7 +194,11 @@ pub enum Text {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Fill {
     Surface,
+    /// Fills recessed fields and tracks with an opaque surface.
+    Sunken,
+    /// Supplies the foreground wash and its hover opacity.
     Hover,
+    /// Supplies the foreground wash and its pressed opacity.
     Pressed,
     Selected,
     Accent,
