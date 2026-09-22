@@ -202,6 +202,9 @@ pub(crate) struct Published {
     pub local: Vector2,
     pub size: Vector2,
     pub bounded: bool,
+    /// The box was published arranged away under a hidden ancestor, as a zero box at the
+    /// origin that no animation may start from.
+    pub sunk: bool,
 }
 
 impl Published {
@@ -210,6 +213,7 @@ impl Published {
         local: Vector2 { x: f32::NAN, y: f32::NAN },
         size: Vector2 { x: f32::NAN, y: f32::NAN },
         bounded: false,
+        sunk: false,
     };
 }
 
@@ -555,7 +559,10 @@ impl Tree {
                 ancestor = self.parent(ancestor);
             }
             let live_clip = animated;
+            let sunk = self.c.flags[id.index()] & SUNK != 0;
             animated &= was.size.x.is_finite()
+                && !was.sunk
+                && !sunk
                 && self.c.flags[id.index()] & INITIAL == 0
                 && !self.window_resized;
             let write = |prop, value| Op::Bind {
@@ -611,7 +618,7 @@ impl Tree {
                 patch.push(Op::Clip { id, clip });
             }
             self.c.published[id.index()] =
-                Published { local: now.local, size: now.size, bounded };
+                Published { local: now.local, size: now.size, bounded, sunk };
         }
         self.touched.clear();
     }

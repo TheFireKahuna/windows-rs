@@ -166,6 +166,38 @@ fn a_window_resize_sets_animated_layout_bounds_directly() {
 }
 
 #[test]
+fn a_revealed_node_sets_its_bounds_before_it_springs() {
+    let mut patch = fixture();
+    Host::with(|h| h.set_window(Vector2::new(800.0, 600.0)));
+    let (hidden, width) = (Cell::new(true), Cell::new(0.0));
+    let mut mark = NodeId::NONE;
+    let held = Ui::mount_root(|ui| {
+        ui.node(Preset::Row).animate_layout().grow().children(|ui| {
+            ui.node(Preset::Layer).layout_from(move |l| l.width = Len::dip(width.get()));
+            mark = ui.node(Preset::Layer).hide_if(hidden)
+                .width(Len::dip(40.0)).height(Len::dip(20.0)).id().into();
+        });
+    });
+    Host::flush(&mut patch);
+    patch.clear();
+    width.set(200.0);
+    hidden.set(false);
+    Host::flush(&mut patch);
+    for prop in [Prop::Offset, Prop::Size] {
+        assert!(patch.ops().iter().any(|op| matches!(op,
+            Op::Bind { id, prop: p, bind: Bind::Set(_) } if *id == mark && *p == prop
+        )), "a revealed node did not set its {prop:?}: {:#?}", patch.ops());
+    }
+    patch.clear();
+    width.set(300.0);
+    Host::flush(&mut patch);
+    assert!(patch.ops().iter().any(|op| matches!(op,
+        Op::Bind { id, prop: Prop::Offset, bind: Bind::Animate(Anim::Spring { tuning: windows_scene::Tuning::Layout, .. }) } if *id == mark
+    )));
+    drop(held);
+}
+
+#[test]
 fn geometry_settles_without_animation_through_the_entire_creation_publication() {
     let mut patch = fixture();
     let mut parent = NodeId::NONE;
