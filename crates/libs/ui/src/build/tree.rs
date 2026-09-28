@@ -57,6 +57,7 @@ pub(crate) const SUNK: Bits = 1 << 25;
 pub(crate) const PLACED: Bits = 1 << 26;
 pub(crate) const ANIMATE_LAYOUT: Bits = 1 << 27;
 pub(crate) const INITIAL: Bits = 1 << 28;
+pub(crate) const ROUNDED_CLIP: Bits = 1 << 30;
 
 // ── the hit declaration, packed ─────────────────────────────────────────────────────
 
@@ -601,7 +602,8 @@ impl Tree {
             }
             // A clip is declared, not diffed, scene-side, and declaring the absence of one
             // mints a side row on every node that never had one.
-            if bounded != was.bounded || (bounded && !live_clip && now.size != was.size) {
+            if self.c.flags[id.index()] & ROUNDED_CLIP == 0
+                && (bounded != was.bounded || (bounded && !live_clip && now.size != was.size)) {
                 let clip = if bounded && live_clip {
                     Clip::Bounds
                 } else if bounded {

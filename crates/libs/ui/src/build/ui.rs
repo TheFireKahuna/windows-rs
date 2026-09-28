@@ -781,6 +781,13 @@ impl<'a, K> Element<'a, K> {
         self.flag(tree::CLIP, true)
     }
 
+    /// Clips the subtree to its live compositor bounds with a resolved corner radius.
+    /// Layout and hit containment use the same rectangular bounds; corners trim paint only.
+    pub fn clip_rounded(self, radius: impl Into<Len>) -> Self {
+        self.ui.host.clip_rounded(self.node, radius.into());
+        self.flag(tree::CLIP | tree::ROUNDED_CLIP, true)
+    }
+
     /// Springs changed layout bounds in this subtree on the compositor.
     ///
     /// Initial geometry snaps. Subsequent solves retarget native springs;

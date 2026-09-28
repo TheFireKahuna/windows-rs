@@ -1247,6 +1247,9 @@ impl Scene {
                     self.nodes.set_held(id, desc, Held::Stale);
                 }
             }
+            if self.nodes.aux(id).is_some_and(|aux| matches!(aux.decl, Clip::RoundedBounds(_))) {
+                self.bind_rounded_bounds(id, back);
+            }
         }
         self.events.borrow_mut().push(SceneEvent::DeviceRebuilt);
         Ok(())
@@ -1642,18 +1645,25 @@ impl Scene {
             self.nodes.aux(id).and_then(|aux| aux.clip.as_ref()),
             Some(ClipObj::Rect(_))
         );
+        let was_rounded = self.nodes.aux(id).is_some_and(|aux| matches!(aux.decl, Clip::RoundedBounds(_)));
+        let rounded = matches!(clip, Clip::RoundedBounds(_));
         // A rectangle clip already in the slot takes the new sides through the channels, so
         // a resize rebuilds nothing.
-        if was_rect && matches!(clip, Clip::Rect { .. }) {
+        if was_rect && was_rounded == rounded && matches!(clip, Clip::Rect { .. } | Clip::RoundedBounds(_)) {
             self.nodes.aux_mut(id).decl = clip;
             return self.write_clip(id, clip);
+        }
+        if was_rounded {
+            for prop in [Prop::ClipR, Prop::ClipB] {
+                self.nodes.stop(id, desc(prop));
+            }
         }
         let next = match clip {
             Clip::None => None,
             Clip::Bounds => Some(ClipObj::Bounds(back.compositor.create_inset_clip())),
             // Rounded clipping needs no brush slot and no capture: a rectangle clip carries
             // its own radii.
-            Clip::Rect { .. } => Some(ClipObj::Rect(back.compositor.create_rectangle_clip())),
+            Clip::Rect { .. } | Clip::RoundedBounds(_) => Some(ClipObj::Rect(back.compositor.create_rectangle_clip())),
             Clip::Geom(geom) => self.res.geom(geom).map(|geometry| {
                 // Soft border mode antialiases the clip edge, which is what makes a
                 // geometric clip usable as a shape.
@@ -1676,6 +1686,9 @@ impl Scene {
         aux.clip = next;
         aux.decl = clip;
         self.write_clip(id, clip)?;
+        if rounded {
+            self.bind_rounded_bounds(id, back);
+        }
         // The sink's clip and a clip-route shape mask compete for the visual's one slot, so
         // a slot changing hands costs a promotion rather than a wrong render.
         if self.nodes.painted(id).is_some_and(Painted::owns_the_clip) {
@@ -1696,6 +1709,7 @@ impl Scene {
         let size = self.nodes.size(id);
         let (l, t, r, b, radius) = match clip {
             Clip::Rect { l, t, r, b, radius } => (l, t, r, b, radius),
+            Clip::RoundedBounds(radius) => (0.0, 0.0, size.x, size.y, radius),
             Clip::None if self.nodes.has_owner(id, Owner::Clip) => {
                 (0.0, 0.0, size.x, size.y, Corners::default())
             }
@@ -1716,10 +1730,23 @@ impl Scene {
             (Prop::CornerBottomLeftY, radius.bl),
         ];
         for (prop, value) in rows {
+            if matches!(clip, Clip::RoundedBounds(_)) && matches!(prop, Prop::ClipR | Prop::ClipB) {
+                continue;
+            }
             let written = self.nodes.set(id, prop, Value::Scalar(value));
             self.census.count(written);
         }
         Ok(())
+    }
+
+    fn bind_rounded_bounds(&mut self, id: NodeId, back: &Backends) {
+        let Some(visual) = self.nodes.visual(id).cloned() else { return };
+        for (prop, source) in [(Prop::ClipR, "v.Size.X"), (Prop::ClipB, "v.Size.Y")] {
+            let expression = back.compositor.create_expression_animation(source);
+            expression.set_reference_parameter("v", &visual);
+            self.nodes.start(id, desc(prop), &expression.as_animation(), None, Held::Bound);
+            self.census.animations += 1;
+        }
     }
 
     fn bind(
@@ -2772,6 +2799,45 @@ mod tests {
         rig.scene.device_lost(&rig.back, rig.env).expect("rebuilt");
         assert_eq!(rig.scene.nodes.chan(id, blur + 1), 0.3);
         assert_eq!(rig.scene.nodes.chan(id, blur), 12.0);
+    }
+
+    #[test]
+    fn rounded_bounds_keep_native_size_bindings_across_radius_resize_and_recovery() {
+        let mut rig = rig().expect("native compositor");
+        let mut patch = SinkPatch::default();
+        let id = rig.sprite(&mut patch, 40.0);
+        patch.push(Op::Clip { id, clip: Clip::RoundedBounds(Corners::all(6.0)) });
+        let initial = rig.scene.census().animations;
+        rig.apply(&mut patch);
+        assert_eq!(rig.scene.census().animations, initial + 2);
+        for radius in [6.0, 8.0] {
+            patch.push(Op::Clip { id, clip: Clip::RoundedBounds(Corners::all(radius)) });
+            patch.push(Op::Bind { id, prop: Prop::Size, bind: Bind::Set(Value::Vec2(Vector2::new(100.0, 60.0))) });
+            rig.apply(&mut patch);
+            assert_eq!(rig.scene.census().animations, initial + 2);
+            for prop in [Prop::ClipR, Prop::ClipB] {
+                assert_eq!(rig.scene.nodes.held(id, desc(prop)), Held::Bound);
+            }
+            assert_eq!(rig.scene.nodes.chan(id, desc(Prop::CornerTopLeftX).chan), radius);
+        }
+        rig.scene.device_lost(&rig.back, rig.env).expect("device recovery");
+        for prop in [Prop::ClipR, Prop::ClipB] {
+            assert_eq!(rig.scene.nodes.held(id, desc(prop)), Held::Bound);
+        }
+        assert_eq!(rig.scene.census().animations, initial + 4);
+        patch.push(Op::Clip { id, clip: Clip::Rect { l: 0.0, t: 0.0, r: 20.0, b: 30.0, radius: Corners::default() } });
+        rig.apply(&mut patch);
+        assert_eq!(rig.scene.nodes.held(id, desc(Prop::ClipR)), Held::Free);
+        assert_eq!(rig.scene.nodes.chan(id, desc(Prop::ClipR).chan), 20.0);
+        patch.push(Op::Clip { id, clip: Clip::RoundedBounds(Corners::all(6.0)) });
+        rig.apply(&mut patch);
+        assert_eq!(rig.scene.nodes.held(id, desc(Prop::ClipB)), Held::Bound);
+        patch.push(Op::Clip { id, clip: Clip::None });
+        rig.apply(&mut patch);
+        assert!(rig.scene.nodes.aux(id).unwrap().clip.is_none());
+        let before = rig.scene.census().animations;
+        for _ in 0..20 { rig.apply(&mut patch); }
+        assert_eq!(rig.scene.census().animations, before);
     }
 
     #[test]

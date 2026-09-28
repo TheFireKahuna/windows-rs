@@ -24,6 +24,8 @@ use windows_scene::{
     Spread, SpriteId, StrokeStyle, TRACKER, TrackerId, TrackerOp, Value,
 };
 
+mod rounded;
+
 // ── the rows beside the tree ────────────────────────────────────────────────────────
 
 /// Holds one open overlay's placement rule and where it last landed.
@@ -99,6 +101,7 @@ struct Side {
     scroll: u32,
     region: u32,
     surface: u32,
+    rounded: u32,
 }
 
 impl Default for Side {
@@ -118,6 +121,7 @@ impl Default for Side {
             scroll: tree::NONE,
             region: tree::NONE,
             surface: tree::NONE,
+            rounded: tree::NONE,
         }
     }
 }
@@ -172,6 +176,7 @@ pub struct Host {
     /// One row per installed channel writer, chained from the node's `bindings` head.
     pub(crate) binders: super::binding::Binders,
     sides: Pool<Side>,
+    rounded: Pool<rounded::Rounded>,
     anchors: Vec<Attachment>,
     pub(crate) overlays: Vec<Placement>,
     entrances: Vec<Entrance>,
@@ -258,6 +263,7 @@ impl Host {
                 handlers: HandlerTable::default(),
                 binders: Pool::default(),
                 sides: Pool::default(),
+                rounded: Pool::default(),
                 anchors: Vec::new(),
                 overlays: Vec::new(),
                 entrances: Vec::new(),
@@ -1374,6 +1380,9 @@ impl Host {
         let Some(side) = self.sides.free(at) else {
             return;
         };
+        if side.rounded != tree::NONE {
+            self.rounded.free(side.rounded);
+        }
         if let Some(escape) = side.escape {
             self.retired.push(Retired::new(escape));
         }
@@ -1430,6 +1439,7 @@ impl Host {
             // viewport's size when it is created, so the solved boxes reach the patch before
             // any op that reads one. The encode after them emits only what they moved.
             h.tree.encode(&mut h.pending);
+            h.publish_rounded_clips();
             h.publish_text();
             h.publish_scrolls();
             h.place_overlays();

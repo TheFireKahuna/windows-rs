@@ -614,6 +614,8 @@ pub enum Clip {
     None,
     /// Follows the visual's animated size through a zero-inset native clip.
     Bounds,
+    /// Follows the visual's animated size with fixed DIP corner radii.
+    RoundedBounds(Corners),
     Rect {
         l: f32,
         t: f32,
