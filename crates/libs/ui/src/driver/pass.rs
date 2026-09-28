@@ -673,6 +673,7 @@ impl Worker for SceneThread {
                 self.links.window.post(WM_FRAME, 0, 0);
             }
         }
+        self.regions.visibility(self.scene.hits());
         let scrolls = &self.scrolls;
         self.up
             .events

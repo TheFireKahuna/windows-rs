@@ -17,7 +17,7 @@
 //! queue, which does not.
 
 use super::*;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 
 /// Names the present queue a region asks for.
 ///
@@ -161,6 +161,7 @@ struct Inner {
     /// Regions that have bound a freshly drawn buffer since the last present. Zero makes
     /// a present a no-op rather than a re-present of what is already on screen.
     pending: Cell<u32>,
+    scheduled: RefCell<Vec<(u64, u64)>>,
 }
 
 /// Owns a presentation manager and issues the presents for the regions on it.
@@ -199,6 +200,7 @@ impl PresentationGroup {
             statistics,
             lost: Cell::new(false),
             pending: Cell::new(0),
+            scheduled: RefCell::new(Vec::with_capacity(8)),
         })))
     }
 
@@ -255,14 +257,30 @@ impl PresentationGroup {
                 .manager
                 .SetTargetTime(SystemInterruptTime { value: at })
                 .ok()?;
+            let id = inner.manager.GetNextPresentId();
             let hr = inner.manager.Present();
             if hr == PRESENTATION_ERROR_LOST {
                 inner.lost.set(true);
                 return Ok(false);
             }
             hr.ok()?;
+            let now = interrupt_time_now();
+            let mut scheduled = inner.scheduled.borrow_mut();
+            scheduled.retain(|&(_, time)| time > now);
+            scheduled.push((id, at));
         }
         Ok(true)
+    }
+
+    /// Withdraws queued frames that have not reached their scheduled time.
+    pub(crate) fn cancel_future(&self, now: u64) -> Result<()> {
+        let mut scheduled = self.0.scheduled.borrow_mut();
+        if let Some(&(id, _)) = scheduled.iter().find(|&&(_, at)| at > now) {
+            // SAFETY: the manager owns every recorded present ID.
+            unsafe { self.0.manager.CancelPresentsFrom(id).ok()?; }
+        }
+        scheduled.clear();
+        Ok(())
     }
 
     /// Reports whether this group was built to report statistics.

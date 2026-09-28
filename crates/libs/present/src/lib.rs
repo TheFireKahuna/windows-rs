@@ -45,7 +45,7 @@ pub use group::{
     Instance, Interrupt, Outcome, PresentStatistic, PresentTally, PresentationGroup, Queue,
 };
 pub use pump::{Bound, Presenter, Tuning};
-pub use region::{Extent, PresentationRegion, RegionKey, RegionSpec};
+pub use region::{Acquisition, Extent, PresentationRegion, RegionKey, RegionSpec};
 
 // The types a consumer names to implement a `Frame`, re-exported so writing one needs no
 // direct dependency on the drawing crates. Re-exported rather than re-declared, so a

@@ -20,6 +20,7 @@ use std::sync::Mutex;
 /// and turn the present thread into a busy loop.
 pub struct Epoch {
     seq: AtomicU64,
+    urgent: AtomicU64,
     event: Event,
 }
 
@@ -32,6 +33,7 @@ impl Epoch {
     pub fn new() -> Result<Self> {
         Ok(Self {
             seq: AtomicU64::new(0),
+            urgent: AtomicU64::new(0),
             event: Event::auto_reset()?,
         })
     }
@@ -42,6 +44,18 @@ impl Epoch {
         // version also observes whatever the caller wrote before bumping.
         self.seq.fetch_add(1, Ordering::Release);
         self.event.signal();
+    }
+
+    /// Invalidates future scheduled frames after an edit or structural change.
+    pub fn invalidate(&self) {
+        // Release: the pump's acquire observes the input that invalidated its queue.
+        self.urgent.fetch_add(1, Ordering::Release);
+        self.bump();
+    }
+
+    pub(crate) fn urgent(&self) -> u64 {
+        // Acquire: pairs with invalidation before queued frames are replaced.
+        self.urgent.load(Ordering::Acquire)
     }
 
     /// Returns the current version. No kernel call, so this is the gate a renderer compares
@@ -241,13 +255,8 @@ fn raw_sub(id: Option<SubId>) -> u32 {
     }
 }
 
-/// Carries what a renderer is handed to decide whether this frame differs, and to build the
-/// device resources it will differ with.
-///
-/// The device is here and not in [`DrawCtx`] because the gate runs before the pass's own
-/// bracket opens, which is the one point in a pass where a second `BeginDraw` on this device
-/// is legal. A bracket opened from the draw discards every later draw of the batch, other
-/// regions' included, so the draw is handed no device to open one with.
+/// Carries the region's inputs and scheduled time.
+/// Offscreen rasterization must use the pass supplied to [`Frame::prepare`].
 #[derive(Copy, Clone)]
 pub struct GateCtx<'a> {
     /// The region's DIP box, and the display it is solved for. Every number a renderer
@@ -257,6 +266,10 @@ pub struct GateCtx<'a> {
     /// A monotonic present-thread counter. Increments once per *pass*, not once per frame
     /// of a batch — it identifies the wake, which is what a version gate wants.
     pub tick: u64,
+    /// Scheduled presentation time on the monotonic clock.
+    pub at: std::time::Instant,
+    /// Measured display interval.
+    pub interval: std::time::Duration,
     /// The region's own device. Build every brush, geometry and text layout from it;
     /// resources from another `Gpu` do not bind here.
     pub device: &'a Gpu,
@@ -279,6 +292,10 @@ pub struct DrawCtx<'a> {
     pub extent: Extent,
     /// The pass counter this frame belongs to.
     pub tick: u64,
+    /// Scheduled presentation time on the monotonic clock.
+    pub at: std::time::Instant,
+    /// Measured display interval.
+    pub interval: std::time::Duration,
     /// The transform every colour drawn this frame passes through.
     pub out: OutputTransform,
     /// What the front thread has decided about this region since the last frame.
@@ -292,6 +309,8 @@ impl<'a> GateCtx<'a> {
         DrawCtx {
             extent: self.extent,
             tick: self.tick,
+            at: self.at,
+            interval: self.interval,
             out: self.out,
             input: self.input,
         }
@@ -343,10 +362,19 @@ pub trait Frame {
     /// per-slot call would consume the change on the batch's first frame and report "nothing
     /// moved" for the rest of it.
     ///
-    /// Real-time: runs on the present thread's per-frame path and must not allocate. The
-    /// exception is a cached resource's rebuild, which is what [`GateCtx`] carries a device
-    /// for and what [`Gate`](crate::Gate) and [`Layer`](crate::Layer) gate.
+    /// Must not rasterize resources. Cached content is prepared through [`Self::prepare`].
     fn should_draw(&mut self, ctx: GateCtx<'_>) -> bool;
+
+    /// Prepares a scheduled frame through the batch's open drawing bracket.
+    /// Resource rasterization must use `pass`; it must not open another bracket.
+    fn prepare(&mut self, _ctx: GateCtx<'_>, _pass: &mut Pass<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Commits prepared resources after a successful flush, or invalidates them on failure.
+    fn finish_batch(&mut self, success: bool) {
+        if !success { self.device_reset(); }
+    }
 
     /// Draws one frame.
     ///
@@ -385,10 +413,8 @@ pub trait Frame {
         false
     }
 
-    /// Requests one frame per pass while gate-time resources change between frames.
-    fn framewise(&self) -> bool {
-        false
-    }
+    /// Receives region visibility transitions without discarding GPU resources.
+    fn suspended(&mut self, _suspended: bool) {}
 
     /// Drops every cached device resource.
     ///

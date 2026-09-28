@@ -189,9 +189,8 @@ fn send(tx: &Sender<(RegionKey, Bound)>, key: RegionKey, bound: Bound) {
 struct Bars {
     /// Offsets this region's waveform from its neighbours'.
     phase: f32,
-    /// Advanced once per `draw`, so a batch of three draws steps three frames and the eases
-    /// run as though the calls arrived one per refresh.
-    frame: u32,
+    /// Anchors the wave to scheduled presentation time.
+    start: Option<std::time::Instant>,
     /// Re-pointed per bar. Built from the gate, where the device is in scope, because the
     /// draw may neither allocate nor reach one.
     ink: Option<Solid>,
@@ -201,7 +200,7 @@ impl Bars {
     fn new(phase: f32) -> Self {
         Self {
             phase,
-            frame: 0,
+            start: None,
             ink: None,
         }
     }
@@ -211,15 +210,17 @@ const BARS: usize = 48;
 
 impl Frame for Bars {
     fn should_draw(&mut self, ctx: GateCtx<'_>) -> bool {
-        if self.ink.is_none() {
-            self.ink = ctx.device.solid(ctx.out.apply(Radiance::new(0.0, 0.0, 0.0, 1.0))).ok();
-        }
-        self.ink.is_some()
+        self.start.get_or_insert(ctx.at);
+        true
+    }
+
+    fn prepare(&mut self, ctx: GateCtx<'_>, _: &mut windows_present::Pass<'_>) -> windows_core::Result<()> {
+        if self.ink.is_none() { self.ink = Some(ctx.device.solid(ctx.out.apply(Radiance::new(0.0,0.0,0.0,1.0)))?); }
+        Ok(())
     }
 
     fn draw(&mut self, ctx: DrawCtx<'_>, draw: &Draw<'_>) {
-        let t = self.frame as f32 / 60.0 + self.phase * 10.0;
-        self.frame = self.frame.wrapping_add(1);
+        let t = ctx.at.saturating_duration_since(self.start.unwrap_or(ctx.at)).as_secs_f32() + self.phase * 10.0;
 
         // `opaque()` answers true, so the first act is a full-cover clear. Claiming opacity
         // without one leaves the region eligible for a plane on paper and composed in fact.

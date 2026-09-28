@@ -272,6 +272,8 @@ impl<'a> Ui<'a> {
             theme: std::sync::Arc::new(crate::present::Published::new(scope)),
             build: Some(Box::new(build)),
             extent: None,
+            active: false,
+            layout: None,
         });
         self.host.set_region_row(node, at);
         self.host.declare_part(

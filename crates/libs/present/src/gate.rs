@@ -141,16 +141,12 @@ pub enum Cached {
 
 /// Holds an offscreen the size of the region and the key its contents were drawn for.
 ///
-/// The layer is redrawn from the gate, which is the one point in a pass where no bracket is
-/// outstanding on the device, and blitted from the draw. Nothing outside this type opens the
-/// second bracket that a cached intermediate needs, and [`DrawCtx`] carries no device, so a
-/// renderer cannot open one where it would discard the rest of the batch.
-///
-/// `K` states everything the contents depend on **except** the extent and the DPI, which the
-/// layer tracks itself because they decide the allocation.
+/// Rasterizes through the supplied pass and keeps its key provisional until
+/// [`Layer::finish_batch`] confirms a successful flush.
 pub struct Layer<K: Copy + PartialEq> {
     target: Option<Target>,
     key: Option<K>,
+    pending: Option<K>,
     opacity: Opacity,
 }
 
@@ -161,6 +157,7 @@ impl<K: Copy + PartialEq> Layer<K> {
         Self {
             target: None,
             key: None,
+            pending: None,
             opacity,
         }
     }
@@ -172,13 +169,12 @@ impl<K: Copy + PartialEq> Layer<K> {
     /// pass, so a nested intermediate costs no second context. A `paint` that fails commits
     /// no key, leaving the next gate to retry.
     ///
-    /// Call from [`Frame::should_draw`](crate::Frame::should_draw) only: a bracket opened
-    /// while the present thread's own is outstanding latches an error over the whole batch,
-    /// including other regions' frames.
+    /// The owner must discard this cache if the batch fails to flush.
     pub fn ensure(
         &mut self,
         ctx: GateCtx<'_>,
         key: K,
+        pass: &mut Pass<'_>,
         paint: impl FnOnce(&mut Pass<'_>, &Target) -> Result<()>,
     ) -> Cached {
         let px = ctx.extent.px();
@@ -190,12 +186,14 @@ impl<K: Copy + PartialEq> Layer<K> {
             let Ok(target) = ctx.device.offscreen(px, ctx.extent.dpi, self.opacity) else {
                 self.target = None;
                 self.key = None;
+        self.pending = None;
                 return Cached::Failed;
             };
             self.target = Some(target);
             self.key = None;
+        self.pending = None;
         }
-        if self.key == Some(key) {
+        if self.pending.or(self.key) == Some(key) {
             return Cached::Held;
         }
         let Some(target) = self.target.as_ref() else {
@@ -204,28 +202,33 @@ impl<K: Copy + PartialEq> Layer<K> {
         // Cleared before the paint and committed after it: a half-drawn layer holds no key,
         // so nothing blits it and the next gate retries.
         self.key = None;
-        let Ok(mut pass) = ctx.device.pass() else {
-            return Cached::Failed;
-        };
-        let painted = paint(&mut pass, target);
-        let finished = pass.end();
-        if painted.is_err() || finished.is_err() {
+        self.pending = None;
+        if paint(pass, target).is_err() {
             return Cached::Failed;
         }
-        self.key = Some(key);
+        self.pending = Some(key);
         Cached::Drawn
     }
 
-    /// Returns the offscreen when it holds the contents of the key it was last built for.
+    /// Commits the prepared key after a successful bracket or discards unfinished pixels.
+    pub fn finish_batch(&mut self, success: bool) {
+        if success {
+            if let Some(key) = self.pending.take() { self.key = Some(key); }
+        } else { self.device_reset(); }
+    }
+
+    /// Returns prepared pixels for drawing within the batch, or previously committed pixels.
+    /// Submission must wait for successful bracket completion.
     #[must_use]
     pub fn target(&self) -> Option<&Target> {
-        self.key.is_some().then_some(self.target.as_ref()).flatten()
+        self.pending.or(self.key).is_some().then_some(self.target.as_ref()).flatten()
     }
 
     /// Drops the offscreen, which belongs to a device that no longer exists.
     pub fn device_reset(&mut self) {
         self.target = None;
         self.key = None;
+        self.pending = None;
     }
 }
 
@@ -243,6 +246,8 @@ mod tests {
         GateCtx {
             extent: Extent::new(w, 40.0, dpi),
             tick: 0,
+            at: std::time::Instant::now(),
+            interval: std::time::Duration::from_millis(16),
             device: gpu,
             out: OutputTransform::for_display(windows_color::DisplayCapability::Sdr, 1000.0),
             input,
@@ -323,11 +328,15 @@ mod tests {
         let mut layer = Layer::<u32>::new(Opacity::Translucent);
         let mut painted = 0u32;
         let paint = |layer: &mut Layer<u32>, ctx, key, painted: &mut u32| {
-            layer.ensure(ctx, key, |pass, target| {
+            let mut pass = gpu.pass().unwrap();
+            let result = layer.ensure(ctx, key, &mut pass, |pass, target| {
                 *painted += 1;
                 pass.draw(target).clear(windows_color::Scrgb::TRANSPARENT);
                 Ok(())
-            })
+            });
+            pass.end().unwrap();
+            layer.finish_batch(true);
+            result
         };
 
         let base = ctx(&gpu, &input, 100.0, 96.0);
@@ -355,10 +364,12 @@ mod tests {
         assert_eq!(painted, 4);
 
         // A failed paint commits no key, so the next gate retries.
-        let failed = layer.ensure(wider, 9, |_, _| {
+        let mut pass = gpu.pass().unwrap();
+        let failed = layer.ensure(wider, 9, &mut pass, |_, _| {
             painted += 1;
             Err(windows_core::Error::from_hresult(windows_core::HRESULT(-1)))
         });
+        pass.end().unwrap();
         assert_eq!(failed, Cached::Failed);
         assert!(layer.target().is_none());
         assert_eq!(paint(&mut layer, wider, 9, &mut painted), Cached::Drawn);

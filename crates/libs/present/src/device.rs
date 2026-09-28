@@ -8,6 +8,7 @@
 //! per pass rather than once per region.
 
 use super::*;
+use std::os::windows::io::{AsHandle,AsRawHandle};
 
 /// Owns a Direct3D 11 device, a Direct2D device and context over it, and the presentation
 /// factory bound to the same Direct3D device.
@@ -16,6 +17,9 @@ use super::*;
 /// and geometry a [`Frame`](crate::Frame) builds — belongs to the thread that built this.
 pub struct PresentationDevice {
     gpu: Gpu,
+    removal: ID3D11Device4,
+    removed: Event,
+    removal_cookie: u32,
     /// This crate's own projection of the same Direct3D device `gpu` holds, cast once
     /// rather than per buffer allocation. COM identity belongs to the object rather than to
     /// the interface, so it is the same device by construction.
@@ -54,12 +58,23 @@ impl PresentationDevice {
         }
         // SAFETY: as above.
         let flip = unsafe { factory.IsPresentationSupportedWithIndependentFlip() } != 0;
+        let removal: ID3D11Device4 = d3d.cast()?;
+        let removed = Event::auto_reset()?;
+        // SAFETY: removed outlives registration, which Drop cancels before closing it.
+        let removal_cookie = unsafe { removal.RegisterDeviceRemovedEvent(removed.as_handle().as_raw_handle())? };
         Ok(Self {
-            gpu,
+            gpu, removal, removed, removal_cookie,
             d3d,
             factory,
             flip,
         })
+    }
+
+    pub(crate) fn removed_event(&self) -> HANDLE { self.removed.as_handle().as_raw_handle() }
+
+    pub(crate) fn is_removed(&self) -> bool {
+        // SAFETY: this device remains owned until every check and wait has returned.
+        unsafe { self.d3d.GetDeviceRemovedReason().is_err() }
     }
 
     /// Returns the device every region on this thread draws with.
@@ -106,6 +121,13 @@ impl PresentationDevice {
 
     pub(crate) fn d3d(&self) -> &ID3D11Device {
         &self.d3d
+    }
+}
+
+impl Drop for PresentationDevice {
+    fn drop(&mut self) {
+        // SAFETY: this cookie belongs to removal, and removed has not been closed yet.
+        unsafe { self.removal.UnregisterDeviceRemoved(self.removal_cookie); }
     }
 }
 

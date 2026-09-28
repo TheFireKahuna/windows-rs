@@ -131,6 +131,30 @@ impl HitTable {
         self.entries.get(self.index[at].1 as usize)
     }
 
+    /// Reports whether any interior survives the entry's scroll and clip ancestry.
+    #[must_use]
+    pub fn visible(&self, id: ControlId) -> bool {
+        let Some(entry) = self.entry(id) else { return false; };
+        let resolved = |entry: &HitEntry| {
+            let offset = if entry.flags.contains(HitFlags::UNSCROLLED) {
+                Vector2::zero()
+            } else { self.offset(entry.scroll_src) };
+            [entry.x0-offset.x, entry.y0-offset.y, entry.x1-offset.x, entry.y1-offset.y]
+        };
+        let mut rect = resolved(entry);
+        let mut at = entry.clip_parent;
+        let mut remaining = self.entries.len();
+        while at != NO_ENTRY {
+            if remaining == 0 { return false; }
+            let Some(parent) = self.entries.get(at as usize) else { return false; };
+            let clip = resolved(parent);
+            rect = [rect[0].max(clip[0]), rect[1].max(clip[1]), rect[2].min(clip[2]), rect[3].min(clip[3])];
+            at = parent.clip_parent;
+            remaining -= 1;
+        }
+        rect[2] > rect[0] && rect[3] > rect[1]
+    }
+
     /// Records a viewport's live offset and drops the memo.
     ///
     /// Called from the values-changed handler: a tracker runs in another process and every
@@ -375,6 +399,24 @@ mod tests {
         let mut table = HitTable::default();
         table.replace(entries, &index(entries));
         table
+    }
+
+    #[test]
+    fn visibility_follows_clip_scroll_and_control_generation() {
+        let mut child = entry(2,(10.0,80.0,90.0,140.0),HitFlags::INTERACTIVE);
+        child.clip_parent = 0;
+        child.scroll_src = NodeId::raw(4,1);
+        let mut hits = table(&[entry(1,(0.0,0.0,100.0,100.0),HitFlags::CLIP),child]);
+        let id = ControlId::raw(2,1);
+        assert!(hits.visible(id));
+        hits.set_scroll(child.scroll_src,Vector2::new(0.0,140.0));
+        assert!(!hits.visible(id));
+        hits.set_scroll(child.scroll_src,Vector2::new(0.0,40.0));
+        assert!(hits.visible(id));
+        assert!(!hits.visible(ControlId::raw(2,2)));
+        child.x1 = child.x0;
+        hits.replace(&[child],&index(&[child]));
+        assert!(!hits.visible(id));
     }
 
     #[test]

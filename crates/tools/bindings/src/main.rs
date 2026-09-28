@@ -2,6 +2,11 @@ use windows_bindgen::*;
 
 fn main() {
     let time = std::time::Instant::now();
+    if let Some(filter) = std::env::args().nth(1) {
+        helpers::compile_authored_metadata();
+        bindgen(["--etc", &filter]);
+        return;
+    }
 
     bindgen(["--etc", "crates/tools/bindings/src/collections.txt"]);
     bindgen(["--etc", "crates/tools/bindings/src/core.txt"]);

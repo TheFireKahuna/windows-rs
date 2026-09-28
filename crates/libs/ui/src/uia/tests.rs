@@ -660,6 +660,7 @@ fn a_moving_region_changes_its_parts_and_not_the_tree() {
 
     let geometry = Arc::new(RegionParts::new());
     uia.watch_region(RegionPeer {
+        updates: None,
         id,
         geometry: Arc::clone(&geometry),
         parts: vec![PartDecl::new(0, "Low band", UiaRole::Slider)],
@@ -716,6 +717,7 @@ fn re_joining_a_moving_region_allocates_nothing() {
     let geometry = Arc::new(RegionParts::new());
     let levels: Arc<[AtomicU64]> = Arc::from([AtomicU64::new(0), AtomicU64::new(0)]);
     uia.watch_region(RegionPeer {
+        updates: None,
         id,
         geometry: Arc::clone(&geometry),
         parts: vec![
@@ -1182,4 +1184,38 @@ fn tracker_notifications_report_scroll_percent_bounds_and_offscreen_without_stru
     uia.scroll_changed();
     uia.take_pending_for_test(&mut events);
     assert!(events.is_empty());
+}
+
+#[test]
+fn presented_readings_notify_only_subscribers_and_coalesce_until_sync() {
+    use std::sync::{Arc,atomic::AtomicU64};
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let region = screen.add(NONE,(0.0,0.0,100.0,40.0),UiaRole::Graph,"measurements");
+    screen.publish(&mut uia);
+    let id = screen.control(region);
+    let updates = Arc::new(PartUpdates::default());
+    let values: Arc<[AtomicU64]> = vec![AtomicU64::new(MISSING_READING)].into();
+    uia.watch_region(RegionPeer { id,geometry:Arc::new(windows_present::RegionParts::new()),parts:vec![PartDecl::new(0,"LUFS",UiaRole::Text).formatted(|value| value.map_or_else(|| "Unavailable".into(),|v| format!("{v:.1} LUFS")))],values:Some(values.clone()),value:None,updates:Some(updates.clone()) });
+    let mut raised = Vec::new();
+    uia.take_pending_for_test(&mut raised); raised.clear();
+    values[0].store((-14.0f64).to_bits(),Relaxed);
+    updates.changed(1);
+    uia.sync_regions();
+    uia.take_pending_for_test(&mut raised);
+    assert!(raised.is_empty());
+    uia.shared.advised.added(crate::bindings::UIA_AutomationPropertyChangedEventId);
+    for value in [-13.0f64,-12.0,-11.0] {
+        values[0].store(value.to_bits(),Relaxed); updates.changed(1);
+    }
+    uia.sync_regions();
+    uia.take_pending_for_test(&mut raised);
+    assert_eq!(raised.iter().filter(|event| matches!(event,Raise::PartValue(..))).count(),1);
+    raised.clear();
+    updates.changed(1); uia.sync_regions(); uia.take_pending_for_test(&mut raised);
+    assert!(raised.is_empty());
+    uia.shared.regions.forget(id);
+    assert!(updates.shared.lock().unwrap().upgrade().is_none());
+    updates.changed(1); uia.sync_regions(); uia.take_pending_for_test(&mut raised);
+    assert!(raised.is_empty());
 }

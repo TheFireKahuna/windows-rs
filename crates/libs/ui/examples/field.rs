@@ -199,10 +199,11 @@ impl Frame for Pulse {
     }
 
     fn draw(&mut self, ctx: DrawCtx<'_>, draw: &Draw<'_>) {
-        let n = self.gauge.region_frames.fetch_add(1, Ordering::AcqRel);
+        self.gauge.region_frames.fetch_add(1, Ordering::AcqRel);
+        let n = ctx.at.saturating_duration_since(self.gauge.epoch).as_secs_f64()*60.0;
         // Every pixel of the box, so the region can be scanned out rather than composed, and a
         // value that moves every frame, so the buffer's bytes actually differ.
-        let nits = 2.0 + 0.5 * ((n % 32) as f32 / 32.0);
+        let nits = 2.0 + 0.5 * ((n % 32.0) as f32 / 32.0);
         draw.clear(ctx.out.apply(light(nits, 0.004, ACCENT_HUE)));
     }
 

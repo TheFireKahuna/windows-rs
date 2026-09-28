@@ -57,6 +57,9 @@
 // They must be SHARED + NTHANDLE, and DISPLAYABLE to be eligible for a hardware
 // overlay plane or independent flip. FP16 keeps them in linear scRGB with values
 // above paper white intact.
+    ID3D11Device4::RegisterDeviceRemovedEvent
+    ID3D11Device4::UnregisterDeviceRemoved
+    ID3D11Device::GetDeviceRemovedReason
     ID3D11Device::CreateTexture2D
     ID3D11Texture2D
     D3D11_TEXTURE2D_DESC

@@ -708,6 +708,7 @@ fn pattern(element: &Element, id: PATTERNID) -> Result<IUnknown> {
         Some(part) => roles::row(part.role).patterns,
         None => at.tree.patterns(at.at),
     };
+    if at.shared.regions.has_formatted_value(at.entry().id, at.part) { held = held.or(Patterns::VALUE); }
     if at.choice() {
         held = Patterns::SELECTION_ITEM;
     }
@@ -1259,7 +1260,7 @@ fn set_text(element: &Element, value: &PCWSTR) -> Result<()> {
     if !at.flag(S::ENABLED) {
         return Err(disabled());
     }
-    if at.bit(F::READ_ONLY) {
+    if at.bit(F::READ_ONLY) || at.shared.regions.has_formatted_value(element.id, element.part) {
         return Err(invalid());
     }
     if value.is_null() {
@@ -1289,6 +1290,7 @@ fn set_text(element: &Element, value: &PCWSTR) -> Result<()> {
 /// formats to the precision its step implies, so the announced value carries no float noise.
 fn value_text(element: &Element) -> Result<BSTR> {
     let at = element.at()?;
+    if let Some(text) = at.shared.regions.formatted_value(element.id, element.part) { return Ok(BSTR::from(text)); }
     if let Some(field) = at.tree.field(element.id) {
         if field.password {
             return Err(invalid());

@@ -60,8 +60,7 @@ impl Tiles {
     /// Shapes `words`, packs them into rows at most `width` DIPs wide and rasterizes them at
     /// `dpi`.
     ///
-    /// Opens a drawing bracket of its own, so a `Frame` builds this from its gate and never
-    /// from inside the present thread's pass.
+    /// Rasterizes through `pass`. The caller must discard the atlas if the pass fails.
     ///
     /// # Errors
     ///
@@ -69,6 +68,7 @@ impl Tiles {
     /// than `width` is refused, because no packing places it.
     pub fn build(
         gpu: &Gpu,
+        pass: &mut windows_d2d::Pass<'_>,
         dpi: f32,
         ladder: FontLadder,
         width: f32,
@@ -114,7 +114,6 @@ impl Tiles {
         let atlas = gpu.offscreen((bound.max(1), (top + row_h).max(1)), dpi, Opacity::Translucent)?;
         let brush = gpu.solid(Scrgb::TRANSPARENT)?;
         let mut segments = SegBuffers::default();
-        let mut pass = gpu.pass()?;
         {
             let draw = pass.draw(&atlas);
             draw.clear(Scrgb::TRANSPARENT);
@@ -137,8 +136,6 @@ impl Tiles {
                 );
             }
         }
-        pass.end()
-            .map_err(|e| windows_core::Error::from_hresult(e.hr))?;
         Ok(Self { atlas, tiles })
     }
 
@@ -300,8 +297,11 @@ mod tests {
                 },
             })
             .collect();
-        Tiles::build(gpu, dpi, FontLadder::new(["Segoe UI"]), 256.0, &words)
-            .expect("atlas at every scale")
+        let mut pass = gpu.pass().unwrap();
+        let result = Tiles::build(gpu, &mut pass, dpi, FontLadder::new(["Segoe UI"]), 256.0, &words)
+            .expect("atlas at every scale");
+        pass.end().unwrap();
+        result
     }
 
     #[test]
@@ -378,7 +378,8 @@ mod tests {
                 a: 1.0,
             },
         }];
-        let refused = Tiles::build(&gpu, 96.0, FontLadder::new(["Segoe UI"]), 8.0, &words);
+        let mut pass = gpu.pass().unwrap();
+        let refused = Tiles::build(&gpu, &mut pass, 96.0, FontLadder::new(["Segoe UI"]), 8.0, &words);
         assert!(refused.is_err());
     }
 }

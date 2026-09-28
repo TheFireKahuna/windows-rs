@@ -196,9 +196,19 @@ pub(crate) struct RegionRow {
     /// pending. It is the only record of whether the box moved, so a solve that moved nothing
     /// sends nothing.
     pub(crate) extent: Option<Extent>,
+    pub(crate) active: bool,
+    pub(crate) layout: Option<(crate::layout::Anchors, Arc<Published<crate::layout::Table>>)>,
 }
 
 impl Element<'_, Region> {
+    /// Publishes settled child rectangles and scope in the region's coordinate space.
+    pub fn layout_parts(self, anchors: crate::layout::Anchors, output: &Arc<Published<crate::layout::Table>>) -> Self {
+        let node = self.node;
+        let (_, row) = self.ui.host.regions.iter_mut().find(|(_, row)| row.node == node).expect("live region");
+        row.layout = Some((anchors, Arc::clone(output)));
+        self.anchors_origin(anchors)
+    }
+
     /// Rounds the region's own corners.
     ///
     /// The mask is this side's, not the renderer's: the buffer is a rectangle and the compositor
@@ -239,6 +249,15 @@ impl Element<'_, Region> {
         self.host().region_peer(id, move |peer| {
             peer.values = Some(values);
         });
+        self
+    }
+
+    /// Requests coalesced part-value notifications only while a client subscribes.
+    #[must_use]
+    pub fn part_updates(mut self, updates: &Arc<crate::uia::PartUpdates>) -> Self {
+        let id = self.control_id();
+        let updates = Arc::clone(updates);
+        self.host().region_peer(id, move |peer| peer.updates = Some(updates));
         self
     }
 
@@ -286,12 +305,22 @@ pub(crate) fn emit(host: &mut Host, out: &mut Vec<RegionOp>) {
         if !tree.is_live(row.node) {
             continue;
         }
-        let size = tree.c.geom[row.node.index()].size;
-        // Collapsed before the mount, so the first solve is the one with no area to give.
-        let extent = Extent::new(size.x, size.y, env.dpi());
-        if extent.px() == (0, 0) {
-            continue;
+        if let Some((anchors, output)) = &row.layout {
+            anchors.with(|table| {
+                if output.get() != *table {
+                    output.set(table.clone());
+                    row.live.epoch.invalidate();
+                }
+            });
         }
+        let size = tree.c.geom[row.node.index()].size;
+        let active = size.x > 0.0 && size.y > 0.0;
+        if row.extent.is_some() && row.active != active {
+            out.push(RegionOp::Active { sink: row.sink, active });
+        }
+        row.active = active;
+        if !active { continue; }
+        let extent = Extent::new(size.x, size.y, env.dpi());
         match (row.build.take(), row.extent) {
             (Some(build), _) => out.push(RegionOp::Mount {
                 sink: row.sink,
@@ -329,6 +358,8 @@ struct Waiting {
 
 /// One mounted region, as the half that binds its surface holds it.
 struct Mounted {
+    layout_active: bool,
+    active: bool,
     sink: RegionId,
     /// What a hover over the region names, for the pick rows the input thread is handed.
     control: ControlId,
@@ -360,12 +391,23 @@ impl Regions {
         );
     }
 
+    /// Publishes activity transitions after layout or tracker events.
+    pub(crate) fn visibility(&mut self, hits: &HitTable) {
+        for row in &mut self.rows {
+            let active = row.layout_active && hits.visible(row.control);
+            if active != row.active {
+                row.active = active;
+                with(|p, _| p.set_active(key_of(row.sink), active));
+            }
+        }
+    }
+
     /// Rebases every mounted region's scope on a new theme and wakes its renderer, which
     /// invalidates whatever it cached against the old one.
     pub(crate) fn retheme(&mut self, root: Scope) {
         for row in &self.rows {
             row.theme.set(row.theme.get().in_theme(root));
-            row.live.epoch.bump();
+            row.live.epoch.invalidate();
         }
     }
 
@@ -481,6 +523,8 @@ pub(crate) fn apply(
                 theme,
             } => {
                 regions.rows.push(Mounted {
+                    layout_active: true,
+                    active: true,
                     sink,
                     control,
                     live: live.clone(),
@@ -506,6 +550,12 @@ pub(crate) fn apply(
             // the buffers and re-issue a handle that is already bound.
             RegionOp::Resize { sink, extent } => {
                 with(|p, _| p.resize(key_of(sink), extent));
+                Ok(())
+            }
+            RegionOp::Active { sink, active } => {
+                if let Some(row) = regions.rows.iter_mut().find(|row| row.sink == sink) {
+                    row.layout_active = active;
+                }
                 Ok(())
             }
             RegionOp::Drop { sink } => {
@@ -704,7 +754,7 @@ pub(crate) fn pick(reports: &[Report], hits: &HitTable, picks: &mut Picks, out: 
                 {
                     row.live.input.set_hover(None);
                     row.live.input.set_cursor(None);
-                    row.live.epoch.bump();
+                    row.live.epoch.invalidate();
                 }
                 if let Some(to) = to {
                     hover(picks, to, at, hits);
@@ -725,7 +775,7 @@ pub(crate) fn pick(reports: &[Report], hits: &HitTable, picks: &mut Picks, out: 
                 let part = row.at(at);
                 row.live.input.set_active(part);
                 row.live.input.set_cursor(Some((at.x, at.y)));
-                row.live.epoch.bump();
+                row.live.epoch.invalidate();
             }
             // A release commits: the part under the contact stops being active, and the
             // application is told which part the gesture finished on.
@@ -738,7 +788,7 @@ pub(crate) fn pick(reports: &[Report], hits: &HitTable, picks: &mut Picks, out: 
                 };
                 let part = row.at(at);
                 row.live.input.set_active(None);
-                row.live.epoch.bump();
+                row.live.epoch.invalidate();
                 if let Some(part) = part {
                     out.push(Intent {
                         target,
@@ -751,7 +801,7 @@ pub(crate) fn pick(reports: &[Report], hits: &HitTable, picks: &mut Picks, out: 
             Report::Canceled { target, .. } => {
                 if let Some(row) = picks.row(target) {
                     row.live.input.set_active(None);
-                    row.live.epoch.bump();
+                    row.live.epoch.invalidate();
                 }
             }
             _ => {}
@@ -770,7 +820,7 @@ fn hover(picks: &mut Picks, id: ControlId, at: Vector2, hits: &HitTable) {
     let part = row.at(at);
     row.live.input.set_hover(part);
     row.live.input.set_cursor(Some((at.x, at.y)));
-    row.live.epoch.bump();
+    row.live.epoch.invalidate();
 }
 
 #[cfg(test)]

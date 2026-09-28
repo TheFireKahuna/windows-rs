@@ -1077,6 +1077,7 @@ impl Host {
             .position(|peer| peer.id == id)
             .unwrap_or_else(|| {
                 self.peers.push(crate::uia::RegionPeer {
+                    updates: None,
                     id,
                     geometry: std::sync::Arc::new(windows_present::RegionParts::new()),
                     parts: Vec::new(),
@@ -1428,12 +1429,12 @@ impl Host {
             h.publish_scrolls();
             h.place_overlays();
             h.publish_values();
+            h.publish_anchors();
             h.publish_regions();
             h.publish_masks();
             h.publish_fields();
             h.publish_overlay_entries();
             h.publish_probes();
-            h.publish_anchors();
             h.publish_pivots();
             h.schedule_geometry();
             // The predicate walks the flags column, so it is built only where it is asserted.

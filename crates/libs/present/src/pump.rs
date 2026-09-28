@@ -133,6 +133,7 @@ enum Cmd {
     },
     Unmount(RegionKey),
     Resize(RegionKey, Extent),
+    Active(RegionKey, bool),
     Display(OutputTransform),
     Quit,
 }
@@ -246,6 +247,11 @@ impl Presenter {
         self.send(Cmd::Resize(key, extent));
     }
 
+    /// Suspends or resumes a region without releasing its resources.
+    pub fn set_active(&self, key: RegionKey, active: bool) {
+        self.send(Cmd::Active(key, active));
+    }
+
     /// Replaces the output transform every region draws through, after a display-capability
     /// change.
     pub fn set_output_transform(&self, out: OutputTransform) {
@@ -288,11 +294,13 @@ impl GroupKey {
 }
 
 struct Mounted {
+    active: bool,
     spec: RegionSpec,
     resize_pending: bool,
     group: GroupKey,
     epoch: Arc<Epoch>,
     observed_epoch: u64,
+    observed_urgent: u64,
     input: Arc<RegionInput>,
     frame: Box<dyn Frame>,
     region: PresentationRegion,
@@ -353,6 +361,7 @@ struct Pump {
     /// Increments once per pass — it identifies the wake, which is what a version gate
     /// wants, rather than once per frame of a batch.
     tick_count: u64,
+    replace_queued: bool,
     // Reused across wakes so a pass allocates nothing.
     handles: Vec<HANDLE>,
     due: Vec<usize>,
@@ -393,6 +402,7 @@ impl Pump {
             visibility,
             speed: Speed::Full,
             tick_count: 0,
+            replace_queued: false,
             handles: Vec::new(),
             due: Vec::new(),
             slots: Vec::new(),
@@ -412,9 +422,9 @@ impl Pump {
         // Latched by the clock's occluded return, cleared by one probe after an edge.
         let mut dark = false;
         let mut tick = DEFAULT_TICK;
-        let mut last_wake = 0u64;
+        let mut last_frame = 0u64;
         // Wakes remaining to sit out because a batch already drew their frames.
-        let mut skip = 0u32;
+        let mut covered_until = 0u64;
 
         self.rebuild_handles(wake);
         loop {
@@ -422,19 +432,33 @@ impl Pump {
             // display cannot show it. Either way there is nothing to gate on and nothing
             // to present, so drop to EcoQoS and park until an edge says otherwise.
             if dark || self.visibility.as_ref().is_some_and(|v| v.is_hidden()) {
+                for m in &mut self.mounted {
+                    if m.active { let _ = guarded(|| m.frame.suspended(true)); }
+                }
+                for (_, group) in &self.groups { let _ = group.cancel_future(interrupt_time_now()); }
+                covered_until = 0;
+                last_frame = 0;
                 self.qos(Speed::Eco);
                 self.park();
                 if self.commands(rx, wake) {
                     return;
                 }
+                self.recover();
+                self.rebuild_handles(wake);
                 // Only the clock reports whether the display is back, so leaving the parked
                 // state is a single probe on the next iteration rather than state this
                 // thread tracks itself.
                 dark = false;
+                for m in &mut self.mounted {
+                    if m.active {
+                        let _ = guarded(|| m.frame.suspended(false));
+                        m.epoch.invalidate();
+                    }
+                }
                 continue;
             }
             self.qos(Speed::Full);
-            match self.wait(paced, clock_ok) {
+            let frame = match self.wait(paced, clock_ok) {
                 Waken::Failed => {
                     clock_ok = false;
                     continue;
@@ -443,44 +467,48 @@ impl Pump {
                     dark = true;
                     continue;
                 }
-                Waken::Ready => {}
-            }
+                Waken::Ready => false,
+                Waken::Frame => true,
+            };
             if self.commands(rx, wake) {
                 return;
             }
             self.recover();
-            if self.mounted.iter().any(|m| m.resize_pending || m.epoch.seq() != m.observed_epoch) {
-                skip = 0;
-            }
-
-            // Measure the interval the display is actually running at, from the clock we
-            // are already woken by: no second source, and it follows a mode change on its
-            // own. Skipped wakes are excluded because their spacing is the batch's, not
-            // the display's.
+            self.rebuild_handles(wake);
             let now = interrupt_time_now();
-            if last_wake != 0 && skip == 0 {
-                let delta = now.saturating_sub(last_wake);
-                if (MIN_TICK..=MAX_TICK).contains(&delta) {
-                    tick = (tick * 7 + delta) / 8;
+            let urgent = self.mounted.iter().any(|m| m.active && (m.resize_pending || m.epoch.urgent() != m.observed_urgent));
+            if urgent {
+                self.replace_queued = true;
+                for (_, group) in &self.groups { let _ = group.cancel_future(now); }
+                covered_until = 0;
+            }
+            if frame {
+                if last_frame != 0 {
+                    let delta = now.saturating_sub(last_frame);
+                    if (MIN_TICK..=MAX_TICK).contains(&delta) {
+                        tick = (tick * 7 + delta) / 8;
+                    } else {
+                        covered_until = 0;
+                    }
                 }
+                last_frame = now;
             }
-            last_wake = now;
-
-            // A previous batch already drew this wake's frame. The wake still happens; it
-            // costs the gate and no draw, bracket or present.
-            if skip > 0 {
-                skip -= 1;
-                continue;
-            }
-
-            let drew = self.pass(now, tick);
+            if clock_ok && now < covered_until { continue; }
+            let drew = self.pass(now, tick, wake);
             if drew {
-                skip = (self.slots.len() as u32).saturating_sub(1);
+                covered_until = now + tick * self.slots.len() as u64;
             }
+            if self.commands(rx, wake) { return; }
 
+            if !self.mounted.iter().any(|m| m.active) {
+                paced = false;
+                quiet = 0;
+                last_frame = 0;
+                covered_until = 0;
+            }
             // A redraw or a mid-flight ease keeps the loop on the display clock; enough
             // consecutive empty ticks fall back to the zero-cost park.
-            if drew || self.mounted.iter().any(|m| m.frame.animating()) {
+            if self.mounted.iter().any(|m| m.active) && (drew || self.mounted.iter().any(|m| m.active && m.frame.animating())) {
                 paced = true;
                 quiet = 0;
             } else if paced {
@@ -488,6 +516,7 @@ impl Pump {
                 if quiet >= self.tuning.quiet_ticks {
                     paced = false;
                     quiet = 0;
+                    last_frame = 0;
                 }
             }
         }
@@ -495,7 +524,7 @@ impl Pump {
 
     /// Runs one pass: gate every region, draw the whole batch inside one bracket, then bind
     /// and show. Returns `true` when anything was drawn.
-    fn pass(&mut self, now: u64, tick: u64) -> bool {
+    fn pass(&mut self, now: u64, tick: u64, wake: &Event) -> bool {
         self.tick_count += 1;
 
         // Ahead of issuing this pass's presents: the queue is finite and retires its oldest
@@ -514,6 +543,12 @@ impl Pump {
         // Which regions this pass is for, decided once. `should_draw` both tests and commits
         // its version stamp, so asking it per slot would consume the change on the batch's
         // first frame and report "nothing moved" for the rest.
+        let mut interruptions = [wake.as_handle().as_raw_handle(); 3];
+        interruptions[1] = self.device.removed_event();
+        let interruption_count = if let Some(watch) = &self.visibility {
+            interruptions[2] = watch.as_handle().as_raw_handle();
+            3
+        } else { 2 };
         let Self {
             device,
             mounted,
@@ -524,13 +559,19 @@ impl Pump {
             tick_count,
             ..
         } = self;
+        let instant = std::time::Instant::now();
+        let interval = std::time::Duration::from_nanos(tick * 100);
         due.clear();
         poisoned.clear();
         for (i, m) in mounted.iter_mut().enumerate() {
+            if !m.active { continue; }
             m.observed_epoch = m.epoch.seq();
+            m.observed_urgent = m.epoch.urgent();
             let ctx = GateCtx {
                 extent: m.region.extent(),
                 tick: *tick_count,
+                at: instant,
+                interval,
                 device: device.gpu(),
                 out: *out,
                 input: &m.input,
@@ -552,7 +593,7 @@ impl Pump {
         // The frames this pass will draw, at the times they are meant to be shown: one per
         // refresh, starting at the one this wake is for.
         slots.clear();
-        let depth = if mounted.iter().any(|m| m.resize_pending || m.frame.framewise()) {
+        let depth = if self.replace_queued || mounted.iter().any(|m| m.active && (m.resize_pending || m.input.active().is_some())) {
             1
         } else {
             self.tuning.depth
@@ -569,42 +610,82 @@ impl Pump {
         // and spans the whole batch; its cost is fixed per pair and independent of what
         // was drawn, so a batch of `depth` frames pays it once instead of `depth` times.
         let Ok(mut pass) = device.pass() else {
+            for &i in &*due { let _ = guarded(|| mounted[i].frame.finish_batch(false)); }
             return false;
         };
-        for _ in 0..slots.len() {
+        let mut interrupted = false;
+        'drawing: for k in 0..slots.len() {
             for &i in &*due {
                 let m = &mut mounted[i];
-                let Ok(Some(target)) = m.region.acquire() else {
-                    continue;
+                let Ok(Acquisition::Ready(target)) = m.region.acquire_with(&interruptions[..interruption_count]) else {
+                    interrupted = true;
+                    break 'drawing;
                 };
                 debug_assert_eq!(
                     m.frame.opaque(),
                     m.opaque,
                     "a Frame's opacity decides its allocation and may not change after it"
                 );
-                let ctx = DrawCtx {
+                let gate = GateCtx {
+                    device: device.gpu(),
                     extent: m.region.extent(),
                     tick: *tick_count,
+                    at: instant + interval * k as u32,
+                    interval,
                     out: *out,
                     input: &m.input,
                 };
                 // Once per retarget rather than once per call: a latched error discards the
                 // rest of the batch, and the tag names the region that latched it.
                 pass.tag(m.spec.key.0);
-                let draw = pass.draw(target);
-                if guarded(|| m.frame.draw(ctx, &draw)).is_none() {
+                if !matches!(guarded(|| m.frame.prepare(gate, &mut pass)), Some(Ok(()))) {
                     poisoned.push(m.spec.key);
+                    break 'drawing;
+                }
+                let draw = pass.draw(target);
+                if guarded(|| m.frame.draw(gate.draw_ctx(), &draw)).is_none() {
+                    poisoned.push(m.spec.key);
+                    break 'drawing;
                 }
             }
+        }
+        if interrupted || !poisoned.is_empty() {
+            drop(pass);
+            for &i in &*due {
+                mounted[i].region.discard();
+                let _ = guarded(|| mounted[i].frame.finish_batch(false));
+            }
+            self.retire_poisoned();
+            wake.signal();
+            return false;
         }
         let flushed = match Flushed::end(pass) {
             Ok(flushed) => flushed,
             Err(error) => {
+                for &i in &*due {
+                    mounted[i].region.discard();
+                    let _ = guarded(|| mounted[i].frame.finish_batch(false));
+                }
                 self.failed(error);
                 self.retire_poisoned();
                 return true;
             }
         };
+
+        for &i in &*due {
+            if guarded(|| mounted[i].frame.finish_batch(true)).is_none() {
+                poisoned.push(mounted[i].spec.key);
+            }
+        }
+
+        if !poisoned.is_empty() {
+            for &i in &*due {
+                mounted[i].region.discard();
+                let _ = guarded(|| mounted[i].frame.finish_batch(false));
+            }
+            self.retire_poisoned();
+            return false;
+        }
 
         // ── bind and show ───────────────────────────────────────────────────────────
         // Slot outer, group inner. On a shared queue every member must bind its slot-k
@@ -613,12 +694,16 @@ impl Pump {
         // A solo queue is a group of one, so the same shape is correct for both and there
         // is no second ordering to pick between.
         let last = slots.len().saturating_sub(1);
-        for (k, at) in slots.iter().enumerate() {
+        let mut failed_group = None;
+        'submission: for (k, at) in slots.iter().enumerate() {
             for (key, group) in &self.groups {
                 let mut bound = false;
                 for &i in &*due {
                     if mounted[i].group == *key {
-                        bound |= mounted[i].region.submit(&flushed).unwrap_or(false);
+                        match mounted[i].region.submit(&flushed) {
+                            Ok(submitted) => bound |= submitted,
+                            Err(_) => { failed_group = Some(*key); break 'submission; }
+                        }
                     }
                 }
                 if !bound {
@@ -632,11 +717,25 @@ impl Pump {
                 } else {
                     Interrupt::Defer
                 };
-                let _ = group.present_at(*at, interrupt);
+                if group.present_at(*at, interrupt).is_err() {
+                    failed_group = Some(*key);
+                    break 'submission;
+                }
             }
         }
-        // After the presents, not before: a region that panicked mid-batch still has
-        // earlier slots drawn and bound, and showing them is better than a frozen box.
+        if let Some(key) = failed_group {
+            for (_, group) in &self.groups { let _ = group.cancel_future(interrupt_time_now()); }
+            for &i in &*due {
+                mounted[i].region.discard();
+                let _ = guarded(|| mounted[i].frame.finish_batch(false));
+            }
+            self.groups.retain(|(group, _)| *group != key);
+            self.remake(|mounted| mounted.group == key);
+            self.retire_poisoned();
+            wake.signal();
+            return false;
+        }
+        self.replace_queued = false;
         self.retire_poisoned();
         true
     }
@@ -655,8 +754,10 @@ impl Pump {
     /// Handles an error latched by the pass. A device that is gone is rebuilt whole;
     /// anything else was one region's bad draw, and the next pass opens a fresh bracket.
     fn failed(&mut self, error: PassError) {
-        if error.loss == Loss::DeviceRemoved {
-            self.rebuild_device();
+        match error.loss {
+            Loss::DeviceRemoved => self.rebuild_device(),
+            Loss::RecreateTarget => self.remake(|m| m.spec.key.0 == error.tag),
+            Loss::None => self.poisoned.push(RegionKey(error.tag)),
         }
     }
 
@@ -691,7 +792,22 @@ impl Pump {
                         m.resize_pending = true;
                     }
                 }
-                Cmd::Display(out) => self.out = out,
+                Cmd::Active(key, active) => {
+                    if let Some(m) = self.mounted.iter_mut().find(|m| m.spec.key == key) {
+                        if m.active != active {
+                            m.active = active;
+                            if guarded(|| m.frame.suspended(!active)).is_none() { self.poisoned.push(key); }
+                            m.epoch.invalidate();
+                            let _ = m.region.group_cancel();
+                            self.replace_queued = true;
+                            moved = true;
+                        }
+                    }
+                }
+                Cmd::Display(out) => {
+                    self.out = out;
+                    for m in &self.mounted { m.epoch.invalidate(); }
+                },
             }
         }
         for m in &mut self.mounted {
@@ -701,6 +817,7 @@ impl Pump {
                 (self.on_bind)(m.spec.key, Bound::Surface { handle, px });
             }
         }
+        self.retire_poisoned();
         if moved {
             self.rebuild_handles(wake);
         }
@@ -735,10 +852,12 @@ impl Pump {
         let px = region.size_px();
         let raw = region.surface_handle() as isize;
         self.mounted.push(Mounted {
+            active: true,
             spec,
             resize_pending: false,
             group,
             observed_epoch: epoch.seq(),
+            observed_urgent: epoch.urgent(),
             epoch,
             input,
             frame,
@@ -792,6 +911,11 @@ impl Pump {
     /// A lost manager costs its group and the regions in it; a lost device costs every
     /// region. Neither costs the retained visual tree.
     fn recover(&mut self) {
+        if self.device.is_removed() {
+            self.rebuild_device();
+            self.retire_poisoned();
+            return;
+        }
         let lost: Vec<GroupKey> = self
             .groups
             .iter()
@@ -806,6 +930,7 @@ impl Pump {
 
     fn rebuild_device(&mut self) {
         let Ok(device) = PresentationDevice::new() else {
+            self.poisoned.extend(self.mounted.iter().map(|m| m.spec.key));
             return;
         };
         self.device = device;
@@ -823,6 +948,7 @@ impl Pump {
             let (spec, group) = (self.mounted[i].spec, self.mounted[i].group);
             (self.on_bind)(spec.key, Bound::Released);
             let Ok(handle) = self.group(group) else {
+                self.poisoned.push(spec.key);
                 continue;
             };
             let opacity = if self.mounted[i].opaque {
@@ -838,38 +964,45 @@ impl Pump {
                 spec.key,
                 self.tuning.pool(),
             );
-            let Ok(region) = region else { continue };
+            let Ok(region) = region else { self.poisoned.push(spec.key); continue };
             let px = region.size_px();
             let raw = region.surface_handle() as isize;
             self.mounted[i].region = region;
             // Before its next draw, not after: the device those resources came from is
             // gone, and a brush built on it does not bind.
-            self.mounted[i].frame.device_reset();
+            if guarded(|| self.mounted[i].frame.device_reset()).is_none() {
+                self.poisoned.push(spec.key);
+                continue;
+            }
+            self.mounted[i].epoch.invalidate();
             (self.on_bind)(spec.key, Bound::Surface { handle: raw, px });
         }
     }
 
     // ── waiting ─────────────────────────────────────────────────────────────────────
 
-    /// Rebuilds the wait array: handle 0 is the command event, then the visibility watch
-    /// when a window is attached, then each distinct epoch. Called when the mounted set
-    /// changes, never per pass.
+    /// Rebuilds command, device-removal, visibility and active-region wake handles.
     fn rebuild_handles(&mut self, wake: &Event) {
         // Raw, because a `BorrowedHandle`'s lifetime cannot be named in the field's type.
         // The owners outlive every entry: `wake` is the `Arc` held for this thread, and the
         // visibility and epoch `Arc`s are fields of this struct.
         self.handles.clear();
         self.handles.push(wake.as_handle().as_raw_handle());
-        // Slot 1 when a window is attached: the edge that says the window came back on
-        // screen, or that the system's occlusion status moved. It is in both the paced wait
-        // and the park, because it is the only handle that can leave the parked state.
+        self.handles.push(self.device.removed_event());
+        // Visibility remains in the parked wait so showing the window resumes rendering.
         if let Some(visibility) = &self.visibility {
             self.handles.push(visibility.as_handle().as_raw_handle());
         }
         for m in &self.mounted {
+            if !m.active { continue; }
             let raw = m.epoch.as_handle().as_raw_handle();
             if !self.handles.contains(&raw) {
                 self.handles.push(raw);
+            }
+        }
+        for (key, group) in &self.groups {
+            if self.mounted.iter().any(|m| m.active && m.group == *key) {
+                self.handles.push(group.lost_event());
             }
         }
     }
@@ -890,6 +1023,7 @@ impl Pump {
             return match unsafe { clock::wait_for_frame_raw(ptr, count, clock::INFINITE) } {
                 Observed::Occluded => Waken::Occluded,
                 Observed::NoClock => Waken::Failed,
+                Observed::Frame => Waken::Frame,
                 // A frame, one of this thread's own edges, or a stalled clock: all three mean
                 // look at the mounted set, and what to draw comes from epoch stamps rather
                 // than from which handle woke this.
@@ -905,14 +1039,14 @@ impl Pump {
 
     /// Parks until something can be seen again.
     ///
-    /// Waits on the command handle and the visibility watch, and not on the data epochs.
+    /// Waits on commands, device removal and visibility, excluding data epochs.
     /// Ignoring data that arrives while nothing is displayed loses no state:
     /// [`Frame::should_draw`] compares against a stored stamp, so any number of accumulated
     /// changes produce exactly one redraw on the way back.
     fn park(&self) {
-        let count = if self.visibility.is_some() { 2 } else { 1 };
-        // SAFETY: both handles are live kernel objects owned by this pump and by the
-        // window's visibility; the list is a field at least `count` long.
+        let count = if self.visibility.is_some() { 3 } else { 2 };
+        // SAFETY: the pump and window own the command, device-removal and optional
+        // visibility handles; the list contains at least `count` live entries.
         unsafe {
             WaitForMultipleObjects(count, self.handles.as_ptr(), false.into(), INFINITE);
         }
@@ -935,6 +1069,7 @@ impl Pump {
 
 /// Reports why the loop woke.
 enum Waken {
+    Frame,
     /// Run the pass. A clock tick, a data epoch, a command, or a stalled clock — the loop
     /// gates on [`Frame::should_draw`] either way and does not need them told apart.
     Ready,
@@ -949,4 +1084,149 @@ impl Drop for Pump {
     fn drop(&mut self) {
         self.unmount_all();
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use windows_color::DisplayCapability;
+
+    #[derive(Debug, PartialEq)]
+    enum Seen { Observe(u64), Prepare(u64, Instant), Draw(u64, Instant), Finish(u64, bool) }
+    struct Probe { id: u64, seen: Arc<Mutex<Vec<Seen>>>, dirty: bool, fail: bool, panic: bool }
+    impl Frame for Probe {
+        fn should_draw(&mut self, _: GateCtx<'_>) -> bool {
+            self.seen.lock().unwrap().push(Seen::Observe(self.id));
+            core::mem::replace(&mut self.dirty, false)
+        }
+        fn prepare(&mut self, ctx: GateCtx<'_>, pass: &mut Pass<'_>) -> Result<()> {
+            assert!(ctx.device.pass().is_err(), "preparation must share the pump bracket");
+            self.seen.lock().unwrap().push(Seen::Prepare(self.id,ctx.at));
+            let target = ctx.device.offscreen((8,8),96.0,Opacity::Opaque)?;
+            pass.draw(&target).clear(windows_color::Scrgb::TRANSPARENT);
+            assert!(!self.panic, "injected renderer panic");
+            if self.fail { Err(windows_core::Error::from_hresult(E_FAIL)) } else { Ok(()) }
+        }
+        fn draw(&mut self, ctx: DrawCtx<'_>, draw: &Draw<'_>) {
+            self.seen.lock().unwrap().push(Seen::Draw(self.id,ctx.at));
+            draw.clear(windows_color::Scrgb::TRANSPARENT);
+        }
+        fn finish_batch(&mut self, success: bool) {
+            self.seen.lock().unwrap().push(Seen::Finish(self.id,success));
+            if !success { self.dirty = true; }
+        }
+    }
+    fn pump() -> Pump {
+        Pump::new(Tuning::default(), OutputTransform::for_display(DisplayCapability::Sdr,1000.0),
+            Box::new(|_,_|{}),Arc::default(),None).unwrap()
+    }
+    fn mount(pump: &mut Pump, id:u64, seen: &Arc<Mutex<Vec<Seen>>>, fail: bool, panic: bool) {
+        let frame = Probe { id, seen:seen.clone(),dirty:true,fail,panic };
+        pump.mount(RegionSpec {key:RegionKey(id),queue:Queue::Shared("test"),extent:Extent::new(16.0,16.0,96.0)},
+            Arc::new(Epoch::new().unwrap()),Arc::default(),Box::new(move |_| Ok(Box::new(frame)))).unwrap();
+    }
+    #[test]
+    fn observes_once_and_prepares_distinct_scheduled_slots_in_one_bracket() {
+        let mut pump = pump();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        mount(&mut pump,1,&seen,false,false);
+        mount(&mut pump,2,&seen,false,false);
+        let wake = Event::auto_reset().unwrap();
+        assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+        let events = seen.lock().unwrap();
+        assert_eq!(&events[..2], &[Seen::Observe(1),Seen::Observe(2)]);
+        let times:Vec<_> = events.iter().filter_map(|e| if let Seen::Prepare(1,at)=e {Some(*at)} else {None}).collect();
+        assert_eq!(times.len(),3);
+        assert_eq!(times[1]-times[0],Duration::from_millis(10));
+        assert_eq!(times[2]-times[1],Duration::from_millis(10));
+        assert_eq!(&events[events.len()-2..], &[Seen::Finish(1,true),Seen::Finish(2,true)]);
+        drop(events);
+        seen.lock().unwrap().clear();
+        assert!(!pump.pass(interrupt_time_now(),100_000,&wake));
+        assert_eq!(&*seen.lock().unwrap(), &[Seen::Observe(1),Seen::Observe(2)]);
+    }
+    #[test]
+    fn failed_or_panicking_preparation_retries_unaffected_regions() {
+        for panic in [false,true] {
+            let mut pump=pump(); let seen=Arc::new(Mutex::new(Vec::new()));
+            mount(&mut pump,1,&seen,!panic,panic);
+            mount(&mut pump,2,&seen,false,false);
+            let wake=Event::auto_reset().unwrap();
+            assert!(!pump.pass(interrupt_time_now(),100_000,&wake));
+            assert_eq!(pump.mounted.len(),1);
+            assert!(!seen.lock().unwrap().iter().any(|e| matches!(e,Seen::Finish(_,true))));
+            wake.wait(0);
+            assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+            assert!(seen.lock().unwrap().contains(&Seen::Finish(2,true)));
+        }
+    }
+    #[test]
+    fn suspension_excludes_observation_and_exclusive_wakes() {
+        let mut pump=pump(); let seen=Arc::new(Mutex::new(Vec::new()));
+        mount(&mut pump,1,&seen,false,false);
+        let wake=Event::auto_reset().unwrap();
+        let (tx,rx)=channel(); tx.send(Cmd::Active(RegionKey(1),false)).unwrap();
+        assert!(!pump.commands(&rx,&wake));
+        assert_eq!(pump.handles.len(),2);
+        assert!(!pump.pass(interrupt_time_now(),100_000,&wake));
+        assert!(seen.lock().unwrap().is_empty());
+        tx.send(Cmd::Active(RegionKey(1),true)).unwrap();
+        pump.commands(&rx,&wake);
+        assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+    }
+    #[test]
+    fn shutdown_interrupts_acquisition_without_rotating_a_buffer() {
+        let mut pump=pump(); let seen=Arc::new(Mutex::new(Vec::new()));
+        mount(&mut pump,1,&seen,false,false);
+        let command=Event::auto_reset().unwrap();
+        let region=&pump.mounted[0].region;
+        command.signal();
+        assert!(matches!(region.acquire_with(&[command.as_handle().as_raw_handle()]).unwrap(),Acquisition::Interrupted));
+        let flushed=Flushed::end(pump.device.gpu().pass().unwrap()).unwrap();
+        assert!(!region.submit(&flushed).unwrap());
+        assert!(matches!(region.acquire().unwrap(),Acquisition::Ready(_)));
+        region.discard();
+        assert!(!region.submit(&flushed).unwrap());
+    }
+
+    #[test]
+    fn end_draw_failure_discards_every_acquisition_and_keeps_healthy_regions() {
+        struct Broken;
+        impl Frame for Broken {
+            fn should_draw(&mut self,_:GateCtx<'_>)->bool {true}
+            fn prepare(&mut self,ctx:GateCtx<'_>,pass:&mut Pass<'_>)->Result<()> {
+                let target=ctx.device.offscreen((8,8),96.0,Opacity::Opaque)?;
+                let draw=pass.draw(&target);
+                draw.blit(&target,windows_d2d::Rect::sized(0.0,0.0,8.0,8.0),None,windows_d2d::Interp::Nearest);
+                Ok(())
+            }
+            fn draw(&mut self,_:DrawCtx<'_>,_:&Draw<'_>) {}
+        }
+        let mut pump=pump(); let seen=Arc::new(Mutex::new(Vec::new()));
+        pump.mount(RegionSpec {key:RegionKey(1),queue:Queue::Shared("test"),extent:Extent::new(16.0,16.0,96.0)},Arc::new(Epoch::new().unwrap()),Arc::default(),Box::new(|_|Ok(Box::new(Broken)))).unwrap();
+        mount(&mut pump,2,&seen,false,false);
+        let wake=Event::auto_reset().unwrap();
+        pump.pass(interrupt_time_now(),100_000,&wake);
+        assert!(!seen.lock().unwrap().iter().any(|event|matches!(event,Seen::Finish(_,true))));
+        assert_eq!(pump.mounted.len(),1);
+        assert_eq!(pump.mounted[0].spec.key,RegionKey(2));
+        assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+        assert!(seen.lock().unwrap().contains(&Seen::Finish(2,true)));
+    }
+
+    #[test]
+    fn cancelled_slots_get_one_replacement_before_full_batches_resume() {
+        let mut pump=pump(); let seen=Arc::new(Mutex::new(Vec::new()));
+        mount(&mut pump,1,&seen,false,false);
+        let wake=Event::auto_reset().unwrap();
+        pump.replace_queued=true;
+        assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+        assert_eq!(pump.slots.len(),1);
+        assert!(!pump.replace_queued);
+        pump.mounted[0].frame.finish_batch(false);
+        assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+        assert_eq!(pump.slots.len(),3);
+    }
+
 }

@@ -7,6 +7,15 @@
 use super::*;
 use core::cell::Cell;
 
+/// Distinguishes an available buffer from lifecycle interruption and resource loss.
+pub enum Acquisition<'a> {
+    Ready(&'a Target),
+    Interrupted,
+    Lost,
+}
+
+enum BufferWait { Ready, Interrupted, Lost }
+
 /// Carries a region's box: what layout solved, and the display it was solved for.
 ///
 /// One value rather than a size and a DPI that can be set apart: they change together, since
@@ -91,14 +100,6 @@ struct Buffer {
     target: Target,
     available: HANDLE,
 }
-
-/// How long [`PresentationRegion::acquire`] waits for a buffer before giving up on the
-/// frame.
-///
-/// Not `INFINITE`: this runs on a thread that must stay responsive to shutdown, and a
-/// wait that can never return would wedge it. A pass that reaches this has a stalled
-/// present queue, which is a skipped frame rather than a fault.
-const ACQUIRE_TIMEOUT_MS: u32 = 1000;
 
 /// Draws into one presented rectangle and binds the buffer its group will show.
 ///
@@ -273,19 +274,33 @@ impl PresentationRegion {
     /// that arithmetic — a stalled queue blocks here rather than handing out a buffer the
     /// display is still reading.
     ///
-    /// Returns `Ok(None)` to skip this frame, when the group is lost or the wait expired.
+    /// Returns a distinct outcome when the group is lost or a lifecycle event interrupts it.
     /// Bind the returned target with [`Pass::draw`] and draw; the target's contents are
     /// undefined on entry.
-    pub fn acquire(&self) -> Result<Option<&Target>> {
-        if self.buffers.is_empty() || self.is_lost() {
-            return Ok(None);
-        }
+    pub fn acquire(&self) -> Result<Acquisition<'_>> {
+        self.acquire_with(&[])
+    }
+
+    pub(crate) fn acquire_with(&self, interrupt: &[HANDLE]) -> Result<Acquisition<'_>> {
+        if self.buffers.is_empty() || self.is_lost() { return Ok(Acquisition::Lost); }
         let index = (self.acquired.get() % u64::from(self.pool)) as usize;
-        if !self.wait_for(index) {
-            return Ok(None);
+        match self.wait_for(index, interrupt)? {
+            BufferWait::Lost => Ok(Acquisition::Lost),
+            BufferWait::Interrupted => Ok(Acquisition::Interrupted),
+            BufferWait::Ready => {
+                self.acquired.set(self.acquired.get() + 1);
+                Ok(Acquisition::Ready(&self.buffers[index].target))
+            }
         }
-        self.acquired.set(self.acquired.get() + 1);
-        Ok(Some(&self.buffers[index].target))
+    }
+
+    pub(crate) fn group_cancel(&self) -> Result<()> {
+        self.group.cancel_future(interrupt_time_now())
+    }
+
+    /// Discards acquired buffers that were never submitted.
+    pub(crate) fn discard(&self) {
+        self.acquired.set(self.submitted.get());
     }
 
     /// Binds the oldest drawn-but-unbound buffer, to be shown by the group's next present.
@@ -308,32 +323,40 @@ impl PresentationRegion {
             return Ok(false);
         }
         let index = (self.submitted.get() % u64::from(self.pool)) as usize;
-        self.submitted.set(self.submitted.get() + 1);
         // SAFETY: `surface` and the buffer are live and owned by this region.
         unsafe { self.surface.SetBuffer(&self.buffers[index].buffer).ok()? };
+        self.submitted.set(self.submitted.get() + 1);
         self.group.note_bound();
         Ok(true)
     }
 
-    /// Blocks until the compositor has finished with buffer `index`. Returns `false` to skip
-    /// the frame.
+    /// Waits for buffer availability, lifecycle interruption or manager loss.
     ///
     /// The group's lost event is waited on alongside it and placed first, because
     /// `WaitForMultipleObjects` resolves ties by index: a group that dies while its buffer
     /// happens to be free must report the death rather than hand out a buffer.
-    fn wait_for(&self, index: usize) -> bool {
-        let handles = [self.group.lost_event(), self.buffers[index].available];
-        // SAFETY: both handles are live kernel objects owned by the group and by this
-        // region; the array is a stack local of the stated length.
+    fn wait_for(&self, index: usize, interrupt: &[HANDLE]) -> Result<BufferWait> {
+        assert!(interrupt.len() <= 3);
+        let mut handles = [self.group.lost_event(); 5];
+        handles[1..1 + interrupt.len()].copy_from_slice(interrupt);
+        let ready = 1 + interrupt.len();
+        handles[ready] = self.buffers[index].available;
+        // SAFETY: the group, region and caller own every handle until this wait returns;
+        // the stack array contains ready + 1 initialized entries.
         let result = unsafe {
             WaitForMultipleObjects(
-                handles.len() as u32,
+                (ready + 1) as u32,
                 handles.as_ptr(),
                 false.into(),
-                ACQUIRE_TIMEOUT_MS,
+                INFINITE,
             )
         };
-        result == (WAIT_OBJECT_0 as u32) + 1
+        match result {
+            WAIT_FAILED => Err(windows_core::Error::from_thread()),
+            r if r == WAIT_OBJECT_0 as u32 => Ok(BufferWait::Lost),
+            r if r == (WAIT_OBJECT_0 as u32) + ready as u32 => Ok(BufferWait::Ready),
+            _ => Ok(BufferWait::Interrupted),
+        }
     }
 
     /// States which part of the bound buffer is shown, and how it maps into the visual it is

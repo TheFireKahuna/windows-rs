@@ -47,6 +47,7 @@ pub enum Raise {
     Structure(ControlId, StructureChangeType),
     Event(ControlId, i32),
     Property(ControlId, Property, Val),
+    PartValue(ControlId, u32, Val),
 }
 
 impl Raise {
@@ -77,11 +78,12 @@ impl Raise {
 
     /// Returns what this row folds on: the element, the property where it is a property
     /// change, and the event id where it is a plain event.
-    fn key(&self) -> (ControlId, Option<Property>, i32) {
+    fn key(&self) -> (ControlId, Option<Property>, i32, u32) {
         match *self {
-            Self::Structure(id, _) => (id, None, UIA_StructureChangedEventId),
-            Self::Event(id, event) => (id, None, event),
-            Self::Property(id, what, _) => (id, Some(what), 0),
+            Self::Structure(id, _) => (id, None, UIA_StructureChangedEventId, u32::MAX),
+            Self::Event(id, event) => (id, None, event, u32::MAX),
+            Self::Property(id, what, _) => (id, Some(what), 0, u32::MAX),
+            Self::PartValue(id, sub, _) => (id, Some(Property::Text), 0, sub),
         }
     }
 }
@@ -197,7 +199,7 @@ impl Pending {
 
 /// Raises one subscribed event against the published tree.
 pub(super) fn one(raise: &Raise, shared: &Arc<Shared>, tree: &Tree) {
-    let (id, property, event) = raise.key();
+    let (id, property, event, sub) = raise.key();
     let advised = if property.is_some() {
         UIA_AutomationPropertyChangedEventId
     } else {
@@ -206,9 +208,8 @@ pub(super) fn one(raise: &Raise, shared: &Arc<Shared>, tree: &Tree) {
     if !shared.advised.wanted(advised) {
         return;
     }
-    let Some(provider) = super::provider::provider_for(shared, id) else {
-        return;
-    };
+    let Some(mut provider) = super::provider::provider_for(shared, id) else { return; };
+    if sub != u32::MAX { provider = shared.object(id, sub); }
     match *raise {
         // SAFETY: bulk and invalidation events identify the provider's children and take no runtime id.
         Raise::Structure(_, kind) => unsafe {
@@ -219,6 +220,13 @@ pub(super) fn one(raise: &Raise, shared: &Arc<Shared>, tree: &Tree) {
         Raise::Event(..) => unsafe {
             _ = UiaRaiseAutomationEvent(provider.as_raw(), event);
         },
+        Raise::PartValue(_, sub, ref was) => {
+            let Some(text) = shared.regions.formatted_value(id,sub) else { return; };
+            let value = Val::Text(text.encode_utf16().collect());
+            if *was == value { return; }
+            // SAFETY: the live part provider and both owned string variants outlive the call.
+            unsafe { _ = UiaRaiseAutomationPropertyChangedEvent(provider.as_raw(),UIA_ValueValuePropertyId,was.variant(),value.variant()); }
+        }
         Raise::Property(_, what, ref was) => {
             let Some(at) = tree.index_of(id) else {
                 return;
@@ -265,6 +273,10 @@ impl Advised {
         if let Some(at) = held.iter().position(|(id, _)| *id == event) {
             held[at].1 = held[at].1.saturating_sub(1);
         }
+    }
+
+    pub(super) fn subscribed(&self, event: i32) -> bool {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|&(id,count)| id == event && count > 0)
     }
 
     /// Returns whether `event` is worth raising.

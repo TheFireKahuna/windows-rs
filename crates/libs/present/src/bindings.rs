@@ -211,6 +211,13 @@ impl ID3D11Device {
             )
         }
     }
+    pub unsafe fn GetDeviceRemovedReason(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetDeviceRemovedReason)(
+                windows_core::Interface::as_raw(self),
+            )
+        }
+    }
 }
 #[repr(C)]
 pub struct ID3D11Device_Vtbl {
@@ -256,12 +263,148 @@ pub struct ID3D11Device_Vtbl {
     SetPrivateDataInterface: usize,
     GetFeatureLevel: usize,
     GetCreationFlags: usize,
-    GetDeviceRemovedReason: usize,
+    pub GetDeviceRemovedReason:
+        unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
     GetImmediateContext: usize,
     SetExceptionMode: usize,
     GetExceptionMode: usize,
 }
 impl windows_core::RuntimeName for ID3D11Device {}
+windows_core::imp::define_interface!(
+    ID3D11Device1,
+    ID3D11Device1_Vtbl,
+    0xa04bfb29_08ef_43d6_a49c_a9bdbdcbe686
+);
+impl core::ops::Deref for ID3D11Device1 {
+    type Target = ID3D11Device;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(ID3D11Device1, windows_core::IUnknown, ID3D11Device);
+#[repr(C)]
+pub struct ID3D11Device1_Vtbl {
+    pub base__: ID3D11Device_Vtbl,
+    GetImmediateContext1: usize,
+    CreateDeferredContext1: usize,
+    CreateBlendState1: usize,
+    CreateRasterizerState1: usize,
+    CreateDeviceContextState: usize,
+    OpenSharedResource1: usize,
+    OpenSharedResourceByName: usize,
+}
+impl windows_core::RuntimeName for ID3D11Device1 {}
+windows_core::imp::define_interface!(
+    ID3D11Device2,
+    ID3D11Device2_Vtbl,
+    0x9d06dffa_d1e5_4d07_83a8_1bb123f2f841
+);
+impl core::ops::Deref for ID3D11Device2 {
+    type Target = ID3D11Device1;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID3D11Device2,
+    windows_core::IUnknown,
+    ID3D11Device,
+    ID3D11Device1
+);
+#[repr(C)]
+pub struct ID3D11Device2_Vtbl {
+    pub base__: ID3D11Device1_Vtbl,
+    GetImmediateContext2: usize,
+    CreateDeferredContext2: usize,
+    GetResourceTiling: usize,
+    CheckMultisampleQualityLevels1: usize,
+}
+impl windows_core::RuntimeName for ID3D11Device2 {}
+windows_core::imp::define_interface!(
+    ID3D11Device3,
+    ID3D11Device3_Vtbl,
+    0xa05c8c37_d2c6_4732_b3a0_9ce0b0dc9ae6
+);
+impl core::ops::Deref for ID3D11Device3 {
+    type Target = ID3D11Device2;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID3D11Device3,
+    windows_core::IUnknown,
+    ID3D11Device,
+    ID3D11Device1,
+    ID3D11Device2
+);
+#[repr(C)]
+pub struct ID3D11Device3_Vtbl {
+    pub base__: ID3D11Device2_Vtbl,
+    CreateTexture2D1: usize,
+    CreateTexture3D1: usize,
+    CreateRasterizerState2: usize,
+    CreateShaderResourceView1: usize,
+    CreateUnorderedAccessView1: usize,
+    CreateRenderTargetView1: usize,
+    CreateQuery1: usize,
+    GetImmediateContext3: usize,
+    CreateDeferredContext3: usize,
+    WriteToSubresource: usize,
+    ReadFromSubresource: usize,
+}
+impl windows_core::RuntimeName for ID3D11Device3 {}
+windows_core::imp::define_interface!(
+    ID3D11Device4,
+    ID3D11Device4_Vtbl,
+    0x8992ab71_02e6_4b8d_ba48_b056dcda42c4
+);
+impl core::ops::Deref for ID3D11Device4 {
+    type Target = ID3D11Device3;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID3D11Device4,
+    windows_core::IUnknown,
+    ID3D11Device,
+    ID3D11Device1,
+    ID3D11Device2,
+    ID3D11Device3
+);
+impl ID3D11Device4 {
+    pub unsafe fn RegisterDeviceRemovedEvent(&self, hevent: HANDLE) -> windows_core::Result<u32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).RegisterDeviceRemovedEvent)(
+                windows_core::Interface::as_raw(self),
+                hevent,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub unsafe fn UnregisterDeviceRemoved(&self, dwcookie: u32) {
+        unsafe {
+            (windows_core::Interface::vtable(self).UnregisterDeviceRemoved)(
+                windows_core::Interface::as_raw(self),
+                dwcookie,
+            );
+        }
+    }
+}
+#[repr(C)]
+pub struct ID3D11Device4_Vtbl {
+    pub base__: ID3D11Device3_Vtbl,
+    pub RegisterDeviceRemovedEvent: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        HANDLE,
+        *mut u32,
+    ) -> windows_core::HRESULT,
+    pub UnregisterDeviceRemoved: unsafe extern "system" fn(*mut core::ffi::c_void, u32),
+}
+impl windows_core::RuntimeName for ID3D11Device4 {}
 windows_core::imp::define_interface!(
     ID3D11DeviceChild,
     ID3D11DeviceChild_Vtbl,

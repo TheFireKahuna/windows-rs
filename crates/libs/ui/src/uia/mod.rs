@@ -32,7 +32,7 @@ mod variant;
 
 pub use action::Action;
 pub use events::{Property, Raise, Val};
-pub use regions::{PartDecl, RegionPeer};
+pub use regions::{PartDecl, RegionPeer, PartUpdates, MISSING_READING};
 pub use roles::Patterns;
 pub use snapshot::{ColFlags, Entry, NONE, Part, ScrollView, Snapshot, State, Tree, derive_keys};
 
@@ -644,6 +644,9 @@ impl Uia {
     /// The region's renderer publishes the geometry, this side owns what that geometry means,
     /// and [`sync_regions`](Self::sync_regions) joins the two.
     pub fn watch_region(&mut self, peer: RegionPeer) {
+        if let Some(updates) = &peer.updates {
+            *updates.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&self.shared);
+        }
         self.shared.regions.watch(peer);
     }
 
@@ -653,6 +656,7 @@ impl Uia {
     /// so this can sit on the tick unconditionally.
     pub fn sync_regions(&mut self) {
         _ = self.shared.regions.sync();
+        self.shared.regions.notifications(&mut self.pending);
         // A presented read-out's number is written by the thread that drew it, so nothing
         // announces it on the way past. It is announced on the tick instead, quantized, and
         // only for a region declared live.

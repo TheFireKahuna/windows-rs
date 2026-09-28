@@ -18,12 +18,32 @@
 use super::snapshot::Part;
 use crate::widget::UiaRole;
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use windows_present::{RegionParts, SubId};
 use windows_scene::{ControlId, Point};
 
 /// The sub id standing for the region itself rather than one of its parts.
 pub const NO_PART: u32 = u32::MAX;
+
+/// Encodes an unavailable formatted reading; measured NaNs use the canonical NaN instead.
+pub const MISSING_READING: u64 = 0x7ff8_0000_0000_0001;
+
+/// Coalesces requested notifications for up to 64 authoritative region readings.
+#[derive(Default)]
+pub struct PartUpdates {
+    pub(super) shared: Mutex<Weak<super::provider::Shared>>,
+    dirty: AtomicU64,
+}
+impl PartUpdates {
+    /// Records changed sub-IDs as bits; decorative frame changes must not call this.
+    pub fn changed(&self, mask: u64) {
+        if mask == 0 { return; }
+        let Some(shared) = self.shared.lock().unwrap_or_else(PoisonError::into_inner).upgrade() else { return; };
+        if !shared.advised.subscribed(crate::bindings::UIA_AutomationPropertyChangedEventId) { return; }
+        // Release: the UIA thread sees the values stored before their notification bits.
+        if self.dirty.fetch_or(mask, std::sync::atomic::Ordering::Release) == 0 { shared.wake(); }
+    }
+}
 
 /// The name and role of one region part, declared once where the region is.
 #[derive(Copy, Clone, Debug)]
@@ -31,6 +51,7 @@ pub struct PartDecl {
     pub sub: SubId,
     pub name: &'static str,
     pub role: UiaRole,
+    pub format: Option<fn(Option<f64>) -> String>,
 }
 
 impl PartDecl {
@@ -41,8 +62,16 @@ impl PartDecl {
             sub: SubId(sub),
             name,
             role,
+            format: None,
         }
     }
+    /// Formats a producer reading on demand for a read-only value query.
+    #[must_use]
+    pub const fn formatted(mut self, format: fn(Option<f64>) -> String) -> Self {
+        self.format = Some(format);
+        self
+    }
+
 }
 
 /// A region's accessible peer: which control it is, what its parts mean, and where its two
@@ -57,12 +86,15 @@ pub struct RegionPeer {
     /// One slot per part, indexed by [`SubId`], written by whichever thread owns the number.
     /// One allocation for the whole region rather than an `Arc` per part.
     pub values: Option<Arc<[AtomicU64]>>,
+    pub updates: Option<Arc<PartUpdates>>,
     /// The slot the region itself reports its number from.
     pub value: Option<Arc<AtomicU64>>,
 }
 
 /// One declared region and the buffers its join reuses.
 struct Row {
+    updates: Option<Arc<PartUpdates>>,
+    announced: Vec<u64>,
     id: ControlId,
     decls: Vec<PartDecl>,
     geometry: Option<Arc<RegionParts>>,
@@ -82,6 +114,8 @@ struct Row {
 impl Row {
     fn new(id: ControlId) -> Self {
         Self {
+            updates: None,
+            announced: Vec::new(),
             id,
             decls: Vec::new(),
             geometry: None,
@@ -176,9 +210,17 @@ impl Regions {
     /// Starts watching `peer`, replacing any earlier declaration on the same control.
     pub fn watch(&self, peer: RegionPeer) {
         self.row(peer.id, |row| {
+            if let Some(previous) = &row.updates {
+                if peer.updates.as_ref().is_none_or(|next| !Arc::ptr_eq(previous,next)) {
+                    *previous.shared.lock().unwrap_or_else(PoisonError::into_inner) = Weak::new();
+                }
+            }
             row.decls = peer.parts;
             row.geometry = Some(peer.geometry);
             row.values = peer.values;
+            row.updates = peer.updates;
+            row.announced.clear();
+            if let Some(values) = &row.values { row.announced.extend(values.iter().map(|v| v.load(Relaxed))); }
             // A cell bound separately stands: a peer that declares none is stating its parts,
             // not withdrawing the region's own number.
             if peer.value.is_some() {
@@ -188,12 +230,39 @@ impl Regions {
         });
     }
 
+    pub(super) fn notifications(&self, pending: &mut super::events::Pending) {
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for row in held.iter_mut() {
+            let Some(updates) = &row.updates else { continue; };
+            // Acquire: pairs with the producer's release before announcing its value.
+            let mask = updates.dirty.swap(0, std::sync::atomic::Ordering::Acquire);
+            if mask == 0 { continue; }
+            let Some(values) = &row.values else { continue; };
+            for decl in &row.decls {
+                let index = decl.sub.0 as usize;
+                if index >= 64 || mask & (1 << index) == 0 { continue; }
+                let (Some(value), Some(old), Some(format)) = (values.get(index), row.announced.get_mut(index), decl.format) else { continue; };
+                let now = value.load(Relaxed);
+                if now == *old { continue; }
+                let before = format((*old != MISSING_READING).then(|| f64::from_bits(*old)));
+                *old = now;
+                pending.push(super::events::Raise::PartValue(row.id,decl.sub.0,super::events::Val::Text(before.encode_utf16().collect())));
+            }
+        }
+    }
+
     /// Drops what `id` declares, so nothing is published for it.
     pub fn forget(&self, id: ControlId) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|row| row.id != id);
+            .retain(|row| {
+                if row.id != id { return true; }
+                if let Some(updates) = &row.updates {
+                    *updates.shared.lock().unwrap_or_else(PoisonError::into_inner) = Weak::new();
+                }
+                false
+            });
     }
 
     /// Re-joins every watched region whose renderer has moved, and returns whether any did.
@@ -256,6 +325,21 @@ impl Regions {
         })
     }
 
+    /// Reports whether a part declares a read-only formatted value.
+    pub fn has_formatted_value(&self, id: ControlId, sub: u32) -> bool {
+        self.get(id, |row| Some(row.decls.iter().any(|d| d.sub.0 == sub && d.format.is_some()))).unwrap_or(false)
+    }
+
+    /// Formats a part's authoritative value without rebuilding the scene snapshot.
+    pub fn formatted_value(&self, id: ControlId, sub: u32) -> Option<String> {
+        let (format, bits) = self.get(id, |row| {
+            let format = row.decls.iter().find(|d| d.sub.0 == sub)?.format?;
+            let bits = row.values.as_ref()?.get(sub as usize)?.load(Relaxed);
+            Some((format, bits))
+        })?;
+        Some(format((bits != MISSING_READING).then(|| f64::from_bits(bits))))
+    }
+
     /// Returns the number a producer wrote for `id`, or for one of its parts.
     ///
     /// [`NO_PART`] reads the region's own cell. Either way the slot is read here rather than
@@ -300,6 +384,7 @@ mod tests {
         let geometry = Arc::new(RegionParts::new());
         let regions = Regions::default();
         regions.watch(RegionPeer {
+            updates: None,
             id,
             geometry: Arc::clone(&geometry),
             parts: decls(),
@@ -412,6 +497,7 @@ mod tests {
         }]);
         let regions = Regions::default();
         regions.watch(RegionPeer {
+            updates: None,
             id,
             geometry,
             parts: decls(),

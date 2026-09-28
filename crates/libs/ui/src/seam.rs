@@ -693,6 +693,7 @@ pub(crate) enum FocusOp {
 
 /// One edit to the set of presentation regions.
 pub(crate) enum RegionOp {
+    Active { sink: RegionId, active: bool },
     /// Registers a region and hands over the builder that makes its renderer. The builder is
     /// carried rather than called, because it runs on the present thread.
     Mount {
