@@ -681,7 +681,9 @@ fn native_grid_reorder_displaces_neighbors_on_index_edges_and_cancels_stale_geom
         update: DragUpdate { phase: Phase::Free, from: Point::default(), at: Point { x, y },
             delta: Point { x, y }, decided } };
     let mut out = Vec::with_capacity(8);
+    let resting_visuals = rig.scene.census().visuals_live;
     rig.tick(&[press(id), sample(70.0, 80.0, true)], &mut out)?;
+    assert_eq!(rig.scene.census().visuals_live, resting_visuals + 3);
     assert_eq!(rows[0].state.get(), Vector2::new(70.0, 80.0));
     assert_eq!(rig.scene.hits().shifted(0), [70.0, 80.0, 150.0, 120.0]);
     assert_eq!(rows[1].state.get(), Vector2::new(-100.0, 0.0));
@@ -689,6 +691,7 @@ fn native_grid_reorder_displaces_neighbors_on_index_edges_and_cancels_stale_geom
     assert_eq!(out.last().map(|i| i.what), Some(What::Reordered(ReorderUpdate { from: 0, to: 2, decided: true })));
     assert!(rig.controls.take_translation_changed());
     let animations = rig.animations();
+    let minted = rig.visuals_minted();
     let allocations = crate::counting::allocations();
     for _ in 0..100 {
         out.clear();
@@ -697,6 +700,7 @@ fn native_grid_reorder_displaces_neighbors_on_index_edges_and_cancels_stale_geom
     }
     assert_eq!(crate::counting::allocations(), allocations);
     assert_eq!(rig.animations(), animations);
+    assert_eq!(rig.visuals_minted(), minted);
     assert!(!rig.controls.take_translation_changed());
     assert_eq!(rig.scene.hits().shifted(1), [0.0, 0.0, 80.0, 40.0]);
     out.clear();
@@ -715,6 +719,7 @@ fn native_grid_reorder_displaces_neighbors_on_index_edges_and_cancels_stale_geom
     let epoch = rig.controls.take_preview_release().unwrap();
     rig.controls.finish_reorder(epoch, &mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env })?;
     rig.scene.finish_drag_preview(epoch);
+    assert_eq!(rig.scene.census().visuals_live, resting_visuals);
     assert!(rows.iter().all(|r| r.state.get() == Vector2::zero()));
     for from in 0..rows.len() {
         for to in 0..rows.len() {
@@ -739,6 +744,7 @@ fn native_grid_reorder_displaces_neighbors_on_index_edges_and_cancels_stale_geom
             rig.controls.finish_reorder(epoch, &mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env })?;
             assert_eq!(rig.scene.drag_preview_epoch(), Some(current));
             rig.tick(&[Report::Canceled { target, contact: 1 }], &mut out)?;
+            assert_eq!(rig.scene.census().visuals_live, resting_visuals);
             assert!(rows.iter().all(|r| r.state.get() == Vector2::zero()));
             assert_eq!(out.last().map(|i| i.what), Some(What::ReorderEnded(None)));
         }
@@ -751,6 +757,15 @@ fn native_grid_reorder_displaces_neighbors_on_index_edges_and_cancels_stale_geom
     assert_eq!(out.last().map(|i| i.what), Some(What::ReorderEnded(None)));
     assert!(rows.iter().all(|r| r.state.get() == Vector2::zero()));
     assert_eq!(rig.scene.drag_preview_epoch(), None);
+    assert_eq!(rig.scene.census().visuals_live, resting_visuals);
+    rig.tick(&[press(id), sample(70.0, 80.0, true)], &mut out)?;
+    assert_eq!(rig.scene.census().visuals_live, resting_visuals + 3);
+    rig.env = Env::new(144.0, rig.env.output());
+    rig.apply()?;
+    assert_eq!(rig.scene.drag_preview_epoch(), None);
+    assert_eq!(rig.scene.census().visuals_live, resting_visuals);
+    rig.tick(&[sample(70.0, 80.0, false)], &mut out)?;
+    assert!(rows.iter().all(|r| r.state.get() == Vector2::zero()));
     Ok(())
 }
 

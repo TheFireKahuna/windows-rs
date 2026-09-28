@@ -9,6 +9,24 @@ pub(super) struct Lift {
     previous: Option<Visual>,
     previous_id: Option<NodeId>,
     offset: Vector2,
+    placeholder: Option<Placeholder>,
+}
+
+struct Placeholder {
+    visual: SpriteVisual,
+    content: ContainerVisual,
+    origin: Vector3,
+    offset: Vector2,
+}
+
+impl Drop for Placeholder {
+    fn drop(&mut self) {
+        // Removing the sprite breaks parent -> capture -> carrier -> transform-parent.
+        if let Some(parent) = self.visual.parent() {
+            let _ = parent.children().try_remove(&self.visual);
+        }
+        self.content.children().remove_all();
+    }
 }
 
 impl Scene {
@@ -45,8 +63,72 @@ impl Scene {
         self.lift = Some(Box::new(Lift {
             epoch: self.lift_epoch, node, source, parent, carrier, previous, previous_id,
             offset: Vector2::zero(),
+            placeholder: None,
         }));
         true
+    }
+
+    /// Shows a retained copy at the lifted subtree's original slot.
+    /// The copy has no input identity and lives until the preview ends.
+    /// The source must have axis-aligned layout bounds without an authored scale.
+    pub fn show_drag_placeholder(&mut self, opacity: f32, back: &Backends) {
+        let Some(lift) = self.lift.as_mut() else { return; };
+        if lift.placeholder.is_some() || !opacity.is_finite() { return; }
+        let size = self.nodes.size(lift.node);
+        let origin = lift.source.offset();
+        let scale = self.env.map_or(1.0, Env::scale);
+        let content = back.compositor.create_container_visual();
+        // Capture ignores its root transform. Scaling inside that root rasterizes
+        // text at device resolution; the reciprocal outer scale preserves the lift.
+        content.set_scale(Vector3::new(scale, scale, 1.0));
+        let extent = back.compositor.create_expression_animation("parent.Size");
+        extent.set_reference_parameter("parent", &*lift.parent);
+        content.start_animation("Size", &extent);
+        lift.carrier.set_scale(Vector3::new(1.0 / scale, 1.0 / scale, 1.0));
+        lift.carrier.children().remove_all();
+        content.children().insert_at_top(&lift.source);
+        lift.carrier.children().insert_at_top(&content);
+        let capture = back.compositor.capture(&lift.carrier, size, scale);
+        capture.surface.set_source_offset(Vector2::new(origin.x * scale, origin.y * scale));
+        let visual = back.compositor.create_sprite_visual();
+        visual.set_brush(&capture.brush);
+        visual.set_size(size.x, size.y);
+        visual.set_offset(origin.x, origin.y, origin.z);
+        visual.set_opacity(opacity.clamp(0.0, 1.0));
+        visual.set_pixel_snapping(true);
+        match &lift.previous {
+            Some(previous) => lift.parent.children().insert_above(&visual, previous),
+            None => lift.parent.children().insert_at_bottom(&visual),
+        }
+        lift.placeholder = Some(Placeholder { visual, content, origin, offset: Vector2::zero() });
+        self.census.visuals_minted += 2;
+        self.census.visuals_live += 2;
+    }
+
+    /// Moves the placeholder between slots using the shared chrome springs.
+    /// Displacement is relative to the source slot, in its parent's DIPs.
+    /// Unchanged and nonfinite targets issue no native writes.
+    pub fn move_drag_placeholder(&mut self, by: Vector2) {
+        if !by.x.is_finite() || !by.y.is_finite() { return; }
+        let Some(p) = self.lift.as_mut().and_then(|l| l.placeholder.as_mut()) else { return; };
+        if p.offset == by { return; }
+        for (property, before, after, origin) in [
+            ("Offset.X", p.offset.x, by.x, p.origin.x),
+            ("Offset.Y", p.offset.y, by.y, p.origin.y),
+        ] {
+            if before == after { continue; }
+            if self.springs_enabled {
+                let animation = self.motion.templates.spring(1, Tuning::Chrome,
+                    Value::Scalar(origin + after), after - before, Duration::ZERO);
+                p.visual.start_animation(property, &animation);
+                self.census.animations += 1;
+            }
+        }
+        if !self.springs_enabled {
+            p.visual.set_offset(p.origin.x + by.x, p.origin.y + by.y, p.origin.z);
+        }
+        p.offset = by;
+        self.census.props_written += 1;
     }
 
     /// Moves the lifted subtree by a cumulative displacement in its parent's DIPs.
@@ -65,6 +147,10 @@ impl Scene {
         let Some(lift) = self.lift.take() else { return; };
         lift.carrier.children().remove_all();
         let children = lift.parent.children();
+        if let Some(placeholder) = lift.placeholder {
+            drop(placeholder);
+            self.census.visuals_live -= 2;
+        }
         match lift.previous {
             Some(previous) => children.insert_above(&lift.source, &previous),
             None => children.insert_at_bottom(&lift.source),

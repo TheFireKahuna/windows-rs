@@ -65,6 +65,7 @@ impl Reorders {
             || slots.iter().enumerate().any(|(at, s)| s.row.index as usize != at)
         { return Ok(()); }
         let from = source.index as usize;
+        front.scene.show_drag_placeholder(0.25, front.back);
         self.held = Some(Drag { epoch, slots, from, to: from });
         Ok(())
     }
@@ -90,6 +91,9 @@ impl Reorders {
         let to = destination(&drag.slots, drag.from, drag.to, at);
         if to == drag.to && !decided { return Ok((None, false)); }
         drag.to = to;
+        let source = drag.slots[drag.from].rect;
+        let destination = drag.slots[to].rect;
+        front.scene.move_drag_placeholder(Vector2::new(destination[0] - source[0], destination[1] - source[1]));
         let mut changed = false;
         for (index, slot) in drag.slots.iter().enumerate() {
             if index == drag.from { continue; }
