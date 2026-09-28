@@ -697,6 +697,7 @@ impl Controls {
                 }
             }
             Report::FocusChanged { to, .. } => {
+                self.tapped = ControlId::NONE;
                 let was = self.input_focus;
                 self.focused = self.live(to);
                 self.input_focus = self.focused;
@@ -777,7 +778,7 @@ impl Controls {
                 self.tapped = ControlId::NONE;
                 self.end(target, None, front, out)?;
             }
-            Report::CaptureLost => self.tapped = ControlId::NONE,
+            Report::CaptureLost | Report::Dismiss { .. } => self.tapped = ControlId::NONE,
             Report::Gesture { target, event: Recognised::Tapped { at, count }, .. } =>
             {
                 let hit = (at.x.is_finite() && at.y.is_finite()
@@ -840,7 +841,6 @@ impl Controls {
             | Report::Wheel { .. }
             | Report::Key { .. }
             | Report::Escape { .. }
-            | Report::Dismiss { .. }
             | Report::Rotary { .. }
             | Report::RotaryButton { .. } => {}
         }

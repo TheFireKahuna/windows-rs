@@ -344,6 +344,7 @@ impl Router {
     /// commit anything, and the abort releases any explicit mouse capture that contact held.
     pub fn forget(&mut self, target: ControlId) {
         self.decls.remove(&target);
+        self.contacts.forget_tap(target);
         for id in self.contacts.ids() {
             if id != 0
                 && self
@@ -536,6 +537,7 @@ impl Router {
         let sample = self.bell.coords().at_transition(p, env);
         self.census.discrete_hits += 1;
         let Some(hit) = hits.hit(sample.raw, sample.kind()) else {
+            self.contacts.cancel_tap();
             // A press on nothing still takes focus away, so clicking the background dismisses
             // a text caret.
             let from = self.focus.keyboard();
@@ -546,6 +548,7 @@ impl Router {
         // An overlay's blocker consumes the press outright. Nothing under it is pressed, no
         // focus moves, and the overlay's owner decides what closing means.
         if hit.flags.contains(HitFlags::BLOCKER) {
+            self.contacts.cancel_tap();
             out.push(Report::Dismiss {
                 blocker: hit.id,
                 scope: self.focus.innermost(),

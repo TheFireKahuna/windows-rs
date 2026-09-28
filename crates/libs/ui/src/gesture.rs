@@ -785,6 +785,8 @@ pub struct Contacts {
     /// may hold a mouse one next.
     gesture: [Option<Recognizer>; SLOTS],
     physical: [Option<Recognizer>; SLOTS],
+    /// Free slot retaining the preceding tap's recognizer until the next press or cancel.
+    tap: Option<usize>,
     events: Events,
 }
 
@@ -868,8 +870,18 @@ impl Contacts {
         origin: Point,
         rejected: bool,
     ) -> Result<()> {
+        let continued = self.tap.filter(|&i| {
+            !physical && !rejected && self.at(id).is_none()
+                && self.target[i] == target && self.decl[i] == decl
+        });
+        if continued.is_some() {
+            self.tap = None;
+        } else {
+            self.cancel_tap();
+        }
         let Some(i) = self
             .at(id)
+            .or(continued)
             .or_else(|| self.id.iter().position(|held| *held == 0))
         else {
             return Err(windows_core::Error::empty());
@@ -883,7 +895,9 @@ impl Contacts {
             Some(held) => held,
             none => none.insert(Recognizer::new(physical, &self.events)?),
         };
-        recognizer.configure(&decl)?;
+        if continued.is_none() {
+            recognizer.configure(&decl)?;
+        }
         (self.id[i], self.target[i], self.decl[i], self.origin[i]) = (id, target, decl, origin);
         self.phase[i] = Phase::Undecided;
         self.flags[i] =
@@ -940,10 +954,12 @@ impl Contacts {
 
     /// Ends a contact and frees its slot.
     ///
-    /// `abort` is the difference between an up and a cancel: an aborted contact's queued
-    /// events are discarded, so a gesture the user withdrew cannot be delivered after the
-    /// fact. Both complete the gesture, because both end the recogniser's interest.
+    /// An abort completes recognition and discards queued events. An ordinary recognized
+    /// tap retains its recognizer state when the target accepts double taps.
     pub fn release(&mut self, id: u32, abort: bool) {
+        if abort {
+            self.cancel_tap();
+        }
         if let Some(i) = self.at(id) {
             self.free(i, abort);
         }
@@ -956,13 +972,19 @@ impl Contacts {
                 self.free(i, abort);
             }
         }
+        self.cancel_tap();
     }
 
-    /// Completes slot `i`'s gesture and marks the slot free, keeping its recogniser.
+    /// Frees slot `i`, retaining only a recognized double-tap candidate's platform state.
     fn free(&mut self, i: usize, abort: bool) {
-        // A failure here is a recogniser that is already finished, which is exactly the state
-        // being asked for.
-        if let Some(r) = self.recognizer(i) {
+        let retain = !abort && !self.flags[i].has(Flags::REJECTED)
+            && !self.flags[i].has(Flags::PHYSICAL)
+            && self.flags[i].has(Flags::TAPPED)
+            && self.decl[i].settings.contains(GestureSettings::DoubleTap);
+        if retain {
+            self.cancel_tap();
+            self.tap = Some(i);
+        } else if let Some(r) = self.recognizer(i) {
             _ = r.feed(Feed::Complete);
         }
         if abort {
@@ -970,6 +992,22 @@ impl Contacts {
         }
         self.id[i] = 0;
         self.flags[i] = Flags::default();
+    }
+
+    /// Ends the pending tap without allocating or scheduling its expiry.
+    pub(crate) fn cancel_tap(&mut self) {
+        if let Some(i) = self.tap.take()
+            && let Some(r) = &self.gesture[i]
+        {
+            _ = r.feed(Feed::Complete);
+        }
+    }
+
+    /// Discards a retiring target's pending tap without affecting other targets.
+    pub(crate) fn forget_tap(&mut self, target: ControlId) {
+        if self.tap.is_some_and(|i| self.target[i] == target) {
+            self.cancel_tap();
+        }
     }
 
     /// Returns the recogniser slot `i`'s current contact is bound through.
@@ -1258,6 +1296,86 @@ mod tests {
                 false,
             )
             .expect("a recogniser could not be constructed");
+    }
+
+    #[test]
+    fn double_tap_reuses_its_recognizer_before_an_earlier_free_slot() -> Result<()> {
+        let mut contacts = Contacts::default();
+        bind(&mut contacts, 7);
+        let decl = GestureDecl::double_tap();
+        contacts.bind(8, ControlId::FIRST, decl, false, Point::default(), false)?;
+        let slot = contacts.at(8).unwrap();
+        let Kind::Gesture(recognizer) = &contacts.gesture[slot].as_ref().unwrap().kind else {
+            panic!("mouse contact requires GestureRecognizer");
+        };
+        let recognizer = recognizer.clone();
+        let settings = decl.settings | GestureSettings::Hold;
+        recognizer.SetGestureSettings(settings)?;
+        contacts.set(8, Flags::TAPPED, true);
+        contacts.release(8, false);
+        contacts.release(7, false);
+        assert_eq!(contacts.live(), 0);
+        assert!(!contacts.any_inertial());
+        assert_eq!(contacts.tap, Some(slot));
+        contacts.bind(9, ControlId::FIRST, decl, false, Point::default(), false)?;
+        assert_eq!(contacts.at(9), Some(slot));
+        let Kind::Gesture(reused) = &contacts.gesture[slot].as_ref().unwrap().kind else {
+            panic!("mouse contact requires GestureRecognizer");
+        };
+        assert_eq!(recognizer.as_raw(), reused.as_raw());
+        assert_eq!(reused.GestureSettings()?, settings, "continuation must not reconfigure");
+        assert!(contacts.tap.is_none());
+        contacts.set(9, Flags::TAPPED, true);
+        contacts.release(9, false);
+        contacts.release_all(true);
+        assert!(contacts.tap.is_none(), "focus loss also cancels an unbound tap");
+        contacts.bind(10, ControlId::FIRST, decl, false, Point::default(), false)?;
+        let Kind::Gesture(reset) = &contacts.recognizer(contacts.at(10).unwrap()).unwrap().kind else {
+            panic!("mouse contact requires GestureRecognizer");
+        };
+        assert_eq!(reset.GestureSettings()?, decl.settings);
+        Ok(())
+    }
+
+    #[test]
+    fn double_tap_history_rejects_changed_targets_settings_and_canceled_contacts() -> Result<()> {
+        let mut ids = windows_scene::Ids::default();
+        let target = ids.mint();
+        let other = ids.mint();
+        let decl = GestureDecl::double_tap();
+        for (next_target, next_decl, rejected) in [
+            (other, decl, false),
+            (target, GestureDecl::tap(), false),
+            (target, decl, true),
+        ] {
+            let mut contacts = Contacts::default();
+            contacts.bind(1, target, decl, false, Point::default(), false)?;
+            contacts.set(1, Flags::TAPPED, true);
+            contacts.release(1, false);
+            assert!(contacts.tap.is_some());
+            contacts.bind(2, next_target, next_decl, false, Point::default(), rejected)?;
+            assert!(contacts.tap.is_none());
+            let slot = contacts.at(2).unwrap();
+            let Kind::Gesture(recognizer) = &contacts.gesture[slot].as_ref().unwrap().kind else {
+                panic!("mouse contact requires GestureRecognizer");
+            };
+            assert_eq!(recognizer.GestureSettings()?, next_decl.settings);
+            contacts.set(2, Flags::TAPPED, true);
+            contacts.release(2, true);
+            assert!(contacts.tap.is_none());
+        }
+        let mut contacts = Contacts::default();
+        contacts.bind(1, target, decl, false, Point::default(), false)?;
+        contacts.release(1, false);
+        assert!(contacts.tap.is_none(), "an unrecognized release cannot retain tap history");
+        contacts.bind(2, target, decl, false, Point::default(), false)?;
+        contacts.set(2, Flags::TAPPED, true);
+        contacts.release(2, false);
+        contacts.forget_tap(other);
+        assert!(contacts.tap.is_some(), "unrelated retirement must preserve the candidate");
+        contacts.forget_tap(target);
+        assert!(contacts.tap.is_none());
+        Ok(())
     }
 
     #[test]
