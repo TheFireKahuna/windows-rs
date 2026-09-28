@@ -990,6 +990,7 @@ pub struct Scene {
     /// its position in the tree rather than by an ordering every caller keeps.
     overlay: ContainerVisual,
     lift: Option<Box<drag_preview::Lift>>,
+    lift_epoch: u64,
     backdrop: Backdrop,
     nodes: Arena,
     /// Every node with no parent node, in attachment order. A forest and not a tree: a slot
@@ -1070,6 +1071,7 @@ impl Scene {
             content,
             overlay,
             lift: None,
+            lift_epoch: 0,
             backdrop,
             nodes: Arena::default(),
             roots: Vec::new(),

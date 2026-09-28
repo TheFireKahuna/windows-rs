@@ -99,6 +99,7 @@ struct App {
     /// Held for the life of the mount: retiring it unmounts the tree.
     root: Option<Mount>,
     focus_outline: Option<windows_scene::NodeId>,
+    preview_done: Option<u64>,
     overlays: Overlays,
     /// Focus edits the overlay stack emitted since the last batch went out.
     focus: Vec<FocusOp>,
@@ -182,6 +183,7 @@ where
                     owner: Some(owner),
                     root: Some(root),
                     focus_outline,
+                    preview_done: None,
                     overlays: Overlays::new(),
                     focus: Vec::new(),
                     uia_intents: Vec::new(),
@@ -305,6 +307,7 @@ impl App {
         // After the front table has consumed them, which it did on the scene thread before
         // they were forwarded: the press that opens an overlay here has already lit its button.
         Host::dispatch(&up.intents);
+        if up.preview_done.is_some() { self.preview_done = up.preview_done.take(); }
         // A client is owed the number a drag settled on and the fact that an action completed,
         // and neither restales the tree. Collected only while one is listening, so a drag with
         // nothing attached copies nothing.
@@ -357,6 +360,7 @@ impl App {
         // re-entry the borrow panics on.
         Host::flush(&mut down.patch);
         down.focus_outline = self.focus_outline.take();
+        down.preview_done = self.preview_done.take();
         Host::with(|h| {
             h.fill(&mut down);
             if self.links.uia_listening.load(Acquire)
@@ -757,6 +761,7 @@ impl SceneThread {
         let regions_changed = !down.regions.is_empty();
         present::apply(&mut self.regions, &mut down.regions, &mut front)?;
         front.scene.apply(&mut down.patch, front.back, front.env)?;
+        if let Some(epoch) = down.preview_done.take() { front.scene.finish_drag_preview(epoch); }
         if let Some(outline) = down.focus_outline.take() {
             self.controls.set_ring(outline);
         }
@@ -860,6 +865,9 @@ impl SceneThread {
         // intent causes a visual: by the time one exists, the visual has happened.
         self.controls
             .tick(&to.reports, &mut front, &mut self.up.intents)?;
+        if let Some(epoch) = self.controls.take_preview_release() {
+            self.up.preview_done = Some(epoch);
+        }
         // A container's own move, before the controls see the batch: nothing in the front table
         // knows what a viewport is, and the two never name the same control.
         for action in &to.automation {
@@ -921,6 +929,81 @@ impl SceneThread {
 mod tests {
     use super::*;
     use crate::input::{KeyEvent, Mods};
+
+    #[test]
+    fn released_preview_ack_follows_callback_patch_and_survives_backpressure() {
+        use crate::gesture::{DragDecl, DragUpdate, Phase};
+        use crate::layout::Preset;
+        use crate::widget::Gesturing;
+        use windows_scene::{Op, Point};
+
+        let _patch = crate::build::tests::fixture();
+        let window = windows_window::Window::new("drag handoff").hidden().create().unwrap();
+        let links = Arc::new(Links::new(&window).unwrap());
+        let posts = signal::arm_posts(Arc::clone(&links.app_bell));
+        let calls = Rc::new(Cell::new(0));
+        let mut target = ControlId::NONE;
+        let (owner, (mount, remove)) = signal::Owner::scope(|| {
+            let shown = signal::Cell::new(true);
+            let remove = signal::Cell::new(false);
+            let mount = Ui::mount_root(|ui| {
+                let calls = calls.clone();
+                target = ui.node(Preset::Layer).name("Tile")
+                    .on_drag(DragDecl::default(), move |event| {
+                        if matches!(event, Gesturing::Committed(_)) {
+                            calls.set(calls.get() + 1);
+                            if remove.get() { shown.set(false); }
+                        }
+                    }).control_id();
+                ui.when(shown, |ui| { ui.node(Preset::Layer); });
+            });
+            (mount, remove)
+        });
+        let woken = Rc::new(Cell::new(false));
+        signal::set_waker({ let woken = woken.clone(); move || woken.set(true) });
+        let mut app = App {
+            links: links.clone(), owner: Some(owner), root: Some(mount), focus_outline: None,
+            preview_done: None, overlays: Overlays::new(), focus: Vec::new(),
+            uia_intents: Vec::new(), held: None, owed: false, woken, first: true,
+            census: AppCensus::default(), _posts: posts,
+        };
+        app.pass().unwrap();
+        links.down.give(links.down.take().expect("initial declaration"));
+        app.pass().unwrap();
+        assert!(links.down.take().is_none());
+
+        for (epoch, edits) in [(1, false), (2, true)] {
+            remove.set(edits);
+            let spare = links.down.spare().expect("withhold the scene's spare");
+            let mut up = links.up.spare().unwrap();
+            up.preview_done = Some(epoch);
+            up.intents.push(Intent { target, what: What::DragEnded(Some(DragUpdate {
+                phase: Phase::Free, delta: Point { x: 24.0, y: 0.0 },
+                from: Point::default(), at: Point { x: 24.0, y: 0.0 }, decided: false,
+            })) });
+            assert!(links.up.put(up).is_ok());
+            app.pass().unwrap();
+            assert_eq!(calls.get(), epoch);
+            assert_eq!(app.preview_done, Some(epoch));
+            assert!(app.owed);
+            assert!(links.down.take().is_none());
+            assert!(links.down.give(spare));
+            app.pass().unwrap();
+            let down = links.down.take().expect("no-op drops must also return an acknowledgement");
+            assert_eq!(down.preview_done, Some(epoch));
+            assert_eq!(down.patch.ops().iter().any(|op| matches!(op, Op::Drop { .. })), edits);
+            assert_eq!(app.preview_done, None);
+            links.down.give(down);
+            let recycled = links.down.spare().unwrap();
+            assert_eq!(recycled.preview_done, None);
+            links.down.give(recycled);
+            app.pass().unwrap();
+            let flushes = app.census.flushes;
+            app.pass().unwrap();
+            assert_eq!(app.census.flushes, flushes);
+            assert!(links.down.take().is_none());
+        }
+    }
 
     fn key(target: ControlId, key: u16, kind: KeyKind, repeat: bool, mods: Mods) -> Report {
         Report::Key {

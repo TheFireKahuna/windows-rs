@@ -590,6 +590,65 @@ fn native_drag_preview_lifts_once_restores_on_cancel_and_ignores_late_reports() 
 }
 
 #[test]
+fn native_released_preview_waits_for_its_ack_and_rejects_old_gestures() -> Result<()> {
+    let mut rig = Rig::new("released drag preview")?;
+    let parent = rig.node()?;
+    let tile = rig.node_in(windows_scene::Attach::Node(parent))?;
+    rig.patch.push(Op::Bind { id: tile, prop: Prop::Size,
+        bind: Bind::Set(Value::Vec2(Vector2::new(80.0, 40.0))) });
+    rig.apply()?;
+    let id = rig.ids.mint();
+    rig.publish_hits(&[entry(id, 0.0, 0.0, 80.0, 40.0)])?;
+    rig.adopt(&[(id, ChromeRow { flags: flag::DRAGS | flag::DRAG_PREVIEW,
+        ..ChromeRow::default() })], &[], &[])?;
+    rig.controls.adopt_previews(&[(id, tile)]);
+    let count = rig.scene.census().visuals_live;
+    let mut out = Vec::with_capacity(8);
+    let release = Report::Released { target: id, contact: 1, at: Point { x: 24.0, y: 0.0 } };
+    rig.tick(&[press(id), dragged(id, Phase::Free, true), release], &mut out)?;
+    let first = rig.controls.take_preview_release().expect("released preview identity");
+    assert_eq!(rig.controls.take_preview_release(), None);
+    assert_eq!(rig.scene.drag_preview_epoch(), Some(first));
+    assert_eq!(rig.scene.census().visuals_live, count + 1);
+    assert!(matches!(out.last().map(|i| i.what), Some(What::DragEnded(Some(_)))));
+    let held = *rig.scene.census();
+    out.clear();
+    rig.tick(&[], &mut out)?;
+    assert_eq!(*rig.scene.census(), held);
+    assert!(out.is_empty());
+    rig.apply()?;
+    assert_eq!(rig.scene.drag_preview_epoch(), Some(first));
+    rig.scene.finish_drag_preview(first);
+    assert_eq!(rig.scene.census().visuals_live, count);
+
+    rig.tick(&[press(id), dragged(id, Phase::Free, true), release], &mut out)?;
+    let second = rig.controls.take_preview_release().unwrap();
+    assert!(second > first);
+    rig.tick(&[press(id), dragged(id, Phase::Free, true)], &mut out)?;
+    let third = rig.scene.drag_preview_epoch().unwrap();
+    assert!(third > second);
+    rig.scene.finish_drag_preview(second);
+    assert_eq!(rig.scene.drag_preview_epoch(), Some(third));
+    assert_eq!(rig.scene.census().visuals_live, count + 1);
+    rig.tick(&[Report::Canceled { target: id, contact: 1 }], &mut out)?;
+    assert_eq!(rig.controls.take_preview_release(), None);
+    assert_eq!(rig.scene.census().visuals_live, count);
+
+    out.clear();
+    rig.tick(&[press(id), dragged(id, Phase::Free, true), release], &mut out)?;
+    let retired = rig.controls.take_preview_release().unwrap();
+    rig.patch.push(Op::Drop { id: tile, exit: windows_scene::Exit::None,
+        origin: Vector2::zero(), bounds: None });
+    rig.apply()?;
+    assert_eq!(rig.scene.drag_preview_epoch(), None);
+    let after_drop = *rig.scene.census();
+    rig.scene.finish_drag_preview(retired);
+    assert_eq!(*rig.scene.census(), after_drop);
+    assert_eq!(rig.scene.census().visuals_live, count - 1);
+    Ok(())
+}
+
+#[test]
 fn native_a_canceled_decided_drag_raises_exactly_one_report() -> Result<()> {
     let mut rig = Rig::new("drag cancellation")?;
     let id = rig.ids.mint();

@@ -485,6 +485,7 @@ row! {
         && b.fields.is_empty()
         && b.theme.is_none()
         && b.focus_outline.is_none()
+        && b.preview_done.is_none()
         && b.declared.is_empty(),
     columns {
         /// Read by `Scene::apply`: the solve as `Bind` ops, the hit array as `Op::Hits`, the
@@ -512,6 +513,8 @@ row! {
         theme: Option<(Scope, windows_scene::BackdropSpec)>,
         /// The window-owned outline, installed once before interaction.
         focus_outline: Option<NodeId>,
+        /// Preview to restore after this batch's patch has applied.
+        preview_done: Option<u64>,
     }
 }
 
@@ -527,7 +530,8 @@ row! {
         && b.reports.is_empty()
         && b.fields.is_empty()
         && b.size.is_none()
-        && b.env.is_none(),
+        && b.env.is_none()
+        && b.preview_done.is_none(),
     columns {
         /// Read by `Host::field_update` and `deliver_field_commits`.
         fields: Fields,
@@ -545,6 +549,8 @@ row! {
         /// Read by `Host::set_env`: the DPI every layout is solved against and the transform
         /// every colour passes.
         env: Option<Env>,
+        /// Preview held until the app returns this identity with the callback's patch.
+        preview_done: Option<u64>,
     }
 }
 

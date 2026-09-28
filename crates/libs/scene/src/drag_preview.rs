@@ -1,6 +1,7 @@
 use super::*;
 
 pub(super) struct Lift {
+    epoch: u64,
     node: NodeId,
     source: Visual,
     parent: ContainerVisual,
@@ -40,8 +41,10 @@ impl Scene {
         self.overlay.children().insert_at_top(&carrier);
         self.census.visuals_minted += 1;
         self.census.visuals_live += 1;
+        self.lift_epoch = self.lift_epoch.checked_add(1).expect("drag preview epoch exhausted");
         self.lift = Some(Box::new(Lift {
-            node, source, parent, carrier, previous, previous_id, offset: Vector2::zero(),
+            epoch: self.lift_epoch, node, source, parent, carrier, previous, previous_id,
+            offset: Vector2::zero(),
         }));
         true
     }
@@ -68,6 +71,17 @@ impl Scene {
         }
         let _ = self.overlay.children().try_remove(&lift.carrier);
         self.census.visuals_live -= 1;
+    }
+
+    /// Returns the live preview's identity for the application acknowledgement.
+    pub fn drag_preview_epoch(&self) -> Option<u64> {
+        self.lift.as_ref().map(|lift| lift.epoch)
+    }
+
+    /// Restores a released preview after its application's scene patch has applied.
+    /// Acknowledgements for an earlier gesture cannot restore a newer preview.
+    pub fn finish_drag_preview(&mut self, epoch: u64) {
+        if self.drag_preview_epoch() == Some(epoch) { self.end_drag_preview(); }
     }
 
     pub(super) fn preview_before(&mut self, op: Op) {

@@ -294,6 +294,7 @@ pub struct Controls {
     revealed: [ControlId; 3],
     translations: Vec<(ControlId, NodeId, windows_scene::Translation)>,
     previews: Vec<(ControlId, NodeId)>,
+    preview_release: Option<u64>,
     translation_changed: bool,
     /// The window's one focus ring, sprung between controls. Focus is singular, so the ring is per
     /// window rather than per control, and the glide between two controls is a compositor
@@ -418,6 +419,11 @@ impl Controls {
                 self.previews.push((id, node));
             }
         }
+    }
+
+    /// Takes the released preview identity to accompany its completed drag intent.
+    pub fn take_preview_release(&mut self) -> Option<u64> {
+        self.preview_release.take()
     }
 
     fn translate(&mut self, front: &mut Front<'_>) -> Result<()> {
@@ -793,10 +799,14 @@ impl Controls {
         if self.pressed != target || self.chrome.get(target).is_none() {
             return Ok(());
         }
-        front.scene.end_drag_preview();
         self.pressed = ControlId::NONE;
         let grabbed = core::mem::replace(&mut self.grabbed, ControlId::NONE) == target;
         let dragged = core::mem::replace(&mut self.dragged, ControlId::NONE) == target;
+        if dragged && self.decided && at.is_some() {
+            self.preview_release = front.scene.drag_preview_epoch();
+        } else {
+            front.scene.end_drag_preview();
+        }
         self.wash(target, front)?;
         // A decided drag ends here and is not also a tap: the two are the same contact, and
         // raising both would run the click handler at the end of every reorder. A canceled one
