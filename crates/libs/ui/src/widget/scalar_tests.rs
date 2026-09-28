@@ -682,6 +682,8 @@ fn native_grid_reorder_displaces_neighbors_on_index_edges_and_cancels_stale_geom
             delta: Point { x, y }, decided } };
     let mut out = Vec::with_capacity(8);
     rig.tick(&[press(id), sample(70.0, 80.0, true)], &mut out)?;
+    assert_eq!(rows[0].state.get(), Vector2::new(70.0, 80.0));
+    assert_eq!(rig.scene.hits().shifted(0), [70.0, 80.0, 150.0, 120.0]);
     assert_eq!(rows[1].state.get(), Vector2::new(-100.0, 0.0));
     assert_eq!(rows[2].state.get(), Vector2::new(100.0, -60.0));
     assert_eq!(out.last().map(|i| i.what), Some(What::Reordered(ReorderUpdate { from: 0, to: 2, decided: true })));
@@ -700,6 +702,8 @@ fn native_grid_reorder_displaces_neighbors_on_index_edges_and_cancels_stale_geom
     out.clear();
     rig.tick(&[sample(40.0, 80.0, false)], &mut out)?;
     assert!(out.is_empty(), "the central deadband retains insertion");
+    assert_eq!(rows[0].state.get(), Vector2::new(40.0, 80.0));
+    assert!(rig.controls.take_translation_changed());
     rig.tick(&[sample(10.0, 10.0, false)], &mut out)?;
     assert_eq!(rows[1].state.get(), Vector2::zero());
     assert_eq!(rows[2].state.get(), Vector2::zero());

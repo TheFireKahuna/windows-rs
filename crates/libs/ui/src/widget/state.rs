@@ -770,6 +770,7 @@ impl Controls {
                 if self.reorders.contains(target) {
                     let (reorder, changed) = self.reorders.moved(update.at, update.decided, front)?;
                     self.translation_changed |= changed;
+                    self.translation_changed |= self.reorders.follow_preview(Vector2::new(update.delta.x, update.delta.y));
                     if let Some(update) = reorder {
                         out.push(Intent { target, what: What::Reordered(update) });
                     }

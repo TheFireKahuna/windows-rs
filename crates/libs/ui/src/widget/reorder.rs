@@ -105,6 +105,11 @@ impl Reorders {
         self.held.as_ref().map(|d| ReorderUpdate { from: d.from as u32, to: d.to as u32, decided: false })
     }
 
+    pub fn follow_preview(&self, by: Vector2) -> bool {
+        if !by.x.is_finite() || !by.y.is_finite() { return false; }
+        self.held.as_ref().is_some_and(|d| d.slots[d.from].row.state.set(by))
+    }
+
     pub fn finish(&mut self, epoch: u64, front: &mut Front<'_>) -> Result<bool> {
         if self.held.as_ref().is_some_and(|d| d.epoch == epoch) { self.reset(front) }
         else { Ok(false) }
@@ -113,7 +118,12 @@ impl Reorders {
     pub fn reset(&mut self, front: &mut Front<'_>) -> Result<bool> {
         let Some(drag) = self.held.take() else { return Ok(false) };
         let mut changed = false;
-        for slot in drag.slots { changed |= displace(&slot.row, Vector2::zero(), front)?; }
+        for (index, slot) in drag.slots.into_iter().enumerate() {
+            changed |= if index == drag.from {
+                // The carrier owns the source's visual motion; this word owns its input geometry.
+                slot.row.state.set(Vector2::zero())
+            } else { displace(&slot.row, Vector2::zero(), front)? };
+        }
         Ok(changed)
     }
 }
