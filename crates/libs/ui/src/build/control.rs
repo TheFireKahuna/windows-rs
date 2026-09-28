@@ -32,6 +32,7 @@ pub struct Scalar;
 pub(crate) struct Handlers {
     pub click: Option<Rc<dyn Fn()>>,
     pub wheel: Option<Rc<dyn Fn(f32, bool)>>,
+    pub double_tap: Option<Rc<dyn Fn(windows_scene::Point)>>,
     pub choice: Option<(u32, String)>,
     pub expand: Option<Rc<dyn Fn(bool)>>,
     pub select: Option<Rc<dyn Fn(bool)>>,
@@ -62,6 +63,16 @@ pub(crate) struct ControlRow {
     pub value: Option<ValueRow>,
     /// This control's row in the handler table, or [`tree::NONE`] where it declared none.
     pub handlers: u32,
+    /// Receives a platform-recognized double tap in this target's local DIPs.
+    /// The point must still hit this target; descendant controls take precedence.
+    pub fn on_double_tap(mut self, callback: impl Fn(windows_scene::Point) + 'static) -> Self {
+        let id = self.control_id();
+        self.host().gestures.push((id, GestureDecl::double_tap()));
+        self.handler(HitFlags::INTERACTIVE | HitFlags::GESTURE, |row| {
+            row.double_tap.replace(Rc::new(callback)).map(Retired::new)
+        })
+    }
+
     /// Literal names stay borrowed; generated names are released with the control.
     pub name: Option<Cow<'static, str>>,
     pub key: Option<Cow<'static, str>>,

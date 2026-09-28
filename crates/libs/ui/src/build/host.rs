@@ -1261,6 +1261,11 @@ impl Host {
                 let call = handlers?.wheel.clone()?;
                 Some(Box::new(move || call(notches, horizontal)))
             }
+            What::DoubleTapped(at) => {
+                if row.disabled { return None; }
+                let call = handlers?.double_tap.clone()?;
+                Some(Box::new(move || call(at)))
+            }
             What::Selected(change) => {
                 use crate::uia::action::SelectionChange;
                 use crate::widget::UiaRole;

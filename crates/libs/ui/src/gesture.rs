@@ -106,6 +106,12 @@ impl Default for GestureDecl {
 }
 
 impl GestureDecl {
+    /// Returns a declaration that recognizes single and double taps.
+    #[must_use]
+    pub fn double_tap() -> Self {
+        Self { settings: GestureSettings::Tap | GestureSettings::DoubleTap, ..Self::default() }
+    }
+
     /// Returns a declaration that reports taps and nothing else.
     #[must_use]
     pub fn tap() -> Self {

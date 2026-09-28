@@ -10,7 +10,7 @@ fn native_wheel_preserves_fractional_detents_and_requires_a_live_opted_in_target
     rig.adopt(&[(id, row)], &[], &[])?;
     rig.publish_hits(&[hit])?;
     let report = |target, notches, horizontal| Report::Wheel {
-        target, notches, horizontal, at: windows_scene::Point::default(),
+        target, notches, horizontal, at: Point::default(),
     };
     let mut out = Vec::new();
     rig.tick(&[report(Some(id), 1.0, false)], &mut out)?;
@@ -33,10 +33,10 @@ fn native_wheel_preserves_fractional_detents_and_requires_a_live_opted_in_target
     rig.adopt(&[(id, ChromeRow { flags: flag::DRAGS, ..row })], &[], &[])?;
     rig.tick(&[scalar_tests::press(id), Report::Dragged {
         target: id, contact: 1,
-        update: crate::gesture::DragUpdate {
-            phase: crate::gesture::Phase::Free, decided: true,
-            from: windows_scene::Point::default(), at: windows_scene::Point { x: 12.0, y: 0.0 },
-            delta: windows_scene::Point { x: 12.0, y: 0.0 },
+        update: DragUpdate {
+            phase: Phase::Free, decided: true,
+            from: Point::default(), at: Point { x: 12.0, y: 0.0 },
+            delta: Point { x: 12.0, y: 0.0 },
         },
     }], &mut out)?;
     out.clear();

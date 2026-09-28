@@ -219,6 +219,8 @@ impl Intent {
 /// What an [`Intent`] asks of the application.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum What {
+    /// A platform-recognized double tap in target-local DIPs.
+    DoubleTapped(Point),
     /// Signed wheel detents delivered to the positional target that declared interest.
     Wheel { notches: f32, horizontal: bool },
     Closed,
@@ -264,6 +266,8 @@ pub enum What {
 /// names nothing, so retiring a control is one comparison against each.
 #[derive(Default)]
 pub struct Controls {
+    /// Target of the preceding recognized single tap; a double tap cannot cross owners.
+    tapped: ControlId,
     /// The stores over the control id family the app thread mints. This side holds no `Ids`
     /// counter, so it can place a row but never mint an id.
     chrome: Slots<CONTROL, ChromeRow>,
@@ -531,6 +535,7 @@ impl Controls {
         self.chrome.take(id);
         self.values.take(id);
         for slot in [
+            &mut self.tapped,
             &mut self.hovered,
             &mut self.pressed,
             &mut self.focused,
@@ -703,6 +708,7 @@ impl Controls {
                 self.move_ring(front)?;
             }
             Report::Pressed { target, sample, .. } => {
+                if self.tapped != target { self.tapped = ControlId::NONE; }
                 if self.chrome.get(target).is_none() {
                     return Ok(());
                 }
@@ -767,7 +773,25 @@ impl Controls {
                 });
             }
             Report::Released { target, at, .. } => self.end(target, Some(at), front, out)?,
-            Report::Canceled { target, .. } => self.end(target, None, front, out)?,
+            Report::Canceled { target, .. } => {
+                self.tapped = ControlId::NONE;
+                self.end(target, None, front, out)?;
+            }
+            Report::CaptureLost => self.tapped = ControlId::NONE,
+            Report::Gesture { target, event: Recognised::Tapped { at, count }, .. } =>
+            {
+                let hit = (at.x.is_finite() && at.y.is_finite()
+                    && self.chrome.get(target).is_some_and(|row| row.flags & flag::DISABLED == 0))
+                    .then(|| front.scene.hits().hit(at, windows_scene::ContactKind::Mouse))
+                    .flatten().filter(|hit| hit.id == target);
+                let previous = self.tapped;
+                self.tapped = if count == 1 && hit.is_some() { target } else { ControlId::NONE };
+                if count == 2 && previous == target {
+                    if let Some(hit) = hit {
+                        out.push(Intent { target, what: What::DoubleTapped(hit.local) });
+                    }
+                }
+            }
             Report::Wheel { target: Some(target), notches, horizontal, .. }
                 if notches.is_finite() && notches != 0.0 && self.dragged.is_none()
                     && self.chrome.get(target).is_some_and(|row| row.flags & flag::DISABLED == 0)
@@ -818,8 +842,7 @@ impl Controls {
             | Report::Escape { .. }
             | Report::Dismiss { .. }
             | Report::Rotary { .. }
-            | Report::RotaryButton { .. }
-            | Report::CaptureLost => {}
+            | Report::RotaryButton { .. } => {}
         }
         Ok(())
     }
@@ -1177,3 +1200,7 @@ mod reveal_tests;
 #[cfg(test)]
 #[path = "wheel_tests.rs"]
 mod wheel_tests;
+
+#[cfg(test)]
+#[path = "double_tap_tests.rs"]
+mod double_tap_tests;
