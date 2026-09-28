@@ -285,6 +285,17 @@ impl Element<'_, Region> {
         }
         self
     }
+
+    /// Formats the region's producer-owned reading on demand for read-only value queries.
+    ///
+    /// The producer must encode absence as [`crate::uia::MISSING_READING`]. Other
+    /// bit patterns, including measured nonfinite values, reach `format` unchanged.
+    #[must_use]
+    pub fn reading_format(mut self, format: fn(Option<f64>) -> String) -> Self {
+        let id = self.control_id();
+        self.host().region_peer(id, move |peer| peer.format = Some(format));
+        self
+    }
 }
 
 /// Emits this flush's region edits from the solve.

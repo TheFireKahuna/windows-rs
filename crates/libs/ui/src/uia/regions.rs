@@ -77,6 +77,8 @@ impl PartDecl {
 /// A region's accessible peer: which control it is, what its parts mean, and where its two
 /// live sources are.
 pub struct RegionPeer {
+    /// Formats the region's own producer value when automation queries it.
+    pub format: Option<fn(Option<f64>) -> String>,
     /// The control the region occupies in the hit array, one entry like any other.
     pub id: ControlId,
     /// Geometry, as the renderer publishes it.
@@ -93,6 +95,7 @@ pub struct RegionPeer {
 
 /// One declared region and the buffers its join reuses.
 struct Row {
+    format: Option<fn(Option<f64>) -> String>,
     updates: Option<Arc<PartUpdates>>,
     announced: Vec<u64>,
     id: ControlId,
@@ -114,6 +117,7 @@ struct Row {
 impl Row {
     fn new(id: ControlId) -> Self {
         Self {
+            format: None,
             updates: None,
             announced: Vec::new(),
             id,
@@ -207,9 +211,15 @@ impl Regions {
         self.row(id, |row| row.value = Some(cell));
     }
 
+    /// Reports whether a producer owns the region's numeric value, including absence.
+    pub fn has_value(&self, id: ControlId) -> bool {
+        self.get(id, |row| Some(row.value.is_some())).unwrap_or(false)
+    }
+
     /// Starts watching `peer`, replacing any earlier declaration on the same control.
     pub fn watch(&self, peer: RegionPeer) {
         self.row(peer.id, |row| {
+            row.format = peer.format;
             if let Some(previous) = &row.updates {
                 if peer.updates.as_ref().is_none_or(|next| !Arc::ptr_eq(previous,next)) {
                     *previous.shared.lock().unwrap_or_else(PoisonError::into_inner) = Weak::new();
@@ -325,14 +335,21 @@ impl Regions {
         })
     }
 
-    /// Reports whether a part declares a read-only formatted value.
+    /// Reports whether a region or part declares a read-only formatted value.
     pub fn has_formatted_value(&self, id: ControlId, sub: u32) -> bool {
-        self.get(id, |row| Some(row.decls.iter().any(|d| d.sub.0 == sub && d.format.is_some()))).unwrap_or(false)
+        self.get(id, |row| Some(if sub == NO_PART {
+            row.format.is_some()
+        } else {
+            row.decls.iter().any(|d| d.sub.0 == sub && d.format.is_some())
+        })).unwrap_or(false)
     }
 
-    /// Formats a part's authoritative value without rebuilding the scene snapshot.
+    /// Formats a region or part's authoritative value without rebuilding the scene snapshot.
     pub fn formatted_value(&self, id: ControlId, sub: u32) -> Option<String> {
         let (format, bits) = self.get(id, |row| {
+            if sub == NO_PART {
+                return Some((row.format?, row.value.as_ref()?.load(Relaxed)));
+            }
             let format = row.decls.iter().find(|d| d.sub.0 == sub)?.format?;
             let bits = row.values.as_ref()?.get(sub as usize)?.load(Relaxed);
             Some((format, bits))
@@ -384,6 +401,7 @@ mod tests {
         let geometry = Arc::new(RegionParts::new());
         let regions = Regions::default();
         regions.watch(RegionPeer {
+            format: None,
             updates: None,
             id,
             geometry: Arc::clone(&geometry),
@@ -396,6 +414,42 @@ mod tests {
 
     fn count(regions: &Regions, id: ControlId) -> usize {
         regions.with_subs(id, <[Part]>::len)
+    }
+
+    #[test]
+    fn whole_region_text_distinguishes_absence_silence_and_nonfinite_without_a_join() {
+        let id = ids(1)[0];
+        let value = Arc::new(AtomicU64::new(MISSING_READING));
+        let regions = Regions::default();
+        regions.watch(RegionPeer {
+            id,
+            geometry: Arc::new(RegionParts::new()),
+            parts: Vec::new(),
+            values: None,
+            updates: None,
+            value: Some(value.clone()),
+            format: Some(|value| match value {
+                None => "Unavailable".into(),
+                Some(f64::NEG_INFINITY) => "Silence".into(),
+                Some(value) if !value.is_finite() => "Nonfinite".into(),
+                Some(value) => format!("{value:.1} dBFS"),
+            }),
+        });
+        assert!(regions.has_formatted_value(id, NO_PART));
+        for (bits, text, number) in [
+            (MISSING_READING, "Unavailable", None),
+            (f64::NEG_INFINITY.to_bits(), "Silence", None),
+            (f64::NAN.to_bits(), "Nonfinite", None),
+            ((-12.04f64).to_bits(), "-12.0 dBFS", Some(-12.04)),
+        ] {
+            value.store(bits, Relaxed);
+            assert_eq!(regions.formatted_value(id, NO_PART).as_deref(), Some(text));
+            assert_eq!(regions.value(id, NO_PART), number);
+            assert_eq!(count(&regions, id), 0);
+        }
+        regions.forget(id);
+        assert!(!regions.has_formatted_value(id, NO_PART));
+        assert_eq!(regions.formatted_value(id, NO_PART), None);
     }
 
     #[test]
@@ -497,6 +551,7 @@ mod tests {
         }]);
         let regions = Regions::default();
         regions.watch(RegionPeer {
+            format: None,
             updates: None,
             id,
             geometry,

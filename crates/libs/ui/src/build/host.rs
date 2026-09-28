@@ -1094,6 +1094,7 @@ impl Host {
             .position(|peer| peer.id == id)
             .unwrap_or_else(|| {
                 self.peers.push(crate::uia::RegionPeer {
+                    format: None,
                     updates: None,
                     id,
                     geometry: std::sync::Arc::new(windows_present::RegionParts::new()),

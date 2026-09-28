@@ -282,6 +282,32 @@ fn pattern<T: Interface>(element: &IRawElementProviderSimple, id: i32) -> Option
     }
 }
 
+#[test]
+fn a_producer_missing_reading_never_marshals_as_zero_or_a_stale_number() {
+    use crate::bindings::{IRangeValueProvider, UIA_RangeValuePatternId};
+    use std::sync::{Arc, atomic::{AtomicU64, Ordering::Relaxed}};
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let at = screen.slider(NONE, (0.0, 0.0, 100.0, 30.0), Range::new(-48.0, 12.0));
+    screen.publish(&mut uia);
+    let id = screen.control(at);
+    let value = Arc::new(AtomicU64::new((-12.0f64).to_bits()));
+    uia.shared.regions.bind_value(id, value.clone());
+    let provider = super::provider::provider_for(&uia.shared, id).unwrap();
+    let range: IRangeValueProvider = pattern(&provider, UIA_RangeValuePatternId).unwrap();
+    for bits in [(-12.0f64).to_bits(), super::MISSING_READING, f64::NEG_INFINITY.to_bits(), f64::NAN.to_bits()] {
+        value.store(bits, Relaxed);
+        let mut out = 42.0;
+        // SAFETY: `range` owns the live provider and `out` remains writable for the call.
+        unsafe { (range.vtable().Value)(range.as_raw(), &raw mut out).ok().unwrap(); }
+        if f64::from_bits(bits).is_finite() {
+            assert_eq!(out, -12.0);
+        } else {
+            assert!(out.is_nan());
+        }
+    }
+}
+
 fn document_range(text: &ITextProvider2) -> ITextRangeProvider {
     let mut out = core::ptr::null_mut();
     // SAFETY: `text` holds a counted reference for the whole call, and `out` points at a local

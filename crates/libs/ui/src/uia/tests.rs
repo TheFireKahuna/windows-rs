@@ -660,6 +660,7 @@ fn a_moving_region_changes_its_parts_and_not_the_tree() {
 
     let geometry = Arc::new(RegionParts::new());
     uia.watch_region(RegionPeer {
+        format: None,
         updates: None,
         id,
         geometry: Arc::clone(&geometry),
@@ -717,6 +718,7 @@ fn re_joining_a_moving_region_allocates_nothing() {
     let geometry = Arc::new(RegionParts::new());
     let levels: Arc<[AtomicU64]> = Arc::from([AtomicU64::new(0), AtomicU64::new(0)]);
     uia.watch_region(RegionPeer {
+        format: None,
         updates: None,
         id,
         geometry: Arc::clone(&geometry),
@@ -1196,7 +1198,7 @@ fn presented_readings_notify_only_subscribers_and_coalesce_until_sync() {
     let id = screen.control(region);
     let updates = Arc::new(PartUpdates::default());
     let values: Arc<[AtomicU64]> = vec![AtomicU64::new(MISSING_READING)].into();
-    uia.watch_region(RegionPeer { id,geometry:Arc::new(windows_present::RegionParts::new()),parts:vec![PartDecl::new(0,"LUFS",UiaRole::Text).formatted(|value| value.map_or_else(|| "Unavailable".into(),|v| format!("{v:.1} LUFS")))],values:Some(values.clone()),value:None,updates:Some(updates.clone()) });
+    uia.watch_region(RegionPeer { format:None,id,geometry:Arc::new(windows_present::RegionParts::new()),parts:vec![PartDecl::new(0,"LUFS",UiaRole::Text).formatted(|value| value.map_or_else(|| "Unavailable".into(),|v| format!("{v:.1} LUFS")))],values:Some(values.clone()),value:None,updates:Some(updates.clone()) });
     let mut raised = Vec::new();
     uia.take_pending_for_test(&mut raised); raised.clear();
     values[0].store((-14.0f64).to_bits(),Relaxed);

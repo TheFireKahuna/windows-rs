@@ -508,14 +508,10 @@ impl At {
     /// number describes.
     fn number(&self) -> Result<f64> {
         let id = self.entry().id;
-        if self.part != NO_PART {
-            return self.shared.regions.value(id, self.part).ok_or_else(none);
+        if self.part != NO_PART || self.shared.regions.has_value(id) {
+            return Ok(self.shared.regions.value(id, self.part).unwrap_or(f64::NAN));
         }
-        self.shared
-            .regions
-            .value(id, NO_PART)
-            .or_else(|| self.tree.value(self.at))
-            .ok_or_else(none)
+        self.tree.value(self.at).ok_or_else(none)
     }
 }
 
