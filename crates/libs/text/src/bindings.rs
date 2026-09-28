@@ -1640,6 +1640,13 @@ windows_core::imp::define_interface!(
 );
 windows_core::imp::interface_hierarchy!(IDWriteFontFace, windows_core::IUnknown);
 impl IDWriteFontFace {
+    pub unsafe fn GetSimulations(&self) -> DWRITE_FONT_SIMULATIONS {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetSimulations)(windows_core::Interface::as_raw(
+                self,
+            ))
+        }
+    }
     pub unsafe fn GetMetrics(&self, fontfacemetrics: *mut DWRITE_FONT_METRICS) {
         unsafe {
             (windows_core::Interface::vtable(self).GetMetrics)(
@@ -1687,7 +1694,8 @@ pub struct IDWriteFontFace_Vtbl {
     GetType: usize,
     GetFiles: usize,
     GetIndex: usize,
-    GetSimulations: usize,
+    pub GetSimulations:
+        unsafe extern "system" fn(*mut core::ffi::c_void) -> DWRITE_FONT_SIMULATIONS,
     IsSymbolFont: usize,
     pub GetMetrics: unsafe extern "system" fn(*mut core::ffi::c_void, *mut DWRITE_FONT_METRICS),
     GetGlyphCount: usize,
@@ -1832,6 +1840,101 @@ pub struct IDWriteFontFace3_Vtbl {
     IsGlyphLocal: usize,
     AreCharactersLocal: usize,
     AreGlyphsLocal: usize,
+}
+windows_core::imp::define_interface!(
+    IDWriteFontFace4,
+    IDWriteFontFace4_Vtbl,
+    0x27f2a904_4eb8_441d_9678_0563f53e3e2f
+);
+impl core::ops::Deref for IDWriteFontFace4 {
+    type Target = IDWriteFontFace3;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteFontFace4,
+    windows_core::IUnknown,
+    IDWriteFontFace,
+    IDWriteFontFace1,
+    IDWriteFontFace2,
+    IDWriteFontFace3
+);
+#[repr(C)]
+pub struct IDWriteFontFace4_Vtbl {
+    pub base__: IDWriteFontFace3_Vtbl,
+    GetGlyphImageFormats: usize,
+    GetGlyphImageFormats2: usize,
+    GetGlyphImageData: usize,
+    ReleaseGlyphImageData: usize,
+}
+windows_core::imp::define_interface!(
+    IDWriteFontFace5,
+    IDWriteFontFace5_Vtbl,
+    0x98eff3a5_b667_479a_b145_e2fa5b9fdc29
+);
+impl core::ops::Deref for IDWriteFontFace5 {
+    type Target = IDWriteFontFace4;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteFontFace5,
+    windows_core::IUnknown,
+    IDWriteFontFace,
+    IDWriteFontFace1,
+    IDWriteFontFace2,
+    IDWriteFontFace3,
+    IDWriteFontFace4
+);
+impl IDWriteFontFace5 {
+    pub unsafe fn GetFontAxisValueCount(&self) -> u32 {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetFontAxisValueCount)(
+                windows_core::Interface::as_raw(self),
+            )
+        }
+    }
+    pub unsafe fn GetFontAxisValues(
+        &self,
+        fontaxisvalues: *mut DWRITE_FONT_AXIS_VALUE,
+        fontaxisvaluecount: u32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetFontAxisValues)(
+                windows_core::Interface::as_raw(self),
+                fontaxisvalues as _,
+                fontaxisvaluecount,
+            )
+        }
+    }
+    pub unsafe fn GetFontResource(&self) -> windows_core::Result<IDWriteFontResource> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetFontResource)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct IDWriteFontFace5_Vtbl {
+    pub base__: IDWriteFontFace4_Vtbl,
+    pub GetFontAxisValueCount: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
+    pub GetFontAxisValues: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut DWRITE_FONT_AXIS_VALUE,
+        u32,
+    ) -> windows_core::HRESULT,
+    HasVariations: usize,
+    pub GetFontResource: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    Equals: usize,
 }
 windows_core::imp::define_interface!(
     IDWriteFontFaceReference,
@@ -2030,6 +2133,25 @@ windows_core::imp::define_interface!(
     0x1f803a76_6871_48e8_987f_b975551c50f2
 );
 windows_core::imp::interface_hierarchy!(IDWriteFontResource, windows_core::IUnknown);
+impl IDWriteFontResource {
+    pub unsafe fn CreateFontFace(
+        &self,
+        fontsimulations: DWRITE_FONT_SIMULATIONS,
+        fontaxisvalues: &[DWRITE_FONT_AXIS_VALUE],
+    ) -> windows_core::Result<IDWriteFontFace5> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateFontFace)(
+                windows_core::Interface::as_raw(self),
+                fontsimulations,
+                fontaxisvalues.as_ptr(),
+                fontaxisvalues.len().try_into().unwrap(),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
 #[repr(C)]
 pub struct IDWriteFontResource_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -2043,7 +2165,13 @@ pub struct IDWriteFontResource_Vtbl {
     GetAxisValueNameCount: usize,
     GetAxisValueNames: usize,
     HasVariations: usize,
-    CreateFontFace: usize,
+    pub CreateFontFace: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        DWRITE_FONT_SIMULATIONS,
+        *const DWRITE_FONT_AXIS_VALUE,
+        u32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     CreateFontFaceReference: usize,
 }
 windows_core::imp::define_interface!(

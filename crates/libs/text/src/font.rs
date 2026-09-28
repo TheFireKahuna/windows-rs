@@ -40,13 +40,37 @@ impl FaceId {
     pub const NONE: Self = Self(u16::MAX);
 }
 
-/// Selects one face. Size is absent: one face serves every size.
+/// Names one resolved variable-font coordinate by tag and exact value.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FontAxis {
+    tag: i32,
+    bits: u32,
+}
+
+impl FontAxis {
+    /// Returns the OpenType axis tag.
+    pub fn tag(self) -> i32 { self.tag }
+
+    /// Returns the resolved axis value.
+    pub fn value(self) -> f32 { f32::from_bits(self.bits) }
+
+    pub(crate) fn from_dwrite(axis: DWRITE_FONT_AXIS_VALUE) -> Self {
+        Self { tag: axis.axisTag, bits: axis.value.to_bits() }
+    }
+
+    fn dwrite(self) -> DWRITE_FONT_AXIS_VALUE {
+        DWRITE_FONT_AXIS_VALUE { axisTag: self.tag, value: self.value() }
+    }
+}
+
+/// Selects one resolved face, including the optical-size coordinate chosen by shaping.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FaceKey {
     pub family: Box<str>,
     pub weight: u16,
     pub style: FontStyle,
     pub stretch: FontStretch,
+    pub axes: Box<[FontAxis]>,
 }
 
 #[derive(Debug, Default)]
@@ -457,7 +481,7 @@ impl TextEngine {
                 0.0,
                 DWRITE_PIXEL_GEOMETRY_FLAT,
                 DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
-                DWRITE_GRID_FIT_MODE_DISABLED,
+                DWRITE_GRID_FIT_MODE_ENABLED,
             )
         }
     }
@@ -484,7 +508,14 @@ impl TextEngine {
                 key.stretch.dwrite(),
                 key.style.dwrite(),
             )?;
-            Ok(FontFace(font.CreateFontFace()?))
+            let face = font.CreateFontFace()?;
+            if key.axes.is_empty() {
+                return Ok(FontFace(face));
+            }
+            let variable: IDWriteFontFace5 = face.cast()?;
+            let resource = variable.GetFontResource()?;
+            let axes: Vec<_> = key.axes.iter().map(|axis| axis.dwrite()).collect();
+            Ok(FontFace(resource.CreateFontFace(face.GetSimulations(), &axes)?.cast()?))
         }
     }
 }
@@ -510,6 +541,7 @@ mod tests {
             weight: 400,
             style: FontStyle::Normal,
             stretch: FontStretch::Normal,
+            axes: Box::default(),
         }
     }
 

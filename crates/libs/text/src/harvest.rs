@@ -119,8 +119,8 @@ impl Collector {
     /// by.
     fn describe(&self, face: &IDWriteFontFace) -> Result<FaceKey> {
         let face: IDWriteFontFace3 = face.cast()?;
-        // SAFETY: `names` outlives both calls, and the buffer handed to `GetString` is
-        // sized from the length the call before it reported.
+        // SAFETY: the name and axis buffers have the lengths reported by their owning
+        // interfaces, and each buffer outlives the call that writes it.
         unsafe {
             let names = face.GetFamilyNames()?;
             let len = names.GetStringLength(0)? as usize;
@@ -128,11 +128,19 @@ impl Collector {
             names
                 .GetString(0, buffer.as_mut_ptr(), buffer.len() as u32)
                 .ok()?;
+            let axes = if let Ok(variable) = face.cast::<IDWriteFontFace5>() {
+                let mut values = vec![DWRITE_FONT_AXIS_VALUE::default(); variable.GetFontAxisValueCount() as usize];
+                variable.GetFontAxisValues(values.as_mut_ptr(), values.len() as u32).ok()?;
+                values.into_iter().map(FontAxis::from_dwrite).collect()
+            } else {
+                Box::default()
+            };
             Ok(FaceKey {
                 family: String::from_utf16_lossy(&buffer[..len]).into(),
                 weight: face.GetWeight().clamp(1, 999) as u16,
                 style: FontStyle::from_dwrite(face.GetStyle()),
                 stretch: FontStretch::from_dwrite(face.GetStretch()),
+                axes,
             })
         }
     }
@@ -370,4 +378,39 @@ unsafe fn extend<T: Copy>(into: &mut Vec<T>, ptr: *const T, count: usize) {
     // SAFETY: `ptr` is non-null and `count` is non-zero here, and the caller guarantees
     // `count` valid reads from it.
     into.extend_from_slice(unsafe { core::slice::from_raw_parts(ptr, count) });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn axes(face: &IDWriteFontFace) -> Vec<(i32, u32)> {
+        let face: IDWriteFontFace5 = face.cast().unwrap();
+        // SAFETY: the buffer has the count reported by this face and outlives the call.
+        unsafe {
+            let mut values = vec![DWRITE_FONT_AXIS_VALUE::default(); face.GetFontAxisValueCount() as usize];
+            face.GetFontAxisValues(values.as_mut_ptr(), values.len() as u32).ok().unwrap();
+            values.iter().map(|v| (v.axisTag, v.value.to_bits())).collect()
+        }
+    }
+
+    #[test]
+    fn raster_face_preserves_shaped_optical_axes() {
+        let ladder = FontLadder::new(["Segoe UI Variable", "Segoe UI Variable Text"]);
+        let engine = TextEngine::new(ladder.clone()).unwrap();
+        let raster = TextEngine::new(ladder).unwrap();
+        for family in [FamilyId(0), FamilyId(1)] {
+            for size in [9.0, 12.0, 24.0, 48.0] {
+                let mut run = engine.shape("High pass 20000", &FontSpec::new(family, size), Flow::Line).unwrap();
+                engine.harvest(&mut run).unwrap();
+            }
+        }
+        let collector = engine.collector.borrow();
+        let memo = collector.as_ref().unwrap().get().memo.borrow();
+        assert!(!memo.is_empty());
+        for (face, id) in memo.iter() {
+            let rebuilt = raster.face(id.unwrap()).unwrap();
+            assert_eq!(axes(face), axes(&rebuilt.0), "{:?}", engine.ladder().face_key(id.unwrap()));
+        }
+    }
 }

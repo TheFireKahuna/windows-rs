@@ -62,8 +62,7 @@
     IDWriteTypography::AddFontFeature
     DWRITE_FONT_FEATURE
     DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES
-// Variable-font axes. Optical size must be set explicitly: leaving it automatic
-// makes a size change reshape rather than rescale.
+// Optical sizing participates in shaping and in the resolved face identity.
     DWRITE_FONT_AXIS_VALUE
     DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE
 
@@ -87,12 +86,14 @@
 // actually chose and interns it; the front half resolves that description through the
 // lookup above. Nothing else here round-trips.
     IDWriteFontFace3::{GetFamilyNames, GetWeight, GetStyle, GetStretch}
+    IDWriteFontFace5::{GetFontAxisValueCount, GetFontAxisValues, GetFontResource}
+    IDWriteFontResource::CreateFontFace
     IDWriteLocalizedStrings::{GetStringLength, GetString}
 
 // ── Runs, faces, and metrics ──────────────────────────────────────────────────
     IDWriteTextRenderer
     IDWritePixelSnapping
-    IDWriteFontFace::{GetMetrics, GetDesignGlyphMetrics, GetGlyphIndices}
+    IDWriteFontFace::{GetMetrics, GetDesignGlyphMetrics, GetGlyphIndices, GetSimulations}
     DWRITE_GLYPH_RUN
     DWRITE_GLYPH_RUN_DESCRIPTION
     DWRITE_GLYPH_OFFSET

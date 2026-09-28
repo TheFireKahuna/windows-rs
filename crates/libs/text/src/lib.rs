@@ -38,7 +38,7 @@ pub(crate) use harvest::{Collector, Harvest};
 pub(crate) use windows_core::Interface;
 
 pub use font::{
-    FaceId, FaceKey, FamilyId, FontFace, FontFeatures, FontLadder, FontSpec, FontStretch,
+    FaceId, FaceKey, FamilyId, FontAxis, FontFace, FontFeatures, FontLadder, FontSpec, FontStretch,
     FontStyle, TextEngine,
 };
 pub use format::Flow;
