@@ -862,6 +862,9 @@ impl SceneThread {
             back: &self.back,
             env: self.env,
         };
+        if let Some(size) = to.size {
+            self.controls.set_viewport(size, &mut front)?;
+        }
         // The window's own band before the client's hover: while a command holds the pointer
         // the client's hover is stale, and when it gives the pointer back the client's reports
         // below light whatever is underneath.

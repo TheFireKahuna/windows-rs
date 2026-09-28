@@ -314,6 +314,7 @@ pub struct Controls {
     /// animation rather than a behaviour this crate runs.
     ring: NodeId,
     ring_shown: bool,
+    viewport: Option<Vector2>,
 }
 
 impl Controls {
@@ -326,6 +327,12 @@ impl Controls {
     /// Records the window's focus ring visual, minted once by the window's owner.
     pub fn set_ring(&mut self, ring: NodeId) {
         self.ring = ring;
+    }
+
+    /// Keeps the focus outline inside the client area when the window changes size.
+    pub(crate) fn set_viewport(&mut self, size: Vector2, front: &mut Front<'_>) -> Result<()> {
+        self.viewport = Some(size);
+        self.move_ring(front)
     }
 
     /// Adopts the rows a mount produced or a solve corrected, as drained by the app thread
@@ -1143,6 +1150,9 @@ impl Controls {
             x: entry.x1 - entry.x0 + 2.0 * FOCUS_OUTSET,
             y: entry.y1 - entry.y0 + 2.0 * FOCUS_OUTSET,
         };
+        let Some((at, size)) = focus_box(at, size, self.viewport) else {
+            return self.hide_ring(front);
+        };
         if self.ring_shown {
             front.spring(self.ring, Prop::Offset, Value::Vec2(at))?;
             front.spring(self.ring, Prop::Size, Value::Vec2(size))?;
@@ -1189,6 +1199,13 @@ impl Controls {
     }
 }
 
+fn focus_box(at: Vector2, size: Vector2, viewport: Option<Vector2>) -> Option<(Vector2, Vector2)> {
+    let Some(viewport) = viewport else { return Some((at, size)); };
+    let end = Vector2::new((at.x + size.x).min(viewport.x), (at.y + size.y).min(viewport.y));
+    let start = Vector2::new(at.x.max(0.0), at.y.max(0.0));
+    (end.x > start.x && end.y > start.y).then_some((start, end - start))
+}
+
 #[cfg(test)]
 #[path = "scalar_tests.rs"]
 mod scalar_tests;
@@ -1204,3 +1221,7 @@ mod wheel_tests;
 #[cfg(test)]
 #[path = "double_tap_tests.rs"]
 mod double_tap_tests;
+
+#[cfg(test)]
+#[path = "focus_bounds_tests.rs"]
+mod focus_bounds_tests;
