@@ -2981,6 +2981,66 @@ mod tests {
     }
 
     #[test]
+    fn local_translation_survives_layout_and_anchor_writes_without_scaling() {
+        let mut rig = rig().expect("native compositor");
+        let mut patch = SinkPatch::default();
+        let id = rig.sprite(&mut patch, 40.0);
+        for (prop, value) in [(Prop::TranslationX, 2.0), (Prop::TranslationY, -3.0)] {
+            patch.push(Op::Bind { id, prop, bind: Bind::Set(Value::Scalar(value)) });
+        }
+        rig.apply(&mut patch);
+        let matrix = rig.scene.nodes.visual(id).unwrap().transform_matrix();
+        assert_eq!(matrix, windows_numerics::Matrix4x4::translation(2.0, -3.0, 0.0));
+        for prop in [Prop::TranslationX, Prop::TranslationY] {
+            let frames = patch.push_frames(&[
+                (0.0, Value::Scalar(0.0), Easing::Linear),
+                (1.0, Value::Scalar(-3.0), Easing::Linear),
+            ]);
+            patch.push(Op::Bind { id, prop, bind: Bind::Animate(Anim::Frames {
+                frames, duration_ms: 100, iterations: Iterations::Count(1),
+            }) });
+        }
+        rig.apply(&mut patch);
+        for step in 1..20 {
+            for (prop, value) in [
+                (Prop::Offset, Value::Vec2(Vector2::new(step as f32, 10.0))),
+                (Prop::Size, Value::Vec2(Vector2::new(40.0 + step as f32, 60.0))),
+                (Prop::AnchorY, Value::Scalar(step as f32 / 100.0)),
+            ] {
+                patch.push(Op::Bind { id, prop, bind: Bind::Set(value) });
+            }
+            rig.apply(&mut patch);
+            assert_eq!(rig.scene.motion.pending.len(), 2);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut events = Vec::new();
+        while events.len() < 2 {
+            windows_window::pump();
+            rig.scene.drain_events(&mut events);
+            assert!(std::time::Instant::now() < deadline, "translation completion was lost");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for prop in [Prop::TranslationX, Prop::TranslationY] {
+            assert!(events.iter().any(|event| matches!(event,
+                SceneEvent::AnimationCompleted { node, prop: completed } if *node == id && *completed == prop)));
+            rig.scene.retarget(id, prop, Bind::Animate(Anim::Spring {
+                to: Value::Scalar(-3.0), tuning: Tuning::Chrome, delay_ms: 0,
+            }), &rig.back).unwrap();
+            assert_eq!(rig.scene.nodes.held(id, desc(prop)), Held::Playing);
+        }
+        rig.scene.set_springs_enabled(false);
+        let reduced = rig.sprite(&mut patch, 40.0);
+        rig.apply(&mut patch);
+        let before = rig.scene.census().animations;
+        rig.scene.retarget(reduced, Prop::TranslationY, Bind::Animate(Anim::Spring {
+            to: Value::Scalar(-7.0), tuning: Tuning::Chrome, delay_ms: 0,
+        }), &rig.back).unwrap();
+        assert_eq!(rig.scene.census().animations, before);
+        assert_eq!(rig.scene.nodes.visual(reduced).unwrap().transform_matrix().m42, -7.0);
+        assert_eq!(rig.scene.nodes.visual(id).unwrap().scale(), Vector3::new(1.0, 1.0, 1.0));
+    }
+
+    #[test]
     fn anchor_slide_survives_layout_offset_and_size_writes() {
         let Some(mut rig) = rig() else { return };
         let mut patch = SinkPatch::default();

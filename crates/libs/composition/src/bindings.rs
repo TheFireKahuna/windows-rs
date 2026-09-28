@@ -7159,6 +7159,28 @@ impl IVisual {
             .ok()
         }
     }
+    pub(crate) fn TransformMatrix(&self) -> windows_core::Result<windows_numerics::Matrix4x4> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).TransformMatrix)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn SetTransformMatrix(
+        &self,
+        value: windows_numerics::Matrix4x4,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetTransformMatrix)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
 }
 #[repr(C)]
 pub struct IVisual_Vtbl {
@@ -7230,6 +7252,14 @@ pub struct IVisual_Vtbl {
     pub SetSize: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    pub TransformMatrix: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_numerics::Matrix4x4,
+    ) -> windows_core::HRESULT,
+    pub SetTransformMatrix: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Matrix4x4,
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(

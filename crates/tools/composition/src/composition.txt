@@ -273,6 +273,7 @@ Windows.UI.Composition.InsetClip
 Windows.UI.Composition.IInsetClip::{put_LeftInset, put_TopInset, put_RightInset, put_BottomInset}
 Windows.UI.Composition.ICompositor::{CreateInsetClip}
 Windows.UI.Composition.IVisual::{put_Clip, put_RotationAngle}
+Windows.UI.Composition.IVisual::{put_TransformMatrix, get_TransformMatrix}
 
 // A rectangle clip is the same idea carrying per-corner radii, and it is the only way
 // to round a sprite whose one brush slot is already spent on a mask: a clip is not a

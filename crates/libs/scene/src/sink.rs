@@ -842,6 +842,10 @@ pub enum Prop {
     AnchorX,
     /// Vertical anchor fraction, independent of the layout offset.
     AnchorY,
+    /// Horizontal local translation in DIPs, independent of layout offset and anchor.
+    TranslationX,
+    /// Vertical local translation in DIPs, independent of layout offset and anchor.
+    TranslationY,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]

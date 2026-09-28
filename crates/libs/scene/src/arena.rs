@@ -24,8 +24,8 @@ use windows_numerics::{Vector2, Vector3};
 /// rotation, a centre pair and an opacity.
 pub const CORE_CHANS: u8 = 10;
 /// How many channels its side payloads carry: four clip sides, eight corner radii, a trim
-/// pair, a stroke pair, a shadow pair and an anchor pair.
-pub const AUX_CHANS: u8 = 20;
+/// pair, a stroke pair, a shadow pair, an anchor pair and a local translation pair.
+pub const AUX_CHANS: u8 = 22;
 /// The absence of a sibling, a parent or a first child.
 pub const NO_LINK: u32 = u32::MAX;
 
@@ -664,7 +664,7 @@ const fn d(path: &'static str, owner: Owner, group: u8, chan: u8, count: u8) -> 
 use Owner::{Clip as C, Shadow as H, Stroke as S, Trim as T, Visual as V};
 
 /// Positional: a row's place here equals its [`Prop`] discriminant.
-pub const PROPS: [PropDesc; 34] = [
+pub const PROPS: [PropDesc; 36] = [
     d("Offset", V, 0, 0, 2),
     d("Offset.X", V, 0, 0, 1),
     d("Offset.Y", V, 0, 1, 1),
@@ -699,10 +699,12 @@ pub const PROPS: [PropDesc; 34] = [
     d("Opacity", H, 12, 27, 1),
     d("AnchorPoint.X", V, 13, 28, 1),
     d("AnchorPoint.Y", V, 13, 29, 1),
+    d("TransformMatrix._41", V, 14, 30, 1),
+    d("TransformMatrix._42", V, 14, 31, 1),
 ];
 
 /// How many property groups the rows cover.
-pub const GROUP_COUNT: usize = 14;
+pub const GROUP_COUNT: usize = 15;
 
 /// How many channels the *composite* of each group takes: the compositor's offset, scale and
 /// centre point are three-vectors and its size is a pair.
@@ -711,7 +713,7 @@ pub const GROUP_COUNT: usize = 14;
 /// and its per-channel rows together — `Offset`, `Offset.X` and `Offset.Y` are one group —
 /// so the group alone cannot say what type a row's animation takes, and indexing this
 /// directly is how a scalar channel comes to be driven by a three-vector spring.
-const COMPOSITE_SLOT: [u8; GROUP_COUNT] = [3, 2, 3, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+const COMPOSITE_SLOT: [u8; GROUP_COUNT] = [3, 2, 3, 1, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
 
 /// Every channel's ownership has to fit the one state word.
 const _: () = assert!((CORE_CHANS + AUX_CHANS) as usize * 2 <= u64::BITS as usize);
@@ -994,6 +996,7 @@ impl Arena {
         };
         let aux = self.aux(id);
         match group {
+            14 => visual.set_transform_matrix(windows_numerics::Matrix4x4::translation(c(30), c(31), 0.0)),
             13 => visual.set_anchor_point(v2(28)),
             0 => visual.set_offset(c(0), c(1), 0.0),
             1 => visual.set_size(c(2), c(3)),
@@ -1212,7 +1215,7 @@ mod tests {
 
     #[test]
     fn every_row_sits_at_its_own_discriminant() {
-        const ORDER: [Prop; 34] = [
+        const ORDER: [Prop; 36] = [
             Prop::Offset,
             Prop::OffsetX,
             Prop::OffsetY,
@@ -1247,6 +1250,8 @@ mod tests {
             Prop::ShadowOpacity,
             Prop::AnchorX,
             Prop::AnchorY,
+            Prop::TranslationX,
+            Prop::TranslationY,
         ];
         for (at, prop) in ORDER.iter().enumerate() {
             assert_eq!(

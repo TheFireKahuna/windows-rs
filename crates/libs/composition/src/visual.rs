@@ -93,6 +93,16 @@ impl Visual {
         self.0.Scale().unwrap()
     }
 
+    /// Sets the local transform applied before scale, rotation and offset.
+    pub fn set_transform_matrix(&self, transform: windows_numerics::Matrix4x4) {
+        self.0.SetTransformMatrix(transform).unwrap();
+    }
+
+    /// Returns the local transform's authored value, excluding animated presentation values.
+    pub fn transform_matrix(&self) -> windows_numerics::Matrix4x4 {
+        self.0.TransformMatrix().unwrap()
+    }
+
     /// Sets the point, in DIPs, about which rotation and scaling are applied.
     pub fn set_center_point(&self, point: Vector3) {
         self.0.SetCenterPoint(point).unwrap();
