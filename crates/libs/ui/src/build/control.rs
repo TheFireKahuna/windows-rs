@@ -31,6 +31,7 @@ pub struct Scalar;
 #[derive(Default)]
 pub(crate) struct Handlers {
     pub click: Option<Rc<dyn Fn()>>,
+    pub wheel: Option<Rc<dyn Fn(f32, bool)>>,
     pub choice: Option<(u32, String)>,
     pub expand: Option<Rc<dyn Fn(bool)>>,
     pub select: Option<Rc<dyn Fn(bool)>>,
@@ -345,6 +346,14 @@ impl<K> Element<'_, K> {
     pub fn on_click(self, callback: impl Fn() + 'static) -> Self {
         self.handler(HitFlags::INTERACTIVE | HitFlags::GESTURE, |row| {
             row.click.replace(Rc::new(callback)).map(Retired::new)
+        })
+    }
+
+    /// Receives signed wheel detents and whether the wheel is horizontal.
+    /// The positional hit target owns the event; pointer gestures remain unchanged.
+    pub fn on_wheel(self, callback: impl Fn(f32, bool) + 'static) -> Self {
+        self.handler(HitFlags::INTERACTIVE | HitFlags::WHEEL, |row| {
+            row.wheel.replace(Rc::new(callback)).map(Retired::new)
         })
     }
 

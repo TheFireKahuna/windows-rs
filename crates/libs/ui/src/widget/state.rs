@@ -219,6 +219,8 @@ impl Intent {
 /// What an [`Intent`] asks of the application.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum What {
+    /// Signed wheel detents delivered to the positional target that declared interest.
+    Wheel { notches: f32, horizontal: bool },
     Closed,
     /// Entry or exit of an explicitly observed hover scope.
     Hovered(bool),
@@ -766,6 +768,15 @@ impl Controls {
             }
             Report::Released { target, at, .. } => self.end(target, Some(at), front, out)?,
             Report::Canceled { target, .. } => self.end(target, None, front, out)?,
+            Report::Wheel { target: Some(target), notches, horizontal, .. }
+                if notches.is_finite() && notches != 0.0 && self.dragged.is_none()
+                    && self.chrome.get(target).is_some_and(|row| row.flags & flag::DISABLED == 0)
+                    && front.scene.hits().entry(target).is_some_and(|hit| {
+                        hit.flags.contains(HitFlags::WHEEL)
+                    }) =>
+            {
+                out.push(Intent { target, what: What::Wheel { notches, horizontal } });
+            }
             // A dial reports detents, which are a delta: a step count applied as an absolute
             // position would send one click to an end stop.
             Report::Rotary {
@@ -1162,3 +1173,7 @@ mod scalar_tests;
 #[cfg(test)]
 #[path = "reveal_tests.rs"]
 mod reveal_tests;
+
+#[cfg(test)]
+#[path = "wheel_tests.rs"]
+mod wheel_tests;
