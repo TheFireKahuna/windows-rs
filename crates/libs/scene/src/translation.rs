@@ -30,6 +30,12 @@ impl Translation {
     /// Selects the active target or zero and reports whether it changed.
     pub fn set_active(&self, active: bool) -> bool {
         let v = if active { self.0.target } else { Vector2::zero() };
+        self.set(v)
+    }
+
+    /// Publishes a finite target displacement and reports whether it changed.
+    pub fn set(&self, v: Vector2) -> bool {
+        assert!(v.x.is_finite() && v.y.is_finite());
         let bits = pack_offset(v.x, v.y);
         // Relaxed: the complete displacement is this word; no other data is published.
         self.0.value.swap(bits, Relaxed) != bits

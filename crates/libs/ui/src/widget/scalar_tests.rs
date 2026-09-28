@@ -649,6 +649,108 @@ fn native_released_preview_waits_for_its_ack_and_rejects_old_gestures() -> Resul
 }
 
 #[test]
+fn native_grid_reorder_displaces_neighbors_on_index_edges_and_cancels_stale_geometry() -> Result<()> {
+    let mut rig = Rig::new("scene grid reorder")?;
+    let group = rig.node()?;
+    let mut rows = Vec::new();
+    let mut hits = Vec::new();
+    for (index, (x, y)) in [(0.0, 0.0), (100.0, 0.0), (0.0, 60.0)].into_iter().enumerate() {
+        let node = rig.node_in(windows_scene::Attach::Node(group))?;
+        rig.patch.push(Op::Bind { id: node, prop: Prop::Size,
+            bind: Bind::Set(Value::Vec2(Vector2::new(80.0, 40.0))) });
+        for prop in [Prop::TranslationX, Prop::TranslationY] {
+            rig.patch.push(Op::Bind { id: node, prop, bind: Bind::Set(Value::Scalar(0.0)) });
+        }
+        let id = rig.ids.mint();
+        hits.push(entry(id, x, y, x + 80.0, y + 40.0));
+        rows.push(ReorderRow { id, node, group, index: index as u32,
+            state: windows_scene::Translation::new(Vector2::zero()) });
+    }
+    rig.apply()?;
+    rig.publish_hits(&hits)?;
+    let chrome: Vec<_> = rows.iter().map(|row| (row.id, ChromeRow {
+        flags: flag::DRAGS | flag::DRAG_PREVIEW, ..ChromeRow::default()
+    })).collect();
+    rig.adopt(&chrome, &[], &[])?;
+    rig.controls.adopt_previews(&rows.iter().map(|r| (r.id, r.node)).collect::<Vec<_>>());
+    rig.controls.adopt_reorders(&rows, &[]);
+    rig.controls.adopt_translations(&rows.iter().map(|r| (r.id, r.node, r.state.clone())).collect::<Vec<_>>(), &[],
+        &mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env })?;
+    let id = rows[0].id;
+    let sample = |x, y, decided| Report::Dragged { target: id, contact: 1,
+        update: DragUpdate { phase: Phase::Free, from: Point::default(), at: Point { x, y },
+            delta: Point { x, y }, decided } };
+    let mut out = Vec::with_capacity(8);
+    rig.tick(&[press(id), sample(70.0, 80.0, true)], &mut out)?;
+    assert_eq!(rows[1].state.get(), Vector2::new(-100.0, 0.0));
+    assert_eq!(rows[2].state.get(), Vector2::new(100.0, -60.0));
+    assert_eq!(out.last().map(|i| i.what), Some(What::Reordered(ReorderUpdate { from: 0, to: 2, decided: true })));
+    assert!(rig.controls.take_translation_changed());
+    let animations = rig.animations();
+    let allocations = crate::counting::allocations();
+    for _ in 0..100 {
+        out.clear();
+        rig.tick(&[sample(70.0, 80.0, false)], &mut out)?;
+        assert!(out.is_empty());
+    }
+    assert_eq!(crate::counting::allocations(), allocations);
+    assert_eq!(rig.animations(), animations);
+    assert!(!rig.controls.take_translation_changed());
+    assert_eq!(rig.scene.hits().shifted(1), [0.0, 0.0, 80.0, 40.0]);
+    out.clear();
+    rig.tick(&[sample(40.0, 80.0, false)], &mut out)?;
+    assert!(out.is_empty(), "the central deadband retains insertion");
+    rig.tick(&[sample(10.0, 10.0, false)], &mut out)?;
+    assert_eq!(rows[1].state.get(), Vector2::zero());
+    assert_eq!(rows[2].state.get(), Vector2::zero());
+    assert!(matches!(out.last().map(|i| i.what), Some(What::Reordered(ReorderUpdate { to: 0, .. }))));
+    out.clear();
+    rig.tick(&[Report::Released { target: id, contact: 1, at: Point { x: 70.0, y: 80.0 } }], &mut out)?;
+    assert!(matches!(out.last().map(|i| i.what), Some(What::ReorderEnded(Some(ReorderUpdate { to: 2, .. })))));
+    assert_eq!(rows[2].state.get(), Vector2::new(100.0, -60.0));
+    let epoch = rig.controls.take_preview_release().unwrap();
+    rig.controls.finish_reorder(epoch, &mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env })?;
+    rig.scene.finish_drag_preview(epoch);
+    assert!(rows.iter().all(|r| r.state.get() == Vector2::zero()));
+    for from in 0..rows.len() {
+        for to in 0..rows.len() {
+            let target = rows[from].id;
+            let slot = hits[to];
+            let point = Point { x: slot.x0 + (slot.x1 - slot.x0) * if to < from { 0.2 } else { 0.8 },
+                y: (slot.y0 + slot.y1) * 0.5 };
+            out.clear();
+            rig.tick(&[press(target), Report::Dragged { target, contact: 1,
+                update: DragUpdate { phase: Phase::Free, from: Point::default(), at: point,
+                    delta: point, decided: true } }], &mut out)?;
+            let mut order: Vec<_> = (0..rows.len()).collect();
+            let source = order.remove(from);
+            order.insert(to, source);
+            for (slot, &original) in order.iter().enumerate() {
+                if original == from { continue; }
+                assert_eq!(rows[original].state.get(), Vector2::new(
+                    hits[slot].x0 - hits[original].x0, hits[slot].y0 - hits[original].y0));
+            }
+            assert!(matches!(out.last().map(|i| i.what), Some(What::Reordered(update)) if update.to == to as u32));
+            let current = rig.scene.drag_preview_epoch().unwrap();
+            rig.controls.finish_reorder(epoch, &mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env })?;
+            assert_eq!(rig.scene.drag_preview_epoch(), Some(current));
+            rig.tick(&[Report::Canceled { target, contact: 1 }], &mut out)?;
+            assert!(rows.iter().all(|r| r.state.get() == Vector2::zero()));
+            assert_eq!(out.last().map(|i| i.what), Some(What::ReorderEnded(None)));
+        }
+    }
+    rig.tick(&[press(id), sample(70.0, 80.0, true)], &mut out)?;
+    hits[2].y1 += 10.0;
+    rig.publish_hits(&hits)?;
+    out.clear();
+    rig.tick(&[Report::Released { target: id, contact: 1, at: Point { x: 70.0, y: 80.0 } }], &mut out)?;
+    assert_eq!(out.last().map(|i| i.what), Some(What::ReorderEnded(None)));
+    assert!(rows.iter().all(|r| r.state.get() == Vector2::zero()));
+    assert_eq!(rig.scene.drag_preview_epoch(), None);
+    Ok(())
+}
+
+#[test]
 fn native_a_canceled_decided_drag_raises_exactly_one_report() -> Result<()> {
     let mut rig = Rig::new("drag cancellation")?;
     let id = rig.ids.mint();

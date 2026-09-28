@@ -36,6 +36,7 @@ pub(crate) struct Handlers {
     pub select: Option<Rc<dyn Fn(bool)>>,
     pub scalar: Option<Rc<dyn Fn(Gesturing<f64>)>>,
     pub drag: Option<Rc<dyn Fn(Gesturing<DragUpdate>)>>,
+    pub reorder: Option<Box<ReorderHandler>>,
     pub commit: Option<Rc<dyn Fn(&str)>>,
     /// The hover description and the side it opens on.
     ///
@@ -44,6 +45,12 @@ pub(crate) struct Handlers {
     /// button clears its neighbours and the same one below a rail item lands on the next.
     pub tip: Option<(Rc<TextSource>, Side)>,
     pub flyout: Option<(crate::overlay::Align, Rc<dyn Fn(&mut Ui<'_>)>)>,
+}
+
+pub(crate) struct ReorderHandler {
+    pub group: NodeId,
+    pub index: u32,
+    pub call: Rc<dyn Fn(Gesturing<crate::widget::ReorderUpdate>)>,
 }
 
 /// One interactive control. Its index is its slot for the life of its mount.
@@ -567,18 +574,45 @@ impl<K> Element<'_, K> {
         decl: DragDecl,
         callback: impl Fn(Gesturing<DragUpdate>) + 'static,
     ) -> Self {
-        let mut dragged = self.handler(HitFlags::GESTURE, |row| {
+        let dragged = self.handler(HitFlags::GESTURE, |row| {
+            assert!(row.reorder.is_none(), "reorder owns the drag handler");
             row.drag.replace(Rc::new(callback)).map(Retired::new)
         });
-        let id = dragged.control_id();
-        if let Some(row) = dragged.host().control_mut(id) {
+        dragged.drag_decl(decl)
+    }
+
+    /// Reorders densely indexed items below `group` using scene-owned insertion and motion.
+    /// Declare this before children. Both translation channels must be unclaimed;
+    /// put other translations on a separate ancestor or child. Indices must be unique
+    /// and start at zero.
+    pub fn on_reorder(
+        self, group: super::Node, index: u32,
+        callback: impl Fn(Gesturing<crate::widget::ReorderUpdate>) + 'static,
+    ) -> Self {
+        let mut this = self.translate_on_interaction(windows_numerics::Vector2::zero())
+            .drag_preview().handler(HitFlags::GESTURE, |row| {
+                assert!(row.drag.is_none(), "reorder owns the drag handler");
+                row.reorder.replace(Box::new(ReorderHandler {
+                    group: group.id, index, call: Rc::new(callback),
+                })).map(Retired::new)
+            });
+        let node = this.node_id();
+        let mut parent = this.host().tree.parent(node);
+        while !parent.is_none() && parent != group.id { parent = this.host().tree.parent(parent); }
+        assert_eq!(parent, group.id, "a reorder group must contain its items");
+        this.drag_decl(DragDecl { lock: false, ..DragDecl::default() })
+    }
+
+    fn drag_decl(mut self, decl: DragDecl) -> Self {
+        let id = self.control_id();
+        if let Some(row) = self.host().control_mut(id) {
             row.front.flags |= flag::DRAGS;
         }
-        dragged
+        self
             .host()
             .gestures
             .push((id, GestureDecl::default().with_drag(decl)));
-        dragged
+        self
     }
 
     pub fn tip(self, text: impl Into<TextSource>) -> Self {

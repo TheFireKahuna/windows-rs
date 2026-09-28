@@ -506,6 +506,28 @@ fn discrete(report: &Report) -> bool {
     )
 }
 
+pub(super) fn apply_control_patch(controls: &mut Controls, down: &mut Down, front: &mut Front<'_>) -> Result<()> {
+    if let Some(epoch) = down.preview_done { controls.finish_reorder(epoch, front)?; }
+    front.scene.apply(&mut down.patch, front.back, front.env)?;
+    if let Some(epoch) = down.preview_done.take() { front.scene.finish_drag_preview(epoch); }
+    if let Some(outline) = down.focus_outline.take() {
+        controls.set_ring(outline);
+    }
+    controls.adopt(
+        &down.chrome,
+        &down.values,
+        &down.declared.released,
+        front,
+    )?;
+    controls.adopt_reorders(&down.reorders, &down.declared.released);
+    controls.adopt_translations(
+        &down.translations, &down.declared.released, front,
+    )?;
+    controls.adopt_previews(&down.previews);
+    controls.validate_reorder(front)?;
+    Ok(())
+}
+
 // ── the scene thread ─────────────────────────────────────────────────────────────
 
 struct SceneThread {
@@ -760,21 +782,7 @@ impl SceneThread {
         // unmounted: both orders live inside `present::apply`.
         let regions_changed = !down.regions.is_empty();
         present::apply(&mut self.regions, &mut down.regions, &mut front)?;
-        front.scene.apply(&mut down.patch, front.back, front.env)?;
-        if let Some(epoch) = down.preview_done.take() { front.scene.finish_drag_preview(epoch); }
-        if let Some(outline) = down.focus_outline.take() {
-            self.controls.set_ring(outline);
-        }
-        self.controls.adopt(
-            &down.chrome,
-            &down.values,
-            &down.declared.released,
-            &mut front,
-        )?;
-        self.controls.adopt_translations(
-            &down.translations, &down.declared.released, &mut front,
-        )?;
-        self.controls.adopt_previews(&down.previews);
+        apply_control_patch(&mut self.controls, down, &mut front)?;
         self.scrolls.apply_ops(&mut down.scrolls);
         // A restated geometry replaces the map the thumb is bound through, so a container
         // holding an occlusion's extent is bound again from the extended one. Here, because the

@@ -1321,6 +1321,14 @@ impl Host {
                 let gesturing = update.map_or(Gesturing::Canceled, Gesturing::Committed);
                 Some(Box::new(move || call(gesturing)))
             }
+            What::Reordered(update) => {
+                let call = handlers?.reorder.as_ref()?.call.clone();
+                Some(Box::new(move || call(Gesturing::Moved(update))))
+            }
+            What::ReorderEnded(update) => {
+                let call = handlers?.reorder.as_ref()?.call.clone();
+                Some(Box::new(move || call(update.map_or(Gesturing::Canceled, Gesturing::Committed))))
+            }
             // A presented region reports the part a gesture finished on. It reaches the same
             // handler a committed value does, carrying the part's index.
             What::Part(part) => {
@@ -1970,6 +1978,13 @@ impl Host {
                 }
                 if let Some(state) = &row.translation {
                     down.translations.push((id, row.node, state.clone()));
+                    if let Some(reorder) = self.handlers.get(row.handlers)
+                        .and_then(|h| h.reorder.as_ref())
+                    {
+                        down.reorders.push(crate::widget::ReorderRow {
+                            id, node: row.node, group: reorder.group, index: reorder.index, state: state.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -2000,6 +2015,7 @@ impl Host {
             let live = |id: ControlId| controls.get(id).is_some();
             down.chrome.retain(|&(id, _)| live(id));
             down.previews.retain(|&(id, _)| live(id));
+            down.reorders.retain(|row| live(row.id));
             down.translations.retain(|(id, _, _)| live(*id));
             down.values.retain(|&(id, _)| live(id));
             down.declared.gestures.retain(|&(id, _)| live(id));

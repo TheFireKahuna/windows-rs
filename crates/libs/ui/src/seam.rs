@@ -479,6 +479,7 @@ row! {
         && b.chrome.is_empty()
         && b.translations.is_empty()
         && b.previews.is_empty()
+        && b.reorders.is_empty()
         && b.values.is_empty()
         && b.regions.is_empty()
         && b.scrolls.is_empty()
@@ -495,6 +496,7 @@ row! {
         chrome: Vec<(ControlId, ChromeRow)>,
         translations: Vec<(ControlId, NodeId, windows_scene::Translation)>,
         previews: Vec<(ControlId, NodeId)>,
+        reorders: Vec<crate::widget::ReorderRow>,
         /// Read by `Controls::adopt` on the scene thread.
         values: Vec<(ControlId, ValueRow)>,
         /// Read by `present::apply` here, and relayed as pick rows to `Picks::sync`.

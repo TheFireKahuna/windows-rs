@@ -4,14 +4,18 @@
 //! No intent causes a visual: the pixels move front-side in the tick that saw the event, and the
 //! [`Intent`] the application receives is emitted afterwards.
 //!
-//! The path is index arithmetic — a rect test the router already did, an array index, and one
-//! retarget. It performs no hash lookup, no allocation, no role resolve and no hop to the app
-//! thread.
+//! Scalar samples retarget retained channels. A reorder snapshots its group's layout slots
+//! at threshold crossing; later samples reuse that storage and retarget neighbors only when
+//! the insertion index changes.
 //!
 //! Interaction state is held per window, not per control. The pointer and the keyboard are each
 //! one physical thing, so a second hovered control cannot exist to carry a bit.
 
 use super::roles::{FOCUS_OUTSET, ScalarPart, TURN_SWEEP, fraction_of};
+#[path = "reorder.rs"]
+mod reorder;
+pub use reorder::ReorderUpdate;
+pub(crate) use reorder::ReorderRow;
 use crate::gesture::{DragUpdate, Phase, Recognised};
 use crate::input::{KeyKind, Report};
 use crate::uia::Action;
@@ -241,6 +245,8 @@ pub enum What {
     /// A two-axis drag ended. `Some` carries the last sample it reported, whose displacement takes
     /// effect; `None` is a contact that was taken away, whose pre-drag value stands.
     DragEnded(Option<DragUpdate>),
+    Reordered(ReorderUpdate),
+    ReorderEnded(Option<ReorderUpdate>),
     /// A contact finished on one pickable piece of a presented region's pixels.
     ///
     /// Raised by the present layer rather than by these tables: the part is resolved against
@@ -295,6 +301,7 @@ pub struct Controls {
     translations: Vec<(ControlId, NodeId, windows_scene::Translation)>,
     previews: Vec<(ControlId, NodeId)>,
     preview_release: Option<u64>,
+    reorders: reorder::Reorders,
     translation_changed: bool,
     /// The window's one focus ring, sprung between controls. Focus is singular, so the ring is per
     /// window rather than per control, and the glide between two controls is a compositor
@@ -426,9 +433,24 @@ impl Controls {
         self.preview_release.take()
     }
 
+    pub(crate) fn adopt_reorders(&mut self, rows: &[ReorderRow], released: &[ControlId]) {
+        self.reorders.adopt(rows, released);
+    }
+
+    pub(crate) fn validate_reorder(&mut self, front: &mut Front<'_>) -> Result<()> {
+        self.translation_changed |= self.reorders.validate(front)?;
+        Ok(())
+    }
+
+    pub(crate) fn finish_reorder(&mut self, epoch: u64, front: &mut Front<'_>) -> Result<()> {
+        self.translation_changed |= self.reorders.finish(epoch, front)?;
+        Ok(())
+    }
+
     fn translate(&mut self, front: &mut Front<'_>) -> Result<()> {
         let mut changed = false;
         for (id, node, state) in &self.translations {
+            if self.reorders.contains(*id) { continue; }
             let active = [self.hovered, self.pressed, self.focused].into_iter().any(|source| {
                 !source.is_none() && front.scene.hits().entry(source).is_some()
                     && front.scene.hits().in_translation(*id, source)
@@ -682,6 +704,7 @@ impl Controls {
                 if self.chrome.get(target).is_none() {
                     return Ok(());
                 }
+                self.translation_changed |= self.reorders.reset(front)?;
                 front.scene.end_drag_preview();
                 self.focused = ControlId::NONE;
                 self.pressed = target;
@@ -720,6 +743,7 @@ impl Controls {
                     if update.decided {
                         if let Some(&(_, node)) = self.previews.iter().find(|row| row.0 == target) {
                             front.scene.begin_drag_preview(node, front.back);
+                            if self.reorders.contains(target) { self.reorders.begin(target, front)?; }
                         }
                     }
                     front.scene.move_drag_preview(Vector2 { x: update.delta.x, y: update.delta.y });
@@ -727,6 +751,14 @@ impl Controls {
                 self.decided =
                     (self.dragged == target && self.decided) || update.phase != Phase::Undecided;
                 (self.dragged, self.drag_last) = (target, Some(update));
+                if self.reorders.contains(target) {
+                    let (reorder, changed) = self.reorders.moved(update.at, update.decided, front)?;
+                    self.translation_changed |= changed;
+                    if let Some(update) = reorder {
+                        out.push(Intent { target, what: What::Reordered(update) });
+                    }
+                    return Ok(());
+                }
                 out.push(Intent {
                     target,
                     what: What::Dragged(update),
@@ -812,6 +844,18 @@ impl Controls {
         // raising both would run the click handler at the end of every reorder. A canceled one
         // ends the same way carrying nothing, which is the whole of what a drag handler is told.
         if dragged && self.decided {
+            if self.reorders.contains(target) {
+                let update = if let Some(at) = at {
+                    let (_, changed) = self.reorders.moved(at, false, front)?;
+                    self.translation_changed |= changed;
+                    self.reorders.released()
+                } else {
+                    self.translation_changed |= self.reorders.reset(front)?;
+                    None
+                };
+                out.push(Intent { target, what: What::ReorderEnded(update) });
+                return Ok(());
+            }
             out.push(Intent {
                 target,
                 what: What::DragEnded(at.and(self.drag_last)),

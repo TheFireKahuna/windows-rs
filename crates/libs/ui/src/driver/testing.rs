@@ -53,6 +53,17 @@ pub struct LayoutDriver {
 }
 
 impl LayoutDriver {
+    /// Applies retained declarations through the shipping scene/control adoption path.
+    /// Callers dispatch emitted intents before flushing an acknowledged release.
+    /// This drives no OS input, text-services rendering, scrolling or presentation regions.
+    pub fn flush_controls(&mut self, controls: &mut crate::widget::Controls, front: &mut crate::widget::Front<'_>) -> Result<()> {
+        let mut down = crate::seam::Down::default();
+        self.flush(&mut down.patch);
+        Host::with(|h| h.fill(&mut down));
+        down.preview_done = controls.take_preview_release();
+        super::pass::apply_control_patch(controls, &mut down, front)
+    }
+
     pub fn create(create: impl FnOnce(&mut crate::build::Ui<'_>)) -> Self {
         let (owner, root) = crate::signal::Owner::scope(|| crate::build::Ui::mount_root(create));
         Self {
