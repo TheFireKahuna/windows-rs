@@ -25,6 +25,8 @@ pub struct TextStyle {
     pub flow: Flow,
     pub caps: bool,
     pub vertical: bool,
+    /// Line height as a multiple of the em; zero uses the font's natural spacing.
+    pub line_height: f32,
 }
 
 impl TextStyle {
@@ -37,6 +39,7 @@ impl TextStyle {
             flow: Flow::Line,
             caps: false,
             vertical: false,
+            line_height: 0.0,
         }
     }
 
@@ -62,6 +65,13 @@ impl TextStyle {
     #[must_use]
     pub const fn vertical(self, vertical: bool) -> Self {
         Self { vertical, ..self }
+    }
+
+    /// Sets a positive, finite line height as a multiple of the resolved font size.
+    #[must_use]
+    pub const fn line_height(self, multiple: f32) -> Self {
+        assert!(multiple.is_finite() && multiple > 0.0);
+        Self { line_height: multiple, ..self }
     }
 }
 

@@ -76,6 +76,42 @@ pub struct ShapedRun {
 }
 
 impl TextEngine {
+    /// Tags a UTF-16 range for coverage grouping and optionally changes its font weight.
+    ///
+    /// Tag zero denotes unannotated text. Tags are caller-defined small style identities;
+    /// the engine retains one drawing-effect object per distinct nonzero tag. Reshaping
+    /// clears all annotations. Overlapping calls use the last tag and weight supplied.
+    ///
+    /// # Errors
+    ///
+    /// Rejects reversed/out-of-bounds ranges, weights outside 100–950, or a failed
+    /// DirectWrite update. A failed update may leave earlier annotations applied.
+    pub fn annotate(&self, run: &mut ShapedRun, range: Range<u32>, tag: u32, weight: Option<u16>) -> Result<()> {
+        if range.start > range.end || range.end > run.len || weight.is_some_and(|w| !(100..=950).contains(&w)) {
+            return Err(windows_core::Error::from_hresult(windows_core::HRESULT(0x80070057u32 as i32)));
+        }
+        if range.is_empty() { return Ok(()); }
+        let mut tags = self.drawing_tags.borrow_mut();
+        let effect = if tag == 0 { None } else {
+            let at = tags.iter().position(|(value, _)| *value == tag).unwrap_or_else(|| {
+                tags.push((tag, harvest::DrawingTag(tag).into()));
+                tags.len() - 1
+            });
+            Some(&tags[at].1)
+        };
+        let range = DWRITE_TEXT_RANGE { startPosition: range.start, length: range.end - range.start };
+        // SAFETY: the range is within this layout and DirectWrite retains the effect's COM reference.
+        unsafe {
+            run.layout.SetDrawingEffect(effect, range).ok()?;
+            if let Some(weight) = weight {
+                run.layout.SetFontWeight(weight as i32, range).ok()?;
+            }
+        }
+        run.dirty = true;
+        run.pad.set(None);
+        Ok(())
+    }
+
     /// Lays `text` out under `spec`, unconstrained.
     ///
     /// The result is stale until harvested: it is laid out, but the width it will be given
@@ -185,6 +221,31 @@ impl TextEngine {
 }
 
 impl ShapedRun {
+    /// Sets a uniform line height in DIPs, centering added leading around the first
+    /// line's natural baseline. Reshaping restores the font's natural line spacing.
+    ///
+    /// # Errors
+    /// Rejects nonpositive/nonfinite heights or a failed DirectWrite update.
+    pub fn set_line_height(&mut self, height: f32) -> Result<()> {
+        if !height.is_finite() || height <= 0.0 {
+            return Err(windows_core::Error::from_hresult(windows_core::HRESULT(0x80070057u32 as i32)));
+        }
+        self.read_lines()?;
+        let natural = self.lines.first().copied().unwrap_or_default();
+        let spacing = DWRITE_LINE_SPACING {
+            method: 1, // DWRITE_LINE_SPACING_METHOD_UNIFORM
+            height,
+            baseline: (natural.baseline + (height - natural.height) * 0.5).max(0.0),
+            ..Default::default()
+        };
+        let layout: IDWriteTextLayout3 = self.layout.cast()?;
+        // SAFETY: the layout is owned and `spacing` lives through the synchronous call.
+        unsafe { layout.SetLineSpacing(&spacing).ok()?; }
+        self.dirty = true;
+        self.pad.set(None);
+        Ok(())
+    }
+
     /// Returns the spec the run was shaped under.
     #[must_use]
     pub fn spec(&self) -> &FontSpec {
@@ -323,6 +384,32 @@ impl ShapedRun {
     ///
     /// Harvested data: harvest the run first, or a debug build asserts.
     pub fn segments(&self, line: usize, out: &mut SegBuffers) -> Span {
+        self.filtered_segments(line, None, out)
+    }
+
+    /// Returns the ink tile for `tag` and its horizontal offset from the full line's tile.
+    /// The run must have been harvested after its last annotation or layout change.
+    pub fn tagged_ink(&self, line: usize, tag: u32) -> (Ink, f32) {
+        let mut ink = self.line_ink(line);
+        let (full_left, full_right) = self.line_extent(line);
+        let (left, right) = self.tagged_extent(line, Some(tag));
+        ink.size.x = (ink.size.x - (full_right - full_left) + (right - left)).max(0.0);
+        (ink, left - full_left)
+    }
+
+    /// Appends only the segments carrying `tag`, relative to its `tagged_ink` tile.
+    /// The run must have been harvested after its last annotation or layout change.
+    pub fn tagged_segments(&self, line: usize, tag: u32, out: &mut SegBuffers) -> Span {
+        self.filtered_segments(line, Some(tag), out)
+    }
+
+    /// Visits the tags drawn on a harvested line. Repeated tags are not deduplicated.
+    pub fn line_tags(&self, line: usize) -> impl Iterator<Item = u32> + '_ {
+        debug_assert!(!self.dirty);
+        self.harvest.segs.iter().filter(move |h| h.line as usize == line).map(|h| h.tag)
+    }
+
+    fn filtered_segments(&self, line: usize, tag: Option<u32>, out: &mut SegBuffers) -> Span {
         debug_assert!(
             !self.dirty,
             "segments() read a run that has not been harvested"
@@ -331,14 +418,14 @@ impl ShapedRun {
         let Some((top, _)) = self.line_at(line) else {
             return Span::EMPTY;
         };
-        let (left, _) = self.line_extent(line);
+        let (left, _) = self.tagged_extent(line, tag);
         let pad = self.pad();
         let origin = Vector2 {
             x: left - pad.left.max(0.0),
             y: top - pad.top.max(0.0),
         };
 
-        for h in self.harvest.segs.iter().filter(|h| h.line as usize == line) {
+        for h in self.harvest.segs.iter().filter(|h| h.line as usize == line && tag.is_none_or(|tag| tag == h.tag)) {
             let spans = out.push(
                 h.seg.glyphs.of(&self.harvest.glyphs),
                 h.seg.advances.of(&self.harvest.advances),
@@ -477,8 +564,12 @@ impl ShapedRun {
     /// segment advances leftward from its origin, so its extent is not `origin.x + width`
     /// and folding advances would place its tile past its glyphs.
     fn line_extent(&self, line: usize) -> (f32, f32) {
+        self.tagged_extent(line, None)
+    }
+
+    fn tagged_extent(&self, line: usize, tag: Option<u32>) -> (f32, f32) {
         let (mut left, mut right) = (f32::MAX, f32::MIN);
-        for h in self.harvest.segs.iter().filter(|h| h.line as usize == line) {
+        for h in self.harvest.segs.iter().filter(|h| h.line as usize == line && tag.is_none_or(|tag| h.tag == tag)) {
             let w: f32 = h.seg.advances.of(&self.harvest.advances).iter().sum();
             let (a, b) = if h.seg.bidi % 2 == 1 {
                 (h.origin.x - w, h.origin.x)
@@ -527,6 +618,68 @@ mod tests {
         let mut buffers = SegBuffers::default();
         let span = run.segments(line, &mut buffers);
         (buffers, span)
+    }
+
+    #[test]
+    fn annotations_group_shaped_unicode_without_losing_glyphs_or_positions() {
+        let (engine, spec) = engine();
+        let text = "a😀é שלום 日本 key = 12.5\nsecond line";
+        let mut run = engine.shape(text, &spec, Flow::Wrap).unwrap();
+        let split = "a😀é ".encode_utf16().count() as u32;
+        engine.annotate(&mut run, 0..split, 1, Some(600)).unwrap();
+        let len = run.len;
+        engine.annotate(&mut run, split..len, 2, None).unwrap();
+        for width in [85.0, 270.0, 85.0] {
+            run.pin(width);
+            engine.harvest(&mut run).unwrap();
+            assert!(run.line_tags(0).any(|tag| tag == 1));
+            for line in 0..run.lines().len() {
+                let (all, _) = segs_of(&run, line);
+                let mut total = 0;
+                for tag in [1, 2] {
+                    let mut part = SegBuffers::default();
+                    run.tagged_segments(line, tag, &mut part);
+                    let (tile, offset) = run.tagged_ink(line, tag);
+                    assert!(tile.size.x <= run.line_ink(line).size.x + 0.001);
+                    total += part.glyphs.len();
+                    for seg in &part.segs {
+                        assert!(all.segs.iter().any(|original| {
+                            original.face == seg.face && original.bidi == seg.bidi
+                                && (original.origin.x - (seg.origin.x + offset)).abs() < 0.001
+                                && original.origin.y == seg.origin.y
+                                && original.glyphs.of(&all.glyphs) == seg.glyphs.of(&part.glyphs)
+                        }));
+                    }
+                }
+                assert_eq!(total, all.glyphs.len());
+            }
+        }
+        assert_eq!(engine.drawing_tags.borrow().len(), 2);
+        engine.reshape(&mut run, "plain", &spec, Flow::Line).unwrap();
+        run.pin(100.0);
+        engine.harvest(&mut run).unwrap();
+        assert!(run.line_tags(0).all(|tag| tag == 0));
+        assert!(engine.annotate(&mut run, 0..10, 3, None).is_err());
+        assert!(engine.annotate(&mut run, 0..1, 3, Some(999)).is_err());
+    }
+
+    #[test]
+    fn explicit_line_height_preserves_centered_baselines_and_resets_on_reshape() {
+        let (engine, spec) = engine();
+        let mut run = shaped(&engine, "first\nsecond", &spec, Flow::Wrap, 200.0);
+        let natural = run.lines()[0];
+        for height in [22.4, 28.0, 22.4] {
+            run.set_line_height(height).unwrap();
+            engine.harvest(&mut run).unwrap();
+            for line in run.lines() {
+                assert!((line.height - height).abs() < 0.001);
+                assert!((line.baseline - natural.baseline - (height - natural.height) * 0.5).abs() < 0.001);
+            }
+        }
+        assert!(run.set_line_height(f32::NAN).is_err());
+        engine.reshape(&mut run, "first\nsecond", &spec, Flow::Wrap).unwrap();
+        engine.harvest(&mut run).unwrap();
+        assert!((run.lines()[0].height - natural.height).abs() < 0.001);
     }
 
     #[test]

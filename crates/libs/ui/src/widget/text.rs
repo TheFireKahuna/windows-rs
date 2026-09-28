@@ -23,6 +23,16 @@ use windows_text::Ink;
 /// How a run occupies the width it is given.
 pub use windows_text::Flow;
 
+/// Styles a UTF-8 byte range in an annotated text run.
+/// Ranges must be ordered, nonoverlapping, and lie on the source's character boundaries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextAnnotation {
+    pub range: core::ops::Range<usize>,
+    pub ink: crate::role::Role,
+    /// Font weight in 100–950, or the text recipe's weight when absent.
+    pub weight: Option<u16>,
+}
+
 /// What a text-taking method accepts.
 ///
 /// `&'static str` allocates nothing. An owned string costs the application's own allocation

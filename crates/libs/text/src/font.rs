@@ -386,6 +386,7 @@ pub struct TextEngine {
     pub(crate) collector: RefCell<Option<ComObject<Collector>>>,
     /// UTF-16 staging for `CreateTextLayout`, which copies what it is handed.
     pub(crate) scratch: RefCell<Vec<u16>>,
+    pub(crate) drawing_tags: RefCell<Vec<(u32, windows_core::IUnknown)>>,
 }
 
 impl TextEngine {
@@ -431,6 +432,7 @@ impl TextEngine {
             typography: RefCell::new(FxHashMap::default()),
             collector: RefCell::new(None),
             scratch: RefCell::new(Vec::new()),
+            drawing_tags: RefCell::new(Vec::new()),
         })
     }
 

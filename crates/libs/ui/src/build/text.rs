@@ -25,6 +25,9 @@ use windows_scene::{
 };
 use windows_text::{FontLadder, FontSpec, Rect, SegBuffers, ShapedRun, TextEngine};
 
+mod annotated;
+use annotated::Annotated;
+
 /// The message every missing-engine panic carries.
 const ENGINE: &str =
     "a text engine must be installed before anything mounts: install it on the host at start-up";
@@ -65,6 +68,7 @@ pub(crate) enum Target {
         group: GroupId,
         lines: Vec<(SpriteId, RunId)>,
     },
+    Annotated(Box<Annotated>),
 }
 
 /// How the string a run draws differs from the string automation announces.
@@ -236,6 +240,12 @@ impl Entry {
         engine
             .reshape(&mut self.run, self.text.as_str(), &font, self.style.flow)
             .expect(LAYOUT);
+        if let Target::Annotated(data) = &mut self.target {
+            data.apply(engine, &mut self.run, self.text.as_str());
+        }
+        if self.style.line_height > 0.0 {
+            self.run.set_line_height(font.size * self.style.line_height).expect(LAYOUT);
+        }
         self.uia.take();
         self.font = font;
         self.class = class;
@@ -249,7 +259,7 @@ impl Entry {
     const fn line(&self) -> Option<RunId> {
         match self.target {
             Target::Line { run, .. } => Some(run),
-            Target::Wrapped { .. } => None,
+            Target::Wrapped { .. } | Target::Annotated(_) => None,
         }
     }
 }
@@ -291,7 +301,7 @@ pub(super) fn install(
     // the node, so the mask is written here and the emit has no first-time arm.
     let line = match mint.target {
         Target::Line { sprite, run } => Some((sprite, run)),
-        Target::Wrapped { .. } => None,
+        Target::Wrapped { .. } | Target::Annotated(_) => None,
     };
     let key = host.text.mint(mint);
     host.tree.c.text[node.index()] = key;
@@ -336,20 +346,47 @@ impl Ui<'_> {
         style: TextStyle,
         text: impl Into<TextSource>,
     ) -> Element<'_> {
-        let breaks = style.vertical || !matches!(style.flow, Flow::Line);
+        self.text_inner(owner, style, text.into(), None)
+    }
+
+    /// Builds one accessible text run with source-dependent ink and weight ranges.
+    /// The annotator writes into a reused buffer when text or typography changes.
+    /// Text must not request case folding; annotations address the original UTF-8 bytes.
+    pub fn annotated_text(
+        &mut self,
+        style: TextStyle,
+        text: impl Into<TextSource>,
+        annotate: fn(&str, &mut Vec<crate::widget::TextAnnotation>),
+    ) -> Element<'_> {
+        assert!(!style.caps, "annotated text cannot fold source bytes");
+        self.text_inner(None, style, text.into(), Some(annotate))
+    }
+
+    fn text_inner(
+        &mut self,
+        owner: Option<ControlId>,
+        style: TextStyle,
+        text: TextSource,
+        annotate: Option<fn(&str, &mut Vec<crate::widget::TextAnnotation>)>,
+    ) -> Element<'_> {
+        let breaks = annotate.is_some() || style.vertical || !matches!(style.flow, Flow::Line);
         let node = match breaks {
             true => self.node(Preset::Text).node_id(),
             false => self.sprite(Preset::Text).node_id(),
         };
-        let target = match breaks {
-            true => Target::Wrapped {
-                group: GroupId(node),
-                lines: Vec::new(),
-            },
-            false => Target::Line {
-                sprite: SpriteId(node),
-                run: self.host.run(Span::default(), Ink::default()),
-            },
+        let target = if let Some(annotate) = annotate {
+            Target::Annotated(Box::new(Annotated::new(GroupId(node), annotate)))
+        } else {
+            match breaks {
+                true => Target::Wrapped {
+                    group: GroupId(node),
+                    lines: Vec::new(),
+                },
+                false => Target::Line {
+                    sprite: SpriteId(node),
+                    run: self.host.run(Span::default(), Ink::default()),
+                },
+            }
         };
         let owner = owner.unwrap_or(ControlId::NONE);
         let mint = Mint {
@@ -534,7 +571,7 @@ impl Table {
         if let Some(author) = &author {
             text.set(author, mint.fold);
         }
-        let run = match self.spare.pop() {
+        let mut run = match self.spare.pop() {
             Some(mut run) => {
                 engine
                     .reshape(&mut run, text.as_str(), &font, mint.style.flow)
@@ -545,6 +582,10 @@ impl Table {
                 .shape(text.as_str(), &font, mint.style.flow)
                 .expect(LAYOUT),
         };
+        if mint.style.line_height > 0.0 {
+            run.set_line_height(font.size * mint.style.line_height).expect(LAYOUT);
+        }
+        let stale = matches!(&mint.target, Target::Annotated(_));
         self.entries.insert(Entry {
             uia: std::cell::OnceCell::new(),
             run,
@@ -561,7 +602,7 @@ impl Table {
             // Fresh, not stale: the run is laid out from this string under this font. A class
             // resolving a different font still reshapes, because `sync` compares the font
             // rather than trusting this flag.
-            stale: false,
+            stale,
             pair: [f32::NAN; 2],
             at_w: f32::NAN,
             h: f32::NAN,
@@ -699,7 +740,7 @@ impl Table {
             return false;
         };
         entry.sync(engine, class);
-        if w <= 0.0 || (entry.pinned == w && !entry.stale) {
+        if (w <= 0.0 && !entry.text.as_str().is_empty()) || (entry.pinned == w && !entry.stale) {
             return false;
         }
         let moved = entry.run.pin(w);
@@ -744,7 +785,7 @@ impl Table {
     fn line_sprite(&self, at: usize) -> Option<SpriteId> {
         match self.entries.at(at)?.target {
             Target::Line { sprite, .. } => Some(sprite),
-            Target::Wrapped { .. } => None,
+            Target::Wrapped { .. } | Target::Annotated(_) => None,
         }
     }
 
@@ -778,13 +819,17 @@ impl Table {
 
     /// Appends one line's segments to the harvest buffers and answers where they landed and
     /// the tile they occupy.
-    fn line(&mut self, at: usize, line: usize) -> (windows_text::Span, Ink) {
+    fn line(&mut self, at: usize, line: usize, tag: Option<u32>) -> (windows_text::Span, Ink) {
         self.segs.clear();
         let Self { entries, segs, .. } = self;
         let Some(entry) = entries.at_mut(at) else {
             return (windows_text::Span::EMPTY, Ink::default());
         };
-        (entry.run.segments(line, segs), entry.run.line_ink(line))
+        let span = match tag {
+            Some(tag) => entry.run.tagged_segments(line, tag, segs),
+            None => entry.run.segments(line, segs),
+        };
+        (span, tag.map_or_else(|| entry.run.line_ink(line), |tag| entry.run.tagged_ink(line, tag).0))
     }
 
     /// Drops the sprites a shorter run no longer breaks onto, newest first.
@@ -903,6 +948,7 @@ impl Host {
             .or(ink)
             .unwrap_or(Role::Text(Text::Primary));
         let light = resolve(role, scope.for_paint());
+        if self.paint_annotated(at, role, scope) { return; }
         if let Some(sprite) = self.text.line_sprite(at) {
             self.paint(sprite, Paint::Solid(light), None);
             return;
@@ -931,6 +977,9 @@ impl Host {
                     self.release(run);
                 }
             }
+            Target::Annotated(data) => {
+                for part in data.parts.drain(..) { self.release(part.run); }
+            }
         }
         self.text.spare.push(entry.run);
     }
@@ -946,8 +995,9 @@ impl Host {
         let Some(count) = self.text.harvest(at) else {
             return;
         };
+        if self.emit_annotated(at, count) { return; }
         if let Some(run) = self.text.entries.at(at).and_then(Entry::line) {
-            let (span, ink) = self.coverage(at, 0);
+            let (span, ink) = self.coverage(at, 0, None);
             self.set_run(run, span, ink);
             self.paint_run(at);
             return;
@@ -962,7 +1012,7 @@ impl Host {
             .is_some_and(|(_, vertical)| vertical);
         let mut top = 0.0;
         for line in 0..count {
-            let (span, ink) = self.coverage(at, line);
+            let (span, ink) = self.coverage(at, line, None);
             match self.text.line_slot(at, line) {
                 Some((_, run)) => self.set_run(run, span, ink),
                 None => self.mint_line(at, span, ink, vertical),
@@ -1006,8 +1056,15 @@ impl Host {
     /// pools, so the glyphs, advances and offsets are appended here and each segment is
     /// re-pointed at where they landed. A segment names the face fallback chose, which a
     /// family index cannot.
-    fn coverage(&mut self, at: usize, line: usize) -> (Span, Ink) {
-        let (local, ink) = self.text.line(at, line);
+    fn coverage(&mut self, at: usize, line: usize, tag: Option<u32>) -> (Span, Ink) {
+        let (local, mut ink) = self.text.line(at, line, tag);
+        let phase = tag.map_or(0.0, |tag| {
+            let offset = self.text.entries.at(at).unwrap().run.tagged_ink(line, tag).1;
+            offset - (offset * self.env.scale()).floor() / self.env.scale()
+        });
+        // Cropped tiles start on the full line's pixel grid; the fractional remainder
+        // stays in the glyph origins so a color boundary does not change glyph spacing.
+        ink.size.x += phase;
         let Self { text, pending, .. } = self;
         let mut span = Span { off: 0, len: 0 };
         for seg in local.of(&text.segs.segs) {
@@ -1019,7 +1076,7 @@ impl Host {
                 face: seg.face,
                 em: seg.em,
                 bidi: seg.bidi,
-                origin: seg.origin,
+                origin: Vector2 { x: seg.origin.x + phase, y: seg.origin.y },
                 glyphs,
                 advances,
                 offsets,

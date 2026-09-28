@@ -15,11 +15,15 @@ use windows_core::{ComObject, IUnknownImpl, Ref};
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) struct HarvestSeg {
     pub seg: GlyphSeg,
+    pub tag: u32,
     /// Baseline origin in the layout's own coordinate space.
     pub origin: Vector2,
     /// Which line of the layout it sits on. Filled after the walk by [`ShapedRun`].
     pub line: u16,
 }
+
+#[windows_core::implement()]
+pub(crate) struct DrawingTag(pub u32);
 
 /// Describes a rule DirectWrite resolved that is not made of glyphs.
 ///
@@ -193,7 +197,7 @@ impl IDWriteTextRenderer_Impl for Collector_Impl {
         _: DWRITE_MEASURING_MODE,
         run: *const DWRITE_GLYPH_RUN,
         _: *const DWRITE_GLYPH_RUN_DESCRIPTION,
-        _: Ref<windows_core::IUnknown>,
+        effect: Ref<windows_core::IUnknown>,
     ) -> Result<()> {
         // A null run, or one with no face, records nothing and still returns success: an
         // error here aborts the walk and loses the runs already collected.
@@ -203,6 +207,7 @@ impl IDWriteTextRenderer_Impl for Collector_Impl {
         // SAFETY: non-null, and DirectWrite guarantees the struct and its two mandatory
         // arrays live for the length of this callback.
         let run = unsafe { &*run };
+        if run.glyphCount == 0 { return Ok(()); }
         let Some(face) = run.fontFace.as_ref() else {
             return Ok(());
         };
@@ -234,6 +239,8 @@ impl IDWriteTextRenderer_Impl for Collector_Impl {
             }
         }
         out.segs.push(HarvestSeg {
+            tag: effect.as_ref().and_then(|effect| effect.cast_object_ref::<DrawingTag>().ok())
+                .map_or(0, |effect| effect.0),
             seg: GlyphSeg {
                 face,
                 em: run.fontEmSize,
