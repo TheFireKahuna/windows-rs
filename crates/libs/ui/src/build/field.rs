@@ -2,6 +2,7 @@
 
 use super::host::Host;
 use super::text::{Fold, MeasureKey};
+use crate::layout::Align;
 use crate::role::{Fill, Metric, Role, Scope, Text, metric, resolve};
 use crate::text_input::{
     Cluster, Commit, Geometry, InputScope, Layout, Selection, Source, Update, system,
@@ -42,6 +43,7 @@ pub(crate) struct Row {
     /// edit does not continually resize its neighbours, and reveal moves this rather than the
     /// box.
     scroll: f32,
+    align: Align,
     reveal: Option<(u32, u32)>,
     /// One caret, one sprite per selection rect, one per composition underline. Pooled, so a
     /// keystroke inside a selection retargets rather than mints.
@@ -72,6 +74,7 @@ impl Row {
             callback_revision: None,
             delivered_revision: None,
             scroll: 0.0,
+            align: Align::Start,
             reveal: None,
             caret,
             selections: Vec::new(),
@@ -392,17 +395,21 @@ impl Host {
             (row.group, row.style)
         };
         let box_ = self.geom(group.0).size;
-        let inset = metric(Metric::SpaceSm, style);
+        let layout = self.tree.c.layout[group.0.index()];
+        let inset = layout.padding[0].resolve(
+            &self.metrics, self.tree.class(group.0), style, box_.x, self.env.scale(),
+        ).unwrap_or(0.0).max(0.0);
         let width = (box_.x - inset * 2.0).max(1.0);
         let (node, end) = {
             let Self { fields, text, .. } = self;
             let row = fields.get_mut(id)?;
             let resized = row.geometry.as_ref().is_none_or(|g| {
-                g.viewport.w != width || g.viewport.h != box_.y
-            });
+                g.viewport.x != inset || g.viewport.w != width || g.viewport.h != box_.y
+            }) || row.align != layout.justify;
             if !core::mem::take(&mut row.dirty) && !resized {
                 return None;
             }
+            row.align = layout.justify;
             let (node, _, end) = text.field_view(row.key, &mut row.clusters)?;
             (node, end)
         };
@@ -456,7 +463,11 @@ impl Host {
             .min(target.0)
             .clamp(0.0, (right - width).max(0.0));
         geometry.origin = Vector2 {
-            x: inset - row.scroll,
+            x: inset - row.scroll + match row.align {
+                Align::Center => (width - right).max(0.0) * 0.5,
+                Align::End => (width - right).max(0.0),
+                _ => 0.0,
+            },
             y: (box_.y - line.y) * 0.5,
         };
         geometry.viewport = Rect {
@@ -606,6 +617,51 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fields_honor_authored_padding_and_alignment_without_reshaping() {
+        use crate::build::rig::Rig;
+        use crate::layout::Len;
+        use crate::signal::Cell;
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let mut rig = Rig::at(400.0, 160.0, scale);
+            let align = Cell::new(Align::Start);
+            let inset = Cell::new(4.0);
+            let mut target = ControlId::NONE;
+            rig.mount(|ui| {
+                target = crate::widget::field(ui, "20000")
+                    .width(Len::dip(120.0))
+                    .height(Len::dip(24.0))
+                    .layout_from(move |l| {
+                        l.padding[0] = Len::dip(inset.get());
+                        l.justify = align.get();
+                    })
+                    .control_id();
+            });
+            rig.flush();
+            let clusters = Host::with(|host| Arc::clone(
+                &host.fields.get(target).unwrap().geometry.as_ref().unwrap().clusters,
+            ));
+            for (alignment, padding) in [(Align::Start, 4.0), (Align::Center, 4.0), (Align::End, 9.0)] {
+                rig.set(align, alignment);
+                rig.set(inset, padding);
+                rig.flush();
+                Host::with(|host| {
+                    let row = host.fields.get(target).unwrap();
+                    let g = row.geometry.as_ref().unwrap();
+                    assert!(Arc::ptr_eq(&clusters, &g.clusters));
+                    assert_eq!(g.viewport.x, padding);
+                    assert_eq!(g.viewport.w, 120.0 - 2.0 * padding);
+                    let right = g.clusters.iter().fold(g.end.x, |r, c| r.max(c.rect.x + c.rect.w));
+                    let fraction = match alignment { Align::Center => 0.5, Align::End => 1.0, _ => 0.0 };
+                    assert!((g.origin.x - padding - (g.viewport.w - right) * fraction).abs() < 0.01);
+                    let previous = Arc::clone(g);
+                    assert!(host.plan_field(target).is_none());
+                    assert!(Arc::ptr_eq(&previous.clusters, &host.fields.get(target).unwrap().geometry.as_ref().unwrap().clusters));
+                });
+            }
+        }
+    }
 
     /// A masked run draws one dot per character, so the span a dot stands for is two units
     /// where that character is a surrogate pair.
