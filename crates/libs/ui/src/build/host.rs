@@ -133,6 +133,7 @@ pub(crate) enum Visual {
     Unplaced,
     Rect(Vector2, Vector2),
     Insets([f32; 4]),
+    Outset(Len),
 }
 
 /// One attachment to a keyed anchor set, in attachment order.
@@ -567,6 +568,11 @@ impl Host {
 
     pub(crate) fn visual_insets(&mut self, id: SpriteId, insets: [f32; 4]) {
         self.side_mut(id.0).visual = Visual::Insets(insets);
+        self.tree.mark(id.0);
+    }
+
+    pub(crate) fn visual_outset(&mut self, id: SpriteId, width: Len) {
+        self.side_mut(id.0).visual = Visual::Outset(width);
         self.tree.mark(id.0);
     }
 
@@ -1529,6 +1535,12 @@ impl Host {
                 continue;
             };
             let (node, visual) = (side.node, side.visual);
+            let visual = match visual {
+                Visual::Outset(width) => Visual::Insets([
+                    -width.dips_at(self.scope_of(node).at_width(self.tree.class(node)), self.env.scale()); 4
+                ]),
+                visual => visual,
+            };
             let hidden = self.tree.c.flags[node.index()] & (tree::HIDDEN | tree::SUNK) != 0;
             let geom = match visual {
                 Visual::Unplaced => continue,
@@ -1540,6 +1552,7 @@ impl Host {
                     size,
                     ..Geom::default()
                 },
+                Visual::Outset(_) => unreachable!("outsets resolve to insets before placement"),
                 Visual::Insets([l, t, r, b]) => {
                     let owner = self.tree.parent(node);
                     let box_ = self.tree.c.geom[owner.index()].size;

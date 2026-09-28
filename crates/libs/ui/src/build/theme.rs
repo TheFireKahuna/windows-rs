@@ -21,7 +21,7 @@ use windows_scene::{
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum HaloStyle {
     Glow(Role),
-    Shadow(Edge),
+    Shadow(Edge, Option<&'static crate::role::ScopedToken<crate::role::Shadow>>),
 }
 
 /// What a sprite is to the surface that owns it.
@@ -83,6 +83,10 @@ pub(crate) enum PaintMask {
         radius: Len,
         width: Len,
     },
+    OuterOutline {
+        radius: Len,
+        width: Len,
+    },
     Shape {
         geom: GeomId,
         stroke: Option<Len>,
@@ -95,7 +99,7 @@ impl PaintMask {
     /// Whether the resolved silhouette depends on the box it is drawn into, which is what
     /// decides whether a solved extent owes it a re-emission.
     const fn box_bound(self) -> bool {
-        matches!(self, Self::Box { .. } | Self::InsetBox { .. } | Self::Outline { .. })
+        matches!(self, Self::Box { .. } | Self::InsetBox { .. } | Self::Outline { .. } | Self::OuterOutline { .. })
     }
 }
 
@@ -496,6 +500,9 @@ impl Host {
                 id
             }
         };
+        if let PaintMask::OuterOutline { width, .. } = mask {
+            self.visual_outset(id, width);
+        }
         let held = self.appearances.get(id.0).copied();
         let paint = Appearance {
             id,
@@ -505,7 +512,10 @@ impl Host {
             strength,
             scope: self.scope_of(node),
             surface: tree::NONE,
-            halo: held.and_then(|held| held.halo),
+            halo: held.and_then(|held| held.halo).or_else(|| {
+                self.appearances.surface(self.surface_row(node))
+                    .and_then(|surface| surface.halo).filter(|_| part == Part::Fill)
+            }),
             cap: f32::NAN,
             scale: self.env.scale(),
             next: held.map_or(NodeId::NONE, |held| held.next),
@@ -861,6 +871,14 @@ impl Host {
             PaintMask::InsetBox { radius, inset } => Mask::Box {
                 radius: corners((radius.dips_at(scope, scale) - inset.dips_at(scope, scale)).max(0.0).min(cap), attached),
             },
+            PaintMask::OuterOutline { radius, width } => {
+                let width = width.dips_at(scope, scale);
+                Mask::Outline {
+                    radius: corners((radius.dips_at(scope, scale) + width).min(cap), None),
+                    width,
+                    open: None,
+                }
+            }
             PaintMask::Outline { radius, width } => Mask::Outline {
                 radius: corners(radius.dips_at(scope, scale).min(cap), attached),
                 width: width.dips_at(scope, scale),
@@ -891,8 +909,8 @@ impl Host {
                 );
                 halo
             }
-            HaloStyle::Shadow(edge) => {
-                let shadow = shadow(paint);
+            HaloStyle::Shadow(edge, token) => {
+                let shadow = token.map_or_else(|| shadow(paint), |token| token.resolve(paint));
                 let offset = match edge {
                     Edge::Left => Vector2 {
                         x: -shadow.offset,
@@ -1024,6 +1042,20 @@ impl<K> Element<'_, K> {
         self.part(Part::Border, PaintSource::Role(role), mask, 1.0)
     }
 
+    /// Draws an outline outside a container without changing its layout or hit rectangle.
+    /// The derived border follows the container's resolved bounds. Ancestor clips apply.
+    ///
+    /// # Panics
+    ///
+    /// This element must be a container, not a painted sprite.
+    pub fn outline_outside(mut self, radius: impl Into<Len>, role: Role, width: impl Into<Len>) -> Self {
+        let node = self.node_id();
+        assert_eq!(self.host().tree.c.flags[node.index()] & tree::SPRITE, 0,
+            "an outer outline requires a container");
+        self.part(Part::Border, PaintSource::Role(role),
+            PaintMask::OuterOutline { radius: radius.into(), width: width.into() }, 1.0)
+    }
+
     /// A gradient over the whole box, rounded as a plate is.
     pub fn washed(self, id: RampId, radius: Metric) -> Self {
         let mask = PaintMask::Box {
@@ -1070,7 +1102,13 @@ impl<K> Element<'_, K> {
 
     /// Casts this element's own occlusion towards `edge`.
     pub fn shadowed(self, edge: Edge) -> Self {
-        self.halo_style(HaloStyle::Shadow(edge))
+        self.halo_style(HaloStyle::Shadow(edge, None))
+    }
+
+    /// Casts a scope-resolved occlusion through the shared alpha-mask and FP16 tint path.
+    pub fn shadowed_with(self, edge: Edge,
+        token: &'static crate::role::ScopedToken<crate::role::Shadow>) -> Self {
+        self.halo_style(HaloStyle::Shadow(edge, Some(token)))
     }
 
     /// Casts light in `role`, which this element need not paint in.
@@ -1185,6 +1223,15 @@ impl Host {
             || self.tree.c.flags[node.index()] & tree::SPRITE == 0
         {
             self.surface_halo(GroupId(node), halo);
+            let mut link = self.tree.c.paints[node.index()];
+            while let Some(mut paint) = self.appearances.get(link).copied() {
+                link = paint.next;
+                if paint.part == Part::Fill && paint.surface == tree::NONE {
+                    paint.halo = Some(halo);
+                    self.appearances.place(paint.id.0, paint);
+                    self.publish_paint(paint, false);
+                }
+            }
             return;
         }
         let Some(paint) = self.appearances.get_mut(node) else {
@@ -1290,6 +1337,86 @@ mod tests {
             Host::flush(&mut patch);
             assert!(patch.ops().is_empty());
         }
+    }
+
+    #[test]
+    fn outer_rims_follow_live_bounds_and_explicit_plates_receive_scoped_shadows() {
+        use windows_scene::Op;
+        assert_eq!(size_of::<super::super::host::Visual>(), 20);
+        static SHADOW: crate::role::ScopedToken<crate::role::Shadow> =
+            crate::role::ScopedToken::new("test shadow", |_| crate::role::Shadow {
+                sigma: 10.0, offset: 6.0, light: Radiance::new(0.0, 0.0, 0.0, 0.3),
+            });
+        let mut patch = crate::build::rig::fixture();
+        let empty = Host::with(|host| host.live_nodes());
+        let width = crate::signal::Cell::new(100.0);
+        let mut nodes = [NodeId::NONE; 2];
+        let (owner, mount) = crate::signal::Owner::scope(|| Ui::mount_root(|ui| {
+            nodes[0] = ui.node(Preset::Layer).width(Len::dip(100.0)).height(Len::dip(40.0))
+                .shadowed_with(Edge::Bottom, &SHADOW)
+                .plate(Len::dip(7.0), Role::Fill(Fill::Surface), 1.0)
+                .id().into();
+            nodes[1] = ui.node(Preset::Layer).width(Len::dip(100.0)).height(Len::dip(40.0))
+                .layout_from(move |l| l.width = Len::dip(width.get()))
+                .plate(Len::dip(7.0), Role::Fill(Fill::Surface), 1.0)
+                .outline_outside(Len::dip(7.0), Role::Stroke(Stroke::Focus), Len::px(1.0))
+                .shadowed_with(Edge::Bottom, &SHADOW)
+                .id().into();
+        }));
+        Host::flush(&mut patch);
+        for node in nodes {
+            Host::with(|host| {
+                let mut link = host.tree.c.paints[node.index()];
+                let mut fills = 0;
+                while let Some(paint) = host.appearances.get(link) {
+                    if paint.part == Part::Fill {
+                        fills += 1;
+                        assert!(patch.ops().iter().any(|op| matches!(op,
+                            Op::Paint { id, halo: Some(Halo { blur, tint, offset }), .. }
+                            if *id == paint.id && *blur == 10.0 && tint.a == 0.3
+                                && *offset == Vector2::new(0.0, 6.0)
+                        )));
+                    } else { assert!(paint.halo.is_none()); }
+                    link = paint.next;
+                }
+                assert_eq!(fills, 1);
+            });
+        }
+        let count = Host::with(|host| host.live_nodes());
+        for (scale, w) in [(1.5, 160.0), (2.0, 80.0), (1.25, 200.0), (1.0, 100.0)] {
+            width.set(w);
+            crate::signal::flush();
+            Host::with(|host| host.set_env(Env::new(96.0 * scale, host.env.output())));
+            patch.clear();
+            Host::flush(&mut patch);
+            Host::with(|host| {
+                let border = host.appearances.get(host.tree.c.paints[nodes[1].index()]).unwrap();
+                assert!(matches!(border.mask, PaintMask::OuterOutline { .. }));
+                let geom = host.geom(border.id.0);
+                assert_eq!(geom.local, Vector2::new(-1.0 / scale, -1.0 / scale));
+                assert!((geom.size.x - w - 2.0 / scale).abs() < 0.001, "rim {geom:?}, owner {:?}, requested {w}", host.geom(nodes[1]));
+                assert!((geom.size.y - 40.0 - 2.0 / scale).abs() < 0.001);
+                assert!(patch.ops().iter().any(|op| matches!(op,
+                    Op::Mask { id, mask: Mask::Outline { width, radius, .. } }
+                    if *id == border.id && *width == 1.0 / scale
+                        && *radius == Corners::all(7.0 + 1.0 / scale)
+                )));
+                assert_eq!(host.live_nodes(), count);
+            });
+            patch.clear(); Host::flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
+        let allocations = crate::counting::allocations();
+        for _ in 0..20 {
+            patch.clear();
+            Host::flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
+        assert_eq!(crate::counting::allocations(), allocations);
+        drop(mount);
+        drop(owner);
+        Host::flush(&mut patch);
+        assert_eq!(Host::with(|host| host.live_nodes()), empty);
     }
 
     #[test]
