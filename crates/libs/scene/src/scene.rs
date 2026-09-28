@@ -1093,6 +1093,16 @@ impl Scene {
         &self.hits
     }
 
+    /// Shares a subtree's target displacement with hit consumers.
+    pub fn install_translation(&mut self, owner: ControlId, state: &crate::Translation) {
+        self.hits.install_translation(owner, state);
+    }
+
+    /// Removes a retired subtree's target displacement.
+    pub fn remove_translation(&mut self, owner: ControlId) {
+        self.hits.remove_translation(owner);
+    }
+
     /// Makes subsequent spring targets land immediately when animation is disabled.
     pub fn set_springs_enabled(&mut self, enabled: bool) {
         self.springs_enabled = enabled;

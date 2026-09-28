@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use windows_core::Result;
 use crate::layout::Rect;
-use windows_scene::{ContactKind, ControlId, HitEntry, HitFlags, HitTable, NO_ENTRY};
+use windows_scene::{ContactKind, ControlId, HitEntry, HitTable, NO_ENTRY};
 use windows_window::{Hwnd, Window};
 
 pub(crate) struct TextInput {
@@ -306,23 +306,18 @@ fn motion(key: u16, ctrl: bool, select: bool) -> Option<Command> {
 /// Returns `entry`'s box in client DIPs, moved by the live scroll shadows of its scrolling
 /// ancestors and, when `clipped`, cut by every clipping ancestor above it.
 fn box_of(hits: &HitTable, entry: &HitEntry, clipped: bool) -> Rect {
-    let scrolled = |e: &HitEntry| {
-        let o = if e.flags.contains(HitFlags::UNSCROLLED) {
-            windows_scene::Point::zero()
-        } else {
-            hits.offset(e.scroll_src)
-        };
-        Rect {
-            x0: e.x0 - o.x,
-            y0: e.y0 - o.y,
-            x1: e.x1 - o.x,
-            y1: e.y1 - o.y,
-        }
+    let offset = if entry.flags.contains(windows_scene::HitFlags::UNSCROLLED) {
+        windows_scene::Point::zero()
+    } else { hits.offset(entry.scroll_src) };
+    let by = hits.translation(entry.id) - offset;
+    let mut box_ = Rect {
+        x0: entry.x0 + by.x, y0: entry.y0 + by.y,
+        x1: entry.x1 + by.x, y1: entry.y1 + by.y,
     };
-    let mut box_ = scrolled(entry);
     let mut parent = if clipped { entry.clip_parent } else { NO_ENTRY };
     while let Some(ancestor) = hits.entries().get(parent as usize) {
-        let clip = scrolled(ancestor);
+        let [x0, y0, x1, y1] = hits.shifted(parent as usize);
+        let clip = Rect { x0, y0, x1, y1 };
         box_ = Rect {
             x0: box_.x0.max(clip.x0),
             y0: box_.y0.max(clip.y0),

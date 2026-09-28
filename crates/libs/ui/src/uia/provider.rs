@@ -852,7 +852,7 @@ impl Root {
         // A region's parts extend the scan rather than forking it, exactly as pointer routing
         // does: the region's entry wins first, then the part inside it.
         let entry = tree.entries()[at as usize];
-        let by = tree.scroll(at);
+        let by = tree.offset(at);
         let inside = Point {
             x: point.x + by.x - entry.box_[0],
             y: point.y + by.y - entry.box_[1],

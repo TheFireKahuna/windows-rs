@@ -128,6 +128,7 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
     if flags & (tree::HIDDEN | tree::SUSPENDED | tree::DERIVED) != 0 {
         return;
     }
+    let translation_start = out.uia.as_ref().map(|uia| uia.entries.len());
     out.hits.unwind(depth);
     let control = walk.tree.c.control[node.index()];
     if let Some(row) = walk.controls.get(control) {
@@ -203,6 +204,14 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
     }
     for child in walk.tree.children(node) {
         self::walk(walk, out, child, depth + 1);
+    }
+    if let (Some(start), Some(uia), Some(state)) = (
+        translation_start, out.uia.as_deref_mut(),
+        walk.controls.get(control).and_then(|row| row.translation.as_ref()),
+    ) {
+        uia.translations.push(windows_scene::TranslationRange {
+            owner: control, start, end: uia.entries.len(), state: state.clone(),
+        });
     }
 }
 

@@ -397,7 +397,7 @@ fn range_from_point(element: &Element, point: &UiaPoint) -> Result<ITextRangePro
     };
     let (origin, scale) = at.tree.window();
     let entry = at.tree.at(at.at).copied().ok_or_else(gone)?;
-    let by = at.tree.scroll(at.at);
+    let by = at.tree.offset(at.at);
     let local = (point.x as f32 - origin.x) / scale - entry.box_[0] + by.x - clusters.origin.x;
     let (found, _) = clusters.hit(local);
     Ok(Range::new(&at.shared, element.id, (found, found)).into())

@@ -766,6 +766,9 @@ impl SceneThread {
             &down.declared.released,
             &mut front,
         )?;
+        self.controls.adopt_translations(
+            &down.translations, &down.declared.released, &mut front,
+        )?;
         self.scrolls.apply_ops(&mut down.scrolls);
         // A restated geometry replaces the map the thumb is bound through, so a container
         // holding an occlusion's extent is bound again from the extended one. Here, because the
@@ -885,6 +888,9 @@ impl SceneThread {
     /// The array is copied only when its epoch moved, so a patch that changed only values
     /// ships no entries; the shadows only when the tracker count did.
     fn to_input(&mut self) {
+        let shifted = self.controls.take_translation_changed();
+        self.down.translation_changed |= shifted;
+        self.down.text_geometry_changed |= shifted && self.text_focused.is_some();
         let epoch = self.scene.hits().epoch();
         if epoch != self.sent.0 {
             self.down.hits.copy_from(self.scene.hits());

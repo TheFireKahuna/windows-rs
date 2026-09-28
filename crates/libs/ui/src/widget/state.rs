@@ -284,6 +284,8 @@ pub struct Controls {
     superseded_at: u64,
     /// The scopes whose reveal targets are up, deduplicated in fixed storage.
     revealed: [ControlId; 3],
+    translations: Vec<(ControlId, NodeId, windows_scene::Translation)>,
+    translation_changed: bool,
     /// The window's one focus ring, sprung between controls. Focus is singular, so the ring is per
     /// window rather than per control, and the glide between two controls is a compositor
     /// animation rather than a behaviour this crate runs.
@@ -370,6 +372,58 @@ impl Controls {
         self.reveals(front)
     }
 
+    /// Installs shared target geometry after the scene applies the structural patch.
+    pub fn adopt_translations(
+        &mut self,
+        rows: &[(ControlId, NodeId, windows_scene::Translation)],
+        released: &[ControlId],
+        front: &mut Front<'_>,
+    ) -> Result<()> {
+        for &id in released {
+            front.scene.remove_translation(id);
+        }
+        for (id, node, state) in rows {
+            if let Some(row) = self.translations.iter_mut().find(|r| r.0 == *id) {
+                *row = (*id, *node, state.clone());
+            } else {
+                self.translations.push((*id, *node, state.clone()));
+            }
+        }
+        for (id, _, state) in &self.translations {
+            front.scene.install_translation(*id, state);
+        }
+        self.translate(front)
+    }
+
+    pub fn take_translation_changed(&mut self) -> bool {
+        core::mem::take(&mut self.translation_changed)
+    }
+
+    fn translate(&mut self, front: &mut Front<'_>) -> Result<()> {
+        let mut changed = false;
+        for (id, node, state) in &self.translations {
+            let active = [self.hovered, self.pressed, self.focused].into_iter().any(|source| {
+                !source.is_none() && front.scene.hits().entry(source).is_some()
+                    && front.scene.hits().in_translation(*id, source)
+            });
+            if state.set_active(active) {
+                let to = state.get();
+                let by = state.target();
+                for (prop, value, extent) in [
+                    (Prop::TranslationX, to.x, by.x), (Prop::TranslationY, to.y, by.y),
+                ] {
+                    if extent != 0.0 {
+                        front.spring(*node, prop, Value::Scalar(value))?;
+                    }
+                }
+                changed = true;
+            }
+        }
+        self.translation_changed |= changed;
+        if changed { self.move_ring(front)?; }
+        Ok(())
+    }
+
     /// Binds trim and opacity followers to the thumb's compositor offset.
     fn bind_followers(&self, row: ValueRow, front: &mut Front<'_>) -> Result<()> {
         let Some((source, vertical)) = row.parts.iter().find_map(|(node, part)| match part {
@@ -417,6 +471,11 @@ impl Controls {
 
     /// Forgets a control. Anything still pointing at it becomes a miss.
     pub fn release(&mut self, id: ControlId) {
+        self.translations.retain(|(owner, _, state)| {
+            if *owner != id { return true; }
+            state.set_active(false);
+            false
+        });
         self.chrome.take(id);
         self.values.take(id);
         for slot in [
@@ -921,7 +980,7 @@ impl Controls {
             }
         }
         self.revealed = next;
-        Ok(())
+        self.translate(front)
     }
 
     /// Springs the window's one ring onto the focused control, or takes it down.
@@ -938,9 +997,10 @@ impl Controls {
         } else {
             front.scene.hits().offset(entry.scroll_src)
         };
+        let shift = front.scene.hits().translation(self.focused);
         let at = Vector2 {
-            x: entry.x0 - scroll.x - FOCUS_OUTSET,
-            y: entry.y0 - scroll.y - FOCUS_OUTSET,
+            x: entry.x0 - scroll.x + shift.x - FOCUS_OUTSET,
+            y: entry.y0 - scroll.y + shift.y - FOCUS_OUTSET,
         };
         let size = Vector2 {
             x: entry.x1 - entry.x0 + 2.0 * FOCUS_OUTSET,

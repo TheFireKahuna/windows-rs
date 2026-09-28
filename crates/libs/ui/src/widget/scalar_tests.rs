@@ -149,6 +149,12 @@ impl Rig {
         controls.adopt(chrome, values, released, &mut front)
     }
 
+    pub fn adopt_translations(&mut self, rows: &[(ControlId, NodeId, windows_scene::Translation)],
+        released: &[ControlId]) -> Result<()> {
+        let mut front = Front { scene: &mut self.scene, back: &self.back, env: self.env };
+        self.controls.adopt_translations(rows, released, &mut front)
+    }
+
     /// Applies automation actions against this rig's own scene.
     pub fn automation(&mut self, actions: &[Action], out: &mut Vec<Intent>) -> Result<()> {
         let Self {

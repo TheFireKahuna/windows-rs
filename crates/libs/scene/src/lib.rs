@@ -7,6 +7,7 @@ mod sink;
 
 // ── the query · no composition object, two threads ──────────────────────────────────
 mod hit;
+mod translation;
 
 // ── the scene half · `!Send` · owns every composition object ────────────────────────
 mod arena;
@@ -20,6 +21,7 @@ mod scene;
 /// one of which is covered.
 pub use arena::{Forest, Links, NO_LINK, children, link, unlink};
 pub use hit::{HitTable, scan};
+pub use translation::{Translation, TranslationRange};
 pub use hit_entry::{
     ContactKind, Hit, HitDecl, HitEntry, HitFlags, NO_ENTRY, TOUCH_TARGET_DIPS, default_inflation,
     pack_offset, unpack_offset,

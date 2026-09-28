@@ -76,6 +76,7 @@ pub struct Uia {
     /// reads where the content is rather than where it was when the front thread last ticked.
     trackers: Vec<(NodeId, Arc<AtomicU64>)>,
     positions: Vec<(NodeId, Vector2)>,
+    translations: Vec<(ControlId, Vector2)>,
 }
 
 impl Default for Uia {
@@ -96,6 +97,7 @@ impl Uia {
             readings: Vec::new(),
             trackers: Vec::new(),
             positions: Vec::new(),
+            translations: Vec::new(),
         }
     }
 
@@ -414,6 +416,7 @@ impl Uia {
 
         self.shared.tree.write(|held| *held = Arc::clone(&tree));
         tree.positions(&mut self.positions);
+        tree.translation_positions(&mut self.translations);
         self.current = tree;
     }
 
@@ -484,6 +487,25 @@ impl Uia {
                 .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
         };
         Some(span)
+    }
+
+    /// Announces a discrete target displacement without sampling compositor frames.
+    pub(crate) fn translation_changed(&mut self) {
+        if !self.current.translations_changed(&self.translations) { return; }
+        for (at, entry) in self.current.entries().iter().enumerate() {
+            let before = self.current.bounds_with(at as u16, &[], &self.translations);
+            let after = self.current.bounds(at as u16);
+            if before != after {
+                self.pending.push(Raise::Property(entry.id,
+                    Property::Native(UIA_BoundingRectanglePropertyId), Val::Rect(before)));
+                let was_off = before[2] == 0.0 || before[3] == 0.0;
+                if was_off != (after[2] == 0.0 || after[3] == 0.0) {
+                    self.pending.push(Raise::Property(entry.id,
+                        Property::Native(UIA_IsOffscreenPropertyId), Val::Bool(was_off)));
+                }
+            }
+        }
+        self.current.translation_positions(&mut self.translations);
     }
 
     /// Announces tracker movement after an existing compositor notification.

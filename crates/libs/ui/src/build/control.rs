@@ -62,6 +62,7 @@ pub(crate) struct ControlRow {
     /// Where a gesture publishes its in-flight value for as long as it owns one.
     pub live: Option<Cell<Option<f64>>>,
     pub hovered: Option<Cell<bool>>,
+    pub translation: Option<windows_scene::Translation>,
     pub validation: Option<&'static str>,
     /// The number the application last published, in its own units, or `None` where the
     /// application publishes none and the value is written elsewhere — a presented read-out's
@@ -99,6 +100,7 @@ impl ControlRow {
             text: None,
             live: None,
             hovered: None,
+            translation: None,
             validation: None,
             number: None,
             overlay: None,
@@ -476,6 +478,32 @@ impl<K> Element<'_, K> {
             row.front.scope = id;
         }
         self.hit(HitFlags::GESTURE, UiaRole::None)
+    }
+
+    /// Translates this subtree while its interaction scope is hovered, pressed or focused.
+    /// Declare this before its children. The displacement is in DIPs; both components
+    /// must be finite. Hit, focus and automation geometry use the target displacement.
+    /// The scope retains its original hover footprint while active.
+    ///
+    /// # Panics
+    ///
+    /// The node must not already declare translation or bind either translation channel.
+    pub fn translate_on_interaction(self, by: windows_numerics::Vector2) -> Self {
+        let mut this = self.interaction_scope();
+        let id = this.control_id();
+        let node = this.node_id();
+        let mask = (1u64 << Prop::TranslationX as u32) | (1u64 << Prop::TranslationY as u32);
+        assert_eq!(this.host().tree.c.channels[node.index()] & mask, 0,
+            "interaction translation requires unclaimed channels");
+        let state = windows_scene::Translation::new(by);
+        let row = this.host().control_mut(id).expect("the scope owns a control");
+        assert!(row.translation.is_none(), "one translation per scope");
+        row.translation = Some(state);
+        for prop in [Prop::TranslationX, Prop::TranslationY] {
+            this.host().write_channel(node, prop, Value::Scalar(0.0));
+        }
+        this.host().tree.c.driven[node.index()] |= mask;
+        this.hit(HitFlags::INTERACTIVE, UiaRole::None)
     }
 
     /// Reveals this element while its enclosing interaction scope is active.

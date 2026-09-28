@@ -1219,3 +1219,34 @@ fn presented_readings_notify_only_subscribers_and_coalesce_until_sync() {
     updates.changed(1); uia.sync_regions(); uia.take_pending_for_test(&mut raised);
     assert!(raised.is_empty());
 }
+
+#[test]
+fn translation_targets_update_existing_providers_and_announce_geometry_once() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let group = screen.add(NONE, (0.0, 10.0, 100.0, 60.0), UiaRole::Group, "card");
+    let child = screen.add(group, (10.0, 20.0, 80.0, 50.0), UiaRole::Button, "preview");
+    let state = windows_scene::Translation::new(Vector2::new(0.0, -3.0));
+    screen.snapshot.translations.push(windows_scene::TranslationRange {
+        owner: screen.control(group), start: 0, end: 2, state: state.clone(),
+    });
+    screen.publish(&mut uia);
+    let held = uia.current.clone();
+    let before = held.bounds(child);
+    let mut events = Vec::new();
+    uia.take_pending_for_test(&mut events); events.clear();
+    state.set_active(true);
+    assert_eq!(held.shifted(child), [10.0, 17.0, 80.0, 47.0]);
+    assert_eq!(held.hit(Point::new(20.0, 18.0)), Some(child));
+    uia.translation_changed();
+    uia.take_pending_for_test(&mut events);
+    assert!(events.contains(&Raise::Property(screen.control(child),
+        Property::Native(UIA_BoundingRectanglePropertyId), Val::Rect(before))));
+    assert!(!events.iter().any(|e| matches!(e, Raise::Structure(..))));
+    events.clear();
+    uia.translation_changed();
+    uia.take_pending_for_test(&mut events);
+    assert!(events.is_empty());
+    state.set_active(false);
+    assert_eq!(held.bounds(child), before);
+}

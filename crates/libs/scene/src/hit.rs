@@ -56,6 +56,7 @@ struct Memo {
 #[derive(Default)]
 pub struct HitTable {
     entries: Vec<HitEntry>,
+    translations: Vec<crate::TranslationRange>,
     /// Control id to entry index, ordered by id: the app ships it built, so a rebuild copies
     /// and never sorts.
     index: Vec<(ControlId, u32)>,
@@ -103,6 +104,12 @@ impl HitTable {
         );
         self.entries.clear();
         self.entries.extend_from_slice(entries);
+        self.translations.retain_mut(|row| {
+            let Some(start) = entries.iter().position(|e| e.id == row.owner) else { return false };
+            row.start = start;
+            row.end = subtree_end(entries, start);
+            true
+        });
         self.index.clear();
         self.index.extend_from_slice(index);
         self.bump();
@@ -116,6 +123,7 @@ impl HitTable {
     pub fn copy_from(&mut self, other: &Self) {
         self.entries.clear();
         self.entries.extend_from_slice(&other.entries);
+        self.translations.clone_from(&other.translations);
         self.index.clear();
         self.index.extend_from_slice(&other.index);
         self.epoch.set(other.epoch.get());
@@ -135,24 +143,34 @@ impl HitTable {
     #[must_use]
     pub fn visible(&self, id: ControlId) -> bool {
         let Some(entry) = self.entry(id) else { return false; };
-        let resolved = |entry: &HitEntry| {
-            let offset = if entry.flags.contains(HitFlags::UNSCROLLED) {
-                Vector2::zero()
-            } else { self.offset(entry.scroll_src) };
-            [entry.x0-offset.x, entry.y0-offset.y, entry.x1-offset.x, entry.y1-offset.y]
-        };
-        let mut rect = resolved(entry);
+        let Ok(index) = self.index.binary_search_by_key(&id, |&(key, _)| key) else { return false; };
+        let mut rect = self.shifted(self.index[index].1 as usize);
         let mut at = entry.clip_parent;
         let mut remaining = self.entries.len();
         while at != NO_ENTRY {
             if remaining == 0 { return false; }
             let Some(parent) = self.entries.get(at as usize) else { return false; };
-            let clip = resolved(parent);
+            let clip = self.shifted(at as usize);
             rect = [rect[0].max(clip[0]), rect[1].max(clip[1]), rect[2].min(clip[2]), rect[3].min(clip[3])];
             at = parent.clip_parent;
             remaining -= 1;
         }
         rect[2] > rect[0] && rect[3] > rect[1]
+    }
+
+    /// Returns an entry's client-space rectangle, including unnamed clipping entries.
+    pub fn shifted(&self, index: usize) -> [f32; 4] {
+        let Some(e) = self.entries.get(index) else { return [0.0; 4]; };
+        let scroll = if e.flags.contains(HitFlags::UNSCROLLED) { Vector2::zero() }
+            else { self.offset(e.scroll_src) };
+        let by = displacement(&self.translations, index) - scroll;
+        [e.x0 + by.x, e.y0 + by.y, e.x1 + by.x, e.y1 + by.y]
+    }
+
+    /// Reports whether a control belongs to a translated subtree.
+    pub fn in_translation(&self, owner: ControlId, id: ControlId) -> bool {
+        let Ok(at) = self.index.binary_search_by_key(&id, |&(key, _)| key) else { return false; };
+        self.translations.iter().any(|r| r.owner == owner && r.contains(self.index[at].1 as usize))
     }
 
     /// Records a viewport's live offset and drops the memo.
@@ -210,6 +228,34 @@ impl HitTable {
         }
     }
 
+    /// Registers the target displacement of an owner and its hit descendants.
+    pub fn install_translation(&mut self, owner: ControlId, state: &crate::Translation) {
+        let Some(start) = self.entries.iter().position(|e| e.id == owner) else { return };
+        if let Some(row) = self.translations.iter_mut().find(|r| r.owner == owner) {
+            if row.state.same(state) { return; }
+            row.state = state.clone();
+        } else {
+            self.translations.push(crate::TranslationRange {
+                owner, start, end: subtree_end(&self.entries, start), state: state.clone(),
+            });
+        }
+        self.bump();
+    }
+
+    /// Removes a retired owner's displacement.
+    pub fn remove_translation(&mut self, owner: ControlId) {
+        let before = self.translations.len();
+        self.translations.retain(|r| r.owner != owner);
+        if before != self.translations.len() { self.bump(); }
+    }
+
+    /// Returns the sum of target displacements containing a control.
+    pub fn translation(&self, id: ControlId) -> Vector2 {
+        let Some(at) = self.index.binary_search_by_key(&id, |&(key, _)| key).ok()
+            .map(|at| self.index[at].1 as usize) else { return Vector2::zero() };
+        displacement(&self.translations, at)
+    }
+
     /// What is under `p`, recorded as the next memo.
     ///
     /// The memo bounds the scan and does not short-circuit it: a pointer still inside the
@@ -218,6 +264,9 @@ impl HitTable {
     /// win, since the scan is back-to-front and takes the first hit, so it supplies a floor
     /// and the skipped tail holds most of the entries.
     pub fn hit(&self, p: Point, contact: ContactKind) -> Option<Hit> {
+        if !self.translations.is_empty() {
+            return scan_translated(&self.entries, p, contact, 0, &|viewport| self.offset(viewport), &self.translations);
+        }
         let floor = match self.memo.get() {
             Some(memo)
                 if memo.epoch == self.epoch.get()
@@ -282,9 +331,26 @@ pub fn scan(
     floor: u32,
     offset: &dyn Fn(NodeId) -> Vector2,
 ) -> Option<Hit> {
+    scan_translated(entries, p, contact, floor, offset, &[])
+}
+
+fn subtree_end(entries: &[HitEntry], start: usize) -> usize {
+    (start + 1..entries.len()).find(|&i| entries[i].parent == NO_ENTRY || (entries[i].parent as usize) < start)
+        .unwrap_or(entries.len())
+}
+
+fn displacement(rows: &[crate::TranslationRange], at: usize) -> Vector2 {
+    rows.iter().filter(|row| row.contains(at)).fold(Vector2::zero(), |v, row| v + row.state.get())
+}
+
+fn scan_translated(
+    entries: &[HitEntry], p: Point, contact: ContactKind, floor: u32,
+    offset: &dyn Fn(NodeId) -> Vector2, translations: &[crate::TranslationRange],
+) -> Option<Hit> {
     // Layout places content unscrolled and the compositor applies the offset, so a query
     // moves the point rather than the rects.
-    let resolve = |entry: &HitEntry| -> Point {
+    let resolve = |entry: &HitEntry, at: usize| -> Point {
+        let p = p - displacement(translations, at);
         if entry.scroll_src.is_none() || entry.flags.contains(HitFlags::UNSCROLLED) {
             p
         } else {
@@ -305,7 +371,7 @@ pub fn scan(
             let Some(clip) = entries.get(at as usize) else {
                 return false;
             };
-            if !clip.contains(resolve(clip), 0.0) {
+            if !clip.contains(resolve(clip, at as usize), 0.0) {
                 return true;
             }
             at = clip.clip_parent;
@@ -327,13 +393,18 @@ pub fn scan(
         {
             continue;
         }
-        let q = resolve(entry);
+        let q = resolve(entry, index);
+        let own = translations.iter().find(|r| r.owner == entry.id).map_or(Vector2::zero(), |r| r.state.get());
+        let contains = |inflate: f32| {
+            q.x >= entry.x0 - own.x.max(0.0) - inflate && q.x <= entry.x1 - own.x.min(0.0) + inflate
+                && q.y >= entry.y0 - own.y.max(0.0) - inflate && q.y <= entry.y1 - own.y.min(0.0) + inflate
+        };
         let inflate = if contact.inflates() && !entry.flags.contains(HitFlags::NO_INFLATE) {
             entry.touch_inflate
         } else {
             0.0
         };
-        if !entry.contains(q, inflate) || clipped_out(entry.clip_parent) {
+        if !contains(inflate) || clipped_out(entry.clip_parent) {
             continue;
         }
         let hit = Hit {
@@ -349,7 +420,7 @@ pub fn scan(
         // centre first, so two neighbours whose inflated boxes overlap cannot both claim a
         // point. An exact tie keeps the candidate found first, which is the topmost, so the
         // answer is stable frame to frame.
-        if entry.contains(q, 0.0) {
+        if contains(0.0) {
             return Some(hit);
         }
         let distance = entry.centre_distance_sq(q);
@@ -399,6 +470,63 @@ mod tests {
         let mut table = HitTable::default();
         table.replace(entries, &index(entries));
         table
+    }
+
+    #[test]
+    fn translated_hits_share_live_targets_and_keep_the_scope_edge_stable() {
+        let owner = entry(1, (10.0, 10.0, 110.0, 110.0), HitFlags::INTERACTIVE | HitFlags::CLIP);
+        let mut child = entry(2, (20.0, 10.0, 100.0, 100.0), HitFlags::INTERACTIVE);
+        child.parent = 0;
+        child.clip_parent = 0;
+        let mut hits = table(&[owner, child]);
+        let shift = crate::Translation::new(at(0.0, -3.0));
+        hits.install_translation(owner.id, &shift);
+        let mut copy = HitTable::default();
+        copy.copy_from(&hits);
+        let epoch = hits.epoch();
+        assert_eq!(copy.hit(at(30.0, 8.0), ContactKind::Mouse), None);
+        assert!(shift.set_active(true));
+        assert!(!shift.set_active(true));
+        assert_eq!(copy.hit(at(30.0, 8.0), ContactKind::Mouse).unwrap().id, child.id);
+        assert_eq!(copy.hit(at(30.0, 8.0), ContactKind::Mouse).unwrap().local, at(10.0, 1.0));
+        assert_eq!(copy.hit(at(30.0, 109.0), ContactKind::Mouse).unwrap().id, owner.id);
+        assert_eq!(hits.epoch(), epoch, "an interaction edge does not republish hits");
+        shift.set_active(false);
+        assert_eq!(copy.hit(at(30.0, 8.0), ContactKind::Mouse), None);
+        hits.replace(&[child], &index(&[child]));
+        assert!(hits.translations.is_empty());
+        assert_eq!(hits.translation(child.id), Vector2::zero());
+    }
+
+    #[test]
+    fn nested_translation_resolves_unnamed_clips_and_scroll_together() {
+        let mut owner = entry(1, (0.0, 0.0, 100.0, 100.0), HitFlags::INTERACTIVE);
+        owner.scroll_src = NodeId::raw(3, 1);
+        let mut clip = entry(2, (10.0, 10.0, 50.0, 50.0), HitFlags::CLIP);
+        clip.id = ControlId::NONE;
+        clip.parent = 0;
+        clip.scroll_src = owner.scroll_src;
+        let mut child = entry(3, (15.0, 15.0, 45.0, 45.0), HitFlags::INTERACTIVE);
+        child.parent = 1;
+        child.clip_parent = 1;
+        child.scroll_src = owner.scroll_src;
+        let rows = [owner, clip, child];
+        let mut hits = table(&rows);
+        let outer = crate::Translation::new(at(0.0, -3.0));
+        let inner = crate::Translation::new(at(2.0, 0.0));
+        hits.install_translation(owner.id, &outer);
+        hits.install_translation(child.id, &inner);
+        hits.set_scroll(owner.scroll_src, at(0.0, 5.0));
+        outer.set_active(true);
+        inner.set_active(true);
+        assert_eq!(hits.shifted(1), [10.0, 2.0, 50.0, 42.0]);
+        assert_eq!(hits.translation(child.id), at(2.0, -3.0));
+        assert!(hits.in_translation(owner.id, child.id));
+        assert!(hits.visible(child.id));
+        assert_eq!(hits.hit(at(18.0, 8.0), ContactKind::Mouse).unwrap().local, at(1.0, 1.0));
+        assert_ne!(hits.hit(at(18.0, 44.0), ContactKind::Mouse).map(|h| h.id), Some(child.id));
+        hits.remove_translation(child.id);
+        assert_eq!(hits.translation(child.id), at(0.0, -3.0));
     }
 
     #[test]

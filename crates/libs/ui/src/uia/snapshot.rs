@@ -253,6 +253,7 @@ pub struct Snapshot {
     /// The scroll containers the rows resolve through, deduplicated, in the order
     /// [`Entry::scroll`] indexes them.
     pub scrolls: Vec<ScrollView>,
+    pub translations: Vec<windows_scene::TranslationRange>,
     /// The per-entry initial model state, parallel to [`Snapshot::entries`].
     pub state: Vec<State>,
 }
@@ -293,6 +294,7 @@ impl Snapshot {
         self.fields.clear();
         self.text_geometry.clear();
         self.scrolls.clear();
+        self.translations.clear();
         self.state.clear();
     }
 }
@@ -336,6 +338,7 @@ pub struct Tree {
     /// the last contact ended. A container whose tracker has not arrived holds a word of its
     /// own, which reads zero.
     scrolls: Box<[(ScrollView, Arc<AtomicU64>)]>,
+    translations: Box<[windows_scene::TranslationRange]>,
     /// The focused control as a packed generational id. Focus is singular, so it is one word,
     /// and an id rather than an index because an index is only meaningful until the next
     /// republish.
@@ -374,6 +377,7 @@ impl Tree {
             live: Box::default(),
             state: Box::default(),
             scrolls: Box::default(),
+            translations: Box::default(),
             focus: AtomicU64::new(u64::MAX),
             origin: AtomicU64::new(0),
             scale: AtomicU32::new(1.0f32.to_bits()),
@@ -426,6 +430,7 @@ impl Tree {
             state: (0..entries.len())
                 .map(|at| AtomicU32::new(snapshot.state.get(at).copied().unwrap_or_default().0))
                 .collect(),
+            translations: snapshot.translations.clone().into_boxed_slice(),
             entries: entries.into_boxed_slice(),
             pool: snapshot.blob.clone().into_boxed_slice(),
             by_id,
@@ -680,7 +685,7 @@ impl Tree {
     /// Layout places content unscrolled and the compositor applies the offset, so a query
     /// moves the point rather than the rects.
     fn resolve(&self, p: Point, at: u16) -> Point {
-        let by = self.scroll(at);
+        let by = self.offset(at);
         Point {
             x: p.x + by.x,
             y: p.y + by.y,
@@ -706,7 +711,7 @@ impl Tree {
         let Some(entry) = self.at(at) else {
             return [0.0; 4];
         };
-        let by = self.scroll(at);
+        let by = self.offset(at);
         [
             entry.box_[0] - by.x,
             entry.box_[1] - by.y,
@@ -741,6 +746,11 @@ impl Tree {
 
     /// Resolves bounds through supplied scroll positions, falling back to the live trackers.
     pub fn bounds_at(&self, at: u16, positions: &[(NodeId, Vector2)]) -> [f64; 4] {
+        self.bounds_with(at, positions, &[])
+    }
+
+    pub fn bounds_with(&self, at: u16, positions: &[(NodeId, Vector2)],
+        translations: &[(ControlId, Vector2)]) -> [f64; 4] {
         let shifted = |at| {
             let Some(entry) = self.at(at) else {
                 return [0.0; 4];
@@ -754,7 +764,7 @@ impl Tree {
                         .find(|(node, _)| *node == view.node)
                         .map(|(_, by)| *by)
                 })
-                .unwrap_or_else(|| self.scroll(at));
+                .unwrap_or_else(|| self.scroll(at)) - self.translation(at, translations);
             [
                 entry.box_[0] - by.x,
                 entry.box_[1] - by.y,
@@ -785,6 +795,30 @@ impl Tree {
             f64::from((b[2] - b[0]) * scale),
             f64::from((b[3] - b[1]) * scale),
         ]
+    }
+
+    /// Returns the layout-space offset after scrolling and target translation.
+    pub fn offset(&self, at: u16) -> Vector2 {
+        self.scroll(at) - self.translation(at, &[])
+    }
+
+    fn translation(&self, at: u16, saved: &[(ControlId, Vector2)]) -> Vector2 {
+        self.translations.iter().filter(|r| r.contains(at as usize)).fold(
+            Vector2::zero(), |v, r| v + saved.iter().find(|(id, _)| *id == r.owner)
+                .map_or_else(|| r.state.get(), |(_, by)| *by),
+        )
+    }
+
+    pub fn translations_changed(&self, saved: &[(ControlId, Vector2)]) -> bool {
+        self.translations.len() != saved.len() || self.translations.iter().any(|r| {
+            saved.iter().find(|(id, _)| *id == r.owner)
+                .is_none_or(|(_, by)| *by != r.state.get())
+        })
+    }
+
+    pub fn translation_positions(&self, out: &mut Vec<(ControlId, Vector2)>) {
+        out.clear();
+        out.extend(self.translations.iter().map(|r| (r.owner, r.state.get())));
     }
 
     pub fn positions_changed(&self, positions: &[(NodeId, Vector2)]) -> bool {

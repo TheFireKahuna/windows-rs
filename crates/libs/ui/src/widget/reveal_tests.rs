@@ -224,3 +224,51 @@ fn native_semantic_hover_reports_scope_edges_and_ignores_child_crossings() -> Re
     );
     Ok(())
 }
+
+#[test]
+fn native_translation_keeps_child_crossings_quiet_and_retires_shared_geometry() -> Result<()> {
+    let mut rig = Rig::new("interaction translation")?;
+    let node = rig.node()?;
+    let (scope, a, b) = (rig.ids.mint(), rig.ids.mint(), rig.ids.mint());
+    let mut first = entry(a, 10.0, 10.0, 40.0, 40.0);
+    first.parent = 0;
+    let mut second = entry(b, 50.0, 10.0, 90.0, 40.0);
+    second.parent = 0;
+    rig.publish_hits(&[entry(scope, 0.0, 0.0, 100.0, 50.0), first, second])?;
+    rig.adopt(&[(scope, ChromeRow::default()), (a, ChromeRow::default()),
+        (b, ChromeRow::default())], &[], &[])?;
+    let state = windows_scene::Translation::new(Vector2::new(0.0, -3.0));
+    rig.adopt_translations(&[(scope, node, state.clone())], &[])?;
+    let mut out = Vec::with_capacity(8);
+    let before = rig.animations();
+    rig.tick(&[hover(ControlId::NONE, a)], &mut out)?;
+    assert_eq!(state.get().y, -3.0);
+    assert!(rig.controls.take_translation_changed());
+    assert_eq!(rig.animations(), before + 1);
+    rig.tick(&[hover(a, b)], &mut out)?;
+    assert_eq!(rig.animations(), before + 1);
+    assert!(!rig.controls.take_translation_changed());
+    rig.tick(&[Report::FocusChanged { from: None, to: Some(a) }, hover(b, ControlId::NONE)], &mut out)?;
+    assert_eq!(state.get().y, -3.0);
+    rig.tick(&[Report::FocusChanged { from: Some(a), to: None }], &mut out)?;
+    assert_eq!(state.get(), Vector2::zero());
+    for _ in 0..2 {
+        rig.tick(&[hover(ControlId::NONE, a), hover(a, ControlId::NONE)], &mut out)?;
+    }
+    let allocations = crate::counting::allocations();
+    for _ in 0..100 {
+        rig.tick(&[hover(ControlId::NONE, a)], &mut out)?;
+        rig.tick(&[hover(a, ControlId::NONE)], &mut out)?;
+    }
+    assert_eq!(crate::counting::allocations(), allocations);
+    assert!(out.is_empty());
+    let settled = rig.animations();
+    rig.tick(&[], &mut out)?;
+    assert_eq!(rig.animations(), settled);
+    rig.tick(&[hover(ControlId::NONE, a)], &mut out)?;
+    rig.adopt(&[], &[], &[scope])?;
+    rig.adopt_translations(&[], &[scope])?;
+    assert_eq!(state.get(), Vector2::zero());
+    assert!(rig.controls.translations.is_empty());
+    Ok(())
+}

@@ -217,6 +217,7 @@ pub fn pivot_of(hits: &HitTable, target: ControlId, decl: GestureDecl) -> Option
     } else {
         hits.offset(entry.scroll_src)
     };
+    let offset = offset - hits.translation(target);
     Some(Pivot {
         radius: (entry.x1 - entry.x0).min(entry.y1 - entry.y0) * 0.5,
         center: Point {

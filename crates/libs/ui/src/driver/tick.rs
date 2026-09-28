@@ -307,6 +307,9 @@ impl Tick {
         if down.scroll_changed {
             self.from_pump.uia.borrow_mut().scroll_changed();
         }
+        if down.translation_changed {
+            self.from_pump.uia.borrow_mut().translation_changed();
+        }
         if down.text_geometry_changed {
             self.from_pump.text.tsf.layout_changed();
         }

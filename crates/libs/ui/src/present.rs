@@ -725,9 +725,13 @@ impl Pick {
 /// point resolved against a missing box would land at the window's origin rather than nowhere.
 fn local(hits: &HitTable, id: ControlId, at: Vector2) -> Option<Vector2> {
     let entry = hits.entry(id)?;
+    let scroll = if entry.flags.contains(windows_scene::HitFlags::UNSCROLLED) {
+        Vector2::zero()
+    } else { hits.offset(entry.scroll_src) };
+    let by = hits.translation(id) - scroll;
     Some(Vector2 {
-        x: at.x - entry.x0,
-        y: at.y - entry.y0,
+        x: at.x - entry.x0 - by.x,
+        y: at.y - entry.y0 - by.y,
     })
 }
 

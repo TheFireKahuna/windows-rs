@@ -1458,3 +1458,32 @@ fn conditional_slide_releases_input_and_retires_during_entry() {
         Host::with(|h| h.complete_overlay_entry(id));
     }
 }
+
+#[test]
+fn translated_scope_without_uia_role_publishes_one_shared_descendant_range() {
+    use crate::seam::Row;
+    let mut rig = Rig::new();
+    rig.mount(|ui| {
+        ui.node(Preset::Stack).translate_on_interaction(Vector2::new(0.0, -3.0))
+            .children(|ui| { button(ui, "Preview").on_click(|| {}); });
+        button(ui, "Outside").on_click(|| {});
+    });
+    let mut snapshot = crate::uia::Snapshot::default();
+    let mut down = crate::seam::Down::default();
+    Host::with(|host| { host.uia_entries(&mut snapshot); host.fill(&mut down); });
+    assert_eq!(down.translations.len(), 1);
+    assert_eq!(snapshot.translations.len(), 1);
+    let row = &snapshot.translations[0];
+    assert!(row.state.same(&down.translations[0].2));
+    assert!(row.end > row.start);
+    assert!(row.end < snapshot.entries.len(), "the sibling is outside the subtree");
+    let tree = crate::uia::Tree::adopt(&snapshot, &[]);
+    let before = tree.shifted(row.start as u16);
+    let outside = tree.shifted(row.end as u16);
+    row.state.set_active(true);
+    assert_eq!(tree.shifted(row.start as u16)[1], before[1] - 3.0);
+    assert_eq!(tree.shifted(row.end as u16), outside);
+    down.clear();
+    Host::with(|host| host.fill(&mut down));
+    assert!(down.is_empty());
+}

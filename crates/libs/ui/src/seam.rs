@@ -477,6 +477,7 @@ row! {
     Down,
     empty: |b| b.patch.is_empty()
         && b.chrome.is_empty()
+        && b.translations.is_empty()
         && b.values.is_empty()
         && b.regions.is_empty()
         && b.scrolls.is_empty()
@@ -490,6 +491,7 @@ row! {
         patch: SinkPatch,
         /// Read by `Controls::adopt` on the scene thread.
         chrome: Vec<(ControlId, ChromeRow)>,
+        translations: Vec<(ControlId, NodeId, windows_scene::Translation)>,
         /// Read by `Controls::adopt` on the scene thread.
         values: Vec<(ControlId, ValueRow)>,
         /// Read by `present::apply` here, and relayed as pick rows to `Picks::sync`.
@@ -597,6 +599,7 @@ row! {
         && b.fields.is_empty()
         && b.scope.is_none()
         && !b.scroll_changed
+        && !b.translation_changed
         && !b.text_geometry_changed
         && b.declared.is_empty()
         && !b.tallies,
@@ -630,6 +633,7 @@ row! {
         /// hear about even though no box was re-solved.
         text_geometry_changed: bool,
         scroll_changed: bool,
+        translation_changed: bool,
         /// Whether the tallies below moved since the last batch, so the observer reads counts
         /// current to the last apply rather than to the last structural change.
         tallies: bool,

@@ -1952,6 +1952,9 @@ impl Host {
         for id in self.chrome_touched.drain(..) {
             if let Some(row) = self.controls.get(id) {
                 down.chrome.push((id, row.front));
+                if let Some(state) = &row.translation {
+                    down.translations.push((id, row.node, state.clone()));
+                }
             }
         }
         down.values.append(&mut self.values);
@@ -1980,6 +1983,7 @@ impl Host {
             let controls = &self.controls;
             let live = |id: ControlId| controls.get(id).is_some();
             down.chrome.retain(|&(id, _)| live(id));
+            down.translations.retain(|(id, _, _)| live(*id));
             down.values.retain(|&(id, _)| live(id));
             down.declared.gestures.retain(|&(id, _)| live(id));
             down.declared
