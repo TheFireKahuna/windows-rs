@@ -14,6 +14,57 @@ fn hover(from: ControlId, to: ControlId) -> Report {
 }
 
 #[test]
+fn native_focus_border_survives_pointer_press_and_releases_without_idle_work() -> Result<()> {
+    let mut rig = Rig::new("focus border")?;
+    let (a, b) = (rig.ids.mint(), rig.ids.mint());
+    let (wa, wb) = (SpriteId(rig.node()?), SpriteId(rig.node()?));
+    let row = |wash| ChromeRow { wash, hover: 0.08, press: 0.12,
+        flags: flag::FOCUS_WASH, ..ChromeRow::default() };
+    rig.adopt(&[(a, row(wa)), (b, row(wb))], &[], &[])?;
+    let mut out = Vec::with_capacity(16);
+    rig.tick(&[Report::FocusChanged { from: None, to: Some(a) }], &mut out)?;
+    assert_eq!(rig.controls.wash_target(a), Some((wa, 1.0)));
+    rig.tick(&[press(a)], &mut out)?;
+    assert!(rig.controls.focused.is_none());
+    assert_eq!(rig.controls.input_focus, a);
+    assert_eq!(rig.controls.wash_target(a), Some((wa, 1.0)));
+    rig.tick(&[Report::Canceled { target: a, contact: 1 }], &mut out)?;
+    assert!(out.iter().all(|intent| matches!(intent.what, What::Canceled(_))));
+    out.clear();
+    rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
+    assert_eq!(rig.controls.wash_target(a), Some((wa, 0.0)));
+    assert_eq!(rig.controls.wash_target(b), Some((wb, 1.0)));
+    rig.tick(&[hover(ControlId::NONE, b)], &mut out)?;
+    rig.adopt(&[(b, ChromeRow { flags: flag::DISABLED, ..row(wb) })], &[], &[])?;
+    assert_eq!(rig.controls.wash_target(b), Some((wb, 0.0)));
+    rig.adopt(&[(b, row(wb))], &[], &[])?;
+    assert_eq!(rig.controls.wash_target(b), Some((wb, 1.0)));
+    rig.tick(&[hover(b, ControlId::NONE)], &mut out)?;
+    let minted = rig.visuals_minted();
+    for _ in 0..2 {
+        rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a) },
+            Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
+    }
+    let allocations = crate::counting::allocations();
+    for _ in 0..100 {
+        rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a) },
+            Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
+    }
+    assert_eq!(crate::counting::allocations(), allocations);
+    assert_eq!(rig.visuals_minted(), minted);
+    let settled = rig.animations();
+    rig.tick(&[], &mut out)?;
+    assert_eq!(rig.animations(), settled);
+    assert!(out.is_empty());
+    rig.adopt(&[], &[], &[b])?;
+    assert!(rig.controls.input_focus.is_none());
+    assert_eq!(rig.controls.wash_target(b), None);
+    rig.tick(&[Report::FocusChanged { from: None, to: Some(b) }], &mut out)?;
+    assert!(rig.controls.input_focus.is_none());
+    Ok(())
+}
+
+#[test]
 fn native_focus_outline_follows_keyboard_focus_and_hides_for_pointer_and_retirement() -> Result<()> {
     let mut rig = Rig::new("focus outline")?;
     let ring = rig.overlay_node()?;

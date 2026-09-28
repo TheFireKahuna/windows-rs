@@ -61,6 +61,7 @@ const fn wash_role(wash: Wash) -> Option<Role> {
         Wash::None => None,
         Wash::Ink => Some(Role::Text(Text::Primary)),
         Wash::Accent => Some(Role::Fill(Fill::Accent)),
+        Wash::AccentBorder => Some(Role::Stroke(Stroke::Focus)),
     }
 }
 
@@ -217,6 +218,7 @@ impl Surface {
         let width = self.chrome.and_then(|chrome| chrome.border_width)
             .unwrap_or_else(|| Len::from(Metric::HairlineW));
         match part {
+            Part::Wash if self.wash == Wash::AccentBorder => PaintMask::Outline { radius, width },
             Part::Border => PaintMask::Outline {
                 radius,
                 width,
@@ -785,6 +787,17 @@ impl Host {
     /// stopped at the surface's three slots would leave a disabled button's text at its
     /// resting colour.
     pub(crate) fn repaint_control(&mut self, id: ControlId) {
+        if let Some(row) = self.control(id) {
+            let disabled = row.state == ModelState::Disabled;
+            let focus = !disabled
+                && self.appearances.surface(self.surface_row(row.node))
+                    .is_some_and(|surface| surface.wash == Wash::AccentBorder);
+            let row = self.control_mut(id).unwrap();
+            row.front.flags = (row.front.flags
+                & !(crate::widget::flag::FOCUS_WASH | crate::widget::flag::DISABLED))
+                | if focus { crate::widget::flag::FOCUS_WASH } else { 0 }
+                | if disabled { crate::widget::flag::DISABLED } else { 0 };
+        }
         for at in 0..self.appearances.slots() {
             let Some(node) = self.appearances.id_at(at) else {
                 continue;
@@ -1436,6 +1449,48 @@ mod tests {
             assert_eq!(chrome.border_width, Some(Len::px(1.0)));
             assert_eq!(chrome.in_state(ModelState::Rest), crate::widget::roles::BUTTON[2]);
         });
+    }
+
+    #[test]
+    fn focus_border_reuses_the_wash_and_matches_chrome_across_dpi_and_availability() {
+        let mut patch = crate::build::rig::fixture();
+        let mut node = NodeId::NONE;
+        let (_owner, _mount) = crate::signal::Owner::scope(|| Ui::mount_root(|ui| {
+            let mut chrome = Chrome::new(roles(Some(Fill::Surface), Some(Stroke::Default)), Metric::Radius)
+                .border(Len::px(1.0));
+            chrome.attached = Some(Edge::Left);
+            node = ui.control(Some(chrome), crate::widget::UiaRole::Edit, |_| {})
+                .width(Len::dip(100.0)).height(Len::dip(24.0)).id().into();
+        }));
+        Host::flush(&mut patch);
+        let count = Host::with(|host| host.live_nodes());
+        Host::with(|host| host.surface_wash(GroupId(node), Wash::AccentBorder));
+        for scale in [1.0, 1.5, 2.0, 1.25, 1.0] {
+            Host::with(|host| host.set_env(Env::new(96.0 * scale, host.env.output())));
+            patch.clear(); Host::flush(&mut patch);
+            Host::with(|host| {
+                let surface = host.appearances.surface(host.surface_row(node)).unwrap();
+                let border = surface.parts[0].unwrap();
+                let wash = surface.parts[2].unwrap();
+                let mask = |id| patch.ops().iter().rev().find_map(|op| match op {
+                    windows_scene::Op::Mask { id: at, mask } if *at == id => Some(*mask),
+                    _ => None,
+                }).unwrap();
+                assert_eq!(mask(border), mask(wash));
+                assert!(matches!(mask(wash), Mask::Outline { width, open: Some(Side::Left), .. }
+                    if width == 1.0 / scale));
+                let control = host.control_of(node);
+                assert_ne!(host.control(control).unwrap().front.flags & crate::widget::flag::FOCUS_WASH, 0);
+                host.set_state(control, ModelState::Disabled, true);
+                assert_eq!(host.control(control).unwrap().front.flags & crate::widget::flag::FOCUS_WASH, 0);
+                host.set_state(control, ModelState::Disabled, false);
+                assert_ne!(host.control(control).unwrap().front.flags & crate::widget::flag::FOCUS_WASH, 0);
+                assert_eq!(host.live_nodes(), count);
+            });
+            patch.clear(); Host::flush(&mut patch);
+            patch.clear(); Host::flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
     }
 
     fn roles(fill: Option<Fill>, stroke: Option<Stroke>) -> RoleSet {

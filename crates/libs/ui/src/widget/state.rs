@@ -51,6 +51,10 @@ pub mod flag {
     pub const TURN: u8 = 1 << 3;
     /// The value runs up the screen, which is against the coordinate it is read from.
     pub const VERTICAL: u8 = 1 << 4;
+    /// The wash reaches full opacity while its control holds input focus.
+    pub const FOCUS_WASH: u8 = 1 << 5;
+    /// Disabled controls suppress every transient wash contribution.
+    pub const DISABLED: u8 = 1 << 6;
     /// Either way a pointer moves a value.
     pub const VALUED: u8 = SLIDE | TURN;
 }
@@ -257,6 +261,8 @@ pub struct Controls {
     hovered: ControlId,
     pressed: ControlId,
     focused: ControlId,
+    /// Input focus survives pointer presses that hide the external keyboard ring.
+    input_focus: ControlId,
     /// The observed scope the application was last told about, so a crossing between two children
     /// of one scope is not an edge.
     observed: ControlId,
@@ -482,6 +488,7 @@ impl Controls {
             &mut self.hovered,
             &mut self.pressed,
             &mut self.focused,
+            &mut self.input_focus,
             &mut self.observed,
             &mut self.grabbed,
             &mut self.dragged,
@@ -639,7 +646,14 @@ impl Controls {
                 }
             }
             Report::FocusChanged { to, .. } => {
+                let was = self.input_focus;
                 self.focused = self.live(to);
+                self.input_focus = self.focused;
+                for id in [was, self.input_focus] {
+                    if self.flags(id) & flag::FOCUS_WASH != 0 {
+                        self.wash(id, front)?;
+                    }
+                }
                 self.move_ring(front)?;
             }
             Report::Pressed { target, sample, .. } => {
@@ -919,18 +933,29 @@ impl Controls {
     /// Derived per control rather than from the event that arrived, so one control can be hovered
     /// while another is pressed — the state a drag passing under the pointer produces.
     fn wash(&self, id: ControlId, front: &mut Front<'_>) -> Result<()> {
+        if let Some((sprite, opacity)) = self.wash_target(id) {
+            front.spring(sprite.0, Prop::Opacity, Value::Scalar(opacity))?;
+        }
+        Ok(())
+    }
+
+    fn wash_target(&self, id: ControlId) -> Option<(SpriteId, f32)> {
         let row = self.chrome_of(id);
         if row.wash.0.is_none() {
-            return Ok(());
+            return None;
         }
-        let to = if self.pressed == id {
+        let to = if row.flags & flag::DISABLED != 0 {
+            0.0
+        } else if self.input_focus == id && row.flags & flag::FOCUS_WASH != 0 {
+            1.0
+        } else if self.pressed == id {
             row.press
         } else if self.hovered == id {
             row.hover
         } else {
             0.0
         };
-        front.spring(row.wash.0, Prop::Opacity, Value::Scalar(to))
+        Some((row.wash, to))
     }
 
     /// Raises scope entry and exit for the scopes that asked for them.

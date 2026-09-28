@@ -117,8 +117,8 @@ pub const TRACK: [RoleSet; 2] = [
     RoleSet::new(Some(Fill::Accent), None, Text::OnAccent),
 ];
 
-/// The single row a text-editable field reads. Focus is drawn by the window's ring rather than by
-/// a variant.
+/// Supplies the model-state colours for a text-editable field.
+/// Focus uses the window ring and the recipe's wash policy.
 pub const FIELD: [RoleSet; 1] = [RoleSet::new(
     Some(Fill::Sunken),
     Some(Stroke::Default),
@@ -163,6 +163,8 @@ pub enum Wash {
     Ink,
     /// The scope's accent fill, at the state's opacity.
     Accent,
+    /// The focus accent on the chrome's border, fully visible while focused.
+    AccentBorder,
 }
 
 /// What a widget names instead of writing an automation declaration.
