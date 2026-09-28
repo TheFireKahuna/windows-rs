@@ -10,6 +10,7 @@ use crate::role::{
 };
 use crate::signal::Signal;
 use crate::widget::{Chrome, ModelState, RoleSet, Wash};
+use crate::widget::roles::{FOCUS_OUTSET, FOCUS_STROKE};
 use windows_color::Radiance;
 use windows_numerics::Vector2;
 use windows_scene::{
@@ -388,6 +389,9 @@ pub(crate) fn take_theme() -> Option<(Scope, BackdropSpec)> {
     PENDING_THEME.with_borrow_mut(Option::take)
 }
 
+static FOCUS_RADIUS: crate::role::ScopedToken<f32> =
+    crate::role::ScopedToken::new("focus radius", |scope| metric(Metric::Radius, scope) + FOCUS_OUTSET);
+
 impl Host {
     /// Retains the window's focus outline outside layout and hit testing.
     pub(crate) fn focus_outline(&mut self) -> NodeId {
@@ -403,7 +407,10 @@ impl Host {
             id,
             Part::Ink,
             PaintSource::Role(Role::Stroke(Stroke::Focus)),
-            PaintMask::Outline { radius: Len::ZERO, width: Len::dip(2.0) },
+            PaintMask::Outline {
+                radius: Metric::Custom(&FOCUS_RADIUS).into(),
+                width: Len::dip(FOCUS_STROKE),
+            },
             1.0,
         );
         self.write_channel(id, Prop::Opacity, Value::Scalar(0.0));
@@ -827,6 +834,13 @@ impl Host {
     /// Half the shorter side of a sprite's solved box, which is where a corner radius
     /// saturates.
     fn cap_of(&self, id: SpriteId) -> f32 {
+        // Detached derived sprites take their bounds from the front thread. The scene
+        // clamps their profile against those bounds; they have no app-side layout box.
+        if self.tree.c.flags[id.0.index()] & tree::DERIVED != 0
+            && self.tree.parent(id.0).is_none()
+        {
+            return f32::INFINITY;
+        }
         let size = self.geom(id.0).size;
         size.x.min(size.y) * 0.5
     }
@@ -1220,6 +1234,29 @@ const fn side_of(edge: Edge) -> Side {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detached_focus_profile_survives_dpi_changes_without_layout_or_idle_work() {
+        let mut patch = crate::build::rig::fixture();
+        let ring = Host::with(Host::focus_outline);
+        let count = Host::with(|host| host.live_nodes());
+        for scale in [1.0, 1.5, 2.0, 1.25, 1.0] {
+            Host::with(|host| host.set_env(Env::new(96.0 * scale, host.env.output().clone())));
+            Host::flush(&mut patch);
+            let expected = Host::with(|host| metric(Metric::Radius, host.root_scope())) + FOCUS_OUTSET;
+            let mask = patch.ops().iter().rev().find_map(|op| match op {
+                windows_scene::Op::Mask { id, mask } if id.0 == ring => Some(mask),
+                _ => None,
+            }).expect("DPI publication retains the detached outline");
+            assert_eq!(*mask, Mask::Outline {
+                radius: Corners::all(expected), width: FOCUS_STROKE, open: None,
+            });
+            assert_eq!(Host::with(|host| host.live_nodes()), count);
+            patch.clear();
+            Host::flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
+    }
 
     #[test]
     fn pixel_borders_and_fill_insets_follow_dpi_without_idle_publication() {

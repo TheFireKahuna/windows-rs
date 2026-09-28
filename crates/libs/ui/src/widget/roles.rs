@@ -11,6 +11,9 @@ use crate::layout::{Edge, Len};
 use crate::role::{Fill, Metric, Stroke, Text};
 use windows_scene::Prop;
 
+pub(crate) const FOCUS_STROKE: f32 = 2.0;
+pub(crate) const FOCUS_OUTSET: f32 = FOCUS_STROKE + 2.0;
+
 // ── colour rows ─────────────────────────────────────────────────────────────────────
 
 /// A widget's colour triple: one row of a table.

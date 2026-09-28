@@ -11,7 +11,7 @@
 //! Interaction state is held per window, not per control. The pointer and the keyboard are each
 //! one physical thing, so a second hovered control cannot exist to carry a bit.
 
-use super::roles::{ScalarPart, TURN_SWEEP, fraction_of};
+use super::roles::{FOCUS_OUTSET, ScalarPart, TURN_SWEEP, fraction_of};
 use crate::gesture::{DragUpdate, Phase, Recognised};
 use crate::input::{KeyKind, Report};
 use crate::uia::Action;
@@ -939,12 +939,12 @@ impl Controls {
             front.scene.hits().offset(entry.scroll_src)
         };
         let at = Vector2 {
-            x: entry.x0 - scroll.x,
-            y: entry.y0 - scroll.y,
+            x: entry.x0 - scroll.x - FOCUS_OUTSET,
+            y: entry.y0 - scroll.y - FOCUS_OUTSET,
         };
         let size = Vector2 {
-            x: entry.x1 - entry.x0,
-            y: entry.y1 - entry.y0,
+            x: entry.x1 - entry.x0 + 2.0 * FOCUS_OUTSET,
+            y: entry.y1 - entry.y0 + 2.0 * FOCUS_OUTSET,
         };
         if self.ring_shown {
             front.spring(self.ring, Prop::Offset, Value::Vec2(at))?;

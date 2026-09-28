@@ -31,6 +31,18 @@ fn native_focus_outline_follows_keyboard_focus_and_hides_for_pointer_and_retirem
     assert!(!rig.controls.ring_shown);
     rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a) }], &mut out)?;
     assert!(rig.controls.ring_shown);
+    rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a) }], &mut out)?;
+    let before = crate::counting::allocations();
+    for _ in 0..100 {
+        rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
+        rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a) }], &mut out)?;
+    }
+    assert_eq!(crate::counting::allocations(), before, "warm focus moves allocate no Rust storage");
+    let settled = rig.animations();
+    rig.tick(&[], &mut out)?;
+    assert_eq!(rig.animations(), settled);
+    assert!(out.is_empty(), "focus appearance emits no application intent");
     rig.adopt(&[], &[], &[a])?;
     assert!(!rig.controls.ring_shown);
     assert_eq!(rig.visuals_minted(), minted);
