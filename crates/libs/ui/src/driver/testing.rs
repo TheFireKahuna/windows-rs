@@ -68,6 +68,12 @@ impl LayoutDriver {
         }]);
     }
 
+    /// Delivers explicitly supplied compositor events through the production overlay path.
+    /// This checks completion handling, not animation playback or elapsed time.
+    pub fn scene_events(&mut self, events: &[windows_scene::SceneEvent]) {
+        self.overlays.scene(events, &mut self.focus);
+    }
+
     /// Runs one production declaration pass and solves its geometry.
     ///
     /// The caller must clear `patch` before another flush, as with [`Host::flush`].

@@ -52,6 +52,9 @@ pub(crate) struct Placement {
 pub(crate) struct Entrance {
     pub node: NodeId,
     pub slide: crate::overlay::Slide,
+    /// DIP displacement with an opacity entrance; otherwise `slide.by` is fractional.
+    dip_fade: bool,
+    delay_ms: u32,
     /// Whether the slide is on the compositor. Set when it starts and read to keep the next
     /// publication from binding the same curve again.
     started: bool,
@@ -67,6 +70,8 @@ impl Entrance {
         Self {
             node,
             slide,
+            dip_fade: false,
+            delay_ms: 0,
             started: false,
             done: false,
         }
@@ -1714,6 +1719,16 @@ impl Host {
         self.entrances.push(Entrance::new(node, slide));
     }
 
+    pub(crate) fn enter_from(&mut self, node: NodeId, slide: crate::overlay::Slide, delay_ms: u32) {
+        assert!(!self.entrances.iter().any(|entry| entry.node == node), "one entrance per node");
+        let channels = &mut self.tree.c.channels[node.index()];
+        let owned = (1 << Prop::Opacity as u32) | (1 << Prop::AnchorX as u32) | (1 << Prop::AnchorY as u32);
+        assert!(*channels & owned == 0, "an entrance requires unclaimed opacity and anchor channels");
+        *channels |= owned;
+        self.suspend_input(node, true);
+        self.entrances.push(Entrance { dip_fade: true, delay_ms, ..Entrance::new(node, slide) });
+    }
+
     /// Publishes conditional and overlay entrances through the same geometry policy.
     fn publish_overlay_entries(&mut self) {
         for at in 0..self.overlays.len() {
@@ -1736,17 +1751,39 @@ impl Host {
             return entry;
         }
         if !entry.started {
-            for (prop, by) in [(Prop::AnchorX, entry.slide.by.x), (Prop::AnchorY, entry.slide.by.y)] {
+            let duration_ms = entry.slide.ms + entry.delay_ms;
+            let start = if entry.delay_ms == 0 { 0.0 } else { entry.delay_ms as f32 / duration_ms as f32 };
+            let by = if entry.dip_fade {
+                Vector2::new(entry.slide.by.x / geom.size.x, entry.slide.by.y / geom.size.y)
+            } else {
+                entry.slide.by
+            };
+            for (prop, by) in [(Prop::AnchorX, by.x), (Prop::AnchorY, by.y)] {
                 if by == 0.0 {
                     continue;
                 }
-                let frames = self.frames(&[
+                let keys = [
                     (0.0, Value::Scalar(-by), Easing::Linear),
+                    (start, Value::Scalar(-by), Easing::Linear),
                     (1.0, Value::Scalar(0.0), entry.slide.easing),
-                ]);
+                ];
+                let frames = self.frames(&keys[usize::from(entry.delay_ms == 0)..]);
                 self.bind(entry.node, prop, Bind::Animate(Anim::Frames {
                     frames,
-                    duration_ms: entry.slide.ms,
+                    duration_ms,
+                    iterations: Iterations::Count(1),
+                }));
+            }
+            if entry.dip_fade {
+                let keys = [
+                    (0.0, Value::Scalar(0.0), Easing::Linear),
+                    (start, Value::Scalar(0.0), Easing::Linear),
+                    (1.0, Value::Scalar(1.0), entry.slide.easing),
+                ];
+                let frames = self.frames(&keys[usize::from(entry.delay_ms == 0)..]);
+                self.bind(entry.node, Prop::Opacity, Bind::Animate(Anim::Frames {
+                    frames,
+                    duration_ms,
                     iterations: Iterations::Count(1),
                 }));
             }
@@ -1957,6 +1994,10 @@ impl Host {
         self.uia_stale.set(false);
     }
 }
+
+#[cfg(test)]
+#[path = "entry_tests.rs"]
+mod entry_tests;
 
 /// Fails to compile if the host ever gains a way to be sent. Only `Host` holds a `SinkPatch`,
 /// and `Host` is app-thread affine, which is what stops any layer above from moving a pixel

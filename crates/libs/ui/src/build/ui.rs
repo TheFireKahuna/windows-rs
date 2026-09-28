@@ -858,6 +858,20 @@ impl<'a, K> Element<'a, K> {
         self.channel(Prop::Opacity, value)
     }
 
+    /// Fades this subtree in while translating from a displacement in DIPs.
+    ///
+    /// Runs once after the first nonempty solve. Input is suspended until the compositor
+    /// completes the translation; a zero displacement fades without suspending input.
+    /// Text and paths retain their native scale. System animation preferences apply.
+    /// The node's opacity and anchor channels must remain exclusive to this entrance.
+    /// `by` must be finite, `ms` must be nonzero, and `ms + delay_ms` must fit in `u32`.
+    pub fn enter_from(self, by: Vector2, ms: u32, delay_ms: u32, easing: windows_scene::Easing) -> Self {
+        assert!(by.x.is_finite() && by.y.is_finite() && ms > 0);
+        assert!(ms.checked_add(delay_ms).is_some());
+        self.ui.host.enter_from(self.node, crate::overlay::Slide { by, ms, easing }, delay_ms);
+        self
+    }
+
     pub fn rotation<M>(self, value: impl Signal<f32, M> + 'static) -> Self {
         self.channel(Prop::RotationAngle, value)
     }
