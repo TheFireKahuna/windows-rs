@@ -199,8 +199,15 @@ impl Len {
     /// pixel length has no scale, so all three answer zero.
     #[must_use]
     pub fn dips(self, scope: Scope) -> f32 {
+        self.dips_at(scope, f32::INFINITY)
+    }
+
+    /// Resolves a non-layout length with a known device scale.
+    /// `scale` must be positive.
+    pub fn dips_at(self, scope: Scope, scale: f32) -> f32 {
         let base = match self.kind {
-            Kind::Unset | Kind::Auto | Kind::Pct | Kind::Zero | Kind::Px => 0.0,
+            Kind::Unset | Kind::Auto | Kind::Pct | Kind::Zero => 0.0,
+            Kind::Px => self.n / scale,
             Kind::Dip => self.n,
             Kind::Metric => named(self.token).map_or(0.0, |m| metric(m, scope)) * self.n,
         };

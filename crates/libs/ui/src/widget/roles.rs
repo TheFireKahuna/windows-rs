@@ -7,7 +7,7 @@
 //! wash a state fades in, what a pointer means, the span a value runs over, and the mapping that
 //! places a part at a fraction. The chrome ladder is here because its rows are [`RoleSet`]s.
 
-use crate::layout::Edge;
+use crate::layout::{Edge, Len};
 use crate::role::{Fill, Metric, Stroke, Text};
 use windows_scene::Prop;
 
@@ -198,12 +198,14 @@ pub enum UiaRole {
 /// The ladder is resolved once, at construction, so a state change is an index rather than a
 /// resolution. A recipe that wants its own selected or disabled row states it with [`Self::when`]
 /// rather than letting a later pass patch one in.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Chrome {
     rows: [RoleSet; 3],
     pub radius: Metric,
     /// The flush edge has square corners and no border.
     pub attached: Option<Edge>,
+    /// The palette hairline width is used when this is absent.
+    pub border_width: Option<Len>,
 }
 
 impl Chrome {
@@ -218,6 +220,7 @@ impl Chrome {
             ],
             radius,
             attached: None,
+            border_width: None,
         }
     }
 
@@ -232,6 +235,18 @@ impl Chrome {
     #[must_use]
     pub const fn in_state(self, state: ModelState) -> RoleSet {
         self.rows[state as usize]
+    }
+
+    /// Returns this shape with the supplied colour roles in every model state.
+    pub const fn with_roles(mut self, roles: RoleSet) -> Self {
+        self.rows = [roles, roles.in_state(ModelState::Selected), roles.in_state(ModelState::Disabled)];
+        self
+    }
+
+    /// Returns this chrome with an explicit border width, including device-pixel lengths.
+    pub const fn border(mut self, width: Len) -> Self {
+        self.border_width = Some(width);
+        self
     }
 }
 

@@ -74,6 +74,10 @@ pub(crate) enum PaintMask {
     Box {
         radius: Len,
     },
+    InsetBox {
+        radius: Len,
+        inset: Len,
+    },
     Outline {
         radius: Len,
         width: Len,
@@ -90,7 +94,7 @@ impl PaintMask {
     /// Whether the resolved silhouette depends on the box it is drawn into, which is what
     /// decides whether a solved extent owes it a re-emission.
     const fn box_bound(self) -> bool {
-        matches!(self, Self::Box { .. } | Self::Outline { .. })
+        matches!(self, Self::Box { .. } | Self::InsetBox { .. } | Self::Outline { .. })
     }
 }
 
@@ -139,6 +143,7 @@ pub(crate) struct Appearance {
     /// Half the shorter side of the box the mask was last resolved against. `NaN` where the
     /// silhouette does not depend on the box.
     pub cap: f32,
+    scale: f32,
     /// The next paint in this mount's chain. Intrusive, because a mount owns an unbounded
     /// number of non-derived paints and a `Vec` per mount would allocate for the many nodes
     /// that own one.
@@ -204,13 +209,16 @@ impl Surface {
         let radius = self
             .chrome
             .map_or(Len::ZERO, |chrome| Len::from(chrome.radius));
+        let width = self.chrome.and_then(|chrome| chrome.border_width)
+            .unwrap_or_else(|| Len::from(Metric::HairlineW));
         match part {
             Part::Border => PaintMask::Outline {
                 radius,
-                width: Len::from(Metric::HairlineW),
+                width,
             },
-            Part::Fill if self.owns(Part::Border) => PaintMask::Box {
-                radius: radius.less(Metric::HairlineW),
+            Part::Fill if self.owns(Part::Border) => PaintMask::InsetBox {
+                radius,
+                inset: width,
             },
             _ => PaintMask::Box { radius },
         }
@@ -223,6 +231,7 @@ impl Surface {
 /// chain and one for the surface, and neither can be freed without the other's table.
 #[derive(Default)]
 pub(crate) struct Appearances {
+    scale: f32,
     paints: Vec<Option<(u32, Appearance)>>,
     /// The retained geometry of a node whose silhouette is a path, so a paint setter states
     /// the stroke without restating the shape.
@@ -491,6 +500,7 @@ impl Host {
             surface: tree::NONE,
             halo: held.and_then(|held| held.halo),
             cap: f32::NAN,
+            scale: self.env.scale(),
             next: held.map_or(NodeId::NONE, |held| held.next),
         };
         self.publish_paint(paint, true);
@@ -513,6 +523,12 @@ impl Host {
     /// the last pass left it. A surface that keeps its parts touches its paint chain not at
     /// all.
     pub(crate) fn publish_surfaces(&mut self) {
+        if self.appearances.scale != self.env.scale() {
+            self.appearances.scale = self.env.scale();
+            for surface in self.appearances.surfaces.iter_mut().flatten() {
+                surface.dirty = true;
+            }
+        }
         for at in 0..self.appearances.surface_rows() {
             let Some(surface) = self.appearances.surface_mut(at) else {
                 continue;
@@ -567,6 +583,7 @@ impl Host {
                 surface: row,
                 halo: surface.halo.filter(|_| part == Part::Fill),
                 cap: f32::NAN,
+                scale: self.env.scale(),
                 next: self
                     .appearances
                     .get(id.0)
@@ -634,7 +651,9 @@ impl Host {
     /// Insets a derived fill inside the border above it, leaving the flush edge alone.
     fn place_part(&mut self, paint: Appearance, surface: Surface) {
         let hairline = match paint.part == Part::Fill && surface.owns(Part::Border) {
-            true => metric(Metric::HairlineW, paint.scope),
+            true => surface.chrome.and_then(|chrome| chrome.border_width)
+                .unwrap_or_else(|| Len::from(Metric::HairlineW))
+                .dips_at(paint.scope, self.env.scale()),
             false => 0.0,
         };
         let mut insets = [hairline; 4];
@@ -794,11 +813,12 @@ impl Host {
             } else {
                 f32::NAN
             };
-            if scope == paint.scope && (!bound || cap == paint.cap) {
+            if scope == paint.scope && paint.scale == self.env.scale() && (!bound || cap == paint.cap) {
                 continue;
             }
             paint.scope = scope;
             paint.cap = cap;
+            paint.scale = self.env.scale();
             self.emit_mask(paint.id, paint.mask, scope, paint.surface);
             self.appearances.place(node, paint);
         }
@@ -819,18 +839,22 @@ impl Host {
             .and_then(|surface| surface.chrome)
             .and_then(|chrome| chrome.attached);
         let cap = self.cap_of(id);
+        let scale = self.env.scale();
         let mask = match mask {
             PaintMask::Box { radius } => Mask::Box {
-                radius: corners(radius.dips(scope).min(cap), attached),
+                radius: corners(radius.dips_at(scope, scale).min(cap), attached),
+            },
+            PaintMask::InsetBox { radius, inset } => Mask::Box {
+                radius: corners((radius.dips_at(scope, scale) - inset.dips_at(scope, scale)).max(0.0).min(cap), attached),
             },
             PaintMask::Outline { radius, width } => Mask::Outline {
-                radius: corners(radius.dips(scope).min(cap), attached),
-                width: width.dips(scope),
+                radius: corners(radius.dips_at(scope, scale).min(cap), attached),
+                width: width.dips_at(scope, scale),
                 open: attached.map(side_of),
             },
             PaintMask::Shape { geom, stroke } => {
                 let stroke =
-                    stroke.map(|width| self.stroke(width.dips(scope), Cap::Round, Join::Round, &[]));
+                    stroke.map(|width| self.stroke(width.dips_at(scope, scale), Cap::Round, Join::Round, &[]));
                 Mask::Shape { geom, stroke }
             }
             PaintMask::Region => Mask::Box {
@@ -1013,9 +1037,14 @@ impl<K> Element<'_, K> {
         self.button_chrome(crate::widget::roles::ACCENT_SUBTLE)
     }
 
-    fn button_chrome(self, variant: u8) -> Self {
+    fn button_chrome(mut self, variant: u8) -> Self {
         let roles = crate::widget::roles::BUTTON[variant as usize];
-        self.appearance(Chrome::new(roles, Metric::Radius))
+        let node = self.node_id();
+        let host = self.host();
+        let chrome = host.appearances.surface(host.surface_row(node))
+            .and_then(|surface| surface.chrome)
+            .unwrap_or_else(|| Chrome::new(roles, Metric::Radius));
+        self.appearance(chrome.with_roles(roles))
     }
 
     /// Raises this element's scope by one rung, and every paint already on it with it.
@@ -1192,6 +1221,59 @@ const fn side_of(edge: Edge) -> Side {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pixel_borders_and_fill_insets_follow_dpi_without_idle_publication() {
+        use windows_scene::{Env, Op};
+        let mut patch = crate::build::rig::fixture();
+        let mut node = NodeId::NONE;
+        let (_owner, _mount) = crate::signal::Owner::scope(|| super::super::Ui::mount_root(|ui| {
+            node = ui.control(Some(Chrome::new(
+                roles(Some(Fill::Surface), Some(Stroke::Default)), Metric::Radius,
+            ).border(Len::px(1.0))), crate::widget::UiaRole::Button, |_| {})
+                .width(Len::dip(100.0)).height(Len::dip(24.0)).id().into();
+        }));
+        for scale in [1.0, 1.5, 2.0, 1.25, 1.0] {
+            Host::with(|host| host.set_env(Env::new(96.0 * scale, host.env.output().clone())));
+            patch.clear();
+            Host::flush(&mut patch);
+            Host::with(|host| {
+                let surface = host.appearances.surface(host.surface_row(node)).unwrap();
+                let border = surface.parts[0].unwrap();
+                let fill = surface.parts[1].unwrap();
+                assert!(patch.ops().iter().any(|op| matches!(op,
+                    Op::Mask { id, mask: Mask::Outline { width, .. } }
+                    if *id == border && (width * scale - 1.0).abs() < 0.001
+                )));
+                let outer = host.geom(node).size;
+                let inner = host.geom(fill.0).size;
+                assert!(((outer.x - inner.x) * scale - 2.0).abs() < 0.001);
+                assert!(((outer.y - inner.y) * scale - 2.0).abs() < 0.001);
+            });
+            patch.clear();
+            Host::flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
+    }
+
+    #[test]
+    fn button_variants_preserve_the_authored_shape() {
+        let mut rig = crate::build::rig::Rig::at(300.0, 100.0, 1.5);
+        let mut node = NodeId::NONE;
+        rig.mount(|ui| {
+            let mut chrome = Chrome::new(roles(None, None), Metric::RadiusSurface).border(Len::px(1.0));
+            chrome.attached = Some(Edge::Left);
+            node = ui.button(chrome, crate::widget::TextStyle::new(crate::role::TypeRole::Body), "Action")
+                .ghost().accent().accent_subtle().id().into();
+        });
+        Host::with(|host| {
+            let chrome = host.appearances.surface(host.surface_row(node)).unwrap().chrome.unwrap();
+            assert_eq!(chrome.radius, Metric::RadiusSurface);
+            assert_eq!(chrome.attached, Some(Edge::Left));
+            assert_eq!(chrome.border_width, Some(Len::px(1.0)));
+            assert_eq!(chrome.in_state(ModelState::Rest), crate::widget::roles::BUTTON[2]);
+        });
+    }
+
     fn roles(fill: Option<Fill>, stroke: Option<Stroke>) -> RoleSet {
         RoleSet::new(fill, stroke, Text::Primary)
     }
@@ -1226,9 +1308,10 @@ mod tests {
             roles(Some(Fill::Surface), None),
             Metric::Radius,
         ));
-        let inset = Len::from(Metric::Radius).less(Metric::HairlineW);
+        let outer = Len::from(Metric::Radius);
+        let width = Len::from(Metric::HairlineW);
         assert!(
-            matches!(bordered.mask_of(Part::Fill), PaintMask::Box { radius } if radius == inset)
+            matches!(bordered.mask_of(Part::Fill), PaintMask::InsetBox { radius, inset } if radius == outer && inset == width)
         );
         let whole = Len::from(Metric::Radius);
         assert!(matches!(plain.mask_of(Part::Fill), PaintMask::Box { radius } if radius == whole));
