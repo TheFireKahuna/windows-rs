@@ -551,6 +551,17 @@ impl<K> Element<'_, K> {
         self
     }
 
+    /// Lifts this subtree at a declared drag's threshold, preserving its native text
+    /// and paint resources. The scene restores it on release, cancel or retirement.
+    /// Declare `on_drag` on the same element; descendant controls keep their gestures.
+    pub fn drag_preview(mut self) -> Self {
+        let id = self.control_id();
+        if let Some(row) = self.host().control_mut(id) {
+            row.front.flags |= flag::DRAG_PREVIEW;
+        }
+        self
+    }
+
     pub fn on_drag(
         self,
         decl: DragDecl,

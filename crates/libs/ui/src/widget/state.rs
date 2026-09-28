@@ -55,6 +55,8 @@ pub mod flag {
     pub const FOCUS_WASH: u8 = 1 << 5;
     /// Disabled controls suppress every transient wash contribution.
     pub const DISABLED: u8 = 1 << 6;
+    /// A decided drag lifts its retained subtree into the scene's overlay band.
+    pub const DRAG_PREVIEW: u8 = 1 << 7;
     /// Either way a pointer moves a value.
     pub const VALUED: u8 = SLIDE | TURN;
 }
@@ -291,6 +293,7 @@ pub struct Controls {
     /// The scopes whose reveal targets are up, deduplicated in fixed storage.
     revealed: [ControlId; 3],
     translations: Vec<(ControlId, NodeId, windows_scene::Translation)>,
+    previews: Vec<(ControlId, NodeId)>,
     translation_changed: bool,
     /// The window's one focus ring, sprung between controls. Focus is singular, so the ring is per
     /// window rather than per control, and the glide between two controls is a compositor
@@ -341,6 +344,7 @@ impl Controls {
         // Retirement is part of adoption and not an optional driver step: a late report can never
         // reach a visual this same patch destroyed.
         for &id in released {
+            if id == self.dragged { front.scene.end_drag_preview(); }
             self.release(id);
         }
         for &(id, row) in chrome {
@@ -403,6 +407,17 @@ impl Controls {
 
     pub fn take_translation_changed(&mut self) -> bool {
         core::mem::take(&mut self.translation_changed)
+    }
+
+    /// Installs only the controls that declared a retained drag preview.
+    pub fn adopt_previews(&mut self, rows: &[(ControlId, NodeId)]) {
+        for &(id, node) in rows {
+            if let Some(row) = self.previews.iter_mut().find(|row| row.0 == id) {
+                row.1 = node;
+            } else {
+                self.previews.push((id, node));
+            }
+        }
     }
 
     fn translate(&mut self, front: &mut Front<'_>) -> Result<()> {
@@ -477,6 +492,7 @@ impl Controls {
 
     /// Forgets a control. Anything still pointing at it becomes a miss.
     pub fn release(&mut self, id: ControlId) {
+        self.previews.retain(|row| row.0 != id);
         self.translations.retain(|(owner, _, state)| {
             if *owner != id { return true; }
             state.set_active(false);
@@ -660,6 +676,7 @@ impl Controls {
                 if self.chrome.get(target).is_none() {
                     return Ok(());
                 }
+                front.scene.end_drag_preview();
                 self.focused = ControlId::NONE;
                 self.pressed = target;
                 // Where the value stood when the contact landed: a turn is measured from it, and
@@ -692,9 +709,15 @@ impl Controls {
                 self.put(target, self.grab_at + turned, How::Carried, front, out)?;
             }
             Report::Dragged { target, update, .. } if self.flags(target) & flag::DRAGS != 0 => {
-                // What a two-axis drag displaces is the application's own subject — a row's place
-                // in a list, a scope over channels — which these tables hold no geometry for, so
-                // nothing here moves a pixel for it.
+                if self.pressed != target { return Ok(()); }
+                if self.flags(target) & flag::DRAG_PREVIEW != 0 {
+                    if update.decided {
+                        if let Some(&(_, node)) = self.previews.iter().find(|row| row.0 == target) {
+                            front.scene.begin_drag_preview(node, front.back);
+                        }
+                    }
+                    front.scene.move_drag_preview(Vector2 { x: update.delta.x, y: update.delta.y });
+                }
                 self.decided =
                     (self.dragged == target && self.decided) || update.phase != Phase::Undecided;
                 (self.dragged, self.drag_last) = (target, Some(update));
@@ -770,6 +793,7 @@ impl Controls {
         if self.pressed != target || self.chrome.get(target).is_none() {
             return Ok(());
         }
+        front.scene.end_drag_preview();
         self.pressed = ControlId::NONE;
         let grabbed = core::mem::replace(&mut self.grabbed, ControlId::NONE) == target;
         let dragged = core::mem::replace(&mut self.dragged, ControlId::NONE) == target;

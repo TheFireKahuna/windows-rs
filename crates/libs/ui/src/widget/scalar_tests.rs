@@ -546,6 +546,50 @@ fn native_a_turn_reads_the_rotation_about_its_own_centre_and_a_cancel_restores_i
 }
 
 #[test]
+fn native_drag_preview_lifts_once_restores_on_cancel_and_ignores_late_reports() -> Result<()> {
+    let mut rig = Rig::new("drag preview")?;
+    let parent = rig.node()?;
+    let tile = rig.node_in(windows_scene::Attach::Node(parent))?;
+    rig.patch.push(Op::Bind { id: tile, prop: Prop::Size,
+        bind: Bind::Set(Value::Vec2(Vector2::new(80.0, 40.0))) });
+    rig.apply()?;
+    let id = rig.ids.mint();
+    rig.publish_hits(&[entry(id, 0.0, 0.0, 80.0, 40.0)])?;
+    rig.adopt(&[(id, ChromeRow { flags: flag::DRAGS | flag::DRAG_PREVIEW,
+        ..ChromeRow::default() })], &[], &[])?;
+    rig.controls.adopt_previews(&[(id, tile)]);
+    let count = rig.scene.census().visuals_live;
+    let mut out = Vec::with_capacity(8);
+    rig.tick(&[press(id), dragged(id, Phase::Undecided, false)], &mut out)?;
+    assert_eq!(rig.scene.census().visuals_live, count);
+    rig.tick(&[dragged(id, Phase::Free, true)], &mut out)?;
+    assert_eq!(rig.scene.census().visuals_live, count + 1);
+    let minted = rig.visuals_minted();
+    let allocations = crate::counting::allocations();
+    for _ in 0..100 {
+        out.clear();
+        rig.tick(&[dragged(id, Phase::Free, false)], &mut out)?;
+    }
+    assert_eq!(crate::counting::allocations(), allocations);
+    assert_eq!(rig.visuals_minted(), minted);
+    rig.tick(&[Report::Canceled { target: id, contact: 1 }], &mut out)?;
+    assert_eq!(rig.scene.census().visuals_live, count);
+    assert_eq!(out.last().map(|intent| intent.what), Some(What::DragEnded(None)));
+    out.clear();
+    rig.tick(&[dragged(id, Phase::Free, true)], &mut out)?;
+    assert!(out.is_empty());
+    assert_eq!(rig.scene.census().visuals_live, count);
+    rig.tick(&[press(id), dragged(id, Phase::Free, true)], &mut out)?;
+    rig.adopt(&[], &[], &[id])?;
+    assert_eq!(rig.scene.census().visuals_live, count);
+    assert!(rig.controls.previews.is_empty());
+    let stopped = *rig.scene.census();
+    rig.tick(&[], &mut out)?;
+    assert_eq!(*rig.scene.census(), stopped);
+    Ok(())
+}
+
+#[test]
 fn native_a_canceled_decided_drag_raises_exactly_one_report() -> Result<()> {
     let mut rig = Rig::new("drag cancellation")?;
     let id = rig.ids.mint();

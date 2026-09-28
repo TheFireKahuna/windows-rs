@@ -478,6 +478,7 @@ row! {
     empty: |b| b.patch.is_empty()
         && b.chrome.is_empty()
         && b.translations.is_empty()
+        && b.previews.is_empty()
         && b.values.is_empty()
         && b.regions.is_empty()
         && b.scrolls.is_empty()
@@ -492,6 +493,7 @@ row! {
         /// Read by `Controls::adopt` on the scene thread.
         chrome: Vec<(ControlId, ChromeRow)>,
         translations: Vec<(ControlId, NodeId, windows_scene::Translation)>,
+        previews: Vec<(ControlId, NodeId)>,
         /// Read by `Controls::adopt` on the scene thread.
         values: Vec<(ControlId, ValueRow)>,
         /// Read by `present::apply` here, and relayed as pick rows to `Picks::sync`.

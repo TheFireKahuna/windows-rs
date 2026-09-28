@@ -769,6 +769,7 @@ impl SceneThread {
         self.controls.adopt_translations(
             &down.translations, &down.declared.released, &mut front,
         )?;
+        self.controls.adopt_previews(&down.previews);
         self.scrolls.apply_ops(&mut down.scrolls);
         // A restated geometry replaces the map the thumb is bound through, so a container
         // holding an occlusion's extent is bound again from the extended one. Here, because the

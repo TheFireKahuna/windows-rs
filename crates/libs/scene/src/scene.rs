@@ -28,6 +28,9 @@ use windows_composition::{
 use windows_core::{EventRevoker, Result};
 use windows_numerics::{Vector2, Vector3};
 
+#[path = "drag_preview.rs"]
+mod drag_preview;
+
 // ── the census ──────────────────────────────────────────────────────────────────────
 
 /// Running tallies of what the scene has done since it was created.
@@ -986,6 +989,7 @@ pub struct Scene {
     /// Slot roots and the ghosts an exit leaves behind, so an overlay sits above content by
     /// its position in the tree rather than by an ordering every caller keeps.
     overlay: ContainerVisual,
+    lift: Option<Box<drag_preview::Lift>>,
     backdrop: Backdrop,
     nodes: Arena,
     /// Every node with no parent node, in attachment order. A forest and not a tree: a slot
@@ -1065,6 +1069,7 @@ impl Scene {
             ground,
             content,
             overlay,
+            lift: None,
             backdrop,
             nodes: Arena::default(),
             roots: Vec::new(),
@@ -1189,6 +1194,7 @@ impl Scene {
         if was == env {
             return Ok(());
         }
+        self.end_drag_preview();
         if was.geometry_moved(env) {
             self.generation.dpi = self.generation.dpi.wrapping_add(1);
             set_dip_space(&self.root, env.scale());
@@ -1243,6 +1249,7 @@ impl Scene {
     ///
     /// Fails if the ground or a sprite's chain cannot be rebuilt.
     pub fn device_lost(&mut self, back: &Backends, env: Env) -> Result<()> {
+        self.end_drag_preview();
         self.generation.device = self.generation.device.wrapping_add(1);
         self.cache.clear();
         self.env = Some(env);
@@ -1297,6 +1304,7 @@ impl Scene {
     }
 
     fn op(&mut self, op: Op, patch: &SinkPatch, back: &Backends, env: Env) -> Result<()> {
+        self.preview_before(op);
         match op {
             // The one place that branches on node kind: a sprite visual *is* a container
             // visual, so the destroy, the reorder, the bind and the device-loss rebind all
@@ -3091,6 +3099,73 @@ mod tests {
             assert!(events.iter().any(|event| matches!(event,
                 SceneEvent::AnimationCompleted { node, prop: completed } if *node == id && *completed == prop)));
         }
+    }
+
+    #[test]
+    fn drag_preview_preserves_subtree_and_restores_before_geometry_or_retirement() {
+        let mut rig = rig().expect("native composition is required");
+        let mut patch = SinkPatch::default();
+        let parent = rig.ids.mint();
+        patch.push(Op::New { id: parent, kind: NodeKind::Group, parent: Attach::Window, after: None });
+        let mut previous = None;
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let id = rig.ids.mint();
+            patch.push(Op::New { id, kind: NodeKind::Group, parent: Attach::Node(parent), after: previous });
+            patch.push(Op::Bind { id, prop: Prop::Size, bind: Bind::Set(Value::Vec2(Vector2::new(80.0, 40.0))) });
+            ids.push(id);
+            previous = Some(id);
+        }
+        let child = rig.ids.mint();
+        patch.push(Op::New { id: child, kind: NodeKind::Sprite, parent: Attach::Node(ids[1]), after: None });
+        rig.apply(&mut patch);
+        let source = rig.scene.nodes.visual(ids[1]).unwrap().clone();
+        let held_child = rig.scene.nodes.visual(child).unwrap().clone();
+        let original = source.parent().unwrap();
+        let source_offset = source.offset();
+        let source_size = source.size();
+        let count = rig.scene.census().visuals_live;
+        for _ in 0..3 {
+            assert!(rig.scene.begin_drag_preview(ids[1], &rig.back));
+            assert_eq!(original.children().count(), 2);
+            assert_eq!(rig.scene.census().visuals_live, count + 1);
+            assert_eq!(source.as_container().unwrap().children().count(), 1);
+            assert_eq!(held_child.parent().unwrap().children().count(), 1);
+            let minted = rig.scene.census().visuals_minted;
+            rig.scene.move_drag_preview(Vector2::new(16.0, 24.0));
+            let moved = *rig.scene.census();
+            for _ in 0..100 { rig.scene.move_drag_preview(Vector2::new(16.0, 24.0)); }
+            rig.scene.move_drag_preview(Vector2::new(f32::NAN, 0.0));
+            assert_eq!(*rig.scene.census(), moved);
+            assert_eq!(rig.scene.census().visuals_minted, minted);
+            assert_eq!(source.offset(), source_offset);
+            assert_eq!(source.size(), source_size);
+            assert!(rig.scene.audit().agrees());
+            rig.scene.end_drag_preview();
+            assert_eq!(rig.scene.census().visuals_live, count);
+            assert_eq!(original.children().count(), 3);
+            assert_eq!(source.parent().unwrap().children().count(), 3);
+        }
+        assert!(rig.scene.begin_drag_preview(ids[1], &rig.back));
+        let unrelated = rig.ids.mint();
+        patch.push(Op::New { id: unrelated, kind: NodeKind::Group, parent: Attach::Overlay, after: None });
+        patch.push(Op::Drop { id: unrelated, exit: Exit::None, origin: Point::zero(), bounds: None });
+        rig.apply(&mut patch);
+        assert!(rig.scene.lift.is_some(), "unrelated overlays cannot cancel the lift");
+        patch.push(Op::Bind { id: parent, prop: Prop::Size, bind: Bind::Set(Value::Vec2(Vector2::new(300.0, 100.0))) });
+        rig.apply(&mut patch);
+        assert!(rig.scene.lift.is_none());
+        assert!(rig.scene.begin_drag_preview(ids[1], &rig.back));
+        rig.env = Env::new(144.0, rig.env.output());
+        rig.apply(&mut patch);
+        assert!(rig.scene.lift.is_none());
+        assert!(rig.scene.begin_drag_preview(ids[1], &rig.back));
+        patch.push(Op::Drop { id: parent, exit: Exit::None, origin: Point::zero(), bounds: None });
+        rig.apply(&mut patch);
+        assert!(rig.scene.lift.is_none());
+        assert_eq!(rig.scene.census().visuals_live, 0);
+        assert!(rig.scene.audit().agrees());
+        assert!(!rig.scene.begin_drag_preview(ids[1], &rig.back));
     }
 
     #[test]

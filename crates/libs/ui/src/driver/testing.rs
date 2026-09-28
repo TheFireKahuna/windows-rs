@@ -24,6 +24,11 @@ pub fn install(env: Env, scope: Scope, ladder: FontLadder) -> Result<()> {
     Host::with(|h| h.text.install(ladder))
 }
 
+/// Returns the sink identity for a retained node used by a native scene probe.
+pub fn node_id<K>(node: crate::build::Node<K>) -> windows_scene::NodeId {
+    node.id
+}
+
 /// Returns the automation tree as a client adopts it, over the host as it stands.
 ///
 /// The walk builds into the host's own patch, so it is answered between flushes and the
