@@ -34,6 +34,8 @@ mod note;
 mod pass;
 mod target;
 
+pub use note::note_enabled;
+
 #[cfg(feature = "composition")]
 mod comp;
 
