@@ -2026,7 +2026,12 @@ impl Scene {
                     self.nodes.set_held(id, desc(Prop::TrimEnd), Held::Stale);
                     self.realize(id, back, env)?;
                 }
-                Absent::Refuse => return Ok(()),
+                // A refused write is dropped and nothing re-sends it: the binding layer
+                // above believes the channel held. The note is the only record.
+                Absent::Refuse => {
+                    note!("scene", "bind refused: {:?} on id={} — the channel's object does not exist, the write is dropped", prop, id.index());
+                    return Ok(());
+                }
             }
             if !self.nodes.has_owner(id, row.owner) {
                 debug_assert!(
