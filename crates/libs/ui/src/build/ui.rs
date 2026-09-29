@@ -904,11 +904,14 @@ impl<'a, K> Element<'a, K> {
     }
 
     /// Writes this node's computed layout on every call, reusing its track buffers.
+    ///
+    /// A writer whose inputs have not changed restates the same row, so [`Tree::restate`]
+    /// marks nothing: a signal re-firing every flush cannot hold the pass loop awake.
     pub fn layout_from(self, write: impl Fn(&mut Layout) + 'static) -> Self {
         let node = self.node;
         self.ui
             .host
-            .binding(move || Host::with(|host| host.tree.author(node, &write)));
+            .binding(move || Host::with(|host| host.tree.restate(node, &write)));
         self
     }
 
