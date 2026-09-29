@@ -495,6 +495,10 @@ pub(crate) struct Table {
     engine: Option<TextEngine>,
     /// Where a line's segments are harvested before they are copied into the patch.
     segs: SegBuffers,
+    /// Runs minted, or whose string or fold moved, since the text pass last read them: a
+    /// run can reshape to the box it already had, so its node need not appear in the change
+    /// set.
+    restated: Vec<usize>,
 }
 
 impl Table {
@@ -589,7 +593,7 @@ impl Table {
             run.set_line_height(font.size * mint.style.line_height).expect(LAYOUT);
         }
         let stale = matches!(&mint.target, Target::Annotated(_));
-        self.entries.insert(Entry {
+        let key = self.entries.insert(Entry {
             uia: std::cell::OnceCell::new(),
             run,
             text,
@@ -610,7 +614,9 @@ impl Table {
             at_w: f32::NAN,
             h: f32::NAN,
             pinned: f32::NAN,
-        })
+        });
+        self.restated.push(key.at as usize);
+        key
     }
 
     /// Re-points a run's text, answering the node whose measure has to be re-asked, or `None`
@@ -634,7 +640,9 @@ impl Table {
             *author = Box::from(text);
         }
         entry.stale = true;
-        Some(entry.node)
+        let node = entry.node;
+        self.restated.push(key.at as usize);
+        Some(node)
     }
 
     /// Returns the string a run was laid out from.
@@ -737,6 +745,24 @@ impl Table {
     /// # Panics
     ///
     /// If no shaping engine is installed on this thread.
+    /// The slot a live key names, which is what the text pass addresses a run by.
+    fn slot_of(&self, key: MeasureKey) -> Option<usize> {
+        self.entries.get(key).map(|_| key.at as usize)
+    }
+
+    /// Whether [`Table::pin`] would reshape or re-pin the run at `at`: what a pass that
+    /// skipped it has to be sure of.
+    #[cfg(debug_assertions)]
+    fn due(&self, at: usize, class: WidthClass, w: f32) -> bool {
+        let Some(entry) = self.entries.at(at) else {
+            return false;
+        };
+        let font = typography(entry.style.typography, entry.scope.at_width(class));
+        let reshapes = entry.stale || entry.class != class || entry.font != font;
+        let held = w <= 0.0 && !entry.text.as_str().is_empty();
+        reshapes || (!held && entry.pinned != w)
+    }
+
     fn pin(&mut self, at: usize, class: WidthClass, w: f32) -> bool {
         let engine = self.engine.as_ref().expect(ENGINE);
         let Some(entry) = self.entries.at_mut(at) else {
@@ -817,7 +843,9 @@ impl Table {
         entry.author = (fold != Fold::None).then(|| author.clone());
         entry.text.set(&author, fold);
         entry.stale = true;
-        Some(entry.node)
+        let node = entry.node;
+        self.restated.push(key.at as usize);
+        Some(node)
     }
 
     /// Appends one line's segments to the harvest buffers and answers where they landed and
@@ -869,31 +897,65 @@ impl Table {
 }
 
 impl Host {
-    /// Pins every run at the width the solve gave it and re-publishes the ones that moved.
+    /// Pins each run whose box, class or string may have moved at the width the solve gave
+    /// it, and re-publishes the ones that moved.
     ///
     /// Runs between the solve and the hand-over, so a run laid out at the width layout chose
     /// reaches the *same* patch as that layout rather than arriving a frame after the box it
     /// was measured for.
     ///
-    /// Every live run, and **not** a dirty list: a resize moves every label's box without
-    /// touching a string, and the solved width is what decides whether a run moved. The walk
-    /// costs one solved-rect read and a float compare per run; reshaping and re-emitting are
-    /// both behind the pin.
+    /// A run is pinned where its node is in the change set — a resize moves every label's
+    /// box, and each one lands there — where its own string moved, and on a sweep, which a
+    /// theme or scale change owes. A flush that moved one label reshapes and resolves one
+    /// run, not every run in the window.
     pub(crate) fn publish_text(&mut self) {
-        for at in 0..self.text.slots() {
-            let Some((node, vertical)) = self.text.placement(at) else {
-                continue;
-            };
-            let solved = self.geom(node);
-            // A vertical run is rotated, so its inline extent is the box's cross axis.
-            let w = if vertical {
-                solved.size.y
-            } else {
-                solved.size.x
-            };
-            if self.text.pin(at, self.tree.class(node), w) {
-                self.emit_run(at);
+        if self.changes.sweeping() {
+            self.text.restated.clear();
+            for at in 0..self.text.slots() {
+                self.publish_run(at);
             }
+        } else {
+            let restated = core::mem::take(&mut self.text.restated);
+            for &at in &restated {
+                self.publish_run(at);
+            }
+            self.text.restated = restated;
+            self.text.restated.clear();
+            for i in 0..self.tree.moved.len() {
+                let node = self.tree.moved[i];
+                if !self.tree.is_live(node) {
+                    continue;
+                }
+                if let Some(at) = self.text.slot_of(self.tree.c.text[node.index()]) {
+                    self.publish_run(at);
+                }
+            }
+        }
+        #[cfg(debug_assertions)]
+        for at in 0..self.text.slots() {
+            if let Some((node, class, w)) = self.run_width(at) {
+                debug_assert!(!self.text.due(at, class, w), "the change set missed a run: {node:?}");
+            }
+        }
+    }
+
+    /// The node a run stands in, the class it resolves at and the inline extent it is
+    /// pinned to.
+    fn run_width(&self, at: usize) -> Option<(NodeId, WidthClass, f32)> {
+        let (node, vertical) = self.text.placement(at)?;
+        let solved = self.geom(node);
+        // A vertical run is rotated, so its inline extent is the box's cross axis.
+        let w = if vertical { solved.size.y } else { solved.size.x };
+        Some((node, self.tree.class(node), w))
+    }
+
+    /// Pins one run at its solved width, and re-emits it where its glyphs moved.
+    fn publish_run(&mut self, at: usize) {
+        let Some((_, class, w)) = self.run_width(at) else {
+            return;
+        };
+        if self.text.pin(at, class, w) {
+            self.emit_run(at);
         }
     }
 

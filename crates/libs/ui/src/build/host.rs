@@ -24,6 +24,7 @@ use windows_scene::{
     Spread, SpriteId, StrokeStyle, TRACKER, TrackerId, TrackerOp, Value,
 };
 
+pub(crate) mod changes;
 mod rounded;
 
 // ── the rows beside the tree ────────────────────────────────────────────────────────
@@ -211,6 +212,8 @@ pub struct Host {
     pub(crate) field_sources: Vec<crate::text_input::Source>,
     pub(crate) field_layouts: Vec<crate::text_input::Layout>,
     pub(crate) field_commits: Vec<crate::text_input::Commit>,
+    /// The live fields' ids, gathered once per publication. Kept for its capacity.
+    pub(crate) field_ids: Vec<ControlId>,
     pub(crate) scrolls: Pool<crate::layout::ScrollRow>,
     pub(crate) regions: Pool<crate::present::RegionRow>,
     pub(crate) geometry: super::geometry::Jobs,
@@ -246,6 +249,8 @@ pub struct Host {
     pub(crate) queued: Vec<(NodeId, Prop, Bind)>,
     scratch: Vec<NodeId>,
     scratch_text: String,
+    /// What the flush in progress reads of the tree's change set. See [`changes`].
+    pub(crate) changes: changes::Changes,
     /// Root lists a retired mount handed back, so a warm mount reuses one rather than
     /// allocating its own.
     root_pool: Vec<Vec<NodeId>>,
@@ -297,6 +302,7 @@ impl Host {
                 field_sources: Vec::new(),
                 field_layouts: Vec::new(),
                 field_commits: Vec::new(),
+                field_ids: Vec::new(),
                 scrolls: Pool::default(),
                 regions: Pool::default(),
                 geometry: super::geometry::Jobs::default(),
@@ -319,6 +325,7 @@ impl Host {
                 queued: Vec::new(),
                 scratch: Vec::new(),
                 scratch_text: String::new(),
+                changes: changes::Changes::default(),
                 root_pool: Vec::new(),
             };
             host.root = host.tree.mint(0);
@@ -422,6 +429,9 @@ impl Host {
     /// Sets the pixel grid everything is snapped to and rasterized for.
     pub fn set_env(&mut self, env: Env) {
         self.env = env;
+        // Every metric, mask and run resolves at the scale, and no box need move for one of
+        // them to change.
+        self.changes.owe_sweep();
         let root = self.root;
         self.tree.mark(root);
     }
@@ -940,6 +950,9 @@ impl Host {
         let at = self.side_at(node);
         let side = &mut self.sides[at];
         side.visual = visual;
+        // A visual states a sprite's box without marking it, so the visuals pass learns of the
+        // new one here.
+        self.tree.moved.push(node);
         if side.placed_at == tree::NONE {
             side.placed_at = self.placed.len() as u32;
             self.placed.push(at);
@@ -1622,9 +1635,12 @@ impl Host {
     pub fn flush(patch: &mut SinkPatch) {
         crate::signal::flush();
         Self::with(|h| {
+            h.begin_changes();
             h.publish_surfaces();
             h.size_overlay_viewports();
             h.solve();
+            // Every pass below reads the change set from here, or the whole table on a sweep.
+            h.open_changes();
             // A derived sprite's box is its owner's less the insets, so it is written from the
             // solve before anything reads a sprite's box: the encode below, and the masks.
             h.publish_visuals();
@@ -1666,6 +1682,7 @@ impl Host {
                 }
             }
             h.tree.window_resized = false;
+            h.close_changes();
             h.pending.env = Some(h.env);
             h.census.flushes += 1;
             core::mem::swap(&mut h.pending, patch);
@@ -1726,51 +1743,109 @@ impl Host {
         self.geometry = jobs;
     }
 
-    /// Gives every derived sprite its own box and touches the ones that moved for the encode.
+    /// Gives each derived sprite whose box may have moved its own box, and touches the ones
+    /// that did for the encode.
     ///
-    /// Every placed row and not only those whose owner moved: a sprite's own `HIDDEN` bit
-    /// marks nothing, so this pass is what takes one off the screen. Restating a box that did
-    /// not move costs the write and a comparison; [`Tree::touch`] records only the ones that
-    /// did, so the encode reads what moved and nothing else.
+    /// A sprite's box follows its owner's extent, its own visual and its own `HIDDEN` and
+    /// `SUNK` bits, and each of those names a node in the change set: the owner when its box
+    /// moves, the sprite when its visual or a bit changes. So the pass visits the named
+    /// nodes and the derived sprites under them, and on a sweep every placed row.
     fn publish_visuals(&mut self) {
-        for i in 0..self.placed.len() {
-            let side = &self.sides[self.placed[i]];
-            let (node, visual) = (side.node, side.visual);
-            let visual = match visual {
-                Visual::Outset(width) => Visual::Insets([
-                    -width.dips_at(self.scope_of(node).at_width(self.tree.class(node)), self.env.scale()); 4
-                ]),
-                visual => visual,
-            };
-            let hidden = self.tree.c.flags[node.index()] & (tree::HIDDEN | tree::SUNK) != 0;
-            let geom = match visual {
-                Visual::Unplaced => continue,
-                // Hidden is no box, by its own bit or an ancestor's: the walks never see a
-                // derived sprite, so this is where it stops taking pixels.
-                _ if hidden => Geom::default(),
-                Visual::Rect(local, size) => Geom {
-                    local,
-                    size,
-                    ..Geom::default()
-                },
-                Visual::Outset(_) => unreachable!("outsets resolve to insets before placement"),
-                Visual::Insets([l, t, r, b]) => {
-                    let owner = self.tree.parent(node);
-                    let box_ = self.tree.c.geom[owner.index()].size;
-                    // An owner narrower than its insets leaves no box, not a negative one.
-                    Geom {
-                        local: Vector2 { x: l, y: t },
-                        size: Vector2 {
-                            x: (box_.x - l - r).max(0.0),
-                            y: (box_.y - t - b).max(0.0),
-                        },
-                        ..Geom::default()
-                    }
+        if self.changes.sweeping() {
+            for i in 0..self.placed.len() {
+                let at = self.placed[i];
+                self.place_visual(at);
+            }
+        } else {
+            for i in 0..self.changes.len() {
+                let node = self.tree.moved[i];
+                if !self.tree.is_live(node) {
+                    continue;
                 }
-            };
-            self.tree.c.geom[node.index()] = geom;
-            self.tree.touch(node);
+                self.place_visual_of(node);
+                let mut child = self.tree.c.links[node.index()].first;
+                while child != windows_scene::NO_LINK {
+                    let next = self.tree.c.links[child as usize].next;
+                    if self.tree.c.flags[child as usize] & tree::DERIVED != 0 {
+                        let id = self.tree.ids.id_at(child);
+                        self.place_visual_of(id);
+                    }
+                    child = next;
+                }
+            }
         }
+        #[cfg(debug_assertions)]
+        for &at in &self.placed {
+            let node = self.sides[at].node;
+            if let Some(geom) = self.visual_geom(at) {
+                let held = self.tree.c.geom[node.index()];
+                debug_assert!(
+                    (held.local, held.size) == (geom.local, geom.size),
+                    "the change set missed a derived sprite's box: {node:?}"
+                );
+            }
+        }
+    }
+
+    /// Places `node`'s visual where it states one.
+    fn place_visual_of(&mut self, node: NodeId) {
+        let at = self.tree.c.side[node.index()];
+        if at != tree::NONE && self.sides[at].placed_at != tree::NONE {
+            self.place_visual(at);
+        }
+    }
+
+    /// Writes one placed row's box, and records it where it moved.
+    fn place_visual(&mut self, at: u32) {
+        let Some(geom) = self.visual_geom(at) else {
+            return;
+        };
+        let node = self.sides[at].node;
+        let held = &mut self.tree.c.geom[node.index()];
+        let moved = (held.local, held.size) != (geom.local, geom.size);
+        *held = geom;
+        if moved {
+            self.tree.moved.push(node);
+        }
+        self.tree.touch(node);
+    }
+
+    /// The box one placed row resolves to now, or `None` where it states none.
+    fn visual_geom(&self, at: u32) -> Option<Geom> {
+        let side = &self.sides[at];
+        let (node, visual) = (side.node, side.visual);
+        let visual = match visual {
+            Visual::Outset(width) => Visual::Insets([
+                -width.dips_at(self.scope_of(node).at_width(self.tree.class(node)), self.env.scale()); 4
+            ]),
+            visual => visual,
+        };
+        let hidden = self.tree.c.flags[node.index()] & (tree::HIDDEN | tree::SUNK) != 0;
+        Some(match visual {
+            Visual::Unplaced => return None,
+            // Hidden is no box, by its own bit or an ancestor's: the walks never see a
+            // derived sprite, so this is where it stops taking pixels.
+            _ if hidden => Geom::default(),
+            Visual::Rect(local, size) => Geom {
+                local,
+                size,
+                ..Geom::default()
+            },
+            Visual::Outset(_) => unreachable!("outsets resolve to insets before placement"),
+            Visual::Insets([l, t, r, b]) => {
+                let owner = self.tree.parent(node);
+                let box_ = self.tree.c.geom[owner.index()].size;
+                // An owner narrower than its insets leaves no box, not a negative one.
+                Geom {
+                    local: Vector2 { x: l, y: t },
+                    size: Vector2 {
+                        x: (box_.x - l - r).max(0.0),
+                        y: (box_.y - t - b).max(0.0),
+                    },
+                    ..Geom::default()
+                }
+            }
+        })
     }
 
     /// The rect an overlay's anchor names, in absolute DIPs.

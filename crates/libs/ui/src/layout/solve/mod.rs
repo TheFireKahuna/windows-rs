@@ -651,11 +651,15 @@ impl Solver<'_> {
     fn publish(&mut self, n: NodeId, at: Vector2, parent: Vector2, h: f32, rect: Rect) {
         let scale = self.scale;
         let g = &mut self.tree.c.geom[n.index()];
+        let held = (g.local, g.size, g.rect);
         g.rect = rect;
         g.at = at;
         g.at_h = h;
         g.local = Vector2::new(rect.x0 - snap(parent.x, scale), rect.y0 - snap(parent.y, scale));
         g.size = Vector2::new(rect.width(), rect.height());
+        if (g.local, g.size, g.rect) != held {
+            self.tree.moved.push(n);
+        }
         self.tree.touch(n);
     }
 
@@ -706,7 +710,13 @@ impl Solver<'_> {
                 continue;
             }
             let flags = &mut self.tree.c.flags[id.index()];
+            let held = *flags & tree::SUNK;
             *flags = (*flags & !(tree::MEASURE | tree::DESC | tree::SUNK)) | sunk;
+            // An owner already at a zero box can sink without moving, and a sprite that
+            // states its own rect has to learn it from somewhere.
+            if held != sunk {
+                self.tree.moved.push(id);
+            }
             self.settle_derived(id);
         }
     }

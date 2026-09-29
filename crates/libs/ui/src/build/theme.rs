@@ -248,6 +248,11 @@ pub(crate) struct Appearances {
     shapes: Vec<Option<(u32, GeomId)>>,
     surfaces: Vec<Option<Surface>>,
     free: Vec<u32>,
+    /// Paints written since the masks pass last read them: a new paint, a new mask, a new
+    /// scope. What that pass visits besides the sprites whose box moved.
+    restated: Vec<NodeId>,
+    /// Surface rows marked for the next resolve, so that pass visits them and not every row.
+    marked: Vec<u32>,
 }
 
 impl Appearances {
@@ -265,6 +270,7 @@ impl Appearances {
             self.paints.resize_with(id.index() + 1, || None);
         }
         self.paints[id.index()] = Some((id.generation(), paint));
+        self.restated.push(id);
     }
 
     pub(crate) fn get(&self, id: NodeId) -> Option<&Appearance> {
@@ -274,10 +280,24 @@ impl Appearances {
         }
     }
 
+    /// A writable paint, which the masks pass then revisits: any field of one may be an
+    /// input to its mask.
     pub(crate) fn get_mut(&mut self, id: NodeId) -> Option<&mut Appearance> {
         match self.paints.get_mut(id.index()) {
-            Some(Some((age, paint))) if *age == id.generation() => Some(paint),
+            Some(Some((age, paint))) if *age == id.generation() => {
+                self.restated.push(id);
+                Some(paint)
+            }
             _ => None,
+        }
+    }
+
+    /// Writes back a paint the masks pass resolved, without naming it for that pass again.
+    fn settle(&mut self, id: NodeId, paint: Appearance) {
+        if let Some(Some((age, held))) = self.paints.get_mut(id.index())
+            && *age == id.generation()
+        {
+            *held = paint;
         }
     }
 
@@ -439,6 +459,7 @@ impl Host {
             at = self.appearances.place_surface(Surface::new(node));
             self.set_surface_row(node, at);
         }
+        self.appearances.marked.push(at);
         let surface = self.appearances.surface_mut(at)?;
         surface.dirty = true;
         Some(surface)
@@ -474,6 +495,8 @@ impl Host {
         let scope = self.scope_of(node).elevate(elevation);
         let at = self.intern(scope);
         self.tree.c.scope[node.index()] = at;
+        // Everything that resolves through the node's scope rather than its box.
+        self.tree.moved.push(node);
         let mut link = self.tree.c.paints[node.index()];
         while let Some(paint) = self.appearances.get_mut(link) {
             paint.scope = scope;
@@ -544,23 +567,46 @@ impl Host {
     /// decides which of the three this surface owns now and finds each previous sprite where
     /// the last pass left it. A surface that keeps its parts touches its paint chain not at
     /// all.
+    ///
+    /// Visits the rows marked since the last pass, and every row where the scale moved or a
+    /// sweep is owed. A resolve that marks another row has it resolved in this pass too.
     pub(crate) fn publish_surfaces(&mut self) {
-        if self.appearances.scale != self.env.scale() {
+        let rescaled = self.appearances.scale != self.env.scale();
+        if rescaled {
             self.appearances.scale = self.env.scale();
             for surface in self.appearances.surfaces.iter_mut().flatten() {
                 surface.dirty = true;
             }
         }
-        for at in 0..self.appearances.surface_rows() {
-            let Some(surface) = self.appearances.surface_mut(at) else {
-                continue;
-            };
-            if !core::mem::take(&mut surface.dirty) {
-                continue;
-            }
-            let surface = *surface;
-            self.publish_surface(at, surface);
+        if rescaled || self.changes.sweeping() {
+            self.appearances.marked.clear();
+            self.appearances.marked.extend(0..self.appearances.surface_rows());
         }
+        let mut marked = Vec::new();
+        while !self.appearances.marked.is_empty() {
+            core::mem::swap(&mut marked, &mut self.appearances.marked);
+            for &at in &marked {
+                self.publish_surface_at(at);
+            }
+            marked.clear();
+        }
+        self.appearances.marked = marked;
+        #[cfg(debug_assertions)]
+        for surface in self.appearances.surfaces.iter().flatten() {
+            debug_assert!(!surface.dirty, "a marked surface was not resolved: {:?}", surface.node);
+        }
+    }
+
+    /// Resolves one surface row where it is still marked.
+    fn publish_surface_at(&mut self, at: u32) {
+        let Some(surface) = self.appearances.surface_mut(at) else {
+            return;
+        };
+        if !core::mem::take(&mut surface.dirty) {
+            return;
+        }
+        let surface = *surface;
+        self.publish_surface(at, surface);
     }
 
     fn publish_surface(&mut self, row: u32, surface: Surface) {
@@ -836,30 +882,64 @@ impl Host {
     /// Both, and not the class alone: a rounded silhouette is capped at half the shorter side
     /// of the box it fills, so a box that moved without changing class leaves a pill rounded
     /// for the extent it used to have.
+    ///
+    /// A mask resolves from the paint itself, its sprite's class and box, and the scale: so
+    /// the pass visits the paints written since it last ran and the sprites the change set
+    /// names, and every paint on a sweep.
     pub(crate) fn publish_masks(&mut self) {
-        for at in 0..self.appearances.slots() {
-            let Some(node) = self.appearances.id_at(at) else {
-                continue;
-            };
-            let Some(mut paint) = self.appearances.get(node).copied() else {
-                continue;
-            };
-            let scope = paint.scope.at_width(self.tree.class(node));
-            let bound = paint.mask.box_bound();
-            let cap = if bound {
-                self.cap_of(paint.id)
-            } else {
-                f32::NAN
-            };
-            if scope == paint.scope && paint.scale == self.env.scale() && (!bound || cap == paint.cap) {
-                continue;
+        if self.changes.sweeping() {
+            self.appearances.restated.clear();
+            for at in 0..self.appearances.slots() {
+                if let Some(node) = self.appearances.id_at(at) {
+                    self.publish_mask(node);
+                }
             }
-            paint.scope = scope;
-            paint.cap = cap;
-            paint.scale = self.env.scale();
-            self.emit_mask(paint.id, paint.mask, scope, paint.surface);
-            self.appearances.place(node, paint);
+        } else {
+            let restated = core::mem::take(&mut self.appearances.restated);
+            for &node in &restated {
+                self.publish_mask(node);
+            }
+            self.appearances.restated = restated;
+            self.appearances.restated.clear();
+            for i in 0..self.tree.moved.len() {
+                let node = self.tree.moved[i];
+                self.publish_mask(node);
+            }
         }
+        #[cfg(debug_assertions)]
+        for at in 0..self.appearances.slots() {
+            if let Some(node) = self.appearances.id_at(at) {
+                debug_assert!(self.mask_due(node).is_none(), "the change set missed a mask: {node:?}");
+            }
+        }
+    }
+
+    /// Re-emits one paint's mask where its class, box or scale moved under it.
+    fn publish_mask(&mut self, node: NodeId) {
+        let Some(paint) = self.mask_due(node) else {
+            return;
+        };
+        self.emit_mask(paint.id, paint.mask, paint.scope, paint.surface);
+        self.appearances.settle(node, paint);
+    }
+
+    /// The paint at `node` as its mask resolves now, or `None` where what it last sent holds.
+    fn mask_due(&self, node: NodeId) -> Option<Appearance> {
+        let mut paint = self.appearances.get(node).copied()?;
+        let scope = paint.scope.at_width(self.tree.class(node));
+        let bound = paint.mask.box_bound();
+        let cap = if bound {
+            self.cap_of(paint.id)
+        } else {
+            f32::NAN
+        };
+        if scope == paint.scope && paint.scale == self.env.scale() && (!bound || cap == paint.cap) {
+            return None;
+        }
+        paint.scope = scope;
+        paint.cap = cap;
+        paint.scale = self.env.scale();
+        Some(paint)
     }
 
     /// Half the shorter side of a sprite's solved box, which is where a corner radius
@@ -986,6 +1066,8 @@ impl Host {
         // Every interned scope rebases the same way, so the table is rebased once and no
         // node's own column moves. Lexical elevation and solved width survive it.
         self.rebase_scopes(root);
+        // Every run, mask and radius resolves through the scope, and no box need move.
+        self.changes.owe_sweep();
         // The content peak is the palette's brightest authored channel, so a palette change
         // changes it. Display capability is separate and is not touched here.
         self.env = Env::new(

@@ -66,17 +66,55 @@ impl Host {
             let at = self.rounded.place(Rounded { node, radius, sent: f32::NAN });
             self.side_mut(node).rounded = at;
         }
+        // Names the node rather than the row: the pass finds the row through the side row,
+        // as it does for a node whose scope moved.
+        self.tree.moved.push(node);
     }
 
+    /// Resolves each rounded clip whose radius, scope or scale may have moved.
+    ///
+    /// The radius resolves from the node's scope and the scale and never from its box, so
+    /// the pass visits the nodes the change set names — a new radius names its node, and so
+    /// does an elevation — and every row on a sweep.
     pub(super) fn publish_rounded_clips(&mut self) {
-        for at in 0..self.rounded.slots() {
-            let Some(row) = self.rounded.get(at) else { continue };
-            let node = row.node;
-            let radius = row.radius.dips_at(self.scope_of(node), self.env.scale()).max(0.0);
-            if radius != row.sent {
-                self.pending.push(Op::Clip { id: node, clip: Clip::RoundedBounds(Corners::all(radius)) });
-                self.rounded[at].sent = radius;
+        if self.changes.sweeping() {
+            for at in 0..self.rounded.slots() {
+                self.publish_rounded(at);
             }
+        } else {
+            for i in 0..self.tree.moved.len() {
+                let node = self.tree.moved[i];
+                if !self.tree.is_live(node) {
+                    continue;
+                }
+                let at = self.tree.c.side[node.index()];
+                if at != tree::NONE && self.sides[at].rounded != tree::NONE {
+                    self.publish_rounded(self.sides[at].rounded);
+                }
+            }
+        }
+        #[cfg(debug_assertions)]
+        for at in 0..self.rounded.slots() {
+            if let Some(row) = self.rounded.get(at) {
+                debug_assert!(
+                    self.rounded_radius(row.node, row.radius) == row.sent,
+                    "the change set missed a rounded clip: {:?}", row.node
+                );
+            }
+        }
+    }
+
+    fn rounded_radius(&self, node: NodeId, radius: Len) -> f32 {
+        radius.dips_at(self.scope_of(node), self.env.scale()).max(0.0)
+    }
+
+    fn publish_rounded(&mut self, at: u32) {
+        let Some(row) = self.rounded.get(at) else { return };
+        let node = row.node;
+        let radius = self.rounded_radius(node, row.radius);
+        if radius != row.sent {
+            self.pending.push(Op::Clip { id: node, clip: Clip::RoundedBounds(Corners::all(radius)) });
+            self.rounded[at].sent = radius;
         }
     }
 }

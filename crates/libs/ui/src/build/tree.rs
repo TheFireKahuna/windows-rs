@@ -273,6 +273,14 @@ pub(crate) struct Tree {
     /// flush passes an index check and fails a generation one, which is the case the encode
     /// has to skip.
     pub touched: Vec<NodeId>,
+    /// Nodes whose box, width class or visibility changed, for the passes after the solve.
+    ///
+    /// The change set every per-row pass reads instead of scanning its whole table: a row is
+    /// revisited where its node is named here, where its own inputs changed (each pass keeps
+    /// that list itself), or on a sweep. May name a node twice, or a node since destroyed;
+    /// every reader checks liveness and every pass is idempotent. The host drains what every
+    /// pass has read at the end of a flush.
+    pub moved: Vec<NodeId>,
     /// A setter under a detached root has no ancestor to mark, so it marks this instead.
     pub roots_dirty: bool,
     /// A hover flag, a mount or an unmount rebuilds the array and solves nothing.
@@ -516,7 +524,13 @@ impl Tree {
 
     pub fn set_class(&mut self, n: NodeId, class: WidthClass) {
         let flags = &mut self.c.flags[n.index()];
-        *flags = (*flags & !CLASS) | (class.bits() << CLASS_SHIFT);
+        let next = (*flags & !CLASS) | (class.bits() << CLASS_SHIFT);
+        if next != *flags {
+            *flags = next;
+            // A mask, a run and a probe each resolve at the class, and a box can keep its
+            // extent across a flip.
+            self.moved.push(n);
+        }
     }
 
     pub fn own_class(&self, n: NodeId) -> WidthClass {
@@ -552,6 +566,9 @@ impl Tree {
             // The hit walk returns at a derived sprite, so no bit on one reaches the array.
             if held & next & DERIVED == 0 {
                 self.hits_dirty = true;
+            } else if bit & HIDDEN != 0 {
+                // Marks nothing, so the visuals pass learns of it here.
+                self.moved.push(n);
             }
         }
     }

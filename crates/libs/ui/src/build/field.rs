@@ -343,20 +343,16 @@ impl Host {
     /// input combines them with the hit table, the live scroll shadow, ancestor clipping, the
     /// window origin and the current scale.
     pub(crate) fn publish_fields(&mut self) {
-        let mut after = ControlId::NONE;
-        while let Some(id) = self.next_field(after) {
-            after = id;
+        // The ids first, then the publications: a publication borrows the host, so the walk
+        // cannot hold the table's iterator across one, and finding each next id by a search
+        // from the start would make the pass quadratic in the fields mounted.
+        let mut ids = core::mem::take(&mut self.field_ids);
+        ids.extend(self.fields.iter().map(|(id, _)| id));
+        for &id in &ids {
             self.publish_field(id);
         }
-    }
-
-    /// The live field after `after` in slot order, which is how the walk holds its place
-    /// without borrowing the table across a publication.
-    fn next_field(&self, after: ControlId) -> Option<ControlId> {
-        self.fields
-            .iter()
-            .map(|(id, _)| id)
-            .find(|id| id.index() > after.index())
+        ids.clear();
+        self.field_ids = ids;
     }
 
     fn publish_field(&mut self, id: ControlId) {
