@@ -599,6 +599,7 @@ impl Host {
 
     /// Resolves one surface row where it is still marked.
     fn publish_surface_at(&mut self, at: u32) {
+        self.changes.visit();
         let Some(surface) = self.appearances.surface_mut(at) else {
             return;
         };
@@ -916,6 +917,7 @@ impl Host {
 
     /// Re-emits one paint's mask where its class, box or scale moved under it.
     fn publish_mask(&mut self, node: NodeId) {
+        self.changes.visit();
         let Some(paint) = self.mask_due(node) else {
             return;
         };

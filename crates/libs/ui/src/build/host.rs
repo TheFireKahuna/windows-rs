@@ -214,6 +214,14 @@ pub struct Host {
     pub(crate) field_commits: Vec<crate::text_input::Commit>,
     /// The live fields' ids, gathered once per publication. Kept for its capacity.
     pub(crate) field_ids: Vec<ControlId>,
+    /// The array as the last build sent it, and a patch and a bearing column to rebuild into,
+    /// so a debug build can check that every rebuild it skipped would have changed nothing.
+    #[cfg(debug_assertions)]
+    hits_last: Vec<windows_scene::HitEntry>,
+    #[cfg(debug_assertions)]
+    hits_shadow: SinkPatch,
+    #[cfg(debug_assertions)]
+    hits_shadow_bears: Vec<bool>,
     pub(crate) scrolls: Pool<crate::layout::ScrollRow>,
     pub(crate) regions: Pool<crate::present::RegionRow>,
     pub(crate) geometry: super::geometry::Jobs,
@@ -230,6 +238,9 @@ pub struct Host {
     /// it stands at the fill, not as it stood at the mint. Duplicates are removed there.
     chrome_touched: Vec<ControlId>,
     pub(crate) values: Vec<(ControlId, ValueRow)>,
+    /// The controls that carry a value row, which the values pass reads instead of every
+    /// control. Enrolled where a row is first given one; pruned by the pass as rows go.
+    valued: Vec<ControlId>,
     pub(crate) gestures: Vec<(ControlId, crate::gesture::GestureDecl)>,
     pub(crate) focus_ops: Vec<crate::seam::FocusOp>,
     pub(crate) released: Vec<ControlId>,
@@ -303,6 +314,12 @@ impl Host {
                 field_layouts: Vec::new(),
                 field_commits: Vec::new(),
                 field_ids: Vec::new(),
+                #[cfg(debug_assertions)]
+                hits_last: Vec::new(),
+                #[cfg(debug_assertions)]
+                hits_shadow: SinkPatch::default(),
+                #[cfg(debug_assertions)]
+                hits_shadow_bears: Vec::new(),
                 scrolls: Pool::default(),
                 regions: Pool::default(),
                 geometry: super::geometry::Jobs::default(),
@@ -311,6 +328,7 @@ impl Host {
                 sent_caption: [None; 3],
                 chrome_touched: Vec::new(),
                 values: Vec::new(),
+                valued: Vec::new(),
                 gestures: Vec::new(),
                 focus_ops: Vec::new(),
                 released: Vec::new(),
@@ -1118,6 +1136,13 @@ impl Host {
         self.controls.get(id)
     }
 
+    /// Enrols `id` with the values pass where it is about to be given its first value row.
+    pub(crate) fn enrol_value(&mut self, id: ControlId) {
+        if self.controls.get(id).is_some_and(|row| row.value.is_none()) {
+            self.valued.push(id);
+        }
+    }
+
     pub(crate) fn control_mut(&mut self, id: ControlId) -> Option<&mut ControlRow> {
         // The one mutable way in, so it is where a row is recorded as possibly changed. A run
         // of setters on one control costs one entry.
@@ -1231,6 +1256,7 @@ impl Host {
         number: f64,
         epoch: u64,
     ) {
+        self.enrol_value(id);
         let Some(row) = self.control_mut(id) else {
             return;
         };
@@ -1797,6 +1823,7 @@ impl Host {
 
     /// Writes one placed row's box, and records it where it moved.
     fn place_visual(&mut self, at: u32) {
+        self.changes.visit();
         let Some(geom) = self.visual_geom(at) else {
             return;
         };
@@ -1977,15 +2004,26 @@ impl Host {
     /// A part the router drives is corrected by shipping it the new room, never by writing
     /// its property: writing it would snap the part back to where the application last wrote
     /// it, mid-gesture.
+    ///
+    /// Reads the controls enrolled as carrying a value, not every control.
     fn publish_values(&mut self) {
         let Self {
             controls,
             tree,
             values,
+            valued,
             ..
         } = self;
         tree.fresh_scopes();
-        for (id, row) in controls.iter_mut() {
+        valued.retain(|&id| controls.get(id).is_some_and(|row| row.value.is_some()));
+        #[cfg(debug_assertions)]
+        for (id, row) in controls.iter() {
+            debug_assert!(row.value.is_none() || valued.contains(&id), "a value row was not enrolled: {id:?}");
+        }
+        for &id in valued.iter() {
+            let Some(row) = controls.get_mut(id) else {
+                continue;
+            };
             let (node, flags) = (row.node, row.front.flags);
             let Some(value) = row.value.as_mut() else {
                 continue;
@@ -2154,14 +2192,20 @@ impl Host {
     /// full-window blocker: the array is the z-order and the scan takes the first hit from
     /// the back.
     pub(crate) fn build_hits(&mut self, uia: Option<&mut crate::uia::Snapshot>) {
+        if core::mem::take(&mut self.tree.boxes_moved) {
+            self.uia_stale.set(true);
+        }
         if !self.tree.hits_dirty && uia.is_none() {
+            // What a rebuild would produce here has to be what the scene already holds: a
+            // moved box the bearing column let through would leave a stale rect.
+            #[cfg(debug_assertions)]
+            self.check_hits();
             return;
         }
         if self.tree.hits_dirty {
             self.uia_stale.set(true);
         }
-        let root = self.root;
-        let window = self.tree.c.geom[root.index()].size;
+        let mut bears = core::mem::take(&mut self.tree.bears);
         let Self {
             tree,
             controls,
@@ -2172,6 +2216,7 @@ impl Host {
             pending,
             overlays,
             scratch_text,
+            root,
             ..
         } = self;
         let walk = hits::Walk {
@@ -2187,21 +2232,65 @@ impl Host {
             patch: pending,
             uia,
             scratch: scratch_text,
+            bears: &mut bears,
         };
-        hits::begin(&mut out);
-        hits::walk(&walk, &mut out, root, 0);
-        for placement in overlays.iter() {
-            if let Some(id) = placement.blocker {
-                hits::blocker(&mut out, id, (window.x, window.y));
-            }
-            hits::walk(&walk, &mut out, placement.root, 0);
-        }
-        // Sorted on the way out, so `HitTable::replace` is two copies and never a sort.
-        out.patch.index_mut().sort_unstable_by_key(|&(id, _)| id);
+        hits::fill(&walk, &mut out, *root);
         let patch = out.patch;
         let (entries, index) = (patch.hits_span(), patch.index_span());
         patch.push(Op::Hits { entries, index });
+        #[cfg(debug_assertions)]
+        {
+            self.hits_last.clear();
+            self.hits_last.extend_from_slice(self.pending.hits_mut());
+            // Sized here, so the check a steady flush runs allocates nothing of its own.
+            let (entries, index) = (self.pending.hits_mut().len(), self.pending.index_mut().len());
+            self.hits_shadow.hits_mut().reserve(entries);
+            self.hits_shadow.index_mut().reserve(index);
+            self.hits_shadow_bears.reserve(bears.len());
+        }
+        self.tree.bears = bears;
         self.tree.hits_dirty = false;
+    }
+
+    /// Rebuilds the array into a scratch patch and asserts it is the one last sent.
+    #[cfg(debug_assertions)]
+    fn check_hits(&mut self) {
+        let mut bears = core::mem::take(&mut self.hits_shadow_bears);
+        let mut patch = core::mem::take(&mut self.hits_shadow);
+        let Self {
+            tree,
+            controls,
+            text,
+            handlers,
+            fields,
+            hits,
+            overlays,
+            scratch_text,
+            root,
+            ..
+        } = self;
+        let walk = hits::Walk {
+            tree,
+            controls,
+            text,
+            handlers,
+            fields,
+            overlays,
+        };
+        let mut out = hits::Out {
+            hits,
+            patch: &mut patch,
+            uia: None,
+            scratch: scratch_text,
+            bears: &mut bears,
+        };
+        hits::fill(&walk, &mut out, *root);
+        debug_assert!(
+            patch.hits_mut().as_slice() == self.hits_last.as_slice(),
+            "a box moved under a node that bore no hit entry and the array went stale"
+        );
+        self.hits_shadow = patch;
+        self.hits_shadow_bears = bears;
     }
 
     /// Fills `out` with the automation tree, in one preorder walk over the arena.

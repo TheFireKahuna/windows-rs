@@ -951,6 +951,7 @@ impl Host {
 
     /// Pins one run at its solved width, and re-emits it where its glyphs moved.
     fn publish_run(&mut self, at: usize) {
+        self.changes.visit();
         let Some((_, class, w)) = self.run_width(at) else {
             return;
         };

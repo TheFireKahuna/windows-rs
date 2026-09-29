@@ -285,6 +285,13 @@ pub(crate) struct Tree {
     pub roots_dirty: bool,
     /// A hover flag, a mount or an unmount rebuilds the array and solves nothing.
     pub hits_dirty: bool,
+    /// Whether each node's subtree put anything in the hit array on its last build, by node
+    /// index. A box that moves under a node that bore nothing cannot change the array, so
+    /// only a move where this holds, or past its end, rebuilds it.
+    pub bears: Vec<bool>,
+    /// A laid-out box moved since the last hit build: what the automation tree, which
+    /// reads every box and not only the hit-bearing ones, goes stale on.
+    pub boxes_moved: bool,
     /// The window extent changed since the last flush, so this flush's bounds follow the
     /// window 1:1: every layout write is a plain set, including under `ANIMATE_LAYOUT`.
     pub window_resized: bool,
@@ -781,12 +788,16 @@ impl Tree {
                     Bind::Set(value)
                 },
             };
-            // The array holds absolute rects, so a box that moved leaves it stale. The hit walk
-            // skips a derived sprite and everything under it, so one moving leaves the array
-            // exactly as it was: a meter fill or a text tile restated every frame rebuilds
-            // nothing.
+            // The array holds absolute rects, so a box that moved leaves it stale where anything
+            // under it is in the array. The hit walk skips a derived sprite and everything under
+            // it, so one moving leaves the array exactly as it was: a meter fill or a text tile
+            // restated every frame rebuilds nothing, and neither does a label whose subtree
+            // declares no target.
             if (now.local != was.local || now.size != was.size) && flags & DERIVED == 0 {
-                self.hits_dirty = true;
+                self.boxes_moved = true;
+                if self.bears.get(id.index()).copied().unwrap_or(true) {
+                    self.hits_dirty = true;
+                }
             }
             if now.local != was.local {
                 // A driven channel is not the layout's to write. `Prop::Offset` carries both

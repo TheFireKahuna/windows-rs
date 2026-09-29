@@ -770,6 +770,7 @@ impl<K> Element<'_, K> {
             "a scalar part cannot also bind its driven property"
         );
         self.host().tree.c.driven[node.index()] |= claimed(part);
+        self.host().enrol_value(owner);
         let Some(row) = self.host().control_mut(owner) else {
             return self;
         };
@@ -815,6 +816,9 @@ impl<K> Element<'_, K> {
     ) -> Self {
         let id = self.control_id();
         let write = move |host: &mut Host, (range, source): (Option<Range>, ScalarValue)| {
+            if range.is_some() {
+                host.enrol_value(id);
+            }
             if let Some(row) = host.control_mut(id)
                 && let Some(range) = range
             {

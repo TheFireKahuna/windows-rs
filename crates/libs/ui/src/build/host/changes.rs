@@ -29,12 +29,22 @@ pub(crate) struct Changes {
     /// The pixel scale the last flush resolved at. A flush that finds another sweeps,
     /// however the scale was changed.
     scale: f32,
+    /// How many rows the passes have visited, for a test to bound.
+    #[cfg(test)]
+    pub(crate) rows: u32,
 }
 
 impl Default for Changes {
     fn default() -> Self {
         // Nothing has been published yet, so the first flush reads everything.
-        Self { read: 0, sweeping: false, owed: true, scale: f32::NAN }
+        Self {
+            read: 0,
+            sweeping: false,
+            owed: true,
+            scale: f32::NAN,
+            #[cfg(test)]
+            rows: 0,
+        }
     }
 }
 
@@ -47,6 +57,15 @@ impl Changes {
     /// Whether this flush's passes walk their whole tables.
     pub(crate) fn sweeping(&self) -> bool {
         self.sweeping
+    }
+
+    /// Counts one row a pass visited. Compiled out of everything but tests.
+    #[inline]
+    pub(crate) fn visit(&mut self) {
+        #[cfg(test)]
+        {
+            self.rows += 1;
+        }
     }
 
     /// How much of the change set the first pass reads.

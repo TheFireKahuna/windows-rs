@@ -38,6 +38,8 @@
 //! 16d. A derived sprite that moves leaves the hit array as it was.
 //! 16e. A layout restated unchanged marks nothing.
 //! 16f. A container's lead is its first laid-out child through every splice.
+//! 16g. A flush visits the rows what changed reaches, not every row mounted.
+//! 16h. A box that moves under no hit target leaves the hit array as it was.
 //!
 //! The one hit array
 //! 17. The array is paint order and the id index is id order. [03-LAYOUT §7]
@@ -911,6 +913,72 @@ fn a_containers_lead_is_its_first_laid_out_child_through_every_splice() {
             assert_eq!(tree.lead(parent), expected);
         }
     }
+}
+
+#[test]
+fn a_flush_visits_what_changed_not_what_is_mounted() {
+    const MOUNTED: u32 = 200;
+    let mut rig = Rig::new();
+    let count = Cell::new(0u32);
+    let width = Cell::new(40.0f32);
+    rig.mount(|ui| {
+        ui.stack(|ui| {
+            for _ in 0..MOUNTED {
+                button(ui, "Idle");
+            }
+            text(ui, crate::widget::shown(move || count.get()));
+            ui.node(Preset::Layer)
+                .height(Len::dip(8.0))
+                .layout_from(move |l| l.width = Len::dip(width.get()))
+                .plate(Metric::Radius, Role::Fill(Fill::Sunken), 1.0);
+        });
+    });
+    rig.flush();
+    let visited = |rig: &mut Rig, f: &dyn Fn(&mut Rig)| {
+        Host::with(|h| h.changes.rows = 0);
+        f(rig);
+        Host::with(|h| h.changes.rows)
+    };
+    let text_rows = visited(&mut rig, &|rig| {
+        rig.set(count, 1);
+    });
+    let box_rows = visited(&mut rig, &|rig| {
+        rig.set(width, 90.0);
+    });
+    // Each pass reads what one change reaches: a run, a node's sprites and masks, their
+    // ancestors' boxes where those moved. Walking the window would visit every button's run,
+    // chrome parts and masks, several rows each.
+    assert!(text_rows < 24, "a text change visited {text_rows} rows");
+    assert!(box_rows < 24, "a box change visited {box_rows} rows");
+    // What the last change named after the first pass had read is read once more, and then
+    // nothing is.
+    let replayed = visited(&mut rig, &|rig| {
+        rig.flush();
+    });
+    let idle = visited(&mut rig, &|rig| {
+        rig.flush();
+    });
+    assert!(replayed < 24, "the replay visited {replayed} rows");
+    assert_eq!(idle, 0, "a flush with nothing changed visited rows");
+}
+
+#[test]
+fn a_box_that_moves_under_no_hit_target_leaves_the_array_as_it_was() {
+    let mut rig = Rig::new();
+    let (plain, target) = (Cell::new(40.0f32), Cell::new(40.0f32));
+    rig.mount(|ui| {
+        ui.stack(|ui| {
+            ui.node(Preset::Layer)
+                .height(Len::dip(8.0))
+                .layout_from(move |l| l.width = Len::dip(plain.get()));
+            button(ui, "Target").layout_from(move |l| l.width = Len::dip(target.get()));
+        });
+    });
+    let rebuilt = |frame: super::rig::Frame<'_>| {
+        frame.patch().ops().iter().any(|op| matches!(op, Op::Hits { .. }))
+    };
+    assert!(!rebuilt(rig.set(plain, 90.0)), "a box with nothing to hit rebuilt the array");
+    assert!(rebuilt(rig.set(target, 90.0)), "a target that moved left its rect stale");
 }
 
 /// A clip is restated from the box the solve published, so the last one on the wire is the

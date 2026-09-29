@@ -281,6 +281,7 @@ impl Element<'_, Region> {
         self.host().region_peer(id, move |peer| {
             peer.value = Some(value);
         });
+        self.host().enrol_value(id);
         if let Some(row) = self.host().control_mut(id) {
             row.value = Some(crate::widget::ValueRow {
                 min: range.min,

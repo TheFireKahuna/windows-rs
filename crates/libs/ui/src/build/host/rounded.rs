@@ -109,6 +109,7 @@ impl Host {
     }
 
     fn publish_rounded(&mut self, at: u32) {
+        self.changes.visit();
         let Some(row) = self.rounded.get(at) else { return };
         let node = row.node;
         let radius = self.rounded_radius(node, row.radius);

@@ -47,6 +47,8 @@ pub(crate) struct Out<'a> {
     /// Where a help string is read before it is interned. Held by the caller, so a screen of
     /// tooltips costs one allocation.
     pub scratch: &'a mut String,
+    /// [`Tree::bears`], written by this walk.
+    pub bears: &'a mut Vec<bool>,
 }
 
 /// The ancestry one preorder walk carries, kept across rebuilds for its capacity.
@@ -71,6 +73,33 @@ impl HitBuilder {
         self.uia.retain(|&(at, _)| at < depth);
         self.uia_clips.retain(|&(at, _)| at < depth);
     }
+}
+
+/// Fills the array, and the automation tree where `out` carries one, from the window root
+/// and every overlay above it, in z-order.
+///
+/// Slot roots append after the window subtree, in the order they opened, each
+/// light-dismissing overlay preceded by its full-window blocker: the array is the z-order and
+/// the scan takes the first hit from the back.
+pub(crate) fn fill(walk: &Walk<'_>, out: &mut Out<'_>, root: NodeId) {
+    let window = walk.tree.c.geom[root.index()].size;
+    out.bears.clear();
+    out.bears.resize(walk.tree.c.flags.len(), true);
+    begin(out);
+    self::walk(walk, out, root, 0);
+    for placement in walk.overlays {
+        if let Some(id) = placement.blocker {
+            blocker(out, id, (window.x, window.y));
+        }
+        self::walk(walk, out, placement.root, 0);
+        // A blocker spans the window, so the overlay's root answers for it whatever its
+        // subtree holds.
+        out.bears[placement.root.index()] = true;
+    }
+    // The blockers read the window root's extent.
+    out.bears[root.index()] = true;
+    // Sorted on the way out, so `HitTable::replace` is two copies and never a sort.
+    out.patch.index_mut().sort_unstable_by_key(|&(id, _)| id);
 }
 
 /// Clears the ancestry stacks and every output, starting a fresh array.
@@ -123,10 +152,16 @@ fn push_entry(out: &mut Out<'_>, entry: HitEntry) -> u32 {
 ///
 /// Suspended subtrees and derived sprites are skipped: a thumb's entry would name a rect the
 /// solve fixed and the tracker then moved away from.
-pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usize) {
+///
+/// Answers whether the subtree put anything in the array, and records it in
+/// [`Out::bears`]: an entry, a scrolling node its descendants resolve through, or a clip
+/// collapsed to nothing, whose growing back would reveal what it hid.
+pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usize) -> bool {
     let flags = walk.tree.c.flags[node.index()];
     if flags & (tree::HIDDEN | tree::SUSPENDED | tree::DERIVED) != 0 {
-        return;
+        // Showing, resuming or re-linking one rebuilds the array on its own.
+        out.bears[node.index()] = false;
+        return false;
     }
     let translation_start = out.uia.as_ref().map(|uia| uia.entries.len());
     out.hits.unwind(depth);
@@ -160,8 +195,10 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
     let bounded = flags & tree::CLIP != 0;
     let geom = walk.tree.c.geom[node.index()];
     if bounded && (geom.size.x <= 0.0 || geom.size.y <= 0.0) {
-        return;
+        out.bears[node.index()] = true;
+        return true;
     }
+    let mut bears = flags & (tree::HIT | tree::SCROLL) != 0;
     if flags & tree::HIT != 0 {
         let mut decl = HitDecl {
             flags: HitFlags::from_bits(tree::unpack_decl(flags)),
@@ -203,8 +240,9 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
         out.hits.scrolls.push((depth, node, at));
     }
     for child in walk.tree.children(node) {
-        self::walk(walk, out, child, depth + 1);
+        bears |= self::walk(walk, out, child, depth + 1);
     }
+    out.bears[node.index()] = bears;
     if let (Some(start), Some(uia), Some(state)) = (
         translation_start, out.uia.as_deref_mut(),
         walk.controls.get(control).and_then(|row| row.translation.as_ref()),
@@ -213,6 +251,7 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
             owner: control, start, end: uia.entries.len(), state: state.clone(),
         });
     }
+    bears
 }
 
 /// Emits one node's hit entry and pushes it onto the ancestry stacks.
