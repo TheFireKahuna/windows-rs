@@ -256,6 +256,7 @@ columns! {
     layout: Layout = Layout::DEFAULT,
     geom: Geom = Geom::default(),
     published: Published = Published::MINTED,
+    scoped: u32 = 0,
 }
 
 /// The arena: one mint authority, one column set, one dirty frontier.
@@ -263,7 +264,7 @@ columns! {
 pub(crate) struct Tree {
     pub ids: Ids<NODE>,
     pub c: Columns,
-    /// Nodes the publication wrote a box for, as full ids: a slot minted and destroyed in one
+    /// Nodes the publication moved, as full ids: a slot minted and destroyed in one
     /// flush passes an index check and fails a generation one, which is the case the encode
     /// has to skip.
     pub touched: Vec<NodeId>,
@@ -274,6 +275,13 @@ pub(crate) struct Tree {
     /// The window extent changed since the last flush, so this flush's bounds follow the
     /// window 1:1: every layout write is a plain set, including under `ANIMATE_LAYOUT`.
     pub window_resized: bool,
+    /// The stamp [`Tree::layout_scope`] answers are memoized under. See [`Tree::fresh_scopes`].
+    epoch: u32,
+    /// The ancestry one scope lookup climbed before it met an answer, kept for its capacity.
+    climbed: Vec<u32>,
+    /// How many nodes the scope lookups have climbed through, for a test to bound.
+    #[cfg(test)]
+    pub climbs: u32,
 }
 
 impl Forest for Tree {
@@ -484,7 +492,10 @@ impl Tree {
                     self.mark(n);
                 }
             }
-            self.hits_dirty = true;
+            // The hit walk returns at a derived sprite, so no bit on one reaches the array.
+            if held & next & DERIVED == 0 {
+                self.hits_dirty = true;
+            }
         }
     }
 
@@ -495,6 +506,21 @@ impl Tree {
         }
         write(&mut self.c.layout[n.index()]);
         self.mark(n);
+    }
+
+    /// Edits `n`'s authored layout and marks it only where the edit changed it.
+    ///
+    /// For a writer that restates a derived input every flush: [`Tree::author`] would mark
+    /// the node, and the solve would re-place its children, whether or not anything moved.
+    pub fn restate(&mut self, n: NodeId, write: impl FnOnce(&mut Layout)) {
+        if !self.ids.is_live(n) {
+            return;
+        }
+        let held = self.c.layout[n.index()];
+        write(&mut self.c.layout[n.index()]);
+        if self.c.layout[n.index()] != held {
+            self.mark(n);
+        }
     }
 
     /// How this node announces a change to its content, off a flag word a walk already read.
@@ -522,8 +548,29 @@ impl Tree {
     }
 
     /// Records that the publication wrote `n`'s box, for the encode to read.
+    ///
+    /// A box written where it already was on the wire is not recorded: the encode would emit
+    /// nothing for it, and a publisher that restates every box it owns each flush would
+    /// otherwise grow the list by every node it owns rather than by the ones that moved.
     pub fn touch(&mut self, n: NodeId) {
-        self.touched.push(n);
+        if self.stale(n) {
+            self.touched.push(n);
+        }
+    }
+
+    /// Returns whether `n`'s box, clip or sunk state differs from what the encode last put on
+    /// the wire: everything [`Tree::encode`] would emit an op or a hit rebuild for.
+    ///
+    /// Every write of a box is followed by [`Tree::touch`], and only the encode writes the
+    /// published column, so a node this answers `false` for at its touch cannot become
+    /// stale before the encode reads it without being touched again.
+    pub fn stale(&self, n: NodeId) -> bool {
+        let i = n.index();
+        let (now, was, flags) = (&self.c.geom[i], &self.c.published[i], self.c.flags[i]);
+        now.local != was.local
+            || now.size != was.size
+            || (flags & CLIP != 0) != was.bounded
+            || (flags & SUNK != 0) != was.sunk
     }
 
     /// Returns the first live node that still claims its input is unsolved, with its flags.
@@ -540,23 +587,76 @@ impl Tree {
         first(MEASURE).or_else(|| first(DESC))
     }
 
-    pub(crate) fn layout_scope(&self, mut id: NodeId) -> bool {
-        while !id.is_none() {
-            if self.c.flags[id.index()] & ANIMATE_LAYOUT != 0 {
-                return true;
-            }
-            id = self.parent(id);
+    /// Starts a fresh generation of [`Tree::layout_scope`] answers.
+    ///
+    /// Called at the head of each pass that asks, because between passes a node can be
+    /// relinked or an ancestor can gain or lose [`ANIMATE_LAYOUT`], and nothing on those
+    /// paths should pay to invalidate a memo. Within one pass neither happens, so each answer
+    /// holds for the rest of it.
+    pub(crate) fn fresh_scopes(&mut self) {
+        self.epoch += 1;
+        // The stamp is the epoch shifted past the answer bit. At the top of the range every
+        // stamp is forgotten at once, so a wrapped epoch never matches a stale one.
+        if self.epoch >= 1 << 31 {
+            self.c.scoped.fill(0);
+            self.epoch = 1;
         }
-        false
     }
 
-    pub(crate) fn animates_layout(&self, id: NodeId) -> bool {
+    /// Returns whether `id` or any ancestor declares [`ANIMATE_LAYOUT`].
+    ///
+    /// Memoized per node for the current [`Tree::fresh_scopes`] generation: a lookup climbs
+    /// only until it meets a node already answered this pass, and stamps every node it
+    /// climbed on the way back down. Over a pass the climbs visit each ancestor once in
+    /// total, so asking for every touched node costs the touched nodes plus their distinct
+    /// ancestry rather than the touched count times the depth.
+    pub(crate) fn layout_scope(&mut self, id: NodeId) -> bool {
+        debug_assert!(self.epoch != 0, "fresh_scopes opens every pass that asks");
+        let stamp = self.epoch << 1;
+        let mut climbed = core::mem::take(&mut self.climbed);
+        let mut at = id.index() as u32;
+        let inside = loop {
+            if at == NO_LINK {
+                break false;
+            }
+            let seen = self.c.scoped[at as usize];
+            if seen & !1 == stamp {
+                break seen & 1 != 0;
+            }
+            climbed.push(at);
+            #[cfg(test)]
+            {
+                self.climbs += 1;
+            }
+            if self.c.flags[at as usize] & ANIMATE_LAYOUT != 0 {
+                break true;
+            }
+            at = self.c.links[at as usize].parent;
+        };
+        for &at in &climbed {
+            self.c.scoped[at as usize] = stamp | inside as u32;
+        }
+        climbed.clear();
+        self.climbed = climbed;
+        inside
+    }
+
+    /// Returns whether a box that moved under a layout scope springs rather than snaps,
+    /// given the scope answer the caller already holds.
+    fn springs(&self, id: NodeId, scoped: bool) -> bool {
         let was = self.c.published[id.index()];
-        self.layout_scope(id)
+        scoped
             && was.size.x.is_finite()
             && !was.sunk
             && self.c.flags[id.index()] & (SUNK | INITIAL) == 0
             && !self.window_resized
+    }
+
+    /// Returns whether a move of `id`'s box springs. Opens no generation of its own: the
+    /// caller's pass has called [`Tree::fresh_scopes`].
+    pub(crate) fn animates_layout(&mut self, id: NodeId) -> bool {
+        let scoped = self.layout_scope(id);
+        self.springs(id, scoped)
     }
 
     /// Emits the geometry the publication moved and takes the published column to now.
@@ -565,20 +665,28 @@ impl Tree {
     /// re-sending an unchanged offset would snap a thumb back to where the application last
     /// wrote it. A node gathered and then destroyed in the same flush fails the liveness
     /// check and emits nothing; the scene's cascade on its parent's drop covers the rest.
+    ///
+    /// A node touched twice, or touched and then moved back, is not stale by the time it is
+    /// read and costs one comparison. The scope of the rest is asked once each, through the
+    /// memo, so the pass is linear in what moved.
     pub fn encode(&mut self, patch: &mut SinkPatch) {
+        if self.touched.is_empty() {
+            return;
+        }
+        self.fresh_scopes();
         for at in 0..self.touched.len() {
             let id = self.touched[at];
-            if !self.ids.is_live(id) {
+            if !self.ids.is_live(id) || !self.stale(id) {
                 continue;
             }
             let now = self.c.geom[id.index()];
             let was = self.c.published[id.index()];
-            let bounded = self.c.flags[id.index()] & CLIP != 0;
+            let flags = self.c.flags[id.index()];
+            let bounded = flags & CLIP != 0;
             let live_clip = self.layout_scope(id);
-            let sunk = self.c.flags[id.index()] & SUNK != 0;
-            let animated = self.animates_layout(id);
-            let text = self.c.flags[id.index()] & RUN != 0
-                || self.c.text[id.index()] != MeasureKey::NONE;
+            let sunk = flags & SUNK != 0;
+            let animated = self.springs(id, live_clip);
+            let text = flags & RUN != 0 || self.c.text[id.index()] != MeasureKey::NONE;
             let write = |prop, value| Op::Bind {
                 id,
                 prop,
@@ -588,8 +696,11 @@ impl Tree {
                     Bind::Set(value)
                 },
             };
-            // The array holds absolute rects, so a box that moved leaves it stale.
-            if now.local != was.local || now.size != was.size {
+            // The array holds absolute rects, so a box that moved leaves it stale. The hit walk
+            // skips a derived sprite and everything under it, so one moving leaves the array
+            // exactly as it was: a meter fill or a text tile restated every frame rebuilds
+            // nothing.
+            if (now.local != was.local || now.size != was.size) && flags & DERIVED == 0 {
                 self.hits_dirty = true;
             }
             if now.local != was.local {
@@ -615,7 +726,7 @@ impl Tree {
             }
             // A clip is declared, not diffed, scene-side, and declaring the absence of one
             // mints a side row on every node that never had one.
-            if self.c.flags[id.index()] & ROUNDED_CLIP == 0
+            if flags & ROUNDED_CLIP == 0
                 && (bounded != was.bounded || (bounded && !live_clip && now.size != was.size)) {
                 let clip = if bounded && live_clip {
                     Clip::Bounds

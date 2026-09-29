@@ -32,6 +32,11 @@
 //! The encode
 //! 15. A box that moved is published and one that did not is not. [03-LAYOUT §7]
 //! 16. A node carried by its parent restates no offset of its own. [03-LAYOUT §7]
+//! 16a. A box restated where it already was is not recorded for the encode.
+//! 16b. The encode asks each ancestor its layout scope once, however many moved under it.
+//! 16c. A node moved out of an animated scope snaps its next move.
+//! 16d. A derived sprite that moves leaves the hit array as it was.
+//! 16e. A layout restated unchanged marks nothing.
 //!
 //! The one hit array
 //! 17. The array is paint order and the id index is id order. [03-LAYOUT §7]
@@ -730,6 +735,137 @@ fn a_box_that_moved_is_published_and_one_that_did_not_is_not() {
         frame.bound(fixed, Prop::Size),
         None,
         "an unmoved box restated its size"
+    );
+}
+
+#[test]
+fn a_box_restated_where_it_already_was_is_not_recorded() {
+    let mut rig = Rig::new();
+    let mut held = NodeId::NONE;
+    rig.mount(|ui| held = boxed(ui, 30.0, 20.0));
+    Host::with(|h| {
+        assert!(!h.tree.stale(held), "a settled box reads as moved");
+        h.tree.touch(held);
+        assert!(h.tree.touched.is_empty(), "an unmoved box was recorded for the encode");
+    });
+}
+
+/// `depth` nested stacks, each holding one leaf whose width follows `width`.
+fn nest(ui: &mut Ui<'_>, depth: u32, width: Cell<f32>) {
+    ui.node(Preset::Layer)
+        .height(Len::dip(4.0))
+        .layout_from(move |l| l.width = Len::dip(width.get()));
+    if depth > 0 {
+        ui.node(Preset::Stack).children(|ui| nest(ui, depth - 1, width));
+    }
+}
+
+#[test]
+fn the_encode_asks_each_ancestor_its_scope_once() {
+    const DEPTH: u32 = 64;
+    let mut rig = Rig::new();
+    let width = Cell::new(10.0f32);
+    rig.mount(|ui| {
+        ui.node(Preset::Stack)
+            .animate_layout()
+            .children(|ui| nest(ui, DEPTH, width));
+    });
+    Host::with(|h| h.tree.climbs = 0);
+    let frame = rig.set(width, 30.0);
+    let springs = frame
+        .patch()
+        .ops()
+        .iter()
+        .filter(|op| {
+            matches!(op, Op::Bind { prop: Prop::Size, bind: Bind::Animate(Anim::Spring { .. }), .. })
+        })
+        .count() as u32;
+    assert!(springs > DEPTH, "every leaf under the scope springs: {springs}");
+    // One climb per distinct ancestor plus one per asking node, where a walk per node would
+    // climb the depth of each: about DEPTH² / 2.
+    let climbs = Host::with(|h| h.tree.climbs);
+    assert!(climbs <= 4 * (DEPTH + 2), "the scope lookups climbed {climbs} nodes");
+}
+
+#[test]
+fn a_node_moved_out_of_an_animated_scope_snaps() {
+    let mut rig = Rig::new();
+    let width = Cell::new(40.0f32);
+    let (mut plain, mut leaf) = (NodeId::NONE, NodeId::NONE);
+    rig.mount(|ui| {
+        ui.row(|ui| {
+            ui.node(Preset::Stack).animate_layout().children(|ui| {
+                leaf = ui
+                    .node(Preset::Layer)
+                    .height(Len::dip(20.0))
+                    .layout_from(move |l| l.width = Len::dip(width.get()))
+                    .id()
+                    .into();
+            });
+            plain = ui.node(Preset::Stack).width(Len::dip(200.0)).id().into();
+        });
+    });
+    let springs = |patch: &windows_scene::SinkPatch| {
+        patch.ops().iter().any(|op| {
+            matches!(op, Op::Bind { id, prop: Prop::Size, bind: Bind::Animate(_) } if *id == leaf)
+        })
+    };
+    assert!(springs(rig.set(width, 60.0).patch()), "a move under the scope snapped");
+    Host::with(|h| h.place(leaf, windows_scene::GroupId(plain), None));
+    let frame = rig.set(width, 80.0);
+    assert_eq!(
+        frame.bound(leaf, Prop::Size).map(|v| matches!(v, Value::Vec2(v) if v.x == 80.0)),
+        Some(true)
+    );
+    assert!(!springs(frame.patch()), "a scope answer outlived the pass it was asked in");
+}
+
+#[test]
+fn a_derived_sprite_that_moves_leaves_the_hit_array_as_it_was() {
+    let mut rig = Rig::new();
+    let mut parent = NodeId::NONE;
+    rig.mount(|ui| {
+        parent = boxed(ui, 100.0, 40.0);
+        button(ui, "Hit");
+    });
+    let sprite = Host::with(|h| {
+        let sprite = h.visual(windows_scene::GroupId(parent), None);
+        h.visual_rect(sprite, Vector2::zero(), Vector2::new(10.0, 40.0));
+        sprite
+    });
+    rig.flush();
+    Host::with(|h| h.visual_rect(sprite, Vector2::zero(), Vector2::new(70.0, 40.0)));
+    let frame = rig.flush();
+    assert_eq!(
+        frame.bound(sprite.0, Prop::Size),
+        Some(Value::Vec2(Vector2::new(70.0, 40.0)))
+    );
+    assert!(
+        !frame.patch().ops().iter().any(|op| matches!(op, Op::Hits { .. })),
+        "a derived sprite's move rebuilt the hit array"
+    );
+    Host::with(|h| h.tree.set_flag(sprite.0, super::tree::HIDDEN, true));
+    let frame = rig.flush();
+    assert!(
+        !frame.patch().ops().iter().any(|op| matches!(op, Op::Hits { .. })),
+        "a derived sprite's flag rebuilt the hit array"
+    );
+}
+
+#[test]
+fn a_layout_restated_unchanged_marks_nothing() {
+    let mut rig = Rig::new();
+    let mut held = NodeId::NONE;
+    rig.mount(|ui| held = boxed(ui, 30.0, 20.0));
+    Host::with(|h| {
+        h.tree.restate(held, |l| l.width = Len::dip(30.0));
+        assert!(h.tree.unsettled().is_none(), "an unchanged restatement marked the node");
+        h.tree.restate(held, |l| l.width = Len::dip(50.0));
+        assert!(h.tree.unsettled().is_some(), "a changed restatement marked nothing");
+    });
+    assert_eq!(
+        rig.flush().bound(held, Prop::Size),
+        Some(Value::Vec2(Vector2::new(50.0, 20.0)))
     );
 }
 

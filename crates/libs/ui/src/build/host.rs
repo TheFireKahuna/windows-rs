@@ -103,6 +103,11 @@ struct Side {
     region: u32,
     surface: u32,
     rounded: u32,
+    /// This row's position in [`Host::placed`], or `NONE` while it states no visual.
+    placed_at: u32,
+    /// This row's position in [`Host::readers`], or `NONE` while it holds no probe, anchor
+    /// origin or pivot.
+    reads_at: u32,
 }
 
 impl Default for Side {
@@ -123,6 +128,8 @@ impl Default for Side {
             region: tree::NONE,
             surface: tree::NONE,
             rounded: tree::NONE,
+            placed_at: tree::NONE,
+            reads_at: tree::NONE,
         }
     }
 }
@@ -178,6 +185,15 @@ pub struct Host {
     /// One row per installed channel writer, chained from the node's `bindings` head.
     pub(crate) binders: super::binding::Binders,
     sides: Pool<Side>,
+    /// The side rows that state a derived sprite's visual, which the visuals pass restates.
+    ///
+    /// A roster and not a scan of every row: the passes after the solve each read one kind
+    /// of row, and a scan per pass would visit every side row of the window once per pass
+    /// per flush. Each row holds its own position, so leaving costs one swap.
+    placed: Vec<u32>,
+    /// The side rows that read their node's solved box back out: a probe, an anchor origin,
+    /// or a pivot.
+    readers: Vec<u32>,
     rounded: Pool<rounded::Rounded>,
     anchors: Vec<Attachment>,
     shortcuts: Vec<(ControlId, &'static [super::Shortcut])>,
@@ -266,6 +282,8 @@ impl Host {
                 handlers: HandlerTable::default(),
                 binders: Pool::default(),
                 sides: Pool::default(),
+                placed: Vec::new(),
+                readers: Vec::new(),
                 rounded: Pool::default(),
                 anchors: Vec::new(),
                 shortcuts: Vec::new(),
@@ -580,7 +598,7 @@ impl Host {
     /// complete, so a sprite a publisher places after the solve crosses in the same flush,
     /// and the visuals pass re-reads the row only to take a hidden one off the screen.
     pub(crate) fn visual_rect(&mut self, id: SpriteId, offset: Vector2, size: Vector2) {
-        self.side_mut(id.0).visual = Visual::Rect(offset, size);
+        self.state_visual(id.0, Visual::Rect(offset, size));
         if self.tree.c.flags[id.0.index()] & tree::HIDDEN == 0 {
             self.tree.c.geom[id.0.index()] = Geom {
                 local: offset,
@@ -593,12 +611,12 @@ impl Host {
     }
 
     pub(crate) fn visual_insets(&mut self, id: SpriteId, insets: [f32; 4]) {
-        self.side_mut(id.0).visual = Visual::Insets(insets);
+        self.state_visual(id.0, Visual::Insets(insets));
         self.tree.mark(id.0);
     }
 
     pub(crate) fn visual_outset(&mut self, id: SpriteId, width: Len) {
-        self.side_mut(id.0).visual = Visual::Outset(width);
+        self.state_visual(id.0, Visual::Outset(width));
         self.tree.mark(id.0);
     }
 
@@ -899,18 +917,55 @@ impl Host {
     // ── side rows ───────────────────────────────────────────────────────────────────
 
     fn side_mut(&mut self, node: NodeId) -> &mut Side {
-        let head = self.tree.c.side[node.index()];
-        let at = if head == tree::NONE {
-            let at = self.sides.place(Side {
-                node,
-                ..Side::default()
-            });
-            self.tree.c.side[node.index()] = at;
-            at
-        } else {
-            head
-        };
+        let at = self.side_at(node);
         &mut self.sides[at]
+    }
+
+    /// The side row `node` heads, placed where it has none.
+    fn side_at(&mut self, node: NodeId) -> u32 {
+        let head = self.tree.c.side[node.index()];
+        if head != tree::NONE {
+            return head;
+        }
+        let at = self.sides.place(Side {
+            node,
+            ..Side::default()
+        });
+        self.tree.c.side[node.index()] = at;
+        at
+    }
+
+    /// States a derived sprite's visual and enrols its row with the visuals pass.
+    fn state_visual(&mut self, node: NodeId, visual: Visual) {
+        let at = self.side_at(node);
+        let side = &mut self.sides[at];
+        side.visual = visual;
+        if side.placed_at == tree::NONE {
+            side.placed_at = self.placed.len() as u32;
+            self.placed.push(at);
+        }
+    }
+
+    /// The side row `node` heads, enrolled with the passes that read the solved box back.
+    fn reader_mut(&mut self, node: NodeId) -> &mut Side {
+        let at = self.side_at(node);
+        let side = &mut self.sides[at];
+        if side.reads_at == tree::NONE {
+            side.reads_at = self.readers.len() as u32;
+            self.readers.push(at);
+        }
+        side
+    }
+
+    /// Takes a freed row's entry out of `roster`, re-pointing the row swapped into its place.
+    fn strike(roster: &mut Vec<u32>, sides: &mut Pool<Side>, slot: u32, back: fn(&mut Side) -> &mut u32) {
+        if slot == tree::NONE {
+            return;
+        }
+        roster.swap_remove(slot as usize);
+        if let Some(&moved) = roster.get(slot as usize) {
+            *back(&mut sides[moved]) = slot;
+        }
     }
 
     fn side(&self, node: NodeId) -> Option<&Side> {
@@ -931,11 +986,11 @@ impl Host {
     }
 
     pub(crate) fn set_probe(&mut self, node: NodeId, probe: Probe) {
-        self.side_mut(node).probe = Some(probe);
+        self.reader_mut(node).probe = Some(probe);
     }
 
     pub(crate) fn set_anchor_origin(&mut self, node: NodeId, set: Anchors) {
-        self.side_mut(node).origin = Some(set);
+        self.reader_mut(node).origin = Some(set);
     }
 
     pub(crate) fn attach_anchor(&mut self, node: NodeId, set: Anchors, key: u64) {
@@ -943,7 +998,7 @@ impl Host {
     }
 
     pub(crate) fn set_relative_pivot(&mut self, node: NodeId, fraction: Vector2) {
-        self.side_mut(node).pivot = Some(fraction);
+        self.reader_mut(node).pivot = Some(fraction);
         self.tree.mark(node);
     }
 
@@ -1516,6 +1571,8 @@ impl Host {
         let Some(side) = self.sides.free(at) else {
             return;
         };
+        Self::strike(&mut self.placed, &mut self.sides, side.placed_at, |s| &mut s.placed_at);
+        Self::strike(&mut self.readers, &mut self.sides, side.reads_at, |s| &mut s.reads_at);
         if side.rounded != tree::NONE {
             self.rounded.free(side.rounded);
         }
@@ -1630,12 +1687,13 @@ impl Host {
     }
 
     /// Writes each overlay root's authored extent from the window it is inset into. A setter
-    /// like any other, so the solve below reads it with everything else.
+    /// like any other, so the solve below reads it with everything else, and one that marks
+    /// only where the extent moved: an open overlay is not re-solved on every flush.
     fn size_overlay_viewports(&mut self) {
         for at in 0..self.overlays.len() {
             if let Some(scrim) = self.overlays[at].scrim {
                 let window = self.window.get();
-                self.tree.author(scrim, |l| {
+                self.tree.restate(scrim, |l| {
                     l.width = Len::dip(window.x);
                     l.height = Len::dip(window.y);
                 });
@@ -1649,7 +1707,7 @@ impl Host {
             let anchor = self.overlays[at].anchor;
             let fills = matches!(anchor.to, crate::overlay::AnchorTo::Window);
             let (w, h) = (viewport.width(), viewport.height());
-            self.tree.author(root, |l| {
+            self.tree.restate(root, |l| {
                 if fills {
                     l.width = Len::dip(w);
                     l.height = Len::dip(h);
@@ -1668,12 +1726,15 @@ impl Host {
         self.geometry = jobs;
     }
 
-    /// Gives every derived sprite its own box and touches it for the encode.
+    /// Gives every derived sprite its own box and touches the ones that moved for the encode.
+    ///
+    /// Every placed row and not only those whose owner moved: a sprite's own `HIDDEN` bit
+    /// marks nothing, so this pass is what takes one off the screen. Restating a box that did
+    /// not move costs the write and a comparison; [`Tree::touch`] records only the ones that
+    /// did, so the encode reads what moved and nothing else.
     fn publish_visuals(&mut self) {
-        for at in 0..self.sides.slots() {
-            let Some(side) = self.sides.get(at) else {
-                continue;
-            };
+        for i in 0..self.placed.len() {
+            let side = &self.sides[self.placed[i]];
             let (node, visual) = (side.node, side.visual);
             let visual = match visual {
                 Visual::Outset(width) => Visual::Insets([
@@ -1768,10 +1829,8 @@ impl Host {
     /// because `Cell::set` panics on a disposed handle and the two halves of a probe die at
     /// different moments.
     fn publish_probes(&mut self) {
-        for at in 0..self.sides.slots() {
-            let Some(side) = self.sides.get(at) else {
-                continue;
-            };
+        for i in 0..self.readers.len() {
+            let side = &self.sides[self.readers[i]];
             let (node, probe) = (side.node, side.probe);
             let Some(probe) = probe.filter(|probe| probe.cell().alive()) else {
                 continue;
@@ -1793,10 +1852,8 @@ impl Host {
     fn publish_anchors(&mut self) {
         let tree = &self.tree;
         self.anchors.retain(|a| tree.is_live(a.node));
-        for at in 0..self.sides.slots() {
-            let Some(side) = self.sides.get(at) else {
-                continue;
-            };
+        for i in 0..self.readers.len() {
+            let side = &self.sides[self.readers[i]];
             let Some(set) = side.origin else { continue };
             let origin = self.tree.c.geom[side.node.index()];
             // At the class the origin was solved in, so a reader converting a box to metric
@@ -1852,6 +1909,7 @@ impl Host {
             values,
             ..
         } = self;
+        tree.fresh_scopes();
         for (id, row) in controls.iter_mut() {
             let (node, flags) = (row.node, row.front.flags);
             let Some(value) = row.value.as_mut() else {
@@ -1988,10 +2046,9 @@ impl Host {
 
     /// Writes the centre of every node that stated one as a fraction of its own box.
     fn publish_pivots(&mut self) {
-        for at in 0..self.sides.slots() {
-            let Some(side) = self.sides.get(at) else {
-                continue;
-            };
+        for i in 0..self.readers.len() {
+            let at = self.readers[i];
+            let side = &self.sides[at];
             let (node, pivot) = (side.node, side.pivot);
             let Some(pivot) = pivot else { continue };
             let size = self.tree.c.geom[node.index()].size;
