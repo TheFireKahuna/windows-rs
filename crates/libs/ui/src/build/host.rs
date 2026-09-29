@@ -223,7 +223,7 @@ pub struct Host {
     #[cfg(debug_assertions)]
     hits_shadow: SinkPatch,
     #[cfg(debug_assertions)]
-    hits_shadow_bears: Vec<bool>,
+    hits_shadow_bears: Vec<u8>,
     pub(crate) scrolls: Pool<crate::layout::ScrollRow>,
     pub(crate) regions: Pool<crate::present::RegionRow>,
     pub(crate) geometry: super::geometry::Jobs,

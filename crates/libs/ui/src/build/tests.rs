@@ -42,6 +42,7 @@
 //! 16h. A box that moves under no hit target leaves the hit array as it was.
 //! 16i. Every pass reads each change once, however late in a flush it was named.
 //! 16j. A region mirrors its anchor set when the set moves, and costs nothing when not.
+//! 16k. A box that moves under no automation element leaves the automation tree current.
 //!
 //! The one hit array
 //! 17. The array is paint order and the id index is id order. [03-LAYOUT §7]
@@ -993,6 +994,25 @@ fn every_pass_reads_each_change_once_however_late_it_was_named() {
         h.close_changes();
         assert!(h.tree.moved.is_empty(), "an entry every pass had read was kept");
     });
+}
+
+#[test]
+fn a_box_that_moves_under_no_element_leaves_the_automation_tree_current() {
+    let mut rig = Rig::new();
+    let (plain, element) = (Cell::new(40.0f32), Cell::new(40.0f32));
+    rig.mount(|ui| {
+        ui.stack(|ui| {
+            ui.node(Preset::Layer)
+                .height(Len::dip(8.0))
+                .layout_from(move |l| l.width = Len::dip(plain.get()));
+            button(ui, "Element").layout_from(move |l| l.width = Len::dip(element.get()));
+        });
+    });
+    Host::with(|h| h.uia_published());
+    rig.set(plain, 90.0);
+    assert!(!Host::with(|h| h.uia_stale()), "a box with no element restaled the tree");
+    rig.set(element, 90.0);
+    assert!(Host::with(|h| h.uia_stale()), "an element that moved left the tree current");
 }
 
 #[test]

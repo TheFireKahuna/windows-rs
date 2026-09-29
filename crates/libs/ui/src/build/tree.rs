@@ -12,6 +12,13 @@ use windows_scene::{
     SinkPatch, Tuning, Value,
 };
 
+/// A subtree put an entry in the hit array.
+pub(crate) const BEARS_HITS: u8 = 1 << 0;
+/// A subtree put an element in the automation tree.
+pub(crate) const BEARS_AUTOMATION: u8 = 1 << 1;
+/// Both, which is what a node the last build never reached is taken to bear.
+pub(crate) const BEARS_ALL: u8 = BEARS_HITS | BEARS_AUTOMATION;
+
 /// Absence in a `u32` head column: no row in the pool it heads.
 pub(crate) const NONE: u32 = u32::MAX;
 
@@ -287,12 +294,13 @@ pub(crate) struct Tree {
     pub roots_dirty: bool,
     /// A hover flag, a mount or an unmount rebuilds the array and solves nothing.
     pub hits_dirty: bool,
-    /// Whether each node's subtree put anything in the hit array on its last build, by node
-    /// index. A box that moves under a node that bore nothing cannot change the array, so
-    /// only a move where this holds, or past its end, rebuilds it.
-    pub bears: Vec<bool>,
-    /// A laid-out box moved since the last hit build: what the automation tree, which
-    /// reads every box and not only the hit-bearing ones, goes stale on.
+    /// What each node's subtree put in the hit array and the automation tree on its last
+    /// build, by node index, as [`BEARS_HITS`] and [`BEARS_AUTOMATION`]. A box that moves
+    /// under a node that bore nothing for one of them cannot change it, so only a move where
+    /// the bit holds, or past the column's end, rebuilds the array or restales the tree.
+    pub bears: Vec<u8>,
+    /// A box moved under an automation element since the last hit build, so the automation
+    /// tree a listening client reads is stale.
     pub boxes_moved: bool,
     /// The window extent changed since the last flush, so this flush's bounds follow the
     /// window 1:1: every layout write is a plain set, including under `ANIMATE_LAYOUT`.
@@ -795,11 +803,13 @@ impl Tree {
             // it, so one moving leaves the array exactly as it was: a meter fill or a text tile
             // restated every frame rebuilds nothing, and neither does a label whose subtree
             // declares no target.
+            // The automation tree reads the boxes of its own elements, which are not the hit
+            // targets, so it goes stale on its own bit: a label with no role moving under a
+            // listening client rebuilds neither.
             if (now.local != was.local || now.size != was.size) && flags & DERIVED == 0 {
-                self.boxes_moved = true;
-                if self.bears.get(id.index()).copied().unwrap_or(true) {
-                    self.hits_dirty = true;
-                }
+                let bears = self.bears.get(id.index()).copied().unwrap_or(BEARS_ALL);
+                self.hits_dirty |= bears & BEARS_HITS != 0;
+                self.boxes_moved |= bears & BEARS_AUTOMATION != 0;
             }
             if now.local != was.local {
                 // A driven channel is not the layout's to write. `Prop::Offset` carries both

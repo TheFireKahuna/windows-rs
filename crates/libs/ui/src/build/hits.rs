@@ -48,7 +48,7 @@ pub(crate) struct Out<'a> {
     /// tooltips costs one allocation.
     pub scratch: &'a mut String,
     /// [`Tree::bears`], written by this walk.
-    pub bears: &'a mut Vec<bool>,
+    pub bears: &'a mut Vec<u8>,
 }
 
 /// The ancestry one preorder walk carries, kept across rebuilds for its capacity.
@@ -84,7 +84,7 @@ impl HitBuilder {
 pub(crate) fn fill(walk: &Walk<'_>, out: &mut Out<'_>, root: NodeId) {
     let window = walk.tree.c.geom[root.index()].size;
     out.bears.clear();
-    out.bears.resize(walk.tree.c.flags.len(), true);
+    out.bears.resize(walk.tree.c.flags.len(), tree::BEARS_ALL);
     begin(out);
     self::walk(walk, out, root, 0);
     for placement in walk.overlays {
@@ -94,10 +94,10 @@ pub(crate) fn fill(walk: &Walk<'_>, out: &mut Out<'_>, root: NodeId) {
         self::walk(walk, out, placement.root, 0);
         // A blocker spans the window, so the overlay's root answers for it whatever its
         // subtree holds.
-        out.bears[placement.root.index()] = true;
+        out.bears[placement.root.index()] = tree::BEARS_ALL;
     }
     // The blockers read the window root's extent.
-    out.bears[root.index()] = true;
+    out.bears[root.index()] = tree::BEARS_ALL;
     // Sorted on the way out, so `HitTable::replace` is two copies and never a sort.
     out.patch.index_mut().sort_unstable_by_key(|&(id, _)| id);
 }
@@ -153,15 +153,16 @@ fn push_entry(out: &mut Out<'_>, entry: HitEntry) -> u32 {
 /// Suspended subtrees and derived sprites are skipped: a thumb's entry would name a rect the
 /// solve fixed and the tracker then moved away from.
 ///
-/// Answers whether the subtree put anything in the array, and records it in
-/// [`Out::bears`]: an entry, a scrolling node its descendants resolve through, or a clip
-/// collapsed to nothing, whose growing back would reveal what it hid.
-pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usize) -> bool {
+/// Answers what the subtree put in the array and the automation tree, and records it in
+/// [`Out::bears`]: an entry, an element, a scrolling node its descendants resolve through,
+/// or a clip collapsed to nothing, whose growing back would reveal what it hid. What it
+/// records is what the node would emit, whether or not this walk builds the automation half.
+pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usize) -> u8 {
     let flags = walk.tree.c.flags[node.index()];
     if flags & (tree::HIDDEN | tree::SUSPENDED | tree::DERIVED) != 0 {
         // Showing, resuming or re-linking one rebuilds the array on its own.
-        out.bears[node.index()] = false;
-        return false;
+        out.bears[node.index()] = 0;
+        return 0;
     }
     let translation_start = out.uia.as_ref().map(|uia| uia.entries.len());
     out.hits.unwind(depth);
@@ -195,10 +196,21 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
     let bounded = flags & tree::CLIP != 0;
     let geom = walk.tree.c.geom[node.index()];
     if bounded && (geom.size.x <= 0.0 || geom.size.y <= 0.0) {
-        out.bears[node.index()] = true;
-        return true;
+        out.bears[node.index()] = tree::BEARS_ALL;
+        return tree::BEARS_ALL;
     }
-    let mut bears = flags & (tree::HIT | tree::SCROLL) != 0;
+    let mut bears = 0;
+    if flags & (tree::HIT | tree::SCROLL) != 0 {
+        bears |= tree::BEARS_HITS;
+    }
+    // What `emit_uia` returns early on, answered whether or not this walk builds the tree.
+    let element = walk
+        .controls
+        .get(control)
+        .is_some_and(|row| row.uia != UiaRole::None || row.name.is_some());
+    if element || flags & tree::SCROLL != 0 {
+        bears |= tree::BEARS_AUTOMATION;
+    }
     if flags & tree::HIT != 0 {
         let mut decl = HitDecl {
             flags: HitFlags::from_bits(tree::unpack_decl(flags)),
