@@ -227,9 +227,11 @@ impl Solver<'_> {
 
     // ── child iteration ─────────────────────────────────────────────────────────────
 
-    /// This node's first laid-out child, bottom to top.
+    /// This node's first laid-out child, bottom to top: the lead the tree keeps past its
+    /// chrome, so no walk steps over the same derived sprites once per restart.
     pub(crate) fn first(&self, n: NodeId) -> NodeId {
-        self.laid_out_from(self.tree.links(n.index() as u32).first)
+        let at = self.tree.lead(n);
+        if at == NO_LINK { NodeId::NONE } else { self.tree.id_at(at) }
     }
 
     /// The next laid-out sibling above `c`.
@@ -257,9 +259,12 @@ impl Solver<'_> {
         self.flow_from(self.next(c))
     }
 
+    /// The first in-flow node at or after `c`, off the flag word alone.
     fn flow_from(&self, mut c: NodeId) -> NodeId {
         while !c.is_none() {
-            if self.layout(c).position.in_flow() {
+            let floats = self.bits(c) & tree::FLOATS != 0;
+            debug_assert_eq!(floats, !self.tree.c.layout[c.index()].position.in_flow());
+            if !floats {
                 return c;
             }
             c = self.next(c);

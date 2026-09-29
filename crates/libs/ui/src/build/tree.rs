@@ -23,6 +23,10 @@ pub(crate) const HIDDEN: Bits = 1 << 2;
 pub(crate) const CLIP: Bits = 1 << 3;
 pub(crate) const SCROLL: Bits = 1 << 4;
 pub(crate) const SUSPENDED: Bits = 1 << 5;
+/// The node's authored position takes it out of its container's flow: a mirror of
+/// `Layout::position`, kept beside the bits a sibling walk already reads so that skipping an
+/// out-of-flow child costs no read of its layout row.
+pub(crate) const FLOATS: Bits = 1 << 6;
 pub(crate) const RESPONSIVE: Bits = 1 << 7;
 /// This node's own layout input moved.
 pub(crate) const MEASURE: Bits = 1 << 8;
@@ -257,6 +261,7 @@ columns! {
     geom: Geom = Geom::default(),
     published: Published = Published::MINTED,
     scoped: u32 = 0,
+    lead: u32 = NO_LINK,
 }
 
 /// The arena: one mint authority, one column set, one dirty frontier.
@@ -334,12 +339,14 @@ impl Tree {
     /// child lists and both have to be marked. Marking a parentless one is a no-op.
     pub fn link(&mut self, id: NodeId, parent: NodeId, after: Option<NodeId>) {
         let held = self.parent(id);
+        self.cut_lead(id);
         windows_scene::link(
             self,
             id.index() as u32,
             parent.index() as u32,
             after.map(|a| a.index() as u32),
         );
+        self.join_lead(id);
         // A derived sprite takes no room, so gaining one is not a layout input of its parent.
         if self.c.flags[id.index()] & DERIVED == 0 {
             self.mark(held);
@@ -350,9 +357,59 @@ impl Tree {
 
     pub fn unlink(&mut self, id: NodeId) {
         let parent = self.parent(id);
+        self.cut_lead(id);
         windows_scene::unlink(self, id.index() as u32);
         self.mark(parent);
         self.hits_dirty = true;
+    }
+
+    /// The link index of `n`'s first child the layout walks visit, or [`NO_LINK`].
+    ///
+    /// A node's chrome sits at the bottom of its child list, beneath its content, so every
+    /// walk that starts a container's children would otherwise step over the same derived
+    /// sprites again. This is the head past them, kept by [`Tree::link`] and [`Tree::unlink`]
+    /// in constant time for every splice that does not cross a run of derived siblings.
+    pub fn lead(&self, n: NodeId) -> u32 {
+        let at = self.c.lead[n.index()];
+        debug_assert_eq!(at, self.first_laid_out(self.links(n.index() as u32).first));
+        at
+    }
+
+    /// The first non-derived node at or after link index `at`.
+    fn first_laid_out(&self, mut at: u32) -> u32 {
+        while at != NO_LINK && self.c.flags[at as usize] & DERIVED != 0 {
+            at = self.c.links[at as usize].next;
+        }
+        at
+    }
+
+    /// Moves a parent's lead past `id` before `id` leaves that parent's list.
+    fn cut_lead(&mut self, id: NodeId) {
+        let at = id.index() as u32;
+        let links = self.c.links[at as usize];
+        if links.parent != NO_LINK && self.c.lead[links.parent as usize] == at {
+            self.c.lead[links.parent as usize] = self.first_laid_out(links.next);
+        }
+    }
+
+    /// Makes `id` its new parent's lead where it landed ahead of the old one.
+    ///
+    /// A derived sprite never leads. A laid-out node leads exactly when no laid-out sibling
+    /// sits beneath it, which the walk down its `prev` links answers at the first one it
+    /// meets.
+    fn join_lead(&mut self, id: NodeId) {
+        let at = id.index() as u32;
+        let links = self.c.links[at as usize];
+        if links.parent == NO_LINK || self.c.flags[at as usize] & DERIVED != 0 {
+            return;
+        }
+        let mut below = links.prev;
+        while below != NO_LINK && self.c.flags[below as usize] & DERIVED != 0 {
+            below = self.c.links[below as usize].prev;
+        }
+        if below == NO_LINK {
+            self.c.lead[links.parent as usize] = at;
+        }
     }
 
     /// Appends `root`'s subtree to `out` in reverse preorder, children before their parent.
@@ -505,7 +562,16 @@ impl Tree {
             return;
         }
         write(&mut self.c.layout[n.index()]);
+        self.sync_floats(n);
         self.mark(n);
+    }
+
+    /// Mirrors `n`'s authored position into [`FLOATS`]. Every writer of the layout row
+    /// calls it after the write.
+    fn sync_floats(&mut self, n: NodeId) {
+        let floats = !self.c.layout[n.index()].position.in_flow();
+        let flags = &mut self.c.flags[n.index()];
+        *flags = if floats { *flags | FLOATS } else { *flags & !FLOATS };
     }
 
     /// Edits `n`'s authored layout and marks it only where the edit changed it.
@@ -519,6 +585,7 @@ impl Tree {
         let held = self.c.layout[n.index()];
         write(&mut self.c.layout[n.index()]);
         if self.c.layout[n.index()] != held {
+            self.sync_floats(n);
             self.mark(n);
         }
     }
@@ -544,6 +611,7 @@ impl Tree {
         let stated = self.c.layout[n.index()].preset.node_flags();
         let kept = self.c.flags[n.index()] & !(HIDDEN | CLIP | SCROLL | RESPONSIVE);
         self.c.flags[n.index()] = kept | stated;
+        self.sync_floats(n);
         self.hits_dirty = true;
     }
 

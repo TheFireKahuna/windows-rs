@@ -37,6 +37,7 @@
 //! 16c. A node moved out of an animated scope snaps its next move.
 //! 16d. A derived sprite that moves leaves the hit array as it was.
 //! 16e. A layout restated unchanged marks nothing.
+//! 16f. A container's lead is its first laid-out child through every splice.
 //!
 //! The one hit array
 //! 17. The array is paint order and the id index is id order. [03-LAYOUT §7]
@@ -867,6 +868,49 @@ fn a_layout_restated_unchanged_marks_nothing() {
         rig.flush().bound(held, Prop::Size),
         Some(Value::Vec2(Vector2::new(50.0, 20.0)))
     );
+}
+
+#[test]
+fn a_containers_lead_is_its_first_laid_out_child_through_every_splice() {
+    use super::tree::{DERIVED, Tree};
+    let mut tree = Tree::default();
+    let parents = [tree.mint(0), tree.mint(0)];
+    let kids: Vec<NodeId> = (0..12)
+        .map(|at| {
+            let id = tree.mint(0);
+            if at % 3 != 2 {
+                tree.c.flags[id.index()] |= DERIVED;
+            }
+            id
+        })
+        .collect();
+    // A fixed LCG, so a failure replays.
+    let mut seed = 0x2545_f491_u32;
+    let mut roll = |n: usize| {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) as usize % n
+    };
+    for _ in 0..2000 {
+        let kid = kids[roll(kids.len())];
+        if roll(5) == 0 {
+            tree.unlink(kid);
+        } else {
+            let parent = parents[roll(2)];
+            let siblings: Vec<NodeId> = tree.children(parent).filter(|&s| s != kid).collect();
+            let after = match roll(siblings.len() + 1) {
+                0 => None,
+                at => Some(siblings[at - 1]),
+            };
+            tree.link(kid, parent, after);
+        }
+        for parent in parents {
+            let expected = tree
+                .children(parent)
+                .find(|c| tree.c.flags[c.index()] & DERIVED == 0)
+                .map_or(windows_scene::NO_LINK, |c| c.index() as u32);
+            assert_eq!(tree.lead(parent), expected);
+        }
+    }
 }
 
 /// A clip is restated from the box the solve published, so the last one on the wire is the
