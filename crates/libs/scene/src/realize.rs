@@ -71,8 +71,9 @@ impl Backends {
         self.compositor.request_commit().map(drop)
     }
 
-    /// The minted glow factory, for a probe to read its load status. `None` until the
-    /// first lit node minted it.
+    /// The minted glow factory, for the debug probe to read its load status. `None` until
+    /// the first lit node minted it.
+    #[cfg(test)]
     pub(crate) fn minted_glow_factory(&self) -> Option<&CompositionEffectFactory> {
         self.glow.get()
     }
@@ -1509,14 +1510,17 @@ pub fn realize(
     // content is what the blur reads, and a capture-source paint is the case that has to
     // be watched.
     if has_halo {
+        let box_ = arena.size(id);
         note!(
             "scene",
-            "glow id={} inputs: paint={:?}, route={:?}, alpha-cell={}, silhouette-from={}",
+            "glow id={} inputs: paint={:?}, route={:?}, alpha-cell={}, silhouette-from={}, box=({:.0},{:.0})",
             id.index(),
             paint,
             route,
             alpha.is_some(),
             if chain.is_some() { "chain" } else { "source" },
+            box_.x,
+            box_.y,
         );
     }
 
@@ -1853,6 +1857,15 @@ fn cast_glow(
         (_, Some(halo)) => Some((halo.sigma, halo.tint, halo.offset)),
         _ => None,
     };
+    if let Some((sigma, tint, _)) = lit {
+        let display = ctx.env.apply(tint);
+        note!(
+            "scene",
+            "glow id={} tint: sigma={} scene=({:.3},{:.3},{:.3},{:.3}) display=({:.4},{:.4},{:.4},{:.4})",
+            id.index(), sigma, tint.r, tint.g, tint.b, tint.a,
+            display.r, display.g, display.b, display.a,
+        );
+    }
     let Some(((sigma, tint, offset), silhouette)) = lit.zip(silhouette) else {
         // A node with no halo and no captured paint unlights by design. A lit one whose
         // silhouette never arrived is the failure family: the mask or the paint half of the
@@ -1909,7 +1922,7 @@ fn cast_glow(
             glow.offset = offset;
         }
         if let Some(glow) = arena.aux(id).and_then(|aux| aux.glow.as_ref()) {
-            glow.resize(size, scale);
+            glow.resize(id, size, scale);
         }
         drive_blur(arena, id, sigma, false);
         return Ok(Some(target));
@@ -2001,7 +2014,7 @@ fn cast_glow(
         bleed,
         offset,
     };
-    glow.resize(size, scale);
+    glow.resize(id, size, scale);
     arena.aux_mut(id).glow = Some(glow);
     drive_blur(arena, id, sigma, true);
     Ok(Some(target))

@@ -2220,6 +2220,7 @@ impl Scene {
     /// involved.
     fn resize_captures(&mut self, id: NodeId, env: Env) {
         let (size, scale) = (self.nodes.size(id), env.scale());
+        note!("scene", "resize_captures id={} size=({:.0},{:.0})", id.index(), size.x, size.y);
         let Some(aux) = self.nodes.aux(id) else {
             return;
         };
@@ -2227,7 +2228,7 @@ impl Scene {
             shape.resize(size, scale);
         }
         if let Some(glow) = &aux.glow {
-            glow.resize(size, scale);
+            glow.resize(id, size, scale);
         }
     }
 
@@ -3488,7 +3489,9 @@ mod tests {
     #[test]
     #[ignore]
     fn glow_pipeline_debug() {
-        let Ok(queue) = DispatcherQueueController::create_on_current_thread() else {
+        // Held for the run: dropping it would shut the dispatcher queue down under the
+        // window's own session.
+        let Ok(_queue) = DispatcherQueueController::create_on_current_thread() else {
             eprintln!("skipped: no dispatcher queue in this session");
             return;
         };
