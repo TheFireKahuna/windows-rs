@@ -1025,6 +1025,7 @@ impl Host {
 
     pub(crate) fn set_anchor_origin(&mut self, node: NodeId, set: Anchors) {
         self.reader_mut(node).origin = Some(set);
+        self.tree.c.flags[node.index()] |= tree::ANCHORED;
         self.anchors_owed = true;
     }
 

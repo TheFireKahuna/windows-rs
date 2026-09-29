@@ -187,8 +187,10 @@ impl Drop for Solver<'_> {
 impl Solver<'_> {
     // ── column access ───────────────────────────────────────────────────────────────
 
-    pub(crate) fn layout(&self, n: NodeId) -> Layout {
-        self.tree.c.layout[n.index()]
+    /// This node's authored layout, borrowed: the row is about 140 bytes, and the walks read
+    /// a field or two of it per child visit.
+    pub(crate) fn layout(&self, n: NodeId) -> &Layout {
+        &self.tree.c.layout[n.index()]
     }
 
     pub(crate) fn geom(&self, n: NodeId) -> Geom {
@@ -378,7 +380,7 @@ impl Solver<'_> {
             let g = self.geom(n);
             return [g.pair[0], g.pair[1]];
         }
-        let l = self.layout(n);
+        let l = *self.layout(n);
         let preset = self.preset(&l, class);
         let inner = self.inner_class(n, class);
         let content = match preset {
@@ -457,7 +459,7 @@ impl Solver<'_> {
         self.tree.set_class(n, class);
         self.tree.c.flags[i] |= tree::PLACED;
         self.tree.c.geom[i].at_w = w;
-        let l = self.layout(n);
+        let l = *self.layout(n);
         let inner = self.classify(n, &l, w, class);
         let preset = self.preset(&l, class);
         let (pad_x, pad_y) = self.padding(&l, class, w);
@@ -601,7 +603,7 @@ impl Solver<'_> {
             self.settle_derived(n);
             return;
         }
-        let l = self.layout(n);
+        let l = *self.layout(n);
         let inner = self.inner_class(n, class);
         let preset = self.preset(&l, class);
         let (pad_x, pad_y) = self.padding(&l, class, w);
@@ -651,13 +653,18 @@ impl Solver<'_> {
     fn publish(&mut self, n: NodeId, at: Vector2, parent: Vector2, h: f32, rect: Rect) {
         let scale = self.scale;
         let g = &mut self.tree.c.geom[n.index()];
-        let held = (g.local, g.size, g.rect);
+        let held = (g.local, g.size, g.rect.x0, g.rect.y0);
         g.rect = rect;
         g.at = at;
         g.at_h = h;
         g.local = Vector2::new(rect.x0 - snap(parent.x, scale), rect.y0 - snap(parent.y, scale));
         g.size = Vector2::new(rect.width(), rect.height());
-        if (g.local, g.size, g.rect) != held {
+        // A box that only moved with its parent keeps its offset and extent, and nothing the
+        // change set feeds reads its absolute position but an anchor set. So a translated
+        // subtree names its root, whose offset moved, and the anchor-relevant nodes in it,
+        // rather than every node under the root.
+        let (moved, shifted) = ((g.local, g.size) != (held.0, held.1), (g.rect.x0, g.rect.y0) != (held.2, held.3));
+        if moved || (shifted && self.tree.c.flags[n.index()] & tree::ANCHORED != 0) {
             self.tree.moved.push(n);
         }
         self.tree.touch(n);
@@ -690,7 +697,23 @@ impl Solver<'_> {
             self.translate(c, at, abs, hidden);
             c = self.next(c);
         }
-        self.settle_derived(n);
+        // No `settle_derived`: a translated subtree is settled, so no derived sprite in it
+        // carries a mark, and its visibility did not change, so none changes its sunk bit.
+        // The walk over its chrome would be one per node for nothing.
+        #[cfg(debug_assertions)]
+        {
+            let sunk = self.tree.c.flags[n.index()] & tree::SUNK;
+            let mut at = self.tree.links(n.index() as u32).first;
+            while at != NO_LINK {
+                let flags = self.tree.c.flags[at as usize];
+                debug_assert!(
+                    flags & tree::DERIVED == 0
+                        || flags & (tree::MEASURE | tree::DESC | tree::SUNK) == sunk,
+                    "a translated node's chrome was not settled"
+                );
+                at = self.tree.links(at).next;
+            }
+        }
     }
 
     /// Clears the marks on the derived sprites the walks skip and hands them their parent's
@@ -727,7 +750,7 @@ impl Solver<'_> {
     fn place_out_of_flow(&mut self, n: NodeId, class: WidthClass, w: f32) {
         let mut c = self.first(n);
         while !c.is_none() {
-            let held = self.layout(c);
+            let held = *self.layout(c);
             if !held.position.in_flow() {
                 // Walk A skips an out-of-flow child, because it takes no room from its
                 // siblings, so this is where its subtree is measured.
@@ -765,7 +788,7 @@ impl Solver<'_> {
     fn arrange_out_of_flow(&mut self, n: NodeId, class: WidthClass, w: f32, h: f32, abs: Vector2) {
         let mut c = self.first(n);
         while !c.is_none() {
-            let held = self.layout(c);
+            let held = *self.layout(c);
             if !held.position.in_flow() {
                 let (local, ch) = self.out_of_flow_box(c, &held, class, w, h);
                 self.arrange(c, local, abs, ch, class, false);
@@ -830,7 +853,7 @@ impl Solver<'_> {
     /// Walks B and C read this rather than calling [`Solver::measure`]: A already ran over
     /// every in-flow node, and re-entering it from each level would measure a node once per
     /// level of the depth above it.
-    pub(crate) fn inline_pair(&mut self, c: NodeId, class: WidthClass, room: f32) -> [f32; 2] {
+    pub(crate) fn inline_pair(&self, c: NodeId, class: WidthClass, room: f32) -> [f32; 2] {
         let l = self.layout(c);
         if l.width.is_pct() {
             let v = self.len(l.width, class, room).unwrap_or(0.0);
@@ -849,7 +872,7 @@ impl Solver<'_> {
     /// clipped by the room and floored at its own minimum. A `NO_STRETCH` leaf never
     /// stretches, which is what lets a label's box be its ink on the first solve.
     pub(crate) fn cross_inline(
-        &mut self,
+        &self,
         c: NodeId,
         container: Align,
         class: WidthClass,
@@ -871,7 +894,7 @@ impl Solver<'_> {
     /// Returns the block pair a child offers inside a container of `room`.
     ///
     /// A percentage height resolves here, against the room its container ended up with.
-    pub(crate) fn block_pair(&mut self, c: NodeId, class: WidthClass, room: f32) -> [f32; 2] {
+    pub(crate) fn block_pair(&self, c: NodeId, class: WidthClass, room: f32) -> [f32; 2] {
         let l = self.layout(c);
         if l.height.is_pct()
             && let Some(v) = self.len(l.height, class, room)
@@ -884,7 +907,7 @@ impl Solver<'_> {
 
     /// Returns the block extent a container of `room` gives one cross-axis child.
     pub(crate) fn cross_block(
-        &mut self,
+        &self,
         c: NodeId,
         container: Align,
         class: WidthClass,
