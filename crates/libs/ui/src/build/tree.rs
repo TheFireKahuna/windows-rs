@@ -6,6 +6,8 @@
 
 use crate::build::text::MeasureKey;
 use crate::layout::{Layout, Rect, WidthClass};
+#[cfg(feature = "flush-stats")]
+use std::sync::OnceLock;
 use windows_numerics::Vector2;
 use windows_scene::{
     Anim, Bind, Clip, ControlId, Corners, Forest, Ids, Links, NO_LINK, NODE, NodeId, Op, Prop,
@@ -313,6 +315,9 @@ pub(crate) struct Tree {
     /// How many nodes the scope lookups have climbed through, for a test to bound.
     #[cfg(test)]
     pub climbs: u32,
+    /// Dirty-set and solve accounting, behind the `flush-stats` feature.
+    #[cfg(feature = "flush-stats")]
+    pub(crate) stats: Stats,
 }
 
 impl Forest for Tree {
@@ -326,6 +331,66 @@ impl Forest for Tree {
 
     fn id_at(&self, at: u32) -> NodeId {
         self.ids.id_at(at)
+    }
+}
+
+/// Per-flush dirty-set and solve accounting, behind the `flush-stats` feature.
+///
+/// Counters are reset by [`Tree::tick_stats`] at the end of every flush, so a printed line
+/// is one flush. Every 300th flush arms a one-shot backtrace of the next `mark` when
+/// `NEWAPO_FLUSH_TRACE` is set: the stack names the setter dirtying the tree. Compiled out
+/// of builds without the feature.
+#[cfg(feature = "flush-stats")]
+#[derive(Default)]
+pub(crate) struct Stats {
+    pub(crate) marks: u32,
+    pub(crate) shown: u32,
+    pub(crate) measured: u32,
+    pub(crate) placed: u32,
+    pub(crate) arranged: u32,
+    pub(crate) touched: u32,
+    pub(crate) flushes: u32,
+    /// The flush whose first `mark` should capture its stack, 0 for none.
+    pub(crate) trace_at: u32,
+    pub(crate) trace: Option<String>,
+}
+
+#[cfg(feature = "flush-stats")]
+impl Tree {
+    /// Reports this flush's counts every 60th flush, then resets them.
+    pub(crate) fn tick_stats(&mut self) {
+        static PRINT: OnceLock<bool> = OnceLock::new();
+        static TRACE: OnceLock<bool> = OnceLock::new();
+        self.stats.flushes += 1;
+        if *TRACE.get_or_init(|| std::env::var("NEWAPO_FLUSH_TRACE").is_ok_and(|v| v == "1")) {
+            // The next flush runs with `flushes` still at this value, so its first `mark`
+            // compares equal and captures.
+            self.stats.trace_at = self.stats.flushes;
+        }
+        if self.stats.flushes % 60 == 0
+            && *PRINT.get_or_init(|| std::env::var("NEWAPO_FLUSH_STATS").is_ok())
+        {
+            let s = &self.stats;
+            eprintln!(
+                "flush {}: marks {} shown {} measure {} place {} arrange {} touched {}",
+                s.flushes, s.marks, s.shown, s.measured, s.placed, s.arranged, s.touched,
+            );
+        }
+        if let Some(trace) = self.stats.trace.take() {
+            let ours = trace
+                .lines()
+                .filter(|l| l.contains("windows_ui") || l.contains("newapo"))
+                .take(15);
+            for line in ours {
+                eprintln!("  {line}");
+            }
+        }
+        self.stats.marks = 0;
+        self.stats.shown = 0;
+        self.stats.measured = 0;
+        self.stats.placed = 0;
+        self.stats.arranged = 0;
+        self.stats.touched = 0;
     }
 }
 
@@ -465,6 +530,13 @@ impl Tree {
         if !self.ids.is_live(n) {
             return;
         }
+        #[cfg(feature = "flush-stats")]
+        {
+            self.stats.marks += 1;
+            if self.stats.trace_at == self.stats.flushes && self.stats.trace.is_none() {
+                self.stats.trace = Some(std::backtrace::Backtrace::force_capture().to_string());
+            }
+        }
         let flags = &mut self.c.flags[n.index()];
         // The walks skip a derived sprite, so a mark on one would never clear.
         if *flags & (MEASURE | DERIVED) != 0 {
@@ -513,6 +585,10 @@ impl Tree {
     /// and up the parent until the walk is back at `n`.
     #[cold]
     pub fn mark_shown(&mut self, n: NodeId) {
+        #[cfg(feature = "flush-stats")]
+        {
+            self.stats.shown += 1;
+        }
         let root = n.index() as u32;
         let mut at = root;
         loop {
@@ -657,6 +733,10 @@ impl Tree {
     /// otherwise grow the list by every node it owns rather than by the ones that moved.
     pub fn touch(&mut self, n: NodeId) {
         if self.stale(n) {
+            #[cfg(feature = "flush-stats")]
+            {
+                self.stats.touched += 1;
+            }
             self.touched.push(n);
         }
     }

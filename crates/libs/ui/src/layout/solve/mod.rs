@@ -382,6 +382,10 @@ impl Solver<'_> {
 
     /// Answers this node's `[minimum, natural]` inline widths under `class`.
     pub(crate) fn measure(&mut self, n: NodeId, class: WidthClass) -> [f32; 2] {
+        #[cfg(feature = "flush-stats")]
+        {
+            self.tree.stats.measured += 1;
+        }
         if self.hidden(n) {
             return [0.0, 0.0];
         }
@@ -452,6 +456,10 @@ impl Solver<'_> {
 
     /// Gives this node the width `w` and answers the `[minimum, natural]` heights it implies.
     pub(crate) fn place(&mut self, n: NodeId, w: f32, class: WidthClass) -> [f32; 2] {
+        #[cfg(feature = "flush-stats")]
+        {
+            self.tree.stats.placed += 1;
+        }
         let i = n.index();
         if self.hidden(n) {
             let g = &mut self.tree.c.geom[i];
@@ -573,6 +581,10 @@ impl Solver<'_> {
         class: WidthClass,
         hidden: bool,
     ) {
+        #[cfg(feature = "flush-stats")]
+        {
+            self.tree.stats.arranged += 1;
+        }
         let i = n.index();
         let hidden = hidden || self.hidden(n);
         let (local, w, h) = if hidden {

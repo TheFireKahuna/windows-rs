@@ -1722,6 +1722,8 @@ impl Host {
             h.close_changes();
             h.pending.env = Some(h.env);
             h.census.flushes += 1;
+            #[cfg(feature = "flush-stats")]
+            h.tree.tick_stats();
             core::mem::swap(&mut h.pending, patch);
         });
     }

@@ -43,6 +43,10 @@ use super::links::{Guard, Links};
 /// [`KeyEvent::key`]: crate::input::KeyEvent::key
 const ESCAPE: u16 = crate::VK_ESCAPE as u16;
 const RETURN: u16 = crate::VK_RETURN as u16;
+
+/// The stack of the first signal write between passes, captured by the `flush-stats` build.
+#[cfg(feature = "flush-stats")]
+static WAKE_TRACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 const SPACE: u16 = crate::VK_SPACE as u16;
 
 /// What a worker thread does with one wake.
@@ -170,7 +174,27 @@ where
                 // flag is what makes the loop run again rather than park over the marked work.
                 signal::set_waker({
                     let woken = Rc::clone(&woken);
-                    move || woken.set(true)
+                    move || {
+                        #[cfg(feature = "flush-stats")]
+                        if std::env::var("NEWAPO_FLUSH_TRACE").is_ok_and(|v| v == "1") {
+                            static N: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0);
+                            // The first fires are the mount's writes; the steady-state writer
+                            // is what keeps the loop awake, so capture one of those.
+                            if N.fetch_add(1, Relaxed) == 60_000 && WAKE_TRACE.get().is_none() {
+                                let trace = std::backtrace::Backtrace::force_capture().to_string();
+                                let ours: Vec<&str> = trace
+                                    .lines()
+                                    .filter(|l| {
+                                        l.contains("windows_ui") || l.contains("newapo")
+                                    })
+                                    .take(12)
+                                    .collect();
+                                let _ = WAKE_TRACE.set(ours.join("\n"));
+                            }
+                        }
+                        woken.set(true)
+                    }
                 });
                 // A write from another thread is staged and rings the doorbell instead.
                 let posts = signal::arm_posts(PostWake::Ring(Arc::clone(&links.app_bell)));
@@ -218,6 +242,29 @@ impl Worker for App {
 
     /// One pass: what arrived, what it implied, and one batch out.
     fn pass(&mut self) -> Result<()> {
+        #[cfg(feature = "flush-stats")]
+        if std::env::var("NEWAPO_PASS_STATS").is_ok() {
+            static PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            static PRINT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let n = PASSES.fetch_add(1, Relaxed);
+            if n % 6000 == 0
+                && *PRINT.get_or_init(|| std::env::var("NEWAPO_FLUSH_STATS").is_ok())
+            {
+                eprintln!(
+                    "pass {}: woken {} posts {} uia {} bell {} owed {} held {}",
+                    n,
+                    self.woken.get(),
+                    signal::posts_pending(),
+                    self.links.uia_requested.load(Acquire),
+                    self.links.app_bell.take_pending(),
+                    self.owed,
+                    self.held.is_some(),
+                );
+                if let Some(trace) = WAKE_TRACE.get() {
+                    eprintln!("{trace}");
+                }
+            }
+        }
         // Everything the writes since the last pass implied. Taken before the flush, so a
         // write the flush itself makes — a probe publishing — asks for another pass rather
         // than being folded into this one and forgotten.

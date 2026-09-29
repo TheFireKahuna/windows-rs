@@ -11,6 +11,9 @@ readme = "readme.md"
 
 [features]
 test-support = []
+# Per-flush dirty-set and solve accounting, printed when NEWAPO_FLUSH_STATS is set and
+# one mark backtraced per window when NEWAPO_FLUSH_TRACE is. Zero cost without it.
+flush-stats = []
 
 [dependencies]
 windows-collections = { workspace = true }
