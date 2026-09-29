@@ -197,6 +197,8 @@ pub struct Host {
     readers: Vec<u32>,
     rounded: Pool<rounded::Rounded>,
     anchors: Vec<Attachment>,
+    /// An attachment or an origin was declared or retired since the anchors pass last ran.
+    anchors_owed: bool,
     shortcuts: Vec<(ControlId, &'static [super::Shortcut])>,
     pub(crate) overlays: Vec<Placement>,
     entrances: Vec<Entrance>,
@@ -302,6 +304,7 @@ impl Host {
                 readers: Vec::new(),
                 rounded: Pool::default(),
                 anchors: Vec::new(),
+                anchors_owed: false,
                 shortcuts: Vec::new(),
                 overlays: Vec::new(),
                 entrances: Vec::new(),
@@ -1022,10 +1025,13 @@ impl Host {
 
     pub(crate) fn set_anchor_origin(&mut self, node: NodeId, set: Anchors) {
         self.reader_mut(node).origin = Some(set);
+        self.anchors_owed = true;
     }
 
     pub(crate) fn attach_anchor(&mut self, node: NodeId, set: Anchors, key: u64) {
         self.anchors.push(Attachment { set, key, node });
+        self.tree.c.flags[node.index()] |= tree::ANCHORED;
+        self.anchors_owed = true;
     }
 
     pub(crate) fn set_relative_pivot(&mut self, node: NodeId, fraction: Vector2) {
@@ -1583,6 +1589,12 @@ impl Host {
 
     fn retire_node(&mut self, node: NodeId) {
         let at = node.index();
+        // An attachment leaving shrinks its set; an origin leaving takes its set's source.
+        if self.tree.c.flags[at] & tree::ANCHORED != 0
+            || self.side(node).is_some_and(|side| side.origin.is_some())
+        {
+            self.anchors_owed = true;
+        }
         self.binding_release(self.tree.c.bindings[at]);
         self.tree.c.bindings[at] = tree::NONE;
         let control = self.tree.c.control[at];
@@ -1950,15 +1962,37 @@ impl Host {
     ///
     /// Unmounted attachments leave here rather than through a removal hook: an id carries a
     /// generation, so the liveness check this pass already needs is also what bounds the list.
+    ///
+    /// A set moves only where its origin's box, class or scope moved, where an attached
+    /// node's box moved, or where an attachment came or went; each of those names a node
+    /// in the change set or owes the pass. A flush with none of them walks no set.
     fn publish_anchors(&mut self) {
+        let owed = core::mem::take(&mut self.anchors_owed) || self.changes.sweeping();
+        let due = owed
+            || self.unread(changes::Pass::Anchors).any(|i| {
+                let node = self.tree.moved[i];
+                self.tree.is_live(node)
+                    && (self.tree.c.flags[node.index()] & tree::ANCHORED != 0
+                        || self.side(node).is_some_and(|side| side.origin.is_some()))
+            });
+        self.mark_read(changes::Pass::Anchors);
+        if !due {
+            #[cfg(debug_assertions)]
+            for i in 0..self.readers.len() {
+                debug_assert!(self.anchor_set_held(self.readers[i]), "the change set missed an anchor set");
+            }
+            return;
+        }
         let tree = &self.tree;
         self.anchors.retain(|a| tree.is_live(a.node));
         for i in 0..self.readers.len() {
-            let side = &self.sides[self.readers[i]];
+            let at = self.readers[i];
+            if self.anchor_set_held(at) {
+                continue;
+            }
+            let side = &self.sides[at];
             let Some(set) = side.origin else { continue };
             let origin = self.tree.c.geom[side.node.index()];
-            // At the class the origin was solved in, so a reader converting a box to metric
-            // units divides by the number the solve multiplied by.
             let scope = self
                 .scope_of(side.node)
                 .at_width(self.tree.class(side.node));
@@ -1966,20 +2000,9 @@ impl Host {
             let boxes = || {
                 anchors
                     .iter()
-                    .filter(|a| a.set == set)
+                    .filter(|a| a.set == set && tree.is_live(a.node))
                     .map(|a| (a.key, tree.c.geom[a.node.index()].rect.rebased(origin.rect)))
             };
-            // An update wakes every reader, so a solve that moved nothing writes nothing.
-            let held = crate::signal::untracked(|| {
-                set.cell().with(|table| {
-                    table.size == origin.size
-                        && table.published() == Some(scope)
-                        && table.iter().map(|a| (a.key, a.rect)).eq(boxes())
-                })
-            });
-            if held {
-                continue;
-            }
             set.cell().update(|table| {
                 table.clear();
                 for (key, rect) in boxes() {
@@ -1988,6 +2011,33 @@ impl Host {
                 table.set_origin(origin.size, scope);
             });
         }
+    }
+
+    /// Whether the set side row `at` is the origin of, if any, already holds what its
+    /// origin and attachments state now.
+    ///
+    /// An update wakes every reader, so a set that did not move is never written.
+    fn anchor_set_held(&self, at: u32) -> bool {
+        let side = &self.sides[at];
+        let Some(set) = side.origin else { return true };
+        let origin = self.tree.c.geom[side.node.index()];
+        // At the class the origin was solved in, so a reader converting a box to metric
+        // units divides by the number the solve multiplied by.
+        let scope = self
+            .scope_of(side.node)
+            .at_width(self.tree.class(side.node));
+        let (tree, anchors) = (&self.tree, &self.anchors);
+        let boxes = anchors
+            .iter()
+            .filter(|a| a.set == set && tree.is_live(a.node))
+            .map(|a| (a.key, tree.c.geom[a.node.index()].rect.rebased(origin.rect)));
+        crate::signal::untracked(|| {
+            set.cell().with(|table| {
+                table.size == origin.size
+                    && table.published() == Some(scope)
+                    && table.iter().map(|a| (a.key, a.rect)).eq(boxes)
+            })
+        })
     }
 
     /// Emits a mount for every region that has a box and no buffers, and a resize for every

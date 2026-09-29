@@ -103,6 +103,12 @@ pub(crate) struct ControlRow {
     pub expanded: bool,
     pub disabled: bool,
     pub uia: UiaRole,
+    /// The paints whose source is this control's state, so a state change repaints them
+    /// without a walk of every paint in the window. May name a paint since freed or
+    /// re-sourced; the repaint checks each one and prunes it.
+    pub paints: Vec<NodeId>,
+    /// The runs this control owns, which take their ink from its chrome.
+    pub runs: Vec<MeasureKey>,
 }
 
 impl ControlRow {
@@ -132,6 +138,8 @@ impl ControlRow {
             expanded: false,
             disabled: false,
             uia: UiaRole::None,
+            paints: Vec::new(),
+            runs: Vec::new(),
         }
     }
 }

@@ -31,13 +31,23 @@ pub struct Anchored {
 ///
 /// Read through [`Anchors::with`]. Ordered by attachment, not by key: a consumer that wants
 /// one box asks for it by key, and one that draws the whole set walks it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct Table {
     /// The origin container's own solved size.
     pub size: Vector2,
     /// The origin container's enclosing scope, absent until the first publication.
     scope: Option<Scope>,
     pub(crate) boxes: Vec<Anchored>,
+    /// How many publications have written this table. Not part of its value: what a reader
+    /// that mirrors the table elsewhere compares, instead of the table itself, to learn that
+    /// it moved.
+    revision: u64,
+}
+
+impl PartialEq for Table {
+    fn eq(&self, other: &Self) -> bool {
+        (self.size, self.scope, &self.boxes) == (other.size, other.scope, &other.boxes)
+    }
 }
 
 impl Table {
@@ -66,9 +76,17 @@ impl Table {
     }
 
     /// Records the origin container's own box and scope.
+    ///
+    /// The last write of every publication, so it is where the revision moves.
     pub(crate) fn set_origin(&mut self, size: Vector2, scope: Scope) {
         self.size = size;
         self.scope = Some(scope);
+        self.revision += 1;
+    }
+
+    /// How many publications have written this table.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Attaches one child's box, already rebased onto the origin.

@@ -28,10 +28,13 @@ pub(crate) enum Pass {
     Rounded,
     Text,
     Masks,
+    Anchors,
 }
 
 impl Pass {
-    const COUNT: usize = 4;
+    /// Every pass, in the order a flush runs them.
+    pub(crate) const ALL: [Self; 5] = [Self::Visuals, Self::Rounded, Self::Text, Self::Anchors, Self::Masks];
+    const COUNT: usize = Self::ALL.len();
 }
 
 pub(crate) struct Changes {

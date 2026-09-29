@@ -198,7 +198,9 @@ pub(crate) struct RegionRow {
     pub(crate) extent: Option<Extent>,
     pub(crate) atlas: Option<Box<Atlas>>,
     pub(crate) active: bool,
-    pub(crate) layout: Option<(crate::layout::Anchors, Arc<Published<crate::layout::Table>>)>,
+    /// The set a region lays its parts out from, where it declared one, the mirror the
+    /// present thread reads it through, and the revision of the set last mirrored.
+    pub(crate) layout: Option<(crate::layout::Anchors, Arc<Published<crate::layout::Table>>, u64)>,
 }
 
 pub(crate) struct Atlas {
@@ -211,7 +213,7 @@ impl Element<'_, Region> {
     pub fn layout_parts(self, anchors: crate::layout::Anchors, output: &Arc<Published<crate::layout::Table>>) -> Self {
         let node = self.node;
         let (_, row) = self.ui.host.regions.iter_mut().find(|(_, row)| row.node == node).expect("live region");
-        row.layout = Some((anchors, Arc::clone(output)));
+        row.layout = Some((anchors, Arc::clone(output), u64::MAX));
         self.anchors_origin(anchors)
     }
 
@@ -323,11 +325,16 @@ pub(crate) fn emit(host: &mut Host, out: &mut Vec<RegionOp>) {
         if !tree.is_live(row.node) {
             continue;
         }
-        if let Some((anchors, output)) = &row.layout {
+        // Compared by revision: the mirror sits behind a lock and reading it clones the whole
+        // table, which a flush where the set did not move has no reason to pay.
+        if let Some((anchors, output, seen)) = &mut row.layout {
             anchors.with(|table| {
-                if output.get() != *table {
-                    output.set(table.clone());
-                    row.live.epoch.invalidate();
+                if table.revision() != *seen {
+                    *seen = table.revision();
+                    if output.get() != *table {
+                        output.set(table.clone());
+                        row.live.epoch.invalidate();
+                    }
                 }
             });
         }

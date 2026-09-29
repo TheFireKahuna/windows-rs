@@ -303,8 +303,13 @@ pub(super) fn install(
         Target::Line { sprite, run } => Some((sprite, run)),
         Target::Wrapped { .. } | Target::Annotated(_) => None,
     };
+    let owner = mint.owner;
     let key = host.text.mint(mint);
     host.tree.c.text[node.index()] = key;
+    // A run takes its ink from its owner's chrome, so the owner lists it for a state change.
+    if let Some(row) = host.controls.get_mut(owner) {
+        row.runs.push(key);
+    }
     if let Some((sprite, run)) = line {
         host.mask(sprite, Mask::Run(run));
     }
@@ -996,10 +1001,27 @@ impl Host {
         if owner.is_none() {
             return;
         }
-        for at in 0..self.text.slots() {
-            if self.text.owner(at) == owner {
+        // The owner's own list rather than every run; a key whose run has been released reads
+        // absent and is dropped.
+        let Some(row) = self.controls.get_mut(owner) else {
+            return;
+        };
+        let mut runs = core::mem::take(&mut row.runs);
+        runs.retain(|&key| self.text.slot_of(key).is_some());
+        for &key in &runs {
+            if let Some(at) = self.text.slot_of(key) {
                 self.paint_run(at);
             }
+        }
+        #[cfg(debug_assertions)]
+        for at in 0..self.text.slots() {
+            debug_assert!(
+                self.text.owner(at) != owner || runs.iter().any(|&key| self.text.slot_of(key) == Some(at)),
+                "a run of {owner:?} was not listed"
+            );
+        }
+        if let Some(row) = self.controls.get_mut(owner) {
+            row.runs = runs;
         }
     }
 

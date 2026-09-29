@@ -549,7 +549,7 @@ impl Host {
             next: held.map_or(NodeId::NONE, |held| held.next),
         };
         self.publish_paint(paint, true);
-        self.appearances.place(id.0, paint);
+        self.place_paint(id.0, paint);
         if held.is_none() {
             self.own_appearance(id, node);
         }
@@ -660,7 +660,7 @@ impl Host {
             };
             self.place_part(paint, surface);
             self.publish_paint(paint, true);
-            self.appearances.place(id.0, paint);
+            self.place_paint(id.0, paint);
             if held.is_none() {
                 self.own_appearance(id, node);
                 if let Some(held) = self.appearances.surface_mut(row) {
@@ -841,6 +841,17 @@ impl Host {
     /// an owner-sourced paint like a fill, and it sits on a child node, so a search that
     /// stopped at the surface's three slots would leave a disabled button's text at its
     /// resting colour.
+    /// Places a paint, and lists it on the control its source follows.
+    fn place_paint(&mut self, id: NodeId, paint: Appearance) {
+        self.appearances.place(id, paint);
+        let owner = paint.source.owner();
+        if let Some(row) = self.controls.get_mut(owner)
+            && !row.paints.contains(&id)
+        {
+            row.paints.push(id);
+        }
+    }
+
     pub(crate) fn repaint_control(&mut self, id: ControlId) {
         if let Some(row) = self.control(id) {
             let disabled = row.state == ModelState::Disabled;
@@ -853,16 +864,30 @@ impl Host {
                 | if focus { crate::widget::flag::FOCUS_WASH } else { 0 }
                 | if disabled { crate::widget::flag::DISABLED } else { 0 };
         }
-        for at in 0..self.appearances.slots() {
-            let Some(node) = self.appearances.id_at(at) else {
-                continue;
-            };
-            let Some(paint) = self.appearances.get(node).copied() else {
-                continue;
-            };
-            if paint.source.owner() == id {
+        // The control's own list rather than every paint: a hover over a list row repaints
+        // that row's parts, not the window's. A paint freed or re-sourced since it was listed
+        // is dropped here.
+        let Some(row) = self.controls.get_mut(id) else {
+            return;
+        };
+        let mut paints = core::mem::take(&mut row.paints);
+        paints.retain(|&node| {
+            self.appearances.get(node).is_some_and(|paint| paint.source.owner() == id)
+        });
+        for &node in &paints {
+            if let Some(paint) = self.appearances.get(node).copied() {
                 self.publish_paint(paint, false);
             }
+        }
+        #[cfg(debug_assertions)]
+        for at in 0..self.appearances.slots() {
+            if let Some(node) = self.appearances.id_at(at) {
+                let owned = self.appearances.get(node).is_some_and(|p| p.source.owner() == id);
+                debug_assert!(!owned || paints.contains(&node), "a paint {node:?} of {id:?} was not listed");
+            }
+        }
+        if let Some(row) = self.controls.get_mut(id) {
+            row.paints = paints;
         }
         self.relight_runs(id);
     }
@@ -1094,7 +1119,7 @@ impl Host {
             };
             paint.scope = self.scope_of(node);
             self.publish_paint(paint, true);
-            self.appearances.place(node, paint);
+            self.place_paint(node, paint);
         }
         // Ramps are authored in roles, so a gradient follows the theme like any other paint.
         self.relight_ramps();
@@ -1354,7 +1379,7 @@ impl Host {
                 link = paint.next;
                 if paint.part == Part::Fill && paint.surface == tree::NONE {
                     paint.halo = Some(halo);
-                    self.appearances.place(paint.id.0, paint);
+                    self.place_paint(paint.id.0, paint);
                     self.publish_paint(paint, false);
                 }
             }

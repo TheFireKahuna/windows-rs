@@ -64,6 +64,8 @@ pub(crate) const INITIAL: Bits = 1 << 28;
 /// The sprite samples glyph coverage whose extent changes with the run resource.
 pub(crate) const RUN: Bits = 1 << 29;
 pub(crate) const ROUNDED_CLIP: Bits = 1 << 30;
+/// The node is attached to a keyed anchor set, so its box moving moves that set.
+pub(crate) const ANCHORED: Bits = 1 << 31;
 
 // ── the hit declaration, packed ─────────────────────────────────────────────────────
 

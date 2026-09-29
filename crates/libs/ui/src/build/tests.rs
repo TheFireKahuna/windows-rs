@@ -41,6 +41,7 @@
 //! 16g. A flush visits the rows what changed reaches, not every row mounted.
 //! 16h. A box that moves under no hit target leaves the hit array as it was.
 //! 16i. Every pass reads each change once, however late in a flush it was named.
+//! 16j. A region mirrors its anchor set when the set moves, and costs nothing when not.
 //!
 //! The one hit array
 //! 17. The array is paint order and the id index is id order. [03-LAYOUT §7]
@@ -971,23 +972,24 @@ fn every_pass_reads_each_change_once_however_late_it_was_named() {
             h.unread(pass).map(|at| h.tree.moved[at]).collect()
         };
         h.tree.moved.push(early);
-        assert_eq!(read(h, Pass::Visuals), [early]);
-        h.mark_read(Pass::Visuals);
+        let first = Pass::ALL[0];
+        assert_eq!(read(h, first), [early]);
+        h.mark_read(first);
         // Named after the visuals pass read the set, as a text pass's line tile or an
         // overlay's translate is.
         h.tree.moved.push(late);
-        for pass in [Pass::Rounded, Pass::Text, Pass::Masks] {
+        for pass in Pass::ALL.into_iter().skip(1) {
             assert_eq!(read(h, pass), [early, late]);
             h.mark_read(pass);
         }
         h.close_changes();
         // The next flush: the visuals pass reads what it missed, and nobody reads anything
         // twice.
-        assert_eq!(read(h, Pass::Visuals), [late]);
-        for pass in [Pass::Rounded, Pass::Text, Pass::Masks] {
+        assert_eq!(read(h, first), [late]);
+        for pass in Pass::ALL.into_iter().skip(1) {
             assert!(read(h, pass).is_empty(), "a pass read an entry twice");
         }
-        h.mark_read(Pass::Visuals);
+        h.mark_read(first);
         h.close_changes();
         assert!(h.tree.moved.is_empty(), "an entry every pass had read was kept");
     });
@@ -1420,6 +1422,40 @@ fn stock_slider_centres_its_thumb_on_the_rail_in_both_orientations() {
             assert!(rig.flush().patch().ops().is_empty());
         }
     }
+}
+
+#[test]
+fn a_region_mirrors_its_anchor_set_only_when_the_set_moves() {
+    use crate::present::{Live, Published};
+    use windows_present::Queue;
+    let mut rig = Rig::new();
+    let width = Cell::new(40.0f32);
+    let rows = crate::layout::anchors();
+    let output = std::sync::Arc::new(Published::new(crate::layout::Table::default()));
+    let held = std::sync::Arc::clone(&output);
+    rig.mount(move |ui| {
+        ui.stack(|ui| {
+            ui.region(Queue::Shared("anchored"), &Live::new().unwrap(), |_, _| unreachable!())
+                .height(Len::dip(44.0))
+                .layout_parts(rows, &held);
+            ui.node(Preset::Layer)
+                .height(Len::dip(10.0))
+                .layout_from(move |l| l.width = Len::dip(width.get()))
+                .anchored(rows, 7);
+        });
+    });
+    rig.flush();
+    let mirrored = |output: &Published<crate::layout::Table>| output.get().get(7).map(|r| r.width());
+    assert_eq!(mirrored(&output), Some(40.0));
+    // A set that did not move is not read back through the mirror's lock, let alone cloned.
+    let (seq, before) = (output.seq(), crate::counting::allocations());
+    for _ in 0..20 {
+        rig.flush();
+    }
+    assert_eq!(crate::counting::allocations(), before, "a steady flush copied the anchor set");
+    assert_eq!(output.seq(), seq);
+    rig.set(width, 70.0);
+    assert_eq!(mirrored(&output), Some(70.0), "a moved set was not mirrored");
 }
 
 #[test]
