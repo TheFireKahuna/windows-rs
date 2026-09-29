@@ -921,7 +921,7 @@ impl Host {
             }
             self.text.restated = restated;
             self.text.restated.clear();
-            for i in 0..self.tree.moved.len() {
+            for i in self.unread(crate::build::host::changes::Pass::Text) {
                 let node = self.tree.moved[i];
                 if !self.tree.is_live(node) {
                     continue;
@@ -931,6 +931,7 @@ impl Host {
                 }
             }
         }
+        self.mark_read(crate::build::host::changes::Pass::Text);
         #[cfg(debug_assertions)]
         for at in 0..self.text.slots() {
             if let Some((node, class, w)) = self.run_width(at) {

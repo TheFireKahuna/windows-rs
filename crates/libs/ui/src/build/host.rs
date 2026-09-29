@@ -1665,8 +1665,6 @@ impl Host {
             h.publish_surfaces();
             h.size_overlay_viewports();
             h.solve();
-            // Every pass below reads the change set from here, or the whole table on a sweep.
-            h.open_changes();
             // A derived sprite's box is its owner's less the insets, so it is written from the
             // solve before anything reads a sprite's box: the encode below, and the masks.
             h.publish_visuals();
@@ -1783,7 +1781,7 @@ impl Host {
                 self.place_visual(at);
             }
         } else {
-            for i in 0..self.changes.len() {
+            for i in self.unread(changes::Pass::Visuals) {
                 let node = self.tree.moved[i];
                 if !self.tree.is_live(node) {
                     continue;
@@ -1800,6 +1798,7 @@ impl Host {
                 }
             }
         }
+        self.mark_read(changes::Pass::Visuals);
         #[cfg(debug_assertions)]
         for &at in &self.placed {
             let node = self.sides[at].node;

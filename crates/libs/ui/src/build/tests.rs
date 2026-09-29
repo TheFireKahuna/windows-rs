@@ -40,6 +40,7 @@
 //! 16f. A container's lead is its first laid-out child through every splice.
 //! 16g. A flush visits the rows what changed reaches, not every row mounted.
 //! 16h. A box that moves under no hit target leaves the hit array as it was.
+//! 16i. Every pass reads each change once, however late in a flush it was named.
 //!
 //! The one hit array
 //! 17. The array is paint order and the id index is id order. [03-LAYOUT §7]
@@ -950,16 +951,46 @@ fn a_flush_visits_what_changed_not_what_is_mounted() {
     // chrome parts and masks, several rows each.
     assert!(text_rows < 24, "a text change visited {text_rows} rows");
     assert!(box_rows < 24, "a box change visited {box_rows} rows");
-    // What the last change named after the first pass had read is read once more, and then
-    // nothing is.
-    let replayed = visited(&mut rig, &|rig| {
-        rig.flush();
-    });
     let idle = visited(&mut rig, &|rig| {
         rig.flush();
     });
-    assert!(replayed < 24, "the replay visited {replayed} rows");
     assert_eq!(idle, 0, "a flush with nothing changed visited rows");
+}
+
+#[test]
+fn every_pass_reads_each_change_once_however_late_it_was_named() {
+    use super::host::changes::Pass;
+    let mut rig = Rig::new();
+    let (mut early, mut late) = (NodeId::NONE, NodeId::NONE);
+    rig.mount(|ui| {
+        early = boxed(ui, 10.0, 10.0);
+        late = boxed(ui, 10.0, 10.0);
+    });
+    Host::with(|h| {
+        let read = |h: &Host, pass| -> Vec<NodeId> {
+            h.unread(pass).map(|at| h.tree.moved[at]).collect()
+        };
+        h.tree.moved.push(early);
+        assert_eq!(read(h, Pass::Visuals), [early]);
+        h.mark_read(Pass::Visuals);
+        // Named after the visuals pass read the set, as a text pass's line tile or an
+        // overlay's translate is.
+        h.tree.moved.push(late);
+        for pass in [Pass::Rounded, Pass::Text, Pass::Masks] {
+            assert_eq!(read(h, pass), [early, late]);
+            h.mark_read(pass);
+        }
+        h.close_changes();
+        // The next flush: the visuals pass reads what it missed, and nobody reads anything
+        // twice.
+        assert_eq!(read(h, Pass::Visuals), [late]);
+        for pass in [Pass::Rounded, Pass::Text, Pass::Masks] {
+            assert!(read(h, pass).is_empty(), "a pass read an entry twice");
+        }
+        h.mark_read(Pass::Visuals);
+        h.close_changes();
+        assert!(h.tree.moved.is_empty(), "an entry every pass had read was kept");
+    });
 }
 
 #[test]

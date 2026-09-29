@@ -9,19 +9,34 @@
 //! owes a **sweep** instead: the next flush's passes each walk their whole table once, which
 //! is what every flush did before there was a change set.
 //!
-//! # Which entries a flush drains
+//! # Which entries each pass reads
 //!
-//! The passes run in a fixed order and some of them move boxes of their own: the visuals
-//! pass places sprites, an overlay's placement translates a subtree. An entry named after a
-//! pass has read the set is one that pass has not seen, so a flush drains only what was
-//! named before the first pass read it, and the rest are read again, by every pass, on the
-//! next flush. Reading an entry twice costs a comparison; every pass is idempotent.
+//! The passes run in a fixed order and some of them name entries of their own: the visuals
+//! pass places sprites, the text pass places line tiles, an overlay's placement translates a
+//! subtree, and a draw callback or the second encode can move a box after every pass has
+//! run. So each pass that reads the set keeps its own cursor, reads from it to the end, and
+//! moves it to the end once it is done, past whatever it named itself. Every entry reaches
+//! every pass exactly once, however late in a flush it was named, and a flush drains only the
+//! prefix every cursor has passed.
 
 use super::Host;
 
+/// The passes that read the change set, each with a cursor of its own.
+#[derive(Copy, Clone)]
+pub(crate) enum Pass {
+    Visuals,
+    Rounded,
+    Text,
+    Masks,
+}
+
+impl Pass {
+    const COUNT: usize = 4;
+}
+
 pub(crate) struct Changes {
-    /// How much of the change set was named before the first pass read it.
-    read: usize,
+    /// How far into the change set each pass has read.
+    cursors: [usize; Pass::COUNT],
     /// This flush's passes walk their whole tables.
     sweeping: bool,
     /// The next flush's do.
@@ -38,7 +53,7 @@ impl Default for Changes {
     fn default() -> Self {
         // Nothing has been published yet, so the first flush reads everything.
         Self {
-            read: 0,
+            cursors: [0; Pass::COUNT],
             sweeping: false,
             owed: true,
             scale: f32::NAN,
@@ -67,11 +82,6 @@ impl Changes {
             self.rows += 1;
         }
     }
-
-    /// How much of the change set the first pass reads.
-    pub(super) fn len(&self) -> usize {
-        self.read
-    }
 }
 
 impl Host {
@@ -85,16 +95,27 @@ impl Host {
         self.changes.sweeping = core::mem::take(&mut self.changes.owed) || rescaled;
     }
 
-    /// Fixes how much of the change set this flush's passes read: all of it as it stands
-    /// once the solve has run.
-    pub(super) fn open_changes(&mut self) {
-        self.changes.read = self.tree.moved.len();
+    /// The entries `pass` has not read: from its cursor to the end as the set stands now.
+    ///
+    /// A range and not a slice, because the pass writes the tree while it reads; entries it
+    /// names on the way are past the range and are its own.
+    pub(crate) fn unread(&self, pass: Pass) -> core::ops::Range<usize> {
+        self.changes.cursors[pass as usize]..self.tree.moved.len()
     }
 
-    /// Drains what every pass of this flush has read.
-    pub(super) fn close_changes(&mut self) {
-        self.tree.moved.drain(..self.changes.read);
-        self.changes.read = 0;
+    /// Moves `pass`'s cursor to the end of the set, past everything it read and everything
+    /// it named while reading: the rows it just resolved are already current for it.
+    pub(crate) fn mark_read(&mut self, pass: Pass) {
+        self.changes.cursors[pass as usize] = self.tree.moved.len();
+    }
+
+    /// Drains the prefix every pass has read, and ends the flush's sweep.
+    pub(crate) fn close_changes(&mut self) {
+        let read = self.changes.cursors.iter().copied().min().unwrap_or(0);
+        self.tree.moved.drain(..read);
+        for cursor in &mut self.changes.cursors {
+            *cursor -= read;
+        }
         self.changes.sweeping = false;
     }
 }

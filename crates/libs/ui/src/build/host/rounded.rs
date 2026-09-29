@@ -82,7 +82,7 @@ impl Host {
                 self.publish_rounded(at);
             }
         } else {
-            for i in 0..self.tree.moved.len() {
+            for i in self.unread(changes::Pass::Rounded) {
                 let node = self.tree.moved[i];
                 if !self.tree.is_live(node) {
                     continue;
@@ -93,6 +93,7 @@ impl Host {
                 }
             }
         }
+        self.mark_read(changes::Pass::Rounded);
         #[cfg(debug_assertions)]
         for at in 0..self.rounded.slots() {
             if let Some(row) = self.rounded.get(at) {

@@ -902,11 +902,12 @@ impl Host {
             }
             self.appearances.restated = restated;
             self.appearances.restated.clear();
-            for i in 0..self.tree.moved.len() {
+            for i in self.unread(crate::build::host::changes::Pass::Masks) {
                 let node = self.tree.moved[i];
                 self.publish_mask(node);
             }
         }
+        self.mark_read(crate::build::host::changes::Pass::Masks);
         #[cfg(debug_assertions)]
         for at in 0..self.appearances.slots() {
             if let Some(node) = self.appearances.id_at(at) {
