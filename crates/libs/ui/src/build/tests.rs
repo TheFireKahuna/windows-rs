@@ -621,6 +621,45 @@ fn a_reactive_source_writes_once_per_distinct_value() {
     assert_eq!(rig.set(alpha, 0.25).bound(node, Prop::Opacity), at(0.25));
 }
 
+/// A flush that moves nothing raises no wake, which is what lets the app thread park.
+///
+/// A position write made from inside `Host::flush` runs after the signal graph has flushed, so
+/// its bump raises the app waker directly. A list that re-states an unchanged viewport must not
+/// bump, or the pass that bump wakes bumps it again and the thread never parks.
+#[test]
+fn a_settled_scroll_list_raises_no_wake() {
+    let wakes = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    crate::signal::set_waker({
+        let wakes = wakes.clone();
+        move || wakes.set(wakes.get() + 1)
+    });
+    let mut rig = Rig::new();
+    let rows = crate::layout::list_state();
+    rig.mount(move |ui| {
+        // A reader of the position, as the realization window is: an update-phase effect is
+        // what a bump queues, and queuing it is what raises the waker.
+        crate::signal::Effect::new(move || {
+            let _ = rows.pos().viewport;
+        });
+        crate::layout::scroll_list(ui, rows, |ui| {
+            ui.node(Preset::Layer).height(Len::times(Metric::RowH, 4.0));
+        })
+        .width(Len::dip(200.0))
+        .height(Len::dip(200.0));
+    });
+    // The mount's own passes settle it; the first writes the viewport and may wake.
+    for _ in 0..4 {
+        rig.flush();
+    }
+    wakes.set(0);
+    rig.flush();
+    assert_eq!(
+        wakes.get(),
+        0,
+        "a settled list flush re-woke the app thread, which would spin rather than park"
+    );
+}
+
 #[test]
 fn repeating_a_singleton_handler_replaces_it() {
     let mut rig = Rig::new();

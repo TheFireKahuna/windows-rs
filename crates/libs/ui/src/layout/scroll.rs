@@ -243,11 +243,16 @@ pub struct Pos {
     /// The rows are placed in the group's own space and the tracker reports the content's, so
     /// this is what carries one into the other.
     pub band_y: f32,
-    /// Where inertia will rest, `NaN` while nothing is in flight.
+    /// Where inertia will rest, or `None` while nothing is in flight.
+    ///
+    /// An `Option` rather than a `NaN` sentinel: this value is the signal's own change gate, and
+    /// `NaN != NaN` would make every write look like a move, so an unchanged list would bump the
+    /// cell from inside `Host::flush` and the waker that bump raises would run the app pass
+    /// again rather than letting it park.
     ///
     /// Held **beside** the offset and never in place of it: the destination is realized as
     /// soon as it is known, while the rows the offset still names stay realized too.
-    pub target: f32,
+    pub target: Option<f32>,
     /// The extent the content is held at until the tracker goes idle, in row heights.
     ///
     /// Zero while it is idle. A measurement landing mid-interaction may lengthen the content
@@ -268,7 +273,7 @@ impl Pos {
     /// Returns where inertia will rest, or `None` when nothing is in flight.
     #[must_use]
     pub fn target(self) -> Option<f32> {
-        (!self.target.is_nan()).then_some(self.target)
+        self.target
     }
 }
 
@@ -292,10 +297,7 @@ pub struct ListState {
 #[must_use]
 pub fn list_state() -> ListState {
     ListState {
-        pos: Cell::new(Pos {
-            target: f32::NAN,
-            ..Pos::default()
-        }),
+        pos: Cell::new(Pos::default()),
         rows: Cell::new(Rows::default()),
     }
 }
@@ -1606,14 +1608,14 @@ pub fn observe(events: &[SceneEvent]) {
                     SceneEvent::TrackerValues { position, .. } => at.offset = position.y,
                     // The resting position with snap points applied, which is the destination
                     // the content will actually reach.
-                    SceneEvent::InertiaBegan { rest, .. } => at.target = rest.y,
+                    SceneEvent::InertiaBegan { rest, .. } => at.target = Some(rest.y),
                     // Returning to idle releases the held extent and clears the destination;
                     // leaving idle holds the extent where it stands.
                     SceneEvent::TrackerPhase {
                         phase: TrackerPhase::Idle,
                         ..
                     } => {
-                        at.target = f32::NAN;
+                        at.target = None;
                         at.held = 0.0;
                     }
                     SceneEvent::TrackerPhase { .. } if at.held <= 0.0 => at.held = span,
@@ -2074,7 +2076,6 @@ mod tests {
         Pos {
             offset,
             viewport: viewport_h,
-            target: f32::NAN,
             ..Pos::default()
         }
     }
@@ -2241,7 +2242,7 @@ mod tests {
         let flung = realize(
             &uniform(1.0),
             Pos {
-                target: 1900.0,
+                target: Some(1900.0),
                 ..at(0.0, 100.0)
             },
             SPEC.overscan,
@@ -2261,7 +2262,7 @@ mod tests {
         let nudged = realize(
             &uniform(1.0),
             Pos {
-                target: 440.0,
+                target: Some(440.0),
                 ..at(400.0, 100.0)
             },
             SPEC.overscan,
@@ -2309,7 +2310,7 @@ mod tests {
         let flung = realize(
             &uniform(1.0),
             Pos {
-                target: 0.0,
+                target: Some(0.0),
                 pin: Some(50),
                 ..at(1900.0, 100.0)
             },
@@ -2402,6 +2403,31 @@ mod tests {
         );
         state.edit(|at| at.held = 0.0);
         assert_eq!(state.extent(), 4.0, "the hold outlived the interaction");
+    }
+
+    /// A flush that re-states the viewport it already holds moves the position signal nothing.
+    ///
+    /// The write is what wakes the realization window, and that wake is what keeps the app
+    /// thread from parking: a `Pos` whose `NaN` target compared unequal to itself would bump on
+    /// every flush forever.
+    #[test]
+    fn restating_the_same_viewport_does_not_move_the_position() {
+        let state = list_state();
+        assert!(state.pos().target.is_none(), "a fresh list is at rest");
+        state.resized(400.0);
+        let moved = state.pos.version();
+        state.resized(400.0);
+        assert_eq!(
+            state.pos.version(),
+            moved,
+            "an unchanged viewport bumped the position signal, which wakes the app on every flush"
+        );
+        state.resized(401.0);
+        assert_ne!(
+            state.pos.version(),
+            moved,
+            "a viewport that really moved did not reach the signal"
+        );
     }
 
     // ── the two halves of a container ────────────────────────────────────────────
