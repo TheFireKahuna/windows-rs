@@ -66,6 +66,10 @@ pub fn solve_root(host: &mut Host, root: NodeId) {
     #[cfg(test)]
     ROOTS.with(|held| held.set(held.get() + 1));
     with_solver(host, root, |s| {
+        // A plan is good for the pass that made it: the next pass may relink or restate
+        // any cell.
+        s.scratch.grids.clear();
+        s.scratch.grid_cells.clear();
         let class = s.tree.class(root);
         let window = s.window;
         let pair = s.measure(root, class);
@@ -127,6 +131,10 @@ pub(crate) struct Scratch {
     pub u: Vec<u16>,
     /// The subtree a class flip marks.
     pub marks: Vec<NodeId>,
+    /// What walk B resolved for each grid it placed this pass, for walk C to arrange from.
+    pub grids: Vec<grid::Plan>,
+    /// The cells those plans assigned, four words each.
+    pub grid_cells: Vec<u16>,
 }
 
 thread_local! {
@@ -193,8 +201,9 @@ impl Solver<'_> {
         &self.tree.c.layout[n.index()]
     }
 
-    pub(crate) fn geom(&self, n: NodeId) -> Geom {
-        self.tree.c.geom[n.index()]
+    /// What the solve last wrote for this node, borrowed.
+    pub(crate) fn geom(&self, n: NodeId) -> &Geom {
+        &self.tree.c.geom[n.index()]
     }
 
     fn bits(&self, n: NodeId) -> tree::Bits {
@@ -577,6 +586,7 @@ impl Solver<'_> {
         let holds = self.layout(n).preset == Preset::Text;
         let rect = self.box_at(abs, w, h, holds);
         let held = self.geom(n);
+        let (held_rect, held_at, held_h) = (held.rect, held.at, held.at_h);
         let flags = &mut self.tree.c.flags[i];
         // A box that is only shown or only hidden keeps its rect, so the bit is what says
         // its derived sprites moved.
@@ -584,10 +594,10 @@ impl Solver<'_> {
         *flags = if hidden { *flags | tree::SUNK } else { *flags & !tree::SUNK };
         let placed = *flags & tree::PLACED != 0;
         let settled = !self.dirty(n) && self.published(n) && sunk == hidden;
-        if settled && !placed && rect == held.rect && local == held.at {
+        if settled && !placed && rect == held_rect && local == held_at {
             return;
         }
-        if settled && h == held.at_h && !placed {
+        if settled && h == held_h && !placed {
             // Only the origin moved, so every descendant keeps its offset and its extent.
             self.translate(n, local, parent, hidden);
             return;

@@ -6,6 +6,7 @@
 //! where the flow order is not the visual order.
 
 use super::Solver;
+use super::Scratch;
 use super::flow::{STRIDE, distribute};
 use crate::layout::{COLUMN_CAP, Layout, Position, Templates, Track, TrackMax, WidthClass};
 use windows_numerics::Vector2;
@@ -18,6 +19,24 @@ const ROW_CAP: usize = 64;
 
 /// One child's cell, as four scratch words.
 const CELL: usize = 4;
+
+/// What walk B resolved for one grid: the cells it assigned and the column widths it sized
+/// them into.
+///
+/// Walk C arranges at the width walk B placed at, over the same children, so recomputing
+/// either repeats three walks over the cells and the column sizing for an identical answer.
+/// Kept for the pass, and used only where the width and the gap walk C resolves are the ones
+/// the plan was made at.
+pub(crate) struct Plan {
+    node: NodeId,
+    iw: f32,
+    gap: f32,
+    cols: usize,
+    count: usize,
+    /// Where this plan's cells start in [`Scratch::grid_cells`](super::Scratch::grid_cells).
+    cells: usize,
+    groups: [f32; COLUMN_CAP * STRIDE],
+}
 
 /// Answers a grid's summed column widths plus its gaps.
 pub(crate) fn measure(
@@ -77,6 +96,18 @@ pub(crate) fn place(
     size_columns(s, n, inner, iw, &tracks[..cols], base, count, &mut groups);
     let gaps = gap * cols.saturating_sub(1) as f32;
     resolve(&mut groups[..cols * STRIDE], (iw - gaps).max(0.0));
+    let cells_at = s.scratch.grid_cells.len();
+    let Scratch { u, grid_cells, .. } = &mut s.scratch;
+    grid_cells.extend_from_slice(&u[base..base + count * CELL]);
+    s.scratch.grids.push(Plan {
+        node: n,
+        iw,
+        gap,
+        cols,
+        count,
+        cells: cells_at,
+        groups,
+    });
     let mut heights = [[0.0f32; 2]; ROW_CAP];
     let mut rows = 0usize;
     let mut k = 0usize;
@@ -125,14 +156,51 @@ pub(crate) fn arrange(
     abs: Vector2,
 ) {
     let gap = s.gap(l, inner, iw);
-    let mut tracks = [Track::AUTO; COLUMN_CAP];
-    let cols = columns(s, l, inner, &mut tracks);
     let base = s.scratch.u.len();
-    let count = cells(s, n, cols);
-    let mut groups = [0.0f32; COLUMN_CAP * STRIDE];
-    size_columns(s, n, inner, iw, &tracks[..cols], base, count, &mut groups);
-    let gaps = gap * cols.saturating_sub(1) as f32;
-    resolve(&mut groups[..cols * STRIDE], (iw - gaps).max(0.0));
+    let planned = s
+        .scratch
+        .grids
+        .iter()
+        .rev()
+        .find(|plan| {
+            plan.node == n && plan.iw.to_bits() == iw.to_bits() && plan.gap.to_bits() == gap.to_bits()
+        })
+        .map(|plan| (plan.cols, plan.count, plan.groups, plan.cells));
+    let (cols, count, groups) = match planned {
+        Some((cols, count, groups, at)) => {
+            let Scratch { u, grid_cells, .. } = &mut s.scratch;
+            u.extend_from_slice(&grid_cells[at..at + count * CELL]);
+            #[cfg(debug_assertions)]
+            {
+                let mut tracks = [Track::AUTO; COLUMN_CAP];
+                let fresh_cols = columns(s, l, inner, &mut tracks);
+                let fresh = s.scratch.u.len();
+                let fresh_count = cells(s, n, fresh_cols);
+                let mut fresh_groups = [0.0f32; COLUMN_CAP * STRIDE];
+                size_columns(s, n, inner, iw, &tracks[..fresh_cols], fresh, fresh_count, &mut fresh_groups);
+                let gaps = gap * fresh_cols.saturating_sub(1) as f32;
+                resolve(&mut fresh_groups[..fresh_cols * STRIDE], (iw - gaps).max(0.0));
+                debug_assert!(
+                    (fresh_cols, fresh_count) == (cols, count)
+                        && s.scratch.u[fresh..] == s.scratch.u[base..fresh]
+                        && fresh_groups == groups,
+                    "walk B's grid plan is not what walk C would resolve"
+                );
+                s.scratch.u.truncate(fresh);
+            }
+            (cols, count, groups)
+        }
+        None => {
+            let mut tracks = [Track::AUTO; COLUMN_CAP];
+            let cols = columns(s, l, inner, &mut tracks);
+            let count = cells(s, n, cols);
+            let mut groups = [0.0f32; COLUMN_CAP * STRIDE];
+            size_columns(s, n, inner, iw, &tracks[..cols], base, count, &mut groups);
+            let gaps = gap * cols.saturating_sub(1) as f32;
+            resolve(&mut groups[..cols * STRIDE], (iw - gaps).max(0.0));
+            (cols, count, groups)
+        }
+    };
     let mut pairs = [[0.0f32; 2]; ROW_CAP];
     let mut rows = 0usize;
     let mut k = 0usize;
