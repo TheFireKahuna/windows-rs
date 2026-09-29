@@ -716,6 +716,12 @@ fn raise(how: &PostWake) -> Held {
     }
 }
 
+/// Returns whether the owning graph has staged producer writes to consume.
+pub(crate) fn posts_pending() -> bool {
+    let id = with(|g| g.id);
+    inbox().get(id as usize).is_some_and(|graph| !graph.pending.is_empty())
+}
+
 /// Applies whatever producer threads staged, coalesced to at most one write per cell, and
 /// answers whether anything was staged.
 fn apply_posts() -> bool {

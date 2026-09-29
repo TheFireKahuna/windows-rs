@@ -231,6 +231,36 @@ fn native_a_reveal_survives_crossings_between_the_children_of_one_scope() -> Res
 }
 
 #[test]
+fn native_control_reveal_keeps_its_enclosing_scope_lit() -> Result<()> {
+    let mut rig = Rig::new("control and scope reveal")?;
+    let Scoped { scope, a, b } = scoped(&mut rig, false)?;
+    let reveal = rig.node()?;
+    let mut row = rig.controls.chrome_of(a);
+    row.reveal = reveal;
+    rig.adopt(&[(a, row)], &[], &[])?;
+    let minted = rig.visuals_minted();
+    let before = rig.animations();
+    let mut out = Vec::with_capacity(16);
+    rig.tick(&[hover(ControlId::NONE, a)], &mut out)?;
+    assert_eq!(rig.animations() - before, 3, "wash, control and enclosing scope");
+    assert!(rig.controls.revealed.contains(&a) && rig.controls.revealed.contains(&scope));
+    let before = rig.animations();
+    rig.tick(&[hover(a, b)], &mut out)?;
+    assert_eq!(rig.animations() - before, 3, "two washes and the control reveal only");
+    assert!(!rig.controls.revealed.contains(&a) && rig.controls.revealed.contains(&scope));
+    rig.tick(&[Report::FocusChanged { from: None, to: Some(a) }, hover(b, ControlId::NONE)], &mut out)?;
+    assert!(rig.controls.revealed.contains(&a) && rig.controls.revealed.contains(&scope));
+    let before = rig.animations();
+    rig.tick(&[], &mut out)?;
+    assert_eq!(rig.animations(), before);
+    assert_eq!(rig.visuals_minted(), minted);
+    assert!(out.is_empty(), "cosmetic interaction must not wake the application");
+    rig.adopt(&[], &[], &[a])?;
+    assert!(!rig.controls.revealed.contains(&a));
+    Ok(())
+}
+
+#[test]
 fn native_semantic_hover_reports_scope_edges_and_ignores_child_crossings() -> Result<()> {
     let mut rig = Rig::new("observed hover")?;
     let Scoped { scope, a, b } = scoped(&mut rig, true)?;

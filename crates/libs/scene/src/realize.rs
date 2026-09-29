@@ -19,7 +19,7 @@ use crate::sink::*;
 use rustc_hash::FxHashMap;
 use windows_color::{Radiance, Scrgb};
 use windows_composition::{
-    BorderMode, Brush, Color, CompositionBrush, CompositionDrawingSurface,
+    Animatable, BorderMode, Brush, Color, CompositionBrush, CompositionDrawingSurface,
     CompositionGraphicsDevice, CompositionPath, CompositionPathGeometry, CompositionSurfaceBrush,
     Compositor, SpriteVisual, Stretch, StrokeCap, StrokeJoin, Surface, Visual,
 };
@@ -1309,12 +1309,22 @@ impl Resources {
         }
     }
 
-    /// Every live object, for the one sweep that is not keyed by an id: a region brush
-    /// carries the display it was bound on and no generation re-derives it.
-    pub fn rows_mut(&mut self) -> impl Iterator<Item = &mut ResObj> {
+    pub fn clear_region(&mut self, id: RegionId) {
+        if let Some(row) = self.row_mut(id.erased()) {
+            row.obj = ResObj::Pending;
+        }
+        self.disclaim(id.erased());
+    }
+
+    /// Returns the run and region brushes whose texels map to physical pixels.
+    pub fn pixel_brushes(&self) -> impl Iterator<Item = &CompositionSurfaceBrush> {
         self.0
-            .iter_mut()
-            .filter_map(|row| row.as_mut().map(|row| &mut row.obj))
+            .iter()
+            .flatten()
+            .filter_map(|row| match (&row.obj, row.family) {
+                (ResObj::Brush(brush, _), RUN | REGION) => Some(brush),
+                _ => None,
+            })
     }
 
     fn row_mut(&mut self, id: ResId) -> Option<&mut Row> {
@@ -1354,6 +1364,7 @@ pub struct Ctx<'a> {
 #[must_use]
 pub fn route(mask: &Mask, held: bool, has_clip: bool, has_halo: bool) -> Route {
     match mask {
+        Mask::Shape { space: PathSpace::Unit, .. } => Route::Capture,
         Mask::Shape {
             stroke: Some(_), ..
         } => Route::Capture,
@@ -1390,6 +1401,8 @@ pub fn realize(
     let Some(sprite) = arena.visual(id).and_then(Visual::as_sprite) else {
         return Ok(());
     };
+    sprite.set_pixel_snapping(matches!(mask, Mask::Run(_)) || matches!(paint,
+        Paint::PresentedView { view: RegionView { sampling: RegionSampling::Pixels, .. }, .. }));
     let held = held_capture_channel(arena, id);
     let has_clip = arena.aux(id).is_some_and(|aux| aux.clip.is_some());
     let has_halo = halo.is_some() || matches!(paint, Paint::Captured { .. });
@@ -1410,7 +1423,7 @@ pub fn realize(
     // The reverse: a mask that stops being a shape leaves a capture behind whose channels
     // would keep taking writes nothing renders. Guarded on the row existing, because a sprite
     // that never took the capture route must not be given one to hold the absence in.
-    if route == Route::Clip && !matches!(mask, Mask::Shape { .. }) && arena.has_aux(id) {
+    if !matches!(mask, Mask::Shape { .. }) && arena.has_aux(id) {
         arena.aux_mut(id).shape = None;
     }
 
@@ -1424,7 +1437,14 @@ pub fn realize(
         )),
         _ => None,
     };
-    let source = paint_brush(&paint, captured.as_ref(), ctx)?;
+    let source = if let Paint::PresentedView { region, view } = paint {
+        presented_view(arena, id, region, view, ctx)
+    } else {
+        if arena.has_aux(id) {
+            arena.aux_mut(id).region_view = None;
+        }
+        paint_brush(&paint, captured.as_ref(), ctx)?
+    };
 
     // A mask and a paint arrive as separate ops in either order, so a half-declared sprite
     // waits rather than failing. `Mask::None` skips the outer brush entirely, because a mask
@@ -1508,8 +1528,9 @@ fn mask_brush(
             Ok((Some(nine.as_brush()), Some(key)))
         }
         Mask::Run(run) => Ok((ctx.res.brush(run.erased()).map(Brush::as_brush), None)),
-        Mask::Shape { geom, stroke } => {
+        Mask::Shape { geom, stroke, space } => {
             let Some(path) = ctx.res.geom(geom).cloned() else {
+                if arena.has_aux(id) { arena.aux_mut(id).shape = None; }
                 return Ok((None, None));
             };
             match route {
@@ -1527,7 +1548,23 @@ fn mask_brush(
                     Ok((None, None))
                 }
                 Route::Capture => {
-                    let state = build_capture(&path, stroke, size, scale, ctx);
+                    if space == PathSpace::Unit
+                        && let Some(state) = arena.aux(id).and_then(|aux| aux.shape.as_ref())
+                        && let Some(fitted) = &state.fitted
+                        && fitted.geom == geom && fitted.style == stroke
+                        && GenMask::GEOMETRY.fresh(fitted.built, ctx.generation)
+                    {
+                        return Ok((Some(state.capture.brush.as_brush()), None));
+                    }
+                    let mut state = build_capture(&path, stroke, size, scale, ctx);
+                    if space == PathSpace::Unit {
+                        let previous = arena.aux_mut(id).shape.as_mut().and_then(|shape| {
+                            if shape.fitted.as_ref().is_some_and(|fitted| fitted.geom == geom && fitted.style == stroke) {
+                                shape.fitted.take()
+                            } else { None }
+                        });
+                        fit_capture(&mut state, arena.visual(id).unwrap(), geom, stroke, previous, scale, ctx);
+                    }
                     let brush = state.capture.brush.as_brush();
                     arena.aux_mut(id).shape = Some(state);
                     Ok((Some(brush), None))
@@ -1602,13 +1639,49 @@ fn build_capture(
         shape,
         geom: path.clone(),
         capture,
+        fitted: None,
     };
     state.resize(size, scale);
     state
 }
 
-/// Every paint is a surface brush; the four variants differ only in where the surface comes
-/// from, so there is one binding type and one device-loss rebind.
+fn fit_capture(state: &mut ShapeState, visual: &Visual, geom: GeomId, style: Option<StrokeStyle>, previous: Option<Box<crate::arena::FittedShape>>, scale: f32, ctx: &Ctx<'_>) {
+    let compositor = &ctx.back.compositor;
+    state.shape.set_stroke_non_scaling(true);
+    let extent = compositor.create_expression_animation("Max(v.Size * dpi, Vector2(1, 1))");
+    extent.set_reference_parameter("v", visual);
+    extent.set_scalar_parameter("dpi", scale);
+    state.host.start_animation("Size", &extent);
+    state.capture.surface.start_animation("SourceSize", &extent);
+    let mapping = compositor.create_expression_animation("Max(v.Size, Vector2(0, 0)) * dpi");
+    mapping.set_reference_parameter("v", visual);
+    mapping.set_scalar_parameter("dpi", scale);
+    state.shape.start_animation("Scale", &mapping);
+    state.capture.brush.set_stretch(Stretch::None);
+    state.capture.brush.set_source_transform(Vector2::zero(), Vector2::new(1.0 / scale, 1.0 / scale));
+    state.capture.brush.set_linear_sampling();
+
+    // The ordinary stroke channels remain in DIPs; only the non-scaling capture uses pixels.
+    let mut fitted = previous.unwrap_or_else(|| {
+        let stroke = compositor.create_property_set();
+        stroke.insert_scalar("StrokeThickness", style.map_or(0.0, |s| s.width));
+        stroke.insert_scalar("StrokeDashOffset", 0.0);
+        Box::new(crate::arena::FittedShape { stroke, geom, style, built: ctx.generation })
+    });
+    fitted.built = ctx.generation;
+    for (property, expression) in [
+        ("StrokeThickness", "p.StrokeThickness * dpi"),
+        ("StrokeDashOffset", "p.StrokeDashOffset"),
+    ] {
+        let animation = compositor.create_expression_animation(expression);
+        animation.set_reference_parameter("p", &fitted.stroke);
+        animation.set_scalar_parameter("dpi", scale);
+        state.shape.start_animation(property, &animation);
+    }
+    state.fitted = Some(fitted);
+}
+
+/// Resolves a shared paint source. Presented views own their mapping brush on the sprite.
 fn paint_brush(
     paint: &Paint,
     captured: Option<&windows_composition::Captured>,
@@ -1625,9 +1698,74 @@ fn paint_brush(
         }
         Paint::Ramp(id) => ctx.res.brush(id.erased()).map(Brush::as_brush),
         Paint::Presented(id) => ctx.res.brush(id.erased()).map(Brush::as_brush),
+        Paint::PresentedView { .. } => unreachable!("view brushes are owned by their sprite"),
         Paint::Captured { .. } => captured.map(|held| held.brush.as_brush()),
         Paint::None => None,
     })
+}
+
+pub struct PresentedView {
+    pub(crate) brush: CompositionSurfaceBrush,
+    view: RegionView,
+    scale: f32,
+}
+
+impl Drop for PresentedView {
+    fn drop(&mut self) {
+        self.brush.stop_animation("Scale");
+        self.brush.stop_animation("Offset");
+    }
+}
+
+fn presented_view(
+    arena: &mut Arena,
+    id: NodeId,
+    region: RegionId,
+    view: RegionView,
+    ctx: &mut Ctx<'_>,
+) -> Option<CompositionBrush> {
+    let Some(surface) = ctx.res.brush(region.erased()).and_then(CompositionSurfaceBrush::surface) else {
+        if arena.has_aux(id) {
+            arena.aux_mut(id).region_view = None;
+        }
+        return None;
+    };
+    let visual = arena.visual(id)?.clone();
+    let scale = ctx.env.scale();
+    let held = &mut arena.aux_mut(id).region_view;
+    if let Some(held) = held.as_ref().filter(|held| held.view == view && held.scale == scale) {
+        held.brush.set_surface(&surface);
+        return Some(held.brush.as_brush());
+    }
+    *held = None;
+    let brush = ctx.back.brush(&surface, Stretch::None);
+    brush.set_alignment_ratio(0.0, 0.0);
+    let [left, top, right, bottom] = view.rect.map(|dip| (dip * scale).round());
+    let origin = Vector2::new(left, top);
+    let span = Vector2::new((right - left).max(1.0), (bottom - top).max(1.0));
+    match view.sampling {
+        RegionSampling::Pixels => {
+            brush.set_nearest_sampling();
+            brush.set_source_transform(Vector2::new(-left / scale, -top / scale),
+                Vector2::new(1.0 / scale, 1.0 / scale));
+        }
+        RegionSampling::Fit => {
+            brush.set_linear_sampling();
+            for (property, expression) in [
+                ("Scale", "v.Size / span"),
+                ("Offset", "-origin * v.Size / span"),
+            ] {
+                let expression = ctx.back.compositor.create_expression_animation(expression);
+                expression.set_reference_parameter("v", &visual);
+                expression.set_vector2_parameter("span", span);
+                expression.set_vector2_parameter("origin", origin);
+                brush.start_animation(property, &expression);
+            }
+        }
+    }
+    let source = brush.as_brush();
+    *held = Some(Box::new(PresentedView { brush, view, scale }));
+    Some(source)
 }
 
 /// Casts, or removes, the light this node spends past its own silhouette.
@@ -1733,6 +1871,23 @@ fn cast_glow(
     caster.set_shadow(&shadow);
 
     let capture = comp.capture_bleeding(&host, bleed, size, scale);
+    capture.brush.set_stretch(Stretch::None);
+    capture.brush.set_nearest_sampling();
+    let metrics = host.properties();
+    metrics.insert_scalar("Dpi", scale);
+    let bounds: &Visual = sprite;
+    let extent = comp.create_expression_animation("v.Size * metrics.Dpi");
+    extent.set_reference_parameter("v", bounds);
+    extent.set_reference_parameter("metrics", &metrics);
+    host.start_animation("Size", &extent);
+    let extent = comp.create_expression_animation("v.Size");
+    extent.set_reference_parameter("v", bounds);
+    caster.start_animation("Size", &extent);
+    let extent = comp.create_expression_animation("Max((v.Size + Vector2(pad, pad)) * metrics.Dpi, Vector2(1, 1))");
+    extent.set_reference_parameter("v", bounds);
+    extent.set_reference_parameter("metrics", &metrics);
+    extent.set_scalar_parameter("pad", 2.0 * bleed);
+    capture.surface.start_animation("SourceSize", &extent);
     let brush = comp.create_mask_brush();
     brush.set_mask(&capture.brush);
     brush.set_source(&cell);
@@ -2095,6 +2250,7 @@ mod tests {
         let shape = Mask::Shape {
             geom: GeomId::FIRST,
             stroke: None,
+            space: PathSpace::Local,
         };
         assert_eq!(route(&shape, false, false, false), Route::Clip);
         for held in [false, true] {
@@ -2107,6 +2263,7 @@ mod tests {
         // A stroke lives on a sprite shape, so it can only be captured.
         let stroked = Mask::Shape {
             geom: GeomId::FIRST,
+            space: PathSpace::Local,
             stroke: Some(StrokeStyle {
                 width: 1.0,
                 cap: Cap::Flat,

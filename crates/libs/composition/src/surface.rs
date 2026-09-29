@@ -447,6 +447,27 @@ impl From<Stretch> for bindings::CompositionStretch {
 pub struct CompositionSurfaceBrush(pub(crate) bindings::CompositionSurfaceBrush);
 
 impl CompositionSurfaceBrush {
+    /// Returns the surface shared by this brush.
+    pub fn surface(&self) -> Option<CompositionSurface> {
+        self.0.Surface().ok().map(CompositionSurface)
+    }
+
+    /// Blends neighbouring texels when fitting image content to its destination.
+    pub fn set_linear_sampling(&self) {
+        self.0
+            .SetBitmapInterpolationMode(bindings::CompositionBitmapInterpolationMode::Linear)
+            .unwrap();
+    }
+
+    /// Samples the nearest source texel without blending neighbouring pixels.
+    ///
+    /// The surface must map one texel per physical pixel to preserve rasterized coverage.
+    pub fn set_nearest_sampling(&self) {
+        self.0
+            .SetBitmapInterpolationMode(bindings::CompositionBitmapInterpolationMode::NearestNeighbor)
+            .unwrap();
+    }
+
     /// Sets how the surface is fitted into the area the brush paints.
     ///
     /// The composition default is [`Stretch::Uniform`], which letterboxes the surface

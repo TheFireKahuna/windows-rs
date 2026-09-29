@@ -50,7 +50,7 @@ mod tests;
 
 pub use epoch::Epoch;
 pub use graph::{SignalId, flush, live_nodes, set_waker, untracked};
-pub(crate) use graph::{PostGuard, PostWake, RetiredEffect, arm_posts, flush_geometry};
+pub(crate) use graph::{PostGuard, PostWake, RetiredEffect, arm_posts, flush_geometry, posts_pending};
 
 use core::any::Any;
 use core::cell::RefCell;

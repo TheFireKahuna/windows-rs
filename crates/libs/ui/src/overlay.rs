@@ -31,6 +31,7 @@ use crate::build::{Entrance, Host, Mount, Placement, Ui};
 use crate::gesture::Recognised;
 use crate::input::{KeyKind, Report, ScopeId};
 use crate::layout::{Len, Rect};
+use crate::role::Role;
 use crate::seam::FocusOp;
 use crate::signal::Owner;
 use crate::widget::{Intent, TextSource, What};
@@ -418,6 +419,8 @@ pub struct Spec {
     kind: Kind,
     anchor: Anchor,
     viewport: Option<[Len; 4]>,
+    scrim: Option<(Role, f32)>,
+    fade: Option<u32>,
     slide: Option<Slide>,
     animate_resize: bool,
     dismiss: DismissPolicy,
@@ -446,6 +449,8 @@ impl Spec {
             name: None,
             anchor,
             viewport: None,
+            scrim: None,
+            fade: None,
             slide: None,
             animate_resize: false,
             dismiss: kind.dismiss(),
@@ -490,6 +495,19 @@ impl Spec {
             viewport: Some(insets),
             ..self
         }
+    }
+
+    /// Paints a non-interactive, full-window scrim below this overlay. Its role is
+    /// resolved in the window scope and its lifetime follows the overlay.
+    #[must_use]
+    pub const fn scrim(self, role: Role, strength: f32) -> Self {
+        Self { scrim: Some((role, strength)), ..self }
+    }
+
+    /// Fades the content and scrim on entry and exit without transforming text.
+    #[must_use]
+    pub const fn fade(self, ms: u32) -> Self {
+        Self { fade: Some(ms), exit: Exit::Fade { ms }, ..self }
     }
 
     /// Returns this spec sliding the whole popup from `by` times its size, and back there on
@@ -595,6 +613,7 @@ struct Open {
     owner: Owner,
     /// Dropped on close, which unmounts the subtree and destroys it with its exit.
     mount: Mount,
+    scrim: Option<(NodeId, Mount)>,
 }
 
 impl Open {
@@ -691,15 +710,16 @@ impl Overlays {
         let generation = self.minted;
         let invoker = spec.invoker();
         // The blocker, the slot root and the placement row are minted under one host borrow.
-        let (blocker, root, scope) = Host::with(|host| {
+        let (blocker, root, scope, scrim_root) = Host::with(|host| {
             let blocker = spec.kind.takes_focus().map(|_| host.mint_blocker());
             let scope = host.intern(host.root_scope());
+            let scrim_root = spec.scrim.map(|_| host.overlay_root(scope).0);
             let root = host.overlay_root(scope).0;
             // The slot root is the element its contents are announced inside: a menu, so its
             // rows report as menu items, or a description, or a dialog a reader announces
             // title-first. Without one, a flyout's rows read as loose buttons at the window.
             host.name_overlay(root, scope, spec.kind, invoker, spec.name);
-            (blocker, root, scope)
+            (blocker, root, scope, scrim_root)
         });
         // Mapped over the blocker rather than asking `takes_focus` again: a focus scope is named
         // by its own first entry in the hit array, and that entry is the blocker, so deriving
@@ -721,11 +741,37 @@ impl Overlays {
         } else {
             ControlId::NONE
         };
-        let (owner, mut mount) =
-            Owner::scope(|| Ui::mount_interned(root, None, scope, interaction, body));
+        let (owner, (mut mount, mut scrim)) = Owner::scope(|| {
+            let scrim = scrim_root.zip(spec.scrim).map(|(root, (role, strength))| {
+                let mount = Ui::mount_interned(root, None, scope, ControlId::NONE, |ui| {
+                    ui.node(crate::layout::Preset::Layer)
+                        .width(Len::pct(1.0)).height(Len::pct(1.0))
+                        .plate(Len::ZERO, role, strength);
+                });
+                (root, mount)
+            });
+            (Ui::mount_interned(root, None, scope, interaction, body), scrim)
+        });
         mount.set_exit(spec.exit);
+        if let Some((_, mount)) = &mut scrim {
+            mount.set_exit(match spec.exit {
+                Exit::None | Exit::Collapse => Exit::None,
+                Exit::Fade { ms } | Exit::Slide { ms, .. } | Exit::Scale { ms, .. } => Exit::Fade { ms },
+            });
+        }
         Host::with(|host| {
             let node = mount.node();
+            if let Some(ms) = spec.fade {
+                let frames = host.frames(&[
+                    (0.0, windows_scene::Value::Scalar(0.0), Easing::Linear),
+                    (1.0, windows_scene::Value::Scalar(1.0), Easing::Linear),
+                ]);
+                let fade = windows_scene::Bind::Animate(windows_scene::Anim::Frames {
+                    frames, duration_ms: ms, iterations: windows_scene::Iterations::Count(1),
+                });
+                host.bind(node, Prop::Opacity, fade);
+                if let Some((_, mount)) = &scrim { host.bind(mount.node(), Prop::Opacity, fade); }
+            }
             if spec.slide.is_some() {
                 // The entrance holds input on this subtree for as long as the slide plays, so a
                 // press cannot land on a surface that is still arriving.
@@ -733,6 +779,7 @@ impl Overlays {
             }
             host.overlays.push(Placement {
                 root,
+                scrim: scrim_root,
                 blocker,
                 invoker,
                 anchor: spec.anchor,
@@ -755,6 +802,7 @@ impl Overlays {
             typed: None,
             owner,
             mount,
+            scrim,
         });
         self.id_at(depth)
     }
@@ -806,6 +854,7 @@ impl Overlays {
                 } if held.is_none() && Host::with(|host| host.tree.is_live(key)) => {
                     if resized && !spec.animate_resize {
                         spec.slide = None;
+                        spec.fade = None;
                     }
                     let id = self.open(focus, spec, move |ui| body(ui));
                     self.open[usize::from(id.depth)].binding = Some((key, closed));
@@ -906,6 +955,11 @@ impl Overlays {
                     open.mount.set_exit(Exit::None);
                 }
                 open.mount.retire(host);
+                if let Some((root, mount)) = &mut open.scrim {
+                    if open.mount.exit() == Exit::None { mount.set_exit(Exit::None); }
+                    mount.retire(host);
+                    host.unplace(*root);
+                }
                 if let Some(blocker) = open.blocker {
                     host.release_control(blocker);
                 }
@@ -2535,7 +2589,48 @@ mod tests {
         );
     }
 
-    /// Opening and closing a thousand times leaks no slot root and no signal.
+    #[test]
+    fn scrim_sizes_to_window_and_retires_with_its_popup() {
+        let mut patch = fixture();
+        let (_mount, _) = invoker(&mut patch);
+        let baseline = live_nodes();
+        let mut overlays = Overlays::new();
+        let mut ops = Ops::default();
+        for _ in 0..8 {
+            let opened = overlays.open(&mut ops.0,
+                Spec::popup().viewport([Len::dip(20.0); 4])
+                    .scrim(Role::Fill(crate::role::Fill::Surface), 0.6).fade(200), body);
+            let (scrim_root, scrim_node, content) = {
+                let open = overlays.open.last().unwrap();
+                let (root, mount) = open.scrim.as_ref().unwrap();
+                (*root, mount.node(), open.mount.node())
+            };
+            for window in [size(900.0, 600.0), size(600.0, 420.0)] {
+                Host::with(|host| host.set_window(window));
+                overlays.sync(&mut ops.0);
+                Host::flush(&mut patch);
+                Host::with(|host| {
+                    assert_eq!(host.tree.c.geom[scrim_root.index()].size, window);
+                    assert_eq!(host.tree.c.geom[scrim_node.index()].size, window);
+                    assert!(host.tree.c.geom[content.index()].size.x <= window.x - 40.0);
+                    assert_eq!(host.control_of(scrim_node), ControlId::NONE);
+                });
+                patch.clear();
+            }
+            overlays.close(opened, &mut ops.0);
+            Host::flush(&mut patch);
+            Host::with(|host| {
+                assert!(!host.tree.is_live(scrim_root));
+                assert!(!host.tree.is_live(scrim_node));
+                assert!(host.overlays.is_empty());
+            });
+            assert_eq!(live_nodes(), baseline);
+            patch.clear();
+            Host::flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
+    }
+
     #[test]
     fn a_thousand_opens_leak_no_slot_root_and_no_signal() {
         let mut patch = fixture();

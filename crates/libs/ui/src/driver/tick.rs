@@ -58,6 +58,7 @@ pub(super) struct Tick {
     trackers: Vec<(NodeId, Arc<AtomicU64>)>,
     /// The regions the pointer can be picked inside, with the part copy each is scanned against.
     picks: Picks,
+    correlations: crate::correlation::Router,
     /// Focus edits the app thread emitted, applied after the router's own tick so a keyboard
     /// move lands on the reports the front table is about to read.
     focus: Vec<FocusOp>,
@@ -128,6 +129,7 @@ impl Tick {
             view: Rc::clone(view),
             trackers: Vec::new(),
             picks: Picks::default(),
+            correlations: crate::correlation::Router::default(),
             focus: Vec::new(),
             retiring: Vec::new(),
             reports: Vec::new(),
@@ -244,6 +246,7 @@ impl Tick {
             ..
         } = self;
         view.with(|hits| crate::present::pick(reports, hits, picks, &mut to_scene.intents));
+        self.view.with(|hits| self.correlations.route(&self.reports, hits));
         // ④ what the scene thread turns into pixels, and the window facts that arrived with it.
         // Appended to the batch this thread holds; handed over only when the spare is back,
         // otherwise carried to the next tick in the order it happened.
@@ -326,6 +329,9 @@ impl Tick {
         }
         if down.regions_changed {
             self.picks.sync(&down.regions);
+        }
+        if down.correlations_changed {
+            self.view.with(|hits| self.correlations.sync(&down.correlations, hits));
         }
         for source in &down.fields.sources {
             self.from_pump.text.source(source);

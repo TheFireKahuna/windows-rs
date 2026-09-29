@@ -22,6 +22,13 @@ use windows_scene::{ControlId, HitDecl, HitFlags, NodeId, Prop, Value};
 /// A control whose callbacks exchange scalar values, rather than field text.
 pub struct Scalar;
 
+/// A virtual key and its exact modifier set for a control's window shortcut.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Shortcut {
+    pub key: u16,
+    pub mods: crate::input::Mods,
+}
+
 /// One control's application-side callbacks.
 ///
 /// One handler per gesture and not one per phase: a gesture is a sequence with exactly one
@@ -63,16 +70,6 @@ pub(crate) struct ControlRow {
     pub value: Option<ValueRow>,
     /// This control's row in the handler table, or [`tree::NONE`] where it declared none.
     pub handlers: u32,
-    /// Receives a platform-recognized double tap in this target's local DIPs.
-    /// The point must still hit this target; descendant controls take precedence.
-    pub fn on_double_tap(mut self, callback: impl Fn(windows_scene::Point) + 'static) -> Self {
-        let id = self.control_id();
-        self.host().gestures.push((id, GestureDecl::double_tap()));
-        self.handler(HitFlags::INTERACTIVE | HitFlags::GESTURE, |row| {
-            row.double_tap.replace(Rc::new(callback)).map(Retired::new)
-        })
-    }
-
     /// Literal names stay borrowed; generated names are released with the control.
     pub name: Option<Cow<'static, str>>,
     pub key: Option<Cow<'static, str>>,
@@ -81,6 +78,7 @@ pub(crate) struct ControlRow {
     /// Where a gesture publishes its in-flight value for as long as it owns one.
     pub live: Option<Cell<Option<f64>>>,
     pub hovered: Option<Cell<bool>>,
+    pub correlation: Option<crate::correlation::Member>,
     pub translation: Option<windows_scene::Translation>,
     pub validation: Option<&'static str>,
     /// The number the application last published, in its own units, or `None` where the
@@ -119,6 +117,7 @@ impl ControlRow {
             text: None,
             live: None,
             hovered: None,
+            correlation: None,
             translation: None,
             validation: None,
             number: None,
@@ -368,6 +367,30 @@ impl<K> Element<'_, K> {
         })
     }
 
+    /// Receives a platform-recognized double tap in this target's local DIPs.
+    /// The point must still hit this target; descendant controls take precedence.
+    pub fn on_double_tap(mut self, callback: impl Fn(windows_scene::Point) + 'static) -> Self {
+        let id = self.control_id();
+        self.host().gestures.push((id, GestureDecl::double_tap()));
+        self.handler(HitFlags::INTERACTIVE | HitFlags::GESTURE, |row| {
+            row.double_tap.replace(Rc::new(callback)).map(Retired::new)
+        })
+    }
+
+    /// Invokes this control's click handler on an exact, non-repeated key-down.
+    ///
+    /// Shortcuts require Ctrl or Alt. Focused fields and focus-taking overlays take
+    /// precedence. Disabled, hidden, suspended and detached controls cannot answer;
+    /// a chord claimed by multiple eligible controls invokes none. Repeating this
+    /// declaration replaces the control's shortcuts; an empty slice removes them.
+    pub fn shortcuts(mut self, shortcuts: &'static [Shortcut]) -> Self {
+        assert!(shortcuts.iter().all(|s| s.mods.ctrl || s.mods.alt),
+            "window shortcuts require Ctrl or Alt");
+        let id = self.control_id();
+        self.host().set_shortcuts(id, shortcuts);
+        self
+    }
+
     /// Literal names stay borrowed; generated names are released with the control.
     pub fn name(self, name: impl Into<Cow<'static, str>>) -> Self {
         let named = self.declare(HitFlags::UIA, |row| row.name = Some(name.into()));
@@ -497,6 +520,15 @@ impl<K> Element<'_, K> {
             })
     }
 
+    /// Publishes `member` while this scope or a child is hovered, without app intents.
+    /// `None` selects the target region's picked part. Member ids must not be `u32::MAX`.
+    pub fn correlate(self, group: &crate::correlation::Correlation, member: Option<windows_present::SubId>) -> Self {
+        assert!(member.is_none_or(|key| key.0 != u32::MAX));
+        self.interaction_scope().declare(HitFlags::INTERACTIVE, |row| {
+            row.correlation = Some(crate::correlation::Member { group: group.clone(), key: member });
+        })
+    }
+
     /// Groups hover, press and keyboard focus for one retained reveal target.
     /// Declare the scope before mounting its children.
     pub fn interaction_scope(mut self) -> Self {
@@ -543,13 +575,30 @@ impl<K> Element<'_, K> {
     /// Where no interaction scope encloses this element, where the scope already reveals a
     /// different target, or where the application has claimed this node's opacity.
     pub fn reveal_on_interaction(mut self) -> Self {
-        let node = self.node_id();
         let enclosing = self.ui.control;
         let scope = self
             .host()
             .control(enclosing)
             .map_or(ControlId::NONE, |row| row.front.scope);
         assert!(!scope.is_none(), "a reveal requires an interaction scope");
+        self.reveal_for(scope)
+    }
+
+    /// Reveals this element while its enclosing control is hovered, pressed or focused.
+    /// The enclosing interaction scope keeps its own reveal active independently.
+    ///
+    /// # Panics
+    ///
+    /// Where no control encloses this element, where that control already reveals another
+    /// target, or where the application has claimed this node's opacity.
+    pub fn reveal_on_control_interaction(self) -> Self {
+        let control = self.ui.control;
+        assert!(!control.is_none(), "a reveal requires an enclosing control");
+        self.reveal_for(control)
+    }
+
+    fn reveal_for(mut self, scope: ControlId) -> Self {
+        let node = self.node_id();
         let held = self.host().control(scope).map(|row| row.front.reveal);
         assert!(
             held == Some(NodeId::NONE) || held == Some(node),

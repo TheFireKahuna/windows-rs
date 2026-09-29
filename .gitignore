@@ -9,3 +9,5 @@
 obj
 bin
 aot-publish
+*.log
+*.csv

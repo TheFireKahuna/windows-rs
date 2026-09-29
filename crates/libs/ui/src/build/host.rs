@@ -36,6 +36,7 @@ mod rounded;
 #[derive(Copy, Clone)]
 pub(crate) struct Placement {
     pub root: NodeId,
+    pub scrim: Option<NodeId>,
     pub blocker: Option<ControlId>,
     /// The control this overlay opened from, where it opened from one. What automation
     /// reports as that control's expand-collapse state, which is otherwise a button that
@@ -179,6 +180,7 @@ pub struct Host {
     sides: Pool<Side>,
     rounded: Pool<rounded::Rounded>,
     anchors: Vec<Attachment>,
+    shortcuts: Vec<(ControlId, &'static [super::Shortcut])>,
     pub(crate) overlays: Vec<Placement>,
     entrances: Vec<Entrance>,
     /// The authored stops of every live ramp, so a theme change re-resolves them.
@@ -266,6 +268,7 @@ impl Host {
                 sides: Pool::default(),
                 rounded: Pool::default(),
                 anchors: Vec::new(),
+                shortcuts: Vec::new(),
                 overlays: Vec::new(),
                 entrances: Vec::new(),
                 ramps: Slots::default(),
@@ -668,6 +671,8 @@ impl Host {
     }
 
     pub(crate) fn mask(&mut self, id: SpriteId, mask: Mask) {
+        let flags = &mut self.tree.c.flags[id.0.index()];
+        *flags = (*flags & !tree::RUN) | if matches!(mask, Mask::Run(_)) { tree::RUN } else { 0 };
         self.pending.push(Op::Mask { id, mask });
     }
 
@@ -937,6 +942,26 @@ impl Host {
         self.regions.get(at).map_or(RegionId::NONE, |row| row.sink)
     }
 
+    pub(crate) fn region_source_size(&mut self, node: NodeId, size: Vector2) {
+        let at = self.side(node).map_or(tree::NONE, |side| side.region);
+        if let Some(row) = self.regions.get_mut(at) {
+            assert!(row.atlas.is_none() && row.extent.is_none(), "source packing is fixed at mount");
+            row.atlas = Some(Box::new(crate::present::Atlas { size, views: Vec::new() }));
+        }
+    }
+
+    pub(crate) fn region_view(&mut self, region: RegionId, view: windows_scene::RegionView) -> u32 {
+        let (_, row) = self.regions.iter_mut().find(|(_, row)| row.sink == region)
+            .expect("a live atlas source");
+        assert!(row.extent.is_none(), "atlas views are declared before the source mounts");
+        let atlas = row.atlas.as_mut().expect("an atlas source");
+        assert!(view.is_valid() && view.rect[2] <= atlas.size.x && view.rect[3] <= atlas.size.y,
+            "the view must lie inside the fixed source extent");
+        let at = u32::try_from(atlas.views.len()).expect("view index fits u32");
+        atlas.views.push(view);
+        at
+    }
+
     /// The client extent an overlay is laid out inside, from the insets its spec named.
     ///
     /// Resolved here rather than carried as lengths, because the row the solve reads holds the
@@ -1021,6 +1046,7 @@ impl Host {
         };
         self.control_ids.release(id);
         self.handlers.vacate(row.handlers, &mut self.retired);
+        self.shortcuts.retain(|(control, _)| *control != id);
         self.fields.take(id);
         for slot in &mut self.caption {
             if *slot == Some(id) {
@@ -1145,6 +1171,68 @@ impl Host {
                 crate::signal::flush();
             }
         }
+    }
+
+    pub(crate) fn set_shortcuts(&mut self, id: ControlId, keys: &'static [super::Shortcut]) {
+        if keys.is_empty() {
+            self.shortcuts.retain(|(control, _)| *control != id);
+        } else if let Some((_, held)) = self.shortcuts.iter_mut().find(|(control, _)| *control == id) {
+            *held = keys;
+        } else {
+            self.shortcuts.push((id, keys));
+        }
+    }
+
+    pub(crate) fn shortcut_target(
+        &self,
+        focus: Option<ControlId>,
+        event: crate::input::KeyEvent,
+    ) -> Option<ControlId> {
+        if event.kind != crate::input::KeyKind::Down || event.repeat
+            || self.overlays.iter().any(|p| p.blocker.is_some())
+        {
+            return None;
+        }
+        if let Some(id) = focus {
+            let row = self.control(id)?;
+            if row.uia == crate::widget::UiaRole::Edit {
+                return None;
+            }
+        }
+        let chord = super::Shortcut { key: event.key, mods: event.mods };
+        let mut found = None;
+        for &(id, keys) in &self.shortcuts {
+            if !keys.contains(&chord) || !self.shortcut_enabled(id) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(id);
+        }
+        found
+    }
+
+    fn shortcut_enabled(&self, id: ControlId) -> bool {
+        let Some(row) = self.control(id) else { return false; };
+        if row.disabled || !self.handlers.get(row.handlers).is_some_and(|h| h.click.is_some()) {
+            return false;
+        }
+        let mut node = row.node;
+        while self.tree.is_live(node) {
+            let flags = self.tree.c.flags[node.index()];
+            let size = self.tree.c.geom[node.index()].size;
+            if flags & (tree::HIDDEN | tree::SUSPENDED | tree::DERIVED) != 0
+                || (flags & tree::CLIP != 0 && (size.x <= 0.0 || size.y <= 0.0))
+            {
+                return false;
+            }
+            if node == self.root {
+                return true;
+            }
+            node = self.tree.parent(node);
+        }
+        false
     }
 
     /// Finds the adjacent enabled radio or tab in its owning selection group.
@@ -1460,6 +1548,7 @@ impl Host {
             // A derived sprite's box is its owner's less the insets, so it is written from the
             // solve before anything reads a sprite's box: the encode below, and the masks.
             h.publish_visuals();
+            h.publish_values();
             // Ahead of the publishers: a tracker's source takes its hit region from the
             // viewport's size when it is created, so the solved boxes reach the patch before
             // any op that reads one. The encode after them emits only what they moved.
@@ -1468,7 +1557,6 @@ impl Host {
             h.publish_text();
             h.publish_scrolls();
             h.place_overlays();
-            h.publish_values();
             h.publish_anchors();
             h.publish_regions();
             h.publish_masks();
@@ -1509,6 +1597,9 @@ impl Host {
     fn solve(&mut self) {
         solve::solve_root(self, self.root);
         for at in 0..self.overlays.len() {
+            if let Some(scrim) = self.overlays[at].scrim {
+                solve::solve_root(self, scrim);
+            }
             let root = self.overlays[at].root;
             solve::solve_root(self, root);
         }
@@ -1519,6 +1610,13 @@ impl Host {
     /// like any other, so the solve below reads it with everything else.
     fn size_overlay_viewports(&mut self) {
         for at in 0..self.overlays.len() {
+            if let Some(scrim) = self.overlays[at].scrim {
+                let window = self.window.get();
+                self.tree.author(scrim, |l| {
+                    l.width = Len::dip(window.x);
+                    l.height = Len::dip(window.y);
+                });
+            }
             let (root, viewport) = (self.overlays[at].root, self.overlays[at].viewport);
             // Anchored to the window, the root is the box the spec inset, and the side and
             // alignment it seats on become the root's own: a drawer states its width as a
@@ -1748,10 +1846,13 @@ impl Host {
             });
             let (rest, own) = thumb.map_or((0.0, 0.0), |g| (along(g.local), along(g.size)));
             let travel = (along(tree.c.geom[node.index()].size) - rest * 2.0 - own).max(0.0);
-            if (rest, travel) == (value.rest, value.travel) {
+            let extent = thumb.map(|_| (node, rest * 2.0 + own));
+            if (rest, travel, extent) == (value.rest, value.travel, value.extent) {
                 continue;
             }
             (value.rest, value.travel) = (rest, travel);
+            value.animate_layout = tree.animates_layout(node);
+            value.extent = extent;
             values.push((id, *value));
         }
     }
@@ -1984,6 +2085,9 @@ impl Host {
         for id in self.chrome_touched.drain(..) {
             if let Some(row) = self.controls.get(id) {
                 down.chrome.push((id, row.front));
+                if let Some(member) = &row.correlation {
+                    down.correlations.push(crate::correlation::Route { source: id, member: member.clone() });
+                }
                 if row.front.flags & crate::widget::flag::DRAG_PREVIEW != 0 {
                     down.previews.push((id, row.node));
                 }
@@ -2025,6 +2129,7 @@ impl Host {
             let controls = &self.controls;
             let live = |id: ControlId| controls.get(id).is_some();
             down.chrome.retain(|&(id, _)| live(id));
+            down.correlations.retain(|row| live(row.source));
             down.previews.retain(|&(id, _)| live(id));
             down.reorders.retain(|row| live(row.id));
             down.translations.retain(|(id, _, _)| live(*id));

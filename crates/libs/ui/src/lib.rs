@@ -60,6 +60,7 @@ pub(crate) mod seam;
 // is here is the declaration and the lifecycle that follows the node. Binding a surface
 // handle is raw, which is why this is not under the driver's `deny(unsafe_code)`.
 pub mod present;
+pub mod correlation;
 
 // Flyouts, popups, menus and tooltips: positioned against an anchor rather than by a
 // parent's layout, drawn above everything, and dismissed on a defined trigger. Each

@@ -129,6 +129,7 @@ enum Cmd {
         spec: RegionSpec,
         epoch: Arc<Epoch>,
         input: Arc<RegionInput>,
+        geometry: Arc<RegionGeometry>,
         build: Build,
     },
     Unmount(RegionKey),
@@ -212,7 +213,8 @@ impl Presenter {
     }
 
     /// Mounts a region at its solved box, and hands its surface handle to the binder once it
-    /// exists.
+    /// exists. Returns geometry state owned only by this mount, even when input and epoch
+    /// are shared with another region.
     ///
     /// `build` runs on the present thread with that thread's `Gpu`, so the [`Frame`] it
     /// returns may hold device resources and anything else `!Send`.
@@ -226,13 +228,16 @@ impl Presenter {
         epoch: Arc<Epoch>,
         input: Arc<RegionInput>,
         build: impl FnOnce(&Gpu) -> Result<Box<dyn Frame>> + Send + 'static,
-    ) {
+    ) -> Arc<RegionGeometry> {
+        let geometry = Arc::new(RegionGeometry::default());
         self.send(Cmd::Mount {
             spec,
             epoch,
             input,
+            geometry: Arc::clone(&geometry),
             build: Box::new(build),
         });
+        geometry
     }
 
     /// Destroys a region and frees its buffers, after telling the binder to release.
@@ -301,6 +306,9 @@ struct Mounted {
     epoch: Arc<Epoch>,
     observed_epoch: u64,
     observed_urgent: u64,
+    geometry: Arc<RegionGeometry>,
+    geometry_moving: bool,
+    geometry_revision: u64,
     input: Arc<RegionInput>,
     frame: Box<dyn Frame>,
     region: PresentationRegion,
@@ -526,6 +534,27 @@ impl Pump {
     /// and show. Returns `true` when anything was drawn.
     fn pass(&mut self, now: u64, tick: u64, wake: &Event) -> bool {
         self.tick_count += 1;
+        for m in &mut self.mounted {
+            if !m.active { continue; }
+            let revision = m.epoch.urgent();
+            if m.geometry_revision == revision { continue; }
+            m.geometry_revision = revision;
+            if let Some((extent, target, moving, origin)) = m.geometry.geometry() {
+                m.geometry_moving = moving;
+                m.resize_pending |= m.region.place(origin);
+                let reserve = target.px();
+                let capacity = m.region.size_px();
+                if extent != m.region.extent() || reserve.0 > capacity.0 || reserve.1 > capacity.1 {
+                    if m.region.resize_reserved(extent, target).is_err() {
+                        self.poisoned.push(m.spec.key);
+                    } else {
+                        m.spec.extent = extent;
+                        m.resize_pending = true;
+                    }
+                }
+            }
+        }
+        self.retire_poisoned();
 
         // Ahead of issuing this pass's presents: the queue is finite and retires its oldest
         // entries, so a producer that presents first and reads later reads a queue that has
@@ -566,7 +595,7 @@ impl Pump {
         for (i, m) in mounted.iter_mut().enumerate() {
             if !m.active { continue; }
             m.observed_epoch = m.epoch.seq();
-            m.observed_urgent = m.epoch.urgent();
+            m.observed_urgent = m.geometry_revision;
             let ctx = GateCtx {
                 extent: m.region.extent(),
                 tick: *tick_count,
@@ -578,7 +607,7 @@ impl Pump {
             };
             match guarded(|| m.frame.should_draw(ctx)) {
                 Some(true) => due.push(i),
-                Some(false) => {}
+                Some(false) => { if m.resize_pending { due.push(i); } }
                 None => poisoned.push(m.spec.key),
             }
         }
@@ -593,7 +622,7 @@ impl Pump {
         // The frames this pass will draw, at the times they are meant to be shown: one per
         // refresh, starting at the one this wake is for.
         slots.clear();
-        let depth = if self.replace_queued || mounted.iter().any(|m| m.active && (m.resize_pending || m.input.active().is_some())) {
+        let depth = if self.replace_queued || mounted.iter().any(|m| m.active && (m.resize_pending || m.input.active().is_some() || m.geometry_moving)) {
             1
         } else {
             self.tuning.depth
@@ -672,6 +701,31 @@ impl Pump {
             }
         };
 
+        let mut at = 0;
+        while at < due.len() {
+            let group = mounted[due[at]].group;
+            let stale = due.iter().any(|&i| mounted[i].group == group
+                && mounted[i].epoch.urgent() != mounted[i].observed_urgent);
+            if stale {
+                for j in (0..due.len()).rev() {
+                    let i = due[j];
+                    if mounted[i].group == group {
+                        mounted[i].region.discard();
+                        if guarded(|| mounted[i].frame.finish_batch(false)).is_none() {
+                            poisoned.push(mounted[i].spec.key);
+                        }
+                        due.remove(j);
+                    }
+                }
+                wake.signal();
+            } else {
+                at += 1;
+            }
+        }
+        if due.is_empty() {
+            self.retire_poisoned();
+            return false;
+        }
         for &i in &*due {
             if guarded(|| mounted[i].frame.finish_batch(true)).is_none() {
                 poisoned.push(mounted[i].spec.key);
@@ -776,10 +830,11 @@ impl Pump {
                     spec,
                     epoch,
                     input,
+                    geometry,
                     build,
                 } => {
                     self.unmount(spec.key);
-                    let _ = self.mount(spec, epoch, input, build);
+                    let _ = self.mount(spec, epoch, input, geometry, build);
                     moved = true;
                 }
                 Cmd::Unmount(key) => {
@@ -829,6 +884,7 @@ impl Pump {
         spec: RegionSpec,
         epoch: Arc<Epoch>,
         input: Arc<RegionInput>,
+        geometry: Arc<RegionGeometry>,
         build: Build,
     ) -> Result<()> {
         let frame = build(self.device.gpu())?;
@@ -858,6 +914,9 @@ impl Pump {
             group,
             observed_epoch: epoch.seq(),
             observed_urgent: epoch.urgent(),
+            geometry,
+            geometry_moving: false,
+            geometry_revision: u64::MAX,
             epoch,
             input,
             frame,
@@ -1094,13 +1153,14 @@ mod tests {
 
     #[derive(Debug, PartialEq)]
     enum Seen { Observe(u64), Prepare(u64, Instant), Draw(u64, Instant), Finish(u64, bool) }
-    struct Probe { id: u64, seen: Arc<Mutex<Vec<Seen>>>, dirty: bool, fail: bool, panic: bool }
+    struct Probe { id: u64, seen: Arc<Mutex<Vec<Seen>>>, dirty: bool, fail: bool, panic: bool, invalidate: Option<Arc<Epoch>> }
     impl Frame for Probe {
         fn should_draw(&mut self, _: GateCtx<'_>) -> bool {
             self.seen.lock().unwrap().push(Seen::Observe(self.id));
             core::mem::replace(&mut self.dirty, false)
         }
         fn prepare(&mut self, ctx: GateCtx<'_>, pass: &mut Pass<'_>) -> Result<()> {
+            if let Some(epoch) = self.invalidate.take() { epoch.invalidate(); }
             assert!(ctx.device.pass().is_err(), "preparation must share the pump bracket");
             self.seen.lock().unwrap().push(Seen::Prepare(self.id,ctx.at));
             let target = ctx.device.offscreen((8,8),96.0,Opacity::Opaque)?;
@@ -1121,10 +1181,112 @@ mod tests {
         Pump::new(Tuning::default(), OutputTransform::for_display(DisplayCapability::Sdr,1000.0),
             Box::new(|_,_|{}),Arc::default(),None).unwrap()
     }
+    #[test]
+    fn urgent_revision_during_prepare_discards_only_its_group() {
+        let mut pump = pump();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let epoch = Arc::new(Epoch::new().unwrap());
+        let frame = Probe { id: 1, seen: seen.clone(), dirty: true, fail: false, panic: false, invalidate: Some(epoch.clone()) };
+        pump.mount(RegionSpec { key: RegionKey(1), queue: Queue::Shared("test"), extent: Extent::new(16.0,16.0,96.0) }, epoch, Arc::default(), Arc::default(), Box::new(move |_| Ok(Box::new(frame)))).unwrap();
+        mount(&mut pump, 2, &seen, false, false);
+        let frame = Probe { id: 3, seen: seen.clone(), dirty: true, fail: false, panic: false, invalidate: None };
+        pump.mount(RegionSpec { key: RegionKey(3), queue: Queue::Solo, extent: Extent::new(16.0,16.0,96.0) }, Arc::new(Epoch::new().unwrap()), Arc::default(), Arc::default(), Box::new(move |_| Ok(Box::new(frame)))).unwrap();
+        let wake = Event::auto_reset().unwrap();
+        assert!(pump.pass(interrupt_time_now(), 100_000, &wake));
+        let events = seen.lock().unwrap();
+        assert!(events.contains(&Seen::Finish(1,false)));
+        assert!(events.contains(&Seen::Finish(2,false)));
+        assert!(events.contains(&Seen::Finish(3,true)));
+        assert!(!events.contains(&Seen::Finish(1,true)));
+        assert!(!events.contains(&Seen::Finish(2,true)));
+        drop(events);
+        wake.wait(0);
+        assert!(pump.pass(interrupt_time_now(), 100_000, &wake));
+        assert!(seen.lock().unwrap().contains(&Seen::Finish(1,true)));
+        assert!(seen.lock().unwrap().contains(&Seen::Finish(2,true)));
+    }
+
+    #[test]
+    fn regions_sharing_input_and_epoch_keep_independent_geometry() {
+        let mut pump = pump();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let epoch = Arc::new(Epoch::new().unwrap());
+        let input = Arc::new(RegionInput::new());
+        for (id, width) in [(1, 100.0), (2, 320.0)] {
+            let frame = Probe { id, seen: seen.clone(), dirty: true, fail: false, panic: false, invalidate: None };
+            pump.mount(RegionSpec { key: RegionKey(id), queue: Queue::Shared("test"),
+                extent: Extent::new(width, 44.0, 96.0) }, epoch.clone(), input.clone(),
+                Arc::default(), Box::new(move |_| Ok(Box::new(frame)))).unwrap();
+        }
+        let wake = Event::auto_reset().unwrap();
+        for width in [60.0, 125.0, 250.0] {
+            let extent = Extent::new(width, 44.0, 96.0);
+            pump.mounted[0].geometry.set_geometry(extent, extent, true);
+            epoch.invalidate();
+            pump.pass(interrupt_time_now(), 100_000, &wake);
+            assert_eq!(pump.mounted[0].region.extent(), extent);
+            assert_eq!(pump.mounted[1].region.extent(), Extent::new(320.0, 44.0, 96.0));
+        }
+        assert!(Arc::ptr_eq(&pump.mounted[0].input, &pump.mounted[1].input));
+        assert!(!Arc::ptr_eq(&pump.mounted[0].geometry, &pump.mounted[1].geometry));
+    }
+
+    #[test]
+    fn animated_bounds_reuse_capacity_and_reserve_at_new_dpi() {
+        let mut pump = pump();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        mount(&mut pump, 1, &seen, false, false);
+        let input = pump.mounted[0].geometry.clone();
+        let epoch = pump.mounted[0].epoch.clone();
+        let target = Extent::new(220.0, 120.0, 96.0);
+        input.set_geometry(Extent::new(20.0,20.0,96.0), target, true);
+        epoch.invalidate();
+        let wake = Event::auto_reset().unwrap();
+        pump.pass(interrupt_time_now(),100_000,&wake);
+        assert_eq!(pump.slots.len(), 1);
+        let capacity = pump.mounted[0].region.size_px();
+        assert!(capacity.0 >= 220 && capacity.1 >= 120);
+        for w in [30.0, 80.0, 210.0, 225.0, 220.0] {
+            input.set_geometry(Extent::new(w,100.0,96.0),target,true);
+            epoch.invalidate();
+            pump.pass(interrupt_time_now(),100_000,&wake);
+            assert_eq!(pump.mounted[0].region.size_px(), capacity);
+        }
+        assert!(input.set_geometry_dpi(144.0));
+        epoch.invalidate();
+        pump.pass(interrupt_time_now(),100_000,&wake);
+        assert_eq!(pump.mounted[0].region.extent().dpi,144.0);
+        assert!(pump.mounted[0].region.size_px().0 >= 330);
+        let settled = Extent::new(220.0, 120.0, 144.0);
+        assert!(input.set_geometry(settled, settled, false));
+        epoch.invalidate();
+        pump.mounted[0].frame.finish_batch(false);
+        assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+        assert_eq!(pump.slots.len(), 1);
+        pump.mounted[0].frame.finish_batch(false);
+        assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+        assert_eq!(pump.slots.len(), 3);
+    }
+
+    #[test]
+    fn changed_placement_draws_even_when_the_renderer_content_is_unchanged() {
+        let mut pump=pump();
+        let seen=Arc::new(Mutex::new(Vec::new()));
+        mount(&mut pump,1,&seen,false,false);
+        let wake=Event::auto_reset().unwrap();
+        assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+        seen.lock().unwrap().clear();
+        let extent=Extent::new(16.0,16.0,96.0);
+        assert!(pump.mounted[0].geometry.set_bounds(extent,extent,true,Some([37.0,91.0])));
+        pump.mounted[0].epoch.invalidate();
+        assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+        assert_eq!(pump.slots.len(),1);
+        assert!(seen.lock().unwrap().iter().any(|event| matches!(event,Seen::Draw(1,_))));
+    }
     fn mount(pump: &mut Pump, id:u64, seen: &Arc<Mutex<Vec<Seen>>>, fail: bool, panic: bool) {
-        let frame = Probe { id, seen:seen.clone(),dirty:true,fail,panic };
+        let frame = Probe { id, seen:seen.clone(),dirty:true,fail,panic,invalidate:None };
         pump.mount(RegionSpec {key:RegionKey(id),queue:Queue::Shared("test"),extent:Extent::new(16.0,16.0,96.0)},
-            Arc::new(Epoch::new().unwrap()),Arc::default(),Box::new(move |_| Ok(Box::new(frame)))).unwrap();
+            Arc::new(Epoch::new().unwrap()),Arc::default(),Arc::default(),Box::new(move |_| Ok(Box::new(frame)))).unwrap();
     }
     #[test]
     fn observes_once_and_prepares_distinct_scheduled_slots_in_one_bracket() {
@@ -1204,7 +1366,7 @@ mod tests {
             fn draw(&mut self,_:DrawCtx<'_>,_:&Draw<'_>) {}
         }
         let mut pump=pump(); let seen=Arc::new(Mutex::new(Vec::new()));
-        pump.mount(RegionSpec {key:RegionKey(1),queue:Queue::Shared("test"),extent:Extent::new(16.0,16.0,96.0)},Arc::new(Epoch::new().unwrap()),Arc::default(),Box::new(|_|Ok(Box::new(Broken)))).unwrap();
+        pump.mount(RegionSpec {key:RegionKey(1),queue:Queue::Shared("test"),extent:Extent::new(16.0,16.0,96.0)},Arc::new(Epoch::new().unwrap()),Arc::default(),Arc::default(),Box::new(|_|Ok(Box::new(Broken)))).unwrap();
         mount(&mut pump,2,&seen,false,false);
         let wake=Event::auto_reset().unwrap();
         pump.pass(interrupt_time_now(),100_000,&wake);

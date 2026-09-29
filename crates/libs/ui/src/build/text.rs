@@ -335,8 +335,10 @@ impl Ui<'_> {
     }
 
     /// A run painted in its own stated ink where `owner` is `None`, and in `owner`'s chrome
-    /// ink where one is given. Either way it is the first run the enclosing control declares
-    /// that the control is named from.
+    /// ink where one is given. The first run supplies a semantic control's default name.
+    ///
+    /// Container text remains independently accessible; only semantic controls absorb runs
+    /// into their default name.
     ///
     /// A run that can break mints one sprite per line under a column of its own; one that
     /// cannot **is** the sprite, which is the whole difference between the two targets.
@@ -402,12 +404,13 @@ impl Ui<'_> {
             target,
         };
         let key = install(self.host, node, mint, text.into());
-        if let Some(row) = self.host.control_mut(self.control) {
-            // The first run a control declares is the one its name is read from.
+        if let Some(row) = self.host.control_mut(self.control)
+            .filter(|row| !matches!(row.uia, crate::widget::UiaRole::None | crate::widget::UiaRole::Group))
+        {
+            // The first run a semantic control declares supplies its default name.
             row.text.get_or_insert(key);
         } else {
-            // A run with no control to name is its own element, so a label an author wrote is
-            // readable rather than absent: a status bar of loose readouts is otherwise silence.
+            // Standalone and container-owned runs publish their own text element.
             // It declares no hit entry, because nothing routes to it — only the control column
             // is written, which is what the automation walk reads.
             let scope = self.scope();

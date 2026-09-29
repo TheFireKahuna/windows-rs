@@ -15,7 +15,7 @@ use crate::sink::*;
 use core::num::NonZeroU32;
 use windows_composition::{
     Animatable, Captured, CompositionAnimation, CompositionBrush, CompositionGeometricClip,
-    CompositionMaskBrush, CompositionPathGeometry, CompositionSpriteShape, ContainerVisual,
+    CompositionMaskBrush, CompositionPathGeometry, CompositionPropertySet, CompositionSpriteShape, ContainerVisual,
     DropShadow, Geometry, InsetClip, RectangleClip, ShapeVisual, SpriteVisual, Visual,
 };
 use windows_numerics::{Vector2, Vector3};
@@ -183,6 +183,14 @@ pub struct ShapeState {
     pub shape: CompositionSpriteShape,
     pub geom: CompositionPathGeometry,
     pub capture: Captured,
+    pub fitted: Option<Box<FittedShape>>,
+}
+
+pub struct FittedShape {
+    pub stroke: CompositionPropertySet,
+    pub geom: GeomId,
+    pub style: Option<StrokeStyle>,
+    pub built: Gen,
 }
 
 impl ShapeState {
@@ -194,9 +202,25 @@ impl ShapeState {
     /// the figure at `1 / scale` of its extent on both axes. The three are stated together
     /// so none can be restated without the others.
     pub fn resize(&self, size: Vector2, scale: f32) {
+        if self.fitted.is_some() { return; }
         self.host.set_size(size.x * scale, size.y * scale);
         self.shape.set_scale(Vector2 { x: scale, y: scale });
         self.capture.resize(size, scale);
+    }
+}
+
+impl Drop for ShapeState {
+    fn drop(&mut self) {
+        self.shape.stop_animation("Scale");
+        self.host.stop_animation("Size");
+        self.capture.surface.stop_animation("SourceSize");
+        self.shape.stop_animation("StrokeThickness");
+        self.shape.stop_animation("StrokeDashOffset");
+        if let Some(fitted) = &self.fitted {
+            for property in ["StrokeThickness", "StrokeDashOffset"] {
+                fitted.stroke.stop_animation(property);
+            }
+        }
     }
 }
 
@@ -256,23 +280,27 @@ pub struct ShadowState {
 }
 
 impl ShadowState {
-    /// Restates every extent for a `size` DIP box at `scale`.
-    ///
-    /// Only the stages that state an absolute extent are here. The halo sprite and the
-    /// paint sprite are sized relative to the node, so the compositor re-derives them from
-    /// the one extent the node already carries and a resize writes nothing for either.
+    /// Restates the capture's pixel scale and the separately captured group's extent.
     pub fn resize(&self, size: Vector2, scale: f32) {
-        self.host.set_size(size.x * scale, size.y * scale);
-        self.caster.set_size(size.x, size.y);
+        self.host.properties().insert_scalar("Dpi", scale);
         self.caster.set_scale(Vector3 {
             x: scale,
             y: scale,
             z: 1.0,
         });
-        self.capture.resize_bleeding(self.bleed, size, scale);
+        self.capture.surface.set_source_offset(Vector2::new(-self.bleed * scale, -self.bleed * scale));
+        self.capture.brush.set_source_transform(Vector2::zero(), Vector2::new(1.0 / scale, 1.0 / scale));
         if let Some(group) = &self.group {
             group.resize(size, scale);
         }
+    }
+}
+
+impl Drop for ShadowState {
+    fn drop(&mut self) {
+        self.host.stop_animation("Size");
+        self.caster.stop_animation("Size");
+        self.capture.surface.stop_animation("SourceSize");
     }
 }
 
@@ -282,6 +310,7 @@ impl ShadowState {
 /// absolute across the node and the property table's [`Owner`] selects only the COM object.
 #[derive(Default)]
 pub struct Aux {
+    pub region_view: Option<Box<crate::realize::PresentedView>>,
     pub layout_springs: Vec<(Prop, crate::scene::LayoutSpring)>,
     pub chans: [f32; AUX_CHANS as usize],
     pub clip: Option<ClipObj>,
@@ -401,9 +430,10 @@ pub struct Arena {
     painth: Vec<Option<NonZeroU32>>,
     aux: Pool<Aux>,
     painted: Pool<Painted>,
-    /// Groups whose playing animation a set stopped, as `(node, group)`, until the scene
-    /// hands them to the batch that restates them.
+    /// Groups needing a finite settlement after cancellation, as `(node, group)`.
     pub(crate) restate: Vec<(NodeId, u8)>,
+    // Tokens identify individual scalar runs; replacing one axis leaves the other owned.
+    settling: Vec<(NodeId, u8, u64)>,
 }
 
 impl Forest for Arena {
@@ -489,6 +519,7 @@ impl Arena {
 
     /// Frees the row and hands back what the caller must release.
     pub fn free(&mut self, id: NodeId) -> (Option<Aux>, Option<Painted>) {
+        self.settling.retain(|&(node, _, _)| node != id);
         let at = id.index();
         self.visual[at] = None;
         self.generation[at] = 0;
@@ -820,20 +851,53 @@ impl Arena {
         }
     }
 
-    /// Writes a group's shadow onto its object again, and reports whether it did.
+    /// Starts a finite settlement on a free scalar channel.
     ///
-    /// Only where every channel of the group is still [`Held::Free`]: a group a later
-    /// animation or binding took is that writer's, and the shadow already holds its target.
-    pub(crate) fn restate(&self, id: NodeId, group: u8) -> bool {
-        if !self.live(id)
-            || PROPS
-                .iter()
-                .any(|row| row.group == group && self.held(id, row) != Held::Free)
-        {
+    /// `token` must uniquely identify this run for the lifetime of the arena.
+    pub(crate) fn begin_settle(
+        &mut self,
+        id: NodeId,
+        at: u8,
+        token: u64,
+        animation: &CompositionAnimation,
+    ) -> bool {
+        let row = &PROPS[at as usize];
+        if !self.live(id) || self.held(id, row) != Held::Free
+            || self.settling.iter().any(|&(node, prop, _)| node == id && prop == at) {
             return false;
         }
-        self.write_group(id, group);
+        let Some(object) = self.animatable(id, row.owner) else { return false };
+        object.start(row.path, animation);
+        self.settling.push((id, at, token));
         true
+    }
+
+    pub(crate) fn finish_settle(&mut self, token: u64) -> bool {
+        let Some(at) = self.settling.iter().position(|&(_, _, run)| run == token) else {
+            return false;
+        };
+        let (id, prop, _) = self.settling.swap_remove(at);
+        let row = &PROPS[prop as usize];
+        if !self.live(id) { return false; }
+        if let Some(object) = self.animatable(id, row.owner) { object.stop(row.path); }
+        self.write_group(id, row.group);
+        true
+    }
+
+    pub(crate) fn has_settle(&self, token: u64) -> bool {
+        self.settling.iter().any(|&(_, _, run)| run == token)
+    }
+
+    fn cancel_settles(&mut self, id: NodeId, row: &PropDesc) {
+        let mut at = 0;
+        while at < self.settling.len() {
+            let (node, prop, _) = self.settling[at];
+            let held = &PROPS[prop as usize];
+            if node != id || !held.overlaps(row) { at += 1; continue; }
+            self.settling.swap_remove(at);
+            if let Some(object) = self.animatable(id, held.owner) { object.stop(held.path); }
+            self.restate.push((id, held.group));
+        }
     }
 
     fn chans_eq(&self, id: NodeId, desc: &PropDesc, value: Value) -> bool {
@@ -880,9 +944,8 @@ impl Arena {
             Held::Bound => return false,
             // The shadow is authoritative, so an unchanged value stops here.
             Held::Free if self.chans_eq(id, desc, value) => return false,
-            // The animation would keep writing after this set, so it is stopped first.
-            // The compositor settles a stopped animation onto its own last value after the
-            // writes queued beside the stop, so the group is restated once that batch lands.
+            // A stopped spring can retain its presentation value. A finite replacement
+            // must finish before the channel returns to direct property writes.
             Held::Playing => {
                 self.stop_overlapping(id, desc, None);
                 self.restate.push((id, desc.group));
@@ -936,6 +999,7 @@ impl Arena {
         if self.animatable(id, desc.owner).is_none() {
             return;
         }
+        self.cancel_settles(id, desc);
         // Replacing the same path samples its live compositor value. Stopping it first
         // restores the base value; only overlapping aliases need an explicit stop.
         self.stop_overlapping(id, desc, Some(desc.path));
@@ -956,6 +1020,7 @@ impl Arena {
     /// compositor reached is not knowable, so the next set must write even where the shadow
     /// already matches.
     pub fn stop(&mut self, id: NodeId, desc: &PropDesc) {
+        self.cancel_settles(id, desc);
         if let Some(object) = self.animatable(id, desc.owner) {
             object.stop(desc.path);
         }
@@ -976,7 +1041,13 @@ impl Arena {
             },
             // The geometry, not the shape: a trim is the geometry's property.
             Owner::Trim => Some(&self.aux(id)?.shape.as_ref()?.geom),
-            Owner::Stroke => Some(&self.aux(id)?.shape.as_ref()?.shape),
+            Owner::Stroke => {
+                let shape = self.aux(id)?.shape.as_ref()?;
+                match &shape.fitted {
+                    Some(fitted) => Some(&fitted.stroke),
+                    None => Some(&shape.shape),
+                }
+            }
             Owner::Shadow => Some(&self.aux(id)?.glow.as_ref()?.shadow),
         }
     }
@@ -1032,12 +1103,18 @@ impl Arena {
             }
             9 => {
                 if let Some(shape) = aux.and_then(|aux| aux.shape.as_ref()) {
-                    shape.shape.set_stroke_thickness(c(24));
+                    match &shape.fitted {
+                        Some(fitted) => fitted.stroke.insert_scalar("StrokeThickness", c(24)),
+                        None => shape.shape.set_stroke_thickness(c(24)),
+                    }
                 }
             }
             10 => {
                 if let Some(shape) = aux.and_then(|aux| aux.shape.as_ref()) {
-                    shape.shape.set_stroke_dash_offset(c(25));
+                    match &shape.fitted {
+                        Some(fitted) => fitted.stroke.insert_scalar("StrokeDashOffset", c(25)),
+                        None => shape.shape.set_stroke_dash_offset(c(25)),
+                    }
                 }
             }
             11 => {

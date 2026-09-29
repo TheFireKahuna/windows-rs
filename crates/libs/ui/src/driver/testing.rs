@@ -90,6 +90,26 @@ impl LayoutDriver {
         self.overlays.scene(events, &mut self.focus);
     }
 
+    /// Delivers an activation through the shipping handlers and overlay lifecycle.
+    /// This does not simulate input routing or native focus application.
+    pub fn tap(&mut self, target: windows_scene::ControlId) {
+        let intents = [crate::widget::Intent { target, what: crate::widget::What::Tapped }];
+        Host::dispatch(&intents);
+        self.overlays.settle(&[], &intents, &mut self.focus);
+        self.overlays.after_dispatch(&mut self.focus);
+    }
+
+    /// Delivers an unconsumed key report through the shipping app-side command path.
+    /// The caller supplies focus; this does not simulate Win32, TSF or input routing.
+    pub fn key(&mut self, target: Option<windows_scene::ControlId>, event: crate::input::KeyEvent) {
+        let reports = [crate::input::Report::Key { target, event }];
+        let mut intents = Vec::new();
+        super::pass::key_intents(&mut self.overlays, &reports, &mut self.focus, &mut intents);
+        Host::dispatch(&intents);
+        self.overlays.settle(&reports, &intents, &mut self.focus);
+        self.overlays.after_dispatch(&mut self.focus);
+    }
+
     /// Runs one production declaration pass and solves its geometry.
     ///
     /// The caller must clear `patch` before another flush, as with [`Host::flush`].

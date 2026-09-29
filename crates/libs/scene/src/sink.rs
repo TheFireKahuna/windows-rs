@@ -577,6 +577,7 @@ pub enum Mask {
     Shape {
         geom: GeomId,
         stroke: Option<StrokeStyle>,
+        space: PathSpace,
     },
     None,
 }
@@ -593,7 +594,36 @@ pub enum Paint {
         tint: Radiance,
     },
     Presented(RegionId),
+    PresentedView { region: RegionId, view: RegionView },
     None,
+}
+
+/// A fixed rectangle in a presented source, in DIPs.
+///
+/// The producer must keep its packing fixed while views are mounted. Pixel views must
+/// have destination bounds no larger than the source rectangle.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct RegionView {
+    pub rect: [f32; 4],
+    pub sampling: RegionSampling,
+}
+
+impl RegionView {
+    /// Returns whether the source rectangle has finite coordinates and positive area.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        let [left, top, right, bottom] = self.rect;
+        self.rect.into_iter().all(f32::is_finite)
+            && left >= 0.0 && top >= 0.0 && right > left && bottom > top
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum RegionSampling {
+    /// Preserves source pixels, including text coverage and stroke widths.
+    Pixels,
+    /// Fits image content to the visual's live size. Text must not use this mode.
+    Fit,
 }
 
 /// A blurred copy of the sprite's own silhouette, cast behind it.
@@ -681,12 +711,18 @@ impl Spread {
     }
 }
 
-/// Path geometry, in sprite-local DIPs.
-///
-/// A path is not authored in a unit box and stretched by the sprite's size: a non-uniform
-/// stretch distorts stroke width, corner radii and dash phase, so a hairline comes out one
-/// DIP on one axis and three on the other. A resize re-emits the verbs instead, at event
-/// rate.
+/// Selects the coordinate space of a shape's geometry.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum PathSpace {
+    /// Uses sprite-local DIPs; layout-dependent geometry is re-emitted at event rate.
+    #[default]
+    Local,
+    /// Maps the unit box to the visual's live size, preserving DIP stroke thickness.
+    /// Geometric radii scale with the box. Text must not use this space.
+    Unit,
+}
+
+/// Supplies geometry in the coordinate space selected by its shape mask.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum PathVerb {
     Move {
@@ -779,7 +815,7 @@ impl Paint {
     pub const fn holds(self) -> Option<Holding> {
         match self {
             Self::Ramp(id) => Some(Holding::Ramp(id)),
-            Self::Presented(id) => Some(Holding::Region(id)),
+            Self::Presented(id) | Self::PresentedView { region: id, .. } => Some(Holding::Region(id)),
             _ => None,
         }
     }
@@ -791,6 +827,7 @@ impl Paint {
         match self {
             Self::Solid(_) => GenMask::LIGHT,
             Self::Captured { .. } => GenMask::LIGHT.union(GenMask::GEOMETRY),
+            Self::PresentedView { .. } => GenMask::GEOMETRY,
             _ => GenMask::NONE,
         }
     }
@@ -950,6 +987,9 @@ pub enum Bind {
         source: NodeId,
         vertical: bool,
         affine: Affine,
+        /// Divides the mapped offset by this visual's live axial size minus the inset.
+        /// A non-positive extent maps to zero before clamping.
+        extent: Option<(NodeId, f32)>,
         clamp: [f32; 2],
     },
     /// Hands the property back, leaving it wherever it had reached.
@@ -961,6 +1001,8 @@ pub enum Bind {
 pub enum Exit {
     #[default]
     None,
+    /// Clips the retained subtree closed under its existing parent with the layout spring.
+    Collapse,
     Fade {
         ms: u32,
     },
@@ -1436,7 +1478,8 @@ mod tests {
         assert_eq!(
             Mask::Shape {
                 geom: GeomId::FIRST,
-                stroke: None
+                stroke: None,
+                space: PathSpace::Local,
             }
             .holds(),
             Some(Holding::Geom(GeomId::FIRST))

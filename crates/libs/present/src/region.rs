@@ -120,6 +120,8 @@ pub struct PresentationRegion {
     acquired: Cell<u64>,
     submitted: Cell<u64>,
     extent: Extent,
+    capacity: (u32, u32),
+    origin: Option<[f32; 2]>,
     opacity: Opacity,
     displayable: bool,
     pool: u32,
@@ -184,6 +186,8 @@ impl PresentationRegion {
             acquired: Cell::new(0),
             submitted: Cell::new(0),
             extent,
+            capacity: extent.px(),
+            origin: None,
             opacity,
             displayable: opacity == Opacity::Opaque && device.can_flip(),
             pool,
@@ -207,7 +211,7 @@ impl PresentationRegion {
     /// Returns the buffer allocation, in pixels.
     #[must_use]
     pub fn size_px(&self) -> (u32, u32) {
-        self.extent.px()
+        self.capacity
     }
 
     /// Returns the box this region is allocated and drawn for.
@@ -233,31 +237,54 @@ impl PresentationRegion {
         self.group.is_lost()
     }
 
-    /// Reallocates at a new box, keeping the surface handle, so a resize neither rebinds the
-    /// visual tree nor disturbs any other region in the group.
-    ///
-    /// Tearing a region down and rebuilding it instead drops frames, reallocates buffers,
-    /// and re-issues a handle the front thread has already bound.
+    /// Changes the logical box, retaining the surface handle and reusing buffer capacity.
+    /// Capacity grows in 128-pixel steps and is bounded by the texture dimension limit.
     ///
     /// # Errors
     ///
     /// Fails when the new buffer pool cannot be allocated or the surface rejects the
     /// restated source rect.
     pub fn resize(&mut self, extent: Extent) -> Result<()> {
-        if extent == self.extent {
+        self.resize_reserved(extent, extent)
+    }
+
+    pub(crate) fn resize_reserved(&mut self, extent: Extent, target: Extent) -> Result<()> {
+        let px = extent.px();
+        let reserve = target.px();
+        let need = (px.0.max(reserve.0), px.1.max(reserve.1));
+        if !extent.w.is_finite() || !extent.h.is_finite() || !extent.dpi.is_finite()
+            || extent.w < 0.0 || extent.h < 0.0 || extent.dpi <= 0.0
+            || need.0 > 16384 || need.1 > 16384 {
+            return Err(windows_core::Error::from_hresult(E_FAIL));
+        }
+        if extent.dpi == self.extent.dpi && need.0 <= self.capacity.0 && need.1 <= self.capacity.1 {
+            self.extent = extent;
             return Ok(());
         }
+        let old_extent = self.extent;
+        let old_capacity = self.capacity;
+        let old_displayable = self.displayable;
+        let old_buffers = core::mem::take(&mut self.buffers);
         self.extent = extent;
+        self.capacity = if extent.dpi == old_extent.dpi {
+            (reserve_axis(need.0).max(old_capacity.0), reserve_axis(need.1).max(old_capacity.1))
+        } else { (reserve_axis(need.0), reserve_axis(need.1)) };
         // Dropping the old buffers only tells the manager they will not be presented again.
         // It keeps each alive until the present displaying it retires, so the screen never
         // shows a freed buffer during the swap.
-        self.buffers.clear();
+        if let Err(error) = self.allocate().and_then(|_| self.state_content_layout()) {
+            self.buffers = old_buffers;
+            self.extent = old_extent;
+            self.capacity = old_capacity;
+            self.displayable = old_displayable;
+            let _ = self.state_content_layout();
+            return Err(error);
+        }
         // Both counters index the discarded pool, and anything drawn into it is not this
         // region's to bind.
         self.acquired.set(0);
         self.submitted.set(0);
-        self.allocate()?;
-        self.state_content_layout()
+        Ok(())
     }
 
     /// Takes the next buffer of the rotation, blocking until the compositor is finished with
@@ -323,6 +350,7 @@ impl PresentationRegion {
             return Ok(false);
         }
         let index = (self.submitted.get() % u64::from(self.pool)) as usize;
+        self.state_content_layout()?;
         // SAFETY: `surface` and the buffer are live and owned by this region.
         unsafe { self.surface.SetBuffer(&self.buffers[index].buffer).ok()? };
         self.submitted.set(self.submitted.get() + 1);
@@ -367,7 +395,7 @@ impl PresentationRegion {
     /// empty box with every call having returned success. The whole buffer and an identity
     /// transform are therefore stated at creation and restated on every resize.
     fn state_content_layout(&self) -> Result<()> {
-        let (w, h) = self.extent.px();
+        let (w, h) = if self.origin.is_some() { self.extent.px() } else { self.capacity };
         let source = RECT {
             left: 0,
             top: 0,
@@ -379,8 +407,8 @@ impl PresentationRegion {
             M12: 0.0,
             M21: 0.0,
             M22: 1.0,
-            M31: 0.0,
-            M32: 0.0,
+            M31: self.origin.map_or(0.0,|v| v[0] * self.extent.scale()),
+            M32: self.origin.map_or(0.0,|v| v[1] * self.extent.scale()),
         };
         // SAFETY: `surface` is live; both parameters are stack locals that outlive the
         // calls, and neither is retained.
@@ -391,10 +419,16 @@ impl PresentationRegion {
         Ok(())
     }
 
+    pub(crate) fn place(&mut self, origin: Option<[f32;2]>) -> bool {
+        if self.origin == origin { return false; }
+        self.origin = origin;
+        true
+    }
+
     /// Allocates the rotation: `pool` textures, each registered with the manager and adopted
     /// as a Direct2D target.
     fn allocate(&mut self) -> Result<()> {
-        let (w, h) = self.extent.px();
+        let (w, h) = self.capacity;
         let pool = self.pool as usize;
         self.buffers.reserve(pool);
         let plain = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
@@ -465,8 +499,11 @@ impl PresentationRegion {
     }
 }
 
-/// Maps opacity to the surface's alpha mode, from the same value the Direct2D target's mode
-/// comes from.
+fn reserve_axis(required: u32) -> u32 {
+    required.saturating_add(127).min(16384) / 128 * 128
+}
+
+/// Maps opacity to the surface and Direct2D target's shared alpha convention.
 fn dxgi_alpha(opacity: Opacity) -> DXGI_ALPHA_MODE {
     match opacity {
         Opacity::Translucent => DXGI_ALPHA_MODE_PREMULTIPLIED,

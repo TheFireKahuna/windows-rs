@@ -160,7 +160,7 @@ fn a_slider_keeps_its_full_rail_separate_from_the_trimmed_trail() {
         );
     });
     let paths: Vec<_> = frame.patch().ops().iter().filter_map(|op| match op {
-        Op::Mask { mask: Mask::Shape { geom, stroke: Some(_) }, .. } => Some(*geom),
+        Op::Mask { mask: Mask::Shape { geom, stroke: Some(_), .. }, .. } => Some(*geom),
         _ => None,
     }).collect();
     assert_eq!(paths.len(), 2);

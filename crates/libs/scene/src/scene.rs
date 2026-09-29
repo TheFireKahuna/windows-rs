@@ -151,9 +151,11 @@ const TRACK_EXPR: [&str; 3] = [
 
 /// Restricted to trim and opacity, so a scalar's followers share its exact compositor
 /// position across zero without a second spring and cannot create an offset cycle.
-const FOLLOW_EXPR: [&str; 2] = [
+const FOLLOW_EXPR: [&str; 4] = [
     "Clamp(v.Offset.X * m + c, lo, hi)",
     "Clamp(v.Offset.Y * m + c, lo, hi)",
+    "Clamp(b.Size.X > inset ? (v.Offset.X * m + c) / Max(b.Size.X - inset, 0.0001) : 0, lo, hi)",
+    "Clamp(b.Size.Y > inset ? (v.Offset.Y * m + c) / Max(b.Size.Y - inset, 0.0001) : 0, lo, hi)",
 ];
 
 /// Retains a native layout spring for one visual property.
@@ -209,11 +211,12 @@ impl LayoutSpring {
 
 /// Holds the scene's shared animation templates.
 struct Templates {
+    settle: windows_composition::ScalarKeyFrameAnimation,
     scalar: [SpringScalarNaturalMotionAnimation; 2],
     vec2: [SpringVector2NaturalMotionAnimation; 2],
     vec3: [SpringVector3NaturalMotionAnimation; 2],
     track: [ExpressionAnimation; 3],
-    follow: [ExpressionAnimation; 2],
+    follow: [ExpressionAnimation; 4],
     linear: CompositionEasingFunction,
 }
 
@@ -223,6 +226,11 @@ impl Templates {
         // The damping ratio is the tuning's own and never varies with travel, so it is set
         // once here and the period is what a retarget restates.
         Self {
+            settle: {
+                let animation = comp.create_scalar_key_frame_animation();
+                animation.set_duration(Duration::from_millis(1));
+                animation
+            },
             scalar: core::array::from_fn(|at| {
                 let spring = comp.create_spring_scalar_animation();
                 spring.set_damping_ratio(SPRING[at][1]);
@@ -310,10 +318,15 @@ impl Templates {
         vertical: bool,
         source: &Visual,
         affine: Affine,
+        extent: Option<(&Visual, f32)>,
         clamp: [f32; 2],
     ) -> CompositionAnimation {
-        let expression = &self.follow[usize::from(vertical)];
+        let expression = &self.follow[usize::from(vertical) + 2 * usize::from(extent.is_some())];
         expression.set_reference_parameter("v", source);
+        if let Some((bounds, inset)) = extent {
+            expression.set_reference_parameter("b", bounds);
+            expression.set_scalar_parameter("inset", inset);
+        }
         expression.set_scalar_parameter("m", affine.m);
         expression.set_scalar_parameter("c", affine.c);
         expression.set_scalar_parameter("lo", clamp[0]);
@@ -398,6 +411,7 @@ enum PendingKind {
     /// The flattened capture, on screen for as long as the exit plays. Held because nothing
     /// else does: a ghost is unparented from the model's tree by construction.
     Ghost(Visual),
+    Collapse { id: NodeId, parent: NodeId, carrier: ContainerVisual, resources: Vec<Aux> },
     /// An animation whose target has been collected is dropped by the compositor and the
     /// batch then never reports, so the scratch target is held.
     Delay(
@@ -409,9 +423,8 @@ enum PendingKind {
         CompositionPropertySet,
     ),
     Frames(NodeId, Prop),
-    /// Groups a set wrote over a stopped animation, as `(node, group)`, restated from the
-    /// shadow once the batch that carried the stop has been applied.
-    Restate(Vec<(NodeId, u8)>),
+    /// Scalar settlement identities, released only after their finite animations finish.
+    Restate(Vec<u64>),
 }
 
 /// A batch whose completion is the only report that the work it holds has run.
@@ -431,6 +444,7 @@ struct Pending {
 struct Motion {
     templates: Templates,
     pending: Vec<Pending>,
+    settle_serial: u64,
 }
 
 impl Motion {
@@ -767,7 +781,7 @@ impl Backdrop {
         // DIP and the grain comes out magnified — resampled, which is a blur of a grain
         // and not a dither. The same reciprocal a presented region takes, for the same
         // reason; the surface is already sized in pixels.
-        scale_region(&brush, env);
+        scale_pixels(&brush, env);
         sprite.set_brush(&brush);
         sprite.set_relative_size_adjustment(Vector2 { x: 1.0, y: 1.0 });
         sprite.set_opacity(GRAIN_ALPHA);
@@ -1004,6 +1018,7 @@ pub struct Scene {
     env: Option<Env>,
     motion: Motion,
     springs_enabled: bool,
+    size_observers: Vec<(NodeId, crate::size_observer::Observer)>,
     trackers: Slots<TRACKER, TrackerState>,
     events: Rc<RefCell<Vec<SceneEvent>>>,
     hits: HitTable,
@@ -1019,6 +1034,28 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// Observes native layout bounds without writing layout or animated properties.
+    pub fn observe_size(&mut self, node: NodeId, region: Option<RegionId>, publish: impl FnMut(Vector2, Vector2, Vector2, bool) + 'static, back: &Backends) -> Result<()> {
+        let brush = region.map(|region| self.res.brush(region.erased()).ok_or_else(invalid_arg)).transpose()?;
+        let observer = crate::size_observer::Observer::new(&back.compositor, node, &self.nodes, brush, publish)?;
+        self.size_observers.retain(|(held, _)| *held != node);
+        self.size_observers.push((node, observer));
+        Ok(())
+    }
+
+    /// Suspends or resumes the native observer for a mounted region.
+    pub fn observe_size_active(&mut self, node: NodeId, active: bool) -> Result<()> {
+        if let Some((_, observer)) = self.size_observers.iter_mut().find(|(held, _)| *held == node) {
+            observer.active(active)?;
+        }
+        Ok(())
+    }
+
+    /// Releases an observer and rejects its late native callbacks.
+    pub fn forget_size(&mut self, node: NodeId) {
+        self.size_observers.retain(|(held, _)| *held != node);
+    }
+
     /// Brings up the retained tree for a window another thread owns.
     ///
     /// The compositor is agile and a desktop target asks only for a dispatcher queue on the
@@ -1080,9 +1117,11 @@ impl Scene {
             generation: Gen::default(),
             env: Some(env),
             springs_enabled: true,
+            size_observers: Vec::new(),
             motion: Motion {
                 templates: Templates::new(back),
                 pending: Vec::new(),
+                settle_serial: 0,
             },
             trackers: Slots::default(),
             events: Rc::default(),
@@ -1110,7 +1149,8 @@ impl Scene {
         self.hits.remove_translation(owner);
     }
 
-    /// Makes subsequent spring targets land immediately when animation is disabled.
+    /// Makes subsequent animation targets land immediately and omits exit transitions
+    /// when client-area animation is disabled. Dwell delays retain their timing.
     pub fn set_springs_enabled(&mut self, enabled: bool) {
         self.springs_enabled = enabled;
     }
@@ -1174,14 +1214,60 @@ impl Scene {
             self.op(patch.ops()[at], patch, back, env)?;
             self.census.ops_applied += 1;
         }
-        // One empty batch for the whole pass: it completes once the compositor has applied
-        // everything queued above, stops included, and its report restates the groups.
-        if !self.nodes.restate.is_empty() {
-            let groups = core::mem::take(&mut self.nodes.restate);
-            self.motion.watch(back, PendingKind::Restate(groups), || {})?;
-        }
+        self.settle_stopped(back)?;
         patch.clear();
         Ok(self.census.changed_since(&before))
+    }
+
+    fn settle_stopped(&mut self, back: &Backends) -> Result<()> {
+        self.prune_settlements();
+        if self.nodes.restate.is_empty() { return Ok(()); }
+        let mut groups = core::mem::take(&mut self.nodes.restate);
+        let batch = back.compositor.create_scoped_batch(BatchKind::Animation);
+        let done = Rc::new(Cell::new(false));
+        let signal = Rc::clone(&done);
+        let revoker = batch.on_completed(move || signal.set(true))?;
+        let mut tokens = Vec::new();
+        for &(id, group) in &groups {
+            if !self.nodes.live(id) { continue; }
+            for (at, row) in PROPS.iter().enumerate() {
+                if row.group != group || row.count != 1 { continue; }
+                let value = self.nodes.chan(id, row.chan);
+                let animation = &self.motion.templates.settle;
+                animation.insert_key_frame(0.0, value);
+                animation.insert_key_frame(1.0, value);
+                self.motion.settle_serial = self.motion.settle_serial.checked_add(1)
+                    .expect("settlement identity exhausted");
+                let token = self.motion.settle_serial;
+                if self.nodes.begin_settle(id, at as u8, token, &animation.as_animation()) {
+                    tokens.push(token);
+                    self.census.animations += 1;
+                }
+            }
+        }
+        batch.try_end()?;
+        groups.clear();
+        self.nodes.restate = groups;
+        if !tokens.is_empty() {
+            self.motion.pending.push(Pending {
+                done,
+                holds: PendingKind::Restate(tokens),
+                _batch: batch,
+                _revoker: revoker,
+            });
+        }
+        Ok(())
+    }
+
+    fn prune_settlements(&mut self) {
+        let nodes = &self.nodes;
+        self.motion.pending.retain_mut(|pending| {
+            if let PendingKind::Restate(tokens) = &mut pending.holds {
+                tokens.retain(|&token| nodes.has_settle(token));
+                return !tokens.is_empty();
+            }
+            true
+        });
     }
 
     /// Brings the tree up to date with `env`, rebinding whatever a display move invalidated.
@@ -1200,7 +1286,7 @@ impl Scene {
         if was.geometry_moved(env) {
             self.generation.dpi = self.generation.dpi.wrapping_add(1);
             set_dip_space(&self.root, env.scale());
-            self.rescale_regions(env);
+            self.rescale_pixels(env);
             self.events
                 .borrow_mut()
                 .push(SceneEvent::ScaleChanged { scale: env.scale() });
@@ -1317,6 +1403,10 @@ impl Scene {
                 parent,
                 after,
             } => {
+                if let Attach::Node(parent) = parent {
+                    self.pending_retain(|pending| !matches!(pending.holds,
+                        PendingKind::Collapse { parent: held, .. } if held == parent));
+                }
                 let visual = match kind {
                     NodeKind::Group => (*back.compositor.create_container_visual()).clone(),
                     NodeKind::Sprite => (**back.compositor.create_sprite_visual()).clone(),
@@ -1445,8 +1535,22 @@ impl Scene {
     }
 
     fn release_subtree(&mut self, id: NodeId) {
+        let mut resources = self.collapsing(id).then(Vec::new);
+        self.release_subtree_held(id, &mut resources);
+        if let Some(Pending { holds: PendingKind::Collapse { resources: held, .. }, .. }) =
+            self.motion.pending.iter_mut().find(|pending| matches!(pending.holds,
+                PendingKind::Collapse { id: root, .. } if root == id))
+        {
+            *held = resources.unwrap_or_default();
+        }
+    }
+
+    fn release_subtree_held(&mut self, id: NodeId, resources: &mut Option<Vec<Aux>>) {
+        self.pending_retain(|pending| !matches!(pending.holds,
+            PendingKind::Collapse { parent, .. } if parent == id));
+        self.size_observers.retain(|(node, _)| *node != id);
         for child in children(&self.nodes, id.index() as u32).collect::<Vec<_>>() {
-            self.release_subtree(child);
+            self.release_subtree_held(child, resources);
         }
         // Captures retain the COM tree; releasing arena rows must not remove its children.
         unlink(&mut self.nodes, id.index() as u32);
@@ -1454,7 +1558,9 @@ impl Scene {
         self.pending_retain(
             |pending| !matches!(pending.holds, PendingKind::Frames(node, _) if node == id),
         );
-        let (_, painted) = self.nodes.free(id);
+        let (aux, painted) = self.nodes.free(id);
+        if let (Some(aux), Some(resources)) = (aux, resources) { resources.push(aux); }
+        self.prune_settlements();
         if let Some(painted) = painted {
             self.res.release(painted.mask.holds());
             self.res.release(painted.mask.holds_dash());
@@ -1465,9 +1571,8 @@ impl Scene {
 
     /// Detaches the subtree and keeps it on screen for the length of the exit.
     ///
-    /// It is flattened into one capture mounted as a single top-level sprite, so the original
-    /// visuals unparent at once and a dying panel of sixty visuals fades as one; the
-    /// capture's brush chain keeps the detached source alive while it plays.
+    /// Fade, scale and slide use a top-level capture. Collapse keeps the native descendants
+    /// under their original parent and contracts a clip without resampling their pixels.
     ///
     /// The geometry comes from the op: the app already solved this rect and this clip chain,
     /// so nothing here re-derives them from the tree it is dismantling.
@@ -1479,7 +1584,7 @@ impl Scene {
         bounds: Option<[f32; 4]>,
         back: &Backends,
     ) -> Result<()> {
-        if matches!(exit, Exit::None) {
+        if !self.springs_enabled || matches!(exit, Exit::None) {
             return Ok(());
         }
         let Some(source) = self.nodes.visual(id).cloned() else {
@@ -1490,6 +1595,9 @@ impl Scene {
         // batch held open for an animation with no pixels in it.
         if size.x <= 0.0 || size.y <= 0.0 {
             return Ok(());
+        }
+        if exit == Exit::Collapse {
+            return self.collapse_exit(id, &source, size, back);
         }
         // Capture bounds include the static halos the subtree casts: a blur reaches past the
         // box it is cast from, and the app's solved rect does not know the sigma.
@@ -1554,7 +1662,7 @@ impl Scene {
                     ms,
                 ),
             ),
-            Exit::None => unreachable!("returned above"),
+            Exit::None | Exit::Collapse => unreachable!("returned above"),
         };
         let scalar = matches!(frame.0, Value::Scalar(_));
         let animation = self.motion.templates.frames(
@@ -1567,6 +1675,32 @@ impl Scene {
         self.census.animations += 1;
         self.motion.watch(back, PendingKind::Ghost(mounted), || {
             sprite.start_animation(path, &animation);
+        })
+    }
+
+    fn collapse_exit(&mut self, id: NodeId, source: &Visual, size: Vector2, back: &Backends) -> Result<()> {
+        let at = self.nodes.links(id.index() as u32).parent;
+        if at == NO_LINK { return Ok(()); }
+        let parent = self.nodes.id_at(at);
+        let Some(group) = source.parent() else { return Ok(()); };
+        let carrier = back.compositor.create_container_visual();
+        let parent_size = group.size();
+        carrier.set_size(parent_size.x, parent_size.y);
+        let offset = source.offset();
+        let clip = back.compositor.create_rectangle_clip();
+        clip.set_sides(offset.x, offset.y, offset.x + size.x, offset.y + size.y);
+        carrier.set_clip(Some(&clip));
+        group.children().insert_above(&carrier, source);
+        group.children().remove(source);
+        carrier.children().insert_at_top(source);
+        let animation = self.motion.templates.spring(
+            1, Tuning::Layout, Value::Scalar(offset.y), size.y, Duration::ZERO,
+        );
+        self.census.visuals_minted += 1;
+        self.census.visuals_live += 1;
+        self.census.animations += 1;
+        self.motion.watch(back, PendingKind::Collapse { id, parent, carrier, resources: Vec::new() }, || {
+            clip.start_animation("Bottom", &animation);
         })
     }
 
@@ -1620,6 +1754,11 @@ impl Scene {
             paint.map_or(was.1, |(paint, _)| paint),
             paint.map_or(was.2, |(_, halo)| halo),
         );
+        if let Paint::PresentedView { view, .. } = next.1
+            && !view.is_valid()
+        {
+            return Err(invalid_arg());
+        }
         if was == next && held.fresh(self.generation) {
             self.census.props_skipped += 1;
             return Ok(());
@@ -1717,6 +1856,16 @@ impl Scene {
         Ok(())
     }
 
+    fn bind_rounded_bounds(&mut self, id: NodeId, back: &Backends) {
+        let Some(visual) = self.nodes.visual(id).cloned() else { return };
+        for (prop, source) in [(Prop::ClipR, "v.Size.X"), (Prop::ClipB, "v.Size.Y")] {
+            let expression = back.compositor.create_expression_animation(source);
+            expression.set_reference_parameter("v", &visual);
+            self.nodes.start(id, desc(prop), &expression.as_animation(), None, Held::Bound);
+            self.census.animations += 1;
+        }
+    }
+
     /// Writes the clip's twelve numbers through the property table.
     ///
     /// They are not a second write path: each goes through the setter one channel at a time.
@@ -1759,16 +1908,6 @@ impl Scene {
         Ok(())
     }
 
-    fn bind_rounded_bounds(&mut self, id: NodeId, back: &Backends) {
-        let Some(visual) = self.nodes.visual(id).cloned() else { return };
-        for (prop, source) in [(Prop::ClipR, "v.Size.X"), (Prop::ClipB, "v.Size.Y")] {
-            let expression = back.compositor.create_expression_animation(source);
-            expression.set_reference_parameter("v", &visual);
-            self.nodes.start(id, desc(prop), &expression.as_animation(), None, Held::Bound);
-            self.census.animations += 1;
-        }
-    }
-
     fn bind(
         &mut self,
         id: NodeId,
@@ -1779,8 +1918,14 @@ impl Scene {
         env: Env,
     ) -> Result<()> {
         let row = desc(prop);
+        let completed = !self.springs_enabled && matches!(bind,
+            Bind::Animate(Anim::Frames { iterations: Iterations::Count(_), .. }));
         let bind = match bind {
             Bind::Animate(Anim::Spring { to, .. }) if !self.springs_enabled => Bind::Set(to),
+            Bind::Animate(Anim::Frames { frames, .. }) if !self.springs_enabled => {
+                let Some((_, to, _)) = patch.frames(frames).last() else { return Ok(()) };
+                Bind::Set(*to)
+            }
             other => other,
         };
         // The owner may not exist yet, and what that means differs per owner.
@@ -1813,6 +1958,11 @@ impl Scene {
         match bind {
             Bind::Set(value) => {
                 let written = self.nodes.set(id, prop, value);
+                if written {
+                    for (_, observer) in &mut self.size_observers {
+                        if observer.affected(id,prop) { observer.direct(id,prop,&self.nodes)?; }
+                    }
+                }
                 self.census.count(written);
                 // Only a size change can invalidate a capture, so the property is tested
                 // before the walk: a move, an opacity and a rotation land through the same
@@ -1821,9 +1971,22 @@ impl Scene {
                     self.resize_captures(id, env);
                     self.reclamp_box_mask(id, back, env)?;
                 }
+                if completed {
+                    self.events.borrow_mut().push(SceneEvent::AnimationCompleted { node: id, prop });
+                }
             }
             Bind::Animate(anim) => {
-                self.animate(id, prop, row, anim, patch, back)?;
+                let observed: Vec<_> = self.size_observers.iter().enumerate()
+                    .filter(|(_,(_,observer))| observer.affected(id,prop)).map(|(i,_)| i).collect();
+                for &at in &observed { self.size_observers[at].1.arm()?; }
+                let batch = (!observed.is_empty()).then(|| Rc::new(back.compositor.create_scoped_batch(BatchKind::Animation)));
+                if let Some(batch)=&batch {
+                    for &at in &observed { self.size_observers[at].1.watch(id,prop,batch)?; }
+                }
+                let result = self.animate(id, prop, row, anim, patch, back);
+                for &at in &observed { self.size_observers[at].1.target(&self.nodes); }
+                if let Some(batch)=batch { batch.try_end()?; }
+                result?;
                 if matches!(prop, Prop::Size | Prop::SizeX | Prop::SizeY) {
                     self.resize_captures(id, env);
                     self.reclamp_box_mask(id, back, env)?;
@@ -1851,6 +2014,7 @@ impl Scene {
                 source,
                 vertical,
                 affine,
+                extent,
                 clamp,
             } => {
                 // Trim and opacity cannot feed back into the source's offset.
@@ -1861,17 +2025,30 @@ impl Scene {
                     || !clamp[0].is_finite()
                     || !clamp[1].is_finite()
                     || clamp[0] > clamp[1]
+                    || extent.is_some_and(|(_, inset)| !inset.is_finite() || inset < 0.0)
                 {
                     return Err(invalid_arg());
                 }
                 let Some(from) = self.nodes.visual(source).cloned() else {
                     return Ok(());
                 };
-                let animation = self.motion.templates.follow(vertical, &from, affine, clamp);
+                let bounds = match extent {
+                    Some((node, inset)) => {
+                        let Some(visual) = self.nodes.visual(node) else { return Ok(()); };
+                        Some((visual, inset))
+                    }
+                    None => None,
+                };
+                let animation = self.motion.templates.follow(vertical, &from, affine, bounds, clamp);
                 self.nodes.start(id, row, &animation, None, Held::Bound);
                 self.census.animations += 1;
             }
-            Bind::Stop => self.nodes.stop(id, row),
+            Bind::Stop => {
+                self.nodes.stop(id, row);
+                for (_,observer) in &mut self.size_observers {
+                    if observer.affected(id,prop) { observer.direct(id,prop,&self.nodes)?; }
+                }
+            }
         }
         Ok(())
     }
@@ -2032,9 +2209,6 @@ impl Scene {
                 let brush = back.brush(&surface, Stretch::Fill);
                 ResObj::Brush(brush, Some(surface))
             }
-            // A tile's pixel extent is its ink at the current scale, so a sprite sized to
-            // that same ink samples one texel per physical pixel and nothing resamples.
-            // Fill is what makes that identity hold at every scale.
             ResOp::Run { segs, ink } => {
                 let Some(surface) = back.raster_run(
                     patch.segs(segs),
@@ -2046,7 +2220,9 @@ impl Scene {
                 else {
                     return Ok(());
                 };
-                let brush = back.brush(&surface, Stretch::Fill);
+                let brush = back.brush(&surface, Stretch::None);
+                scale_pixels(&brush, env);
+                brush.set_nearest_sampling();
                 ResObj::Brush(brush, Some(surface))
             }
             ResOp::Dash { runs } => {
@@ -2112,23 +2288,20 @@ impl Scene {
         // the binding does, which is this function's obligation on its caller.
         let surface = unsafe { back.compositor.create_surface_for_handle(handle) }?;
         let brush = back.brush(&surface, Stretch::None);
-        scale_region(&brush, env);
+        scale_pixels(&brush, env);
+        brush.set_nearest_sampling();
         self.res
             .declare(region.erased(), ResObj::Brush(brush, None));
         self.rebind_holders(region.erased(), back, env)
     }
 
-    /// Re-scales every bound region's brush after the pixel grid moved.
+    /// Updates pixel sampling after a DPI change.
     ///
-    /// A brush is not cache-backed and carries no generation, so nothing else re-derives it:
-    /// the sprites rebind to the same object and would keep the factor of the display the
-    /// region was bound on, drawing at half size in its own box with the rest of the tree
-    /// correct.
-    fn rescale_regions(&mut self, env: Env) {
-        for row in self.res.rows_mut() {
-            if let ResObj::Brush(brush, None) = row {
-                scale_region(brush, env);
-            }
+    /// Run re-rasterization retains the brush and replaces its surface; regions retain
+    /// both. Their brush transforms must follow the new pixel grid in either case.
+    fn rescale_pixels(&self, env: Env) {
+        for brush in self.res.pixel_brushes() {
+            scale_pixels(brush, env);
         }
     }
 
@@ -2142,7 +2315,7 @@ impl Scene {
     /// Fails when a dependent sprite cannot be rebound.
     pub fn clear_region(&mut self, region: RegionId, back: &Backends, env: Env) -> Result<()> {
         self.sync(back, env)?;
-        self.res.disclaim(region.erased());
+        self.res.clear_region(region);
         self.rebind_holders(region.erased(), back, env)
     }
 
@@ -2368,7 +2541,33 @@ impl Scene {
 
     /// Ends transient exit snapshots, which a window resize invalidates.
     pub fn cancel_exits(&mut self) {
-        self.pending_retain(|pending| !matches!(pending.holds, PendingKind::Ghost(_)));
+        self.pending_retain(|pending| !matches!(pending.holds,
+            PendingKind::Ghost(_) | PendingKind::Collapse { .. }));
+    }
+
+    /// Returns the collapsing ancestor that keeps a presented region visible in this patch.
+    pub fn collapsing_region(&self, region: RegionId, patch: &SinkPatch) -> Option<NodeId> {
+        for op in patch.ops() {
+            let Op::Drop { id: root, exit: Exit::Collapse, .. } = *op else { continue };
+            for node in self.nodes.ids().filter(|node| self.nodes.painted(*node)
+                .is_some_and(|row| row.paint.holds().map(Holding::id) == Some(region.erased())))
+            {
+                let mut at = node;
+                loop {
+                    if at == root { return Some(root); }
+                    let parent = self.nodes.links(at.index() as u32).parent;
+                    if parent == NO_LINK { break; }
+                    at = self.nodes.id_at(parent);
+                }
+            }
+        }
+        None
+    }
+
+    /// Reports whether a retired subtree still has a native clipped exit.
+    pub fn collapsing(&self, id: NodeId) -> bool {
+        self.motion.pending.iter().any(|pending| matches!(pending.holds,
+            PendingKind::Collapse { id: root, .. } if root == id))
     }
 
     fn pending_retain(&mut self, keep: impl Fn(&Pending) -> bool) {
@@ -2384,6 +2583,12 @@ impl Scene {
                 let _ = overlay.try_remove(visual);
                 census.visuals_live = census.visuals_live.saturating_sub(1);
             }
+            if let PendingKind::Collapse { carrier, .. } = &pending.holds {
+                if let Some(parent) = carrier.parent() {
+                    let _ = parent.children().try_remove(carrier);
+                }
+                census.visuals_live = census.visuals_live.saturating_sub(1);
+            }
             false
         });
     }
@@ -2396,7 +2601,7 @@ impl Scene {
         let mut reports = Vec::new();
         let overlay = self.overlay.children();
         let census = &mut self.census;
-        let nodes = &self.nodes;
+        let nodes = &mut self.nodes;
         self.motion.pending.retain(|pending| {
             if !pending.done.get() {
                 return true;
@@ -2406,14 +2611,20 @@ impl Scene {
                     let _ = overlay.try_remove(visual);
                     census.visuals_live = census.visuals_live.saturating_sub(1);
                 }
+                PendingKind::Collapse { carrier, .. } => {
+                    if let Some(parent) = carrier.parent() {
+                        let _ = parent.children().try_remove(carrier);
+                    }
+                    census.visuals_live = census.visuals_live.saturating_sub(1);
+                }
                 PendingKind::Delay(id, _) => reports.push(SceneEvent::DelayElapsed(*id)),
                 PendingKind::Frames(node, prop) => reports.push(SceneEvent::AnimationCompleted {
                     node: *node,
                     prop: *prop,
                 }),
                 PendingKind::Restate(groups) => {
-                    for &(node, group) in groups {
-                        census.count(nodes.restate(node, group));
+                    for &token in groups {
+                        census.count(nodes.finish_settle(token));
                     }
                 }
             }
@@ -2453,7 +2664,8 @@ impl Scene {
         };
         // A fresh patch allocates nothing, since every buffer of one is an empty `Vec`.
         let empty = SinkPatch::default();
-        self.bind(node, prop, bind, &empty, back, env)
+        self.bind(node, prop, bind, &empty, back, env)?;
+        self.settle_stopped(back)
     }
 
     /// Replaces the window ground within the caller's pass.
@@ -2524,12 +2736,12 @@ fn set_dip_space(root: &ContainerVisual, scale: f32) {
     root.set_relative_size_adjustment(Vector2 { x: dips, y: dips });
 }
 
-/// Maps a region's buffer one texel to one physical pixel inside a visual measured in DIPs.
+/// Maps a pixel surface one texel to one physical pixel inside a visual measured in DIPs.
 ///
 /// A sprite's box is in DIPs and the whole tree hangs under a root carrying the display
-/// scale, so a brush left at unit scale paints one texel per *DIP* and the region comes out
-/// magnified. The offset is zero: the region owns the whole surface.
-fn scale_region(brush: &windows_composition::CompositionSurfaceBrush, env: Env) {
+/// scale, so a brush left at unit scale paints one texel per *DIP* and the content comes out
+/// magnified. The brush addresses the whole surface from its top-left corner.
+fn scale_pixels(brush: &windows_composition::CompositionSurfaceBrush, env: Env) {
     let dips = 1.0 / env.scale();
     brush.set_source_transform(Vector2::zero(), Vector2 { x: dips, y: dips });
 }
@@ -2646,6 +2858,237 @@ mod tests {
     };
 
     #[test]
+    fn native_size_observer_suspends_resumes_and_detaches() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let node = rig.sprite(&mut patch, 20.0);
+        rig.apply(&mut patch);
+        let samples = Rc::new(RefCell::new(Vec::new()));
+        let published = samples.clone();
+        rig.scene.observe_size(node, None, move |_, size, target, moving| {
+            published.borrow_mut().push((size, target, moving));
+        }, &rig.back).unwrap();
+        rig.scene.observe_size_active(node, false).unwrap();
+        rig.scene.retarget(node, Prop::SizeX, Bind::Set(Value::Scalar(40.0)), &rig.back).unwrap();
+        assert_eq!(samples.borrow().len(), 1);
+        rig.scene.observe_size_active(node, true).unwrap();
+        assert_eq!(samples.borrow().last().unwrap().0, Vector2::new(40.0,20.0));
+        rig.scene.retarget(node, Prop::SizeY, Bind::Animate(Anim::Spring {
+            to: Value::Scalar(80.0), tuning: Tuning::Layout, delay_ms: 0,
+        }), &rig.back).unwrap();
+        assert_eq!(samples.borrow().last().unwrap().1, Vector2::new(40.0,80.0));
+        assert!(samples.borrow().last().unwrap().2);
+        rig.scene.retarget(node, Prop::SizeY, Bind::Set(Value::Scalar(30.0)), &rig.back).unwrap();
+        assert_eq!(*samples.borrow().last().unwrap(), (Vector2::new(40.0,30.0), Vector2::new(40.0,30.0), false));
+        rig.scene.forget_size(node);
+        let count = samples.borrow().len();
+        rig.scene.retarget(node, Prop::SizeX, Bind::Set(Value::Scalar(50.0)), &rig.back).unwrap();
+        assert_eq!(samples.borrow().len(), count);
+        assert!(rig.scene.size_observers.is_empty());
+    }
+
+    #[test]
+    fn native_bounds_keep_the_opposite_edge_when_parent_and_size_animate_together() {
+        let Some(mut rig)=rig() else { return; };
+        let parent=rig.ids.mint(); let node=rig.ids.mint();
+        let mut patch=SinkPatch::default();
+        patch.push(Op::New { id:parent,kind:NodeKind::Group,parent:Attach::Window,after:None });
+        patch.push(Op::New { id:node,kind:NodeKind::Sprite,parent:Attach::Node(parent),after:None });
+        patch.push(Op::Bind { id:node,prop:Prop::Size,bind:Bind::Set(Value::Vec2(Vector2::new(300.0,100.0))) });
+        rig.apply(&mut patch);
+        let samples=Rc::new(RefCell::new(Vec::new())); let output=samples.clone();
+        rig.scene.observe_size(node,None,move |origin,size,_,moving| output.borrow_mut().push((origin,size,moving)),&rig.back).unwrap();
+        rig._window.show();
+        for (id,prop,value) in [(parent,Prop::Offset,Vector2::new(100.0,30.0)),(node,Prop::Size,Vector2::new(200.0,70.0))] {
+            rig.scene.retarget(id,prop,Bind::Animate(Anim::Spring { to:Value::Vec2(value),tuning:Tuning::Layout,delay_ms:0 }),&rig.back).unwrap();
+        }
+        drop(rig.back.compositor.request_commit().unwrap());
+        let start=std::time::Instant::now();
+        while start.elapsed()<Duration::from_secs(2) {
+            windows_window::pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let count=samples.borrow().len();
+        assert!(count>5,"native callbacks must run");
+        for (origin,size,_) in samples.borrow().iter() {
+            assert!((origin.x+size.x-300.0).abs()<0.05,"horizontal bounds {origin:?}, {size:?}");
+            assert!((origin.y+size.y-100.0).abs()<0.05,"vertical bounds {origin:?}, {size:?}");
+        }
+        assert!(!samples.borrow().last().unwrap().2);
+        let quiet=std::time::Instant::now();
+        while quiet.elapsed()<Duration::from_millis(100) {
+            windows_window::pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(samples.borrow().len(),count,"settled observers must stop publishing");
+    }
+
+    #[test]
+    fn offset_followers_accept_live_extents_on_both_axes_and_refuse_feedback() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let source = rig.sprite(&mut patch, 12.0);
+        let bounds = rig.sprite(&mut patch, 120.0);
+        let follower = rig.sprite(&mut patch, 120.0);
+        rig.apply(&mut patch);
+        let bind = |vertical, inset| Bind::FollowOffset {
+            source,
+            vertical,
+            affine: Affine { m: 1.0, c: -6.0 },
+            extent: Some((bounds, inset)),
+            clamp: [0.0, 1.0],
+        };
+        for vertical in [false, true] {
+            for size in [0.0, 12.0, 120.0] {
+                rig.scene.retarget(bounds, Prop::Size,
+                    Bind::Set(Value::Vec2(Vector2::new(size, size))), &rig.back).unwrap();
+                rig.scene.retarget(follower, Prop::Opacity, bind(vertical, 12.0), &rig.back).unwrap();
+            }
+        }
+        for inset in [f32::NAN, f32::INFINITY, -1.0] {
+            assert!(rig.scene.retarget(follower, Prop::Opacity, bind(false, inset), &rig.back).is_err());
+        }
+        assert!(rig.scene.retarget(follower, Prop::SizeX, bind(false, 12.0), &rig.back).is_err());
+        assert!(rig.scene.retarget(source, Prop::Opacity, bind(false, 12.0), &rig.back).is_err());
+    }
+
+    #[test]
+    fn unit_paths_reuse_captures_and_keep_stroke_channels_through_resizes() {
+        eprintln!("unit path storage: mask={}, sprite={}, aux={}, shape={}, fitted={}",
+            size_of::<Mask>(), crate::arena::SPRITE_BYTES, size_of::<crate::arena::Aux>(),
+            size_of::<crate::arena::ShapeState>(), size_of::<crate::arena::FittedShape>());
+        let Some(mut rig) = rig() else { return };
+        let geom = GeomId::raw(20, 1);
+        let path = rig.back.path(&[PathVerb::Segment {
+            from: Vector2::new(0.1, 0.2), to: Vector2::new(0.9, 0.8),
+        }]).unwrap();
+        rig.scene.res.declare(geom.erased(), ResObj::Geom(rig.back.compositor.create_path_geometry(&path), path));
+        let mut patch = SinkPatch::default();
+        let id = rig.sprite(&mut patch, 120.0);
+        let mask = Mask::Shape { geom, space: PathSpace::Unit, stroke: Some(StrokeStyle {
+            width: 2.0, cap: Cap::Round, join: Join::Round, dash: DashId::NONE,
+        }) };
+        patch.push(Op::Mask { id: SpriteId(id), mask });
+        patch.push(Op::Paint { id: SpriteId(id), paint: Paint::Solid(Radiance::new(30.0, 140.0, 170.0, 1.0)), halo: None });
+        rig.apply(&mut patch);
+        let shape = rig.scene.nodes.aux(id).unwrap().shape.as_ref().unwrap();
+        let capture = shape.capture.brush.clone();
+        let channels = shape.fitted.as_ref().unwrap().stroke.clone();
+        assert_eq!(channels.scalar("StrokeThickness"), Some(2.0));
+        rig.scene.retarget(id, Prop::StrokeThickness, Bind::Set(Value::Scalar(3.0)), &rig.back).unwrap();
+        rig.scene.retarget(id, Prop::DashOffset, Bind::Set(Value::Scalar(0.25)), &rig.back).unwrap();
+        for width in [0.0, 400.0, 60.0, 250.0] {
+            rig.scene.retarget(id, Prop::Size, Bind::Set(Value::Vec2(Vector2::new(width, 120.0))), &rig.back).unwrap();
+            rig.scene.rebind_holders(geom.erased(), &rig.back, rig.env).unwrap();
+            let shape = rig.scene.nodes.aux(id).unwrap().shape.as_ref().unwrap();
+            assert!(shape.capture.brush == capture);
+            assert_eq!(channels.scalar("StrokeThickness"), Some(3.0));
+            assert_eq!(channels.scalar("StrokeDashOffset"), Some(0.25));
+        }
+        for dpi in [144.0, 192.0, 96.0] {
+            rig.env = Env::new(dpi, OutputTransform::for_display(DisplayCapability::Sdr, 203.0));
+            patch.clear();
+            rig.apply(&mut patch);
+            let shape = rig.scene.nodes.aux(id).unwrap().shape.as_ref().unwrap();
+            assert!(shape.capture.brush != capture);
+            assert_eq!(shape.fitted.as_ref().unwrap().stroke.scalar("StrokeThickness"), Some(3.0));
+            assert_eq!(shape.fitted.as_ref().unwrap().stroke.scalar("StrokeDashOffset"), Some(0.25));
+            assert_eq!(shape.fitted.as_ref().unwrap().style, match mask { Mask::Shape { stroke, .. } => stroke, _ => None });
+        }
+        patch.clear();
+        patch.push(Op::Mask { id: SpriteId(id), mask: Mask::None });
+        rig.apply(&mut patch);
+        assert!(rig.scene.nodes.aux(id).unwrap().shape.is_none());
+    }
+
+    #[test]
+    fn presented_views_reuse_brushes_and_clear_all_holders_before_source_retirement() {
+        eprintln!("atlas scene storage: paint={}, aux={}, view={}", size_of::<Paint>(),
+            size_of::<crate::arena::Aux>(), size_of::<crate::realize::PresentedView>());
+        let Some(mut rig) = rig() else { return };
+        let surface = rig.back.raster_run(&[], &[], &[],
+            Ink { size: Vector2::new(320.0, 44.0), ..Ink::default() }, rig.env)
+            .unwrap().unwrap();
+        let region = RegionId::raw(20, 1);
+        rig.scene.res.declare(region.erased(), ResObj::Brush(rig.back.brush(&surface, Stretch::None), None));
+        let mut patch = SinkPatch::default();
+        let ids = [rig.sprite(&mut patch, 100.0), rig.sprite(&mut patch, 200.0)];
+        for (id, sampling) in ids.into_iter().zip([RegionSampling::Pixels, RegionSampling::Fit]) {
+            patch.push(Op::Paint { id: SpriteId(id), paint: Paint::PresentedView {
+                region, view: RegionView { rect: [10.0, 2.0, 110.0, 22.0], sampling },
+            }, halo: None });
+        }
+        rig.apply(&mut patch);
+        let brushes = ids.map(|id| rig.scene.nodes.aux(id).unwrap().region_view.as_ref().unwrap().brush.clone());
+        let live = rig.scene.census().visuals_live;
+        for rect in [[f32::NAN, 0.0, 10.0, 10.0], [0.0, 0.0, 0.0, 10.0], [-1.0, 0.0, 10.0, 10.0]] {
+            assert!(rig.scene.declare(ids[0], None, Some((Paint::PresentedView {
+                region, view: RegionView { rect, sampling: RegionSampling::Fit },
+            }, None)), &rig.back, rig.env).is_err());
+        }
+        for width in [400.0, 100.0, 250.0] {
+            for (id, brush) in ids.into_iter().zip(&brushes) {
+                rig.scene.retarget(id, Prop::Size, Bind::Set(Value::Vec2(Vector2::new(width, 20.0))), &rig.back).unwrap();
+                rig.scene.realize(id, &rig.back, rig.env).unwrap();
+                assert!(&rig.scene.nodes.aux(id).unwrap().region_view.as_ref().unwrap().brush == brush);
+            }
+        }
+        for dpi in [144.0, 192.0, 96.0] {
+            rig.scene.sync(&rig.back, Env::new(dpi, rig.env.output())).unwrap();
+            assert_eq!(rig.scene.census().visuals_live, live);
+        }
+        rig.scene.clear_region(region, &rig.back, rig.env).unwrap();
+        assert!(rig.scene.res.brush(region.erased()).is_none());
+        for id in ids {
+            assert!(rig.scene.nodes.aux(id).unwrap().region_view.is_none());
+            assert!(rig.scene.nodes.painted(id).unwrap().chain.is_none());
+        }
+        rig.scene.res.declare(region.erased(), ResObj::Brush(rig.back.brush(&surface, Stretch::None), None));
+        rig.scene.rebind_holders(region.erased(), &rig.back, rig.env).unwrap();
+        for id in ids {
+            assert!(rig.scene.nodes.aux(id).unwrap().region_view.is_some());
+            rig.scene.release_subtree(id);
+        }
+        rig.scene.clear_region(region, &rig.back, rig.env).unwrap();
+        assert!(rig.scene.res.obj(region.erased()).is_none());
+    }
+
+    #[test]
+    fn pixel_sampling_sweep_tracks_run_and_region_lifetimes_but_not_ramps() {
+        let Some(mut rig) = rig() else { return };
+        let surface = rig.back.raster_run(&[], &[], &[],
+            Ink { size: Vector2::new(20.0, 20.0), ..Ink::default() }, rig.env)
+            .unwrap().unwrap();
+        let run = RunId::raw(1, 1);
+        let region = RegionId::raw(2, 1);
+        let ramp = RampId::raw(3, 1);
+        let run_brush = rig.back.brush(&surface, Stretch::None);
+        let region_brush = rig.back.brush(&surface, Stretch::None);
+        rig.scene.res.declare(run.erased(), ResObj::Brush(run_brush.clone(), Some(surface.clone())));
+        rig.scene.res.declare(region.erased(), ResObj::Brush(region_brush.clone(), None));
+        rig.scene.res.declare(ramp.erased(), ResObj::Brush(rig.back.brush(&surface, Stretch::Fill), Some(surface.clone())));
+        for dpi in [144.0, 192.0, 96.0] {
+            let env = Env::new(dpi, rig.env.output());
+            rig.scene.sync(&rig.back, env).unwrap();
+            let next = rig.back.brush(&surface, Stretch::None);
+            rig.scene.res.declare(run.erased(), ResObj::Brush(next, Some(surface.clone())));
+            assert!(rig.scene.res.brush(run.erased()).unwrap() == &run_brush);
+            let brushes: Vec<_> = rig.scene.res.pixel_brushes().collect();
+            assert_eq!(brushes.len(), 2);
+            assert!(brushes.contains(&&run_brush));
+            assert!(brushes.contains(&&region_brush));
+        }
+        let held = Some(Holding::Run(run));
+        rig.scene.res.retain(held);
+        rig.scene.res.disclaim(run.erased());
+        assert_eq!(rig.scene.res.pixel_brushes().count(), 2);
+        rig.scene.res.release(held);
+        assert_eq!(rig.scene.res.pixel_brushes().count(), 1);
+        rig.scene.res.disclaim(region.erased());
+        assert_eq!(rig.scene.res.pixel_brushes().count(), 0);
+    }
+
+    #[test]
     fn layout_springs_are_retained_per_node_and_property() {
         let Some(mut rig) = rig() else { return };
         let mut patch = SinkPatch::default();
@@ -2697,17 +3140,61 @@ mod tests {
             bind: Bind::Set(Value::Vec2(Vector2::new(20.0, 0.0))),
         });
         rig.apply(&mut patch);
-        let group = desc(Prop::Offset).group;
-        let queued = rig.scene.motion.pending.iter().filter(|pending| {
-            matches!(&pending.holds, PendingKind::Restate(groups) if groups[..] == [(id, group)])
-        });
-        assert_eq!(queued.count(), 1, "the stopped spring's set was not queued for restating");
+        let tokens = rig.scene.motion.pending.iter().find_map(|pending| {
+            match &pending.holds { PendingKind::Restate(tokens) => Some(tokens.clone()), _ => None }
+        }).expect("the stopped spring has no settlement batch");
+        assert_eq!(tokens.len(), 2);
         assert!(rig.scene.nodes.restate.is_empty(), "the pass kept groups it had handed on");
-        assert!(rig.scene.nodes.restate(id, group));
-        // A newer spring owns the group, so its restate is that spring's to settle.
         patch.push(spring(60.0));
         rig.apply(&mut patch);
-        assert!(!rig.scene.nodes.restate(id, group));
+        for token in tokens { assert!(!rig.scene.nodes.finish_settle(token)); }
+    }
+
+    #[test]
+    fn settlement_completion_cannot_overwrite_a_new_edit_or_a_recycled_node() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let id = rig.sprite(&mut patch, 40.0);
+        rig.apply(&mut patch);
+        patch.push(Op::Bind {
+            id, prop: Prop::Size,
+            bind: Bind::Animate(Anim::Spring {
+                to: Value::Vec2(Vector2::new(80.0, 80.0)),
+                tuning: Tuning::Layout, delay_ms: 0,
+            }),
+        });
+        patch.push(Op::Bind {
+            id, prop: Prop::Size,
+            bind: Bind::Set(Value::Vec2(Vector2::new(60.0, 60.0))),
+        });
+        rig.apply(&mut patch);
+        let first = rig.scene.motion.pending.iter().find_map(|pending| {
+            match &pending.holds { PendingKind::Restate(tokens) => Some(tokens.clone()), _ => None }
+        }).unwrap();
+        assert_eq!(first.len(), 2);
+        patch.push(Op::Bind {
+            id, prop: Prop::SizeX, bind: Bind::Set(Value::Scalar(20.0)),
+        });
+        rig.apply(&mut patch);
+        assert!(rig.scene.nodes.finish_settle(first[0]));
+        assert!(rig.scene.nodes.finish_settle(first[1]));
+        assert_eq!(rig.scene.nodes.size(id), Vector2::new(20.0, 60.0));
+        patch.push(Op::Bind {
+            id, prop: Prop::Size,
+            bind: Bind::Animate(Anim::Spring {
+                to: Value::Vec2(Vector2::new(80.0, 80.0)),
+                tuning: Tuning::Layout, delay_ms: 0,
+            }),
+        });
+        patch.push(Op::Bind {
+            id, prop: Prop::Size, bind: Bind::Set(Value::Vec2(Vector2::new(30.0, 30.0))),
+        });
+        rig.apply(&mut patch);
+        let latest = rig.scene.motion.pending.iter().rev().find_map(|pending| {
+            match &pending.holds { PendingKind::Restate(tokens) => Some(tokens.clone()), _ => None }
+        }).unwrap();
+        rig.scene.release_subtree(id);
+        for token in latest { assert!(!rig.scene.nodes.finish_settle(token)); }
     }
 
     #[test]
@@ -2903,6 +3390,33 @@ mod tests {
         assert_eq!(after.props_skipped, before.props_skipped + 1);
         // An op was applied, so the pass is a change even though nothing was written.
         assert!(changed);
+    }
+
+    #[test]
+    fn disabled_animation_snaps_fades_and_omits_exit_ghosts() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let id = rig.sprite(&mut patch, 40.0);
+        rig.apply(&mut patch);
+        rig.scene.set_springs_enabled(false);
+        let before = rig.scene.census().animations;
+        let frames = patch.push_frames(&[
+            (0.0, Value::Scalar(0.0), Easing::Linear),
+            (1.0, Value::Scalar(1.0), Easing::Linear),
+        ]);
+        patch.push(Op::Bind { id, prop: Prop::Opacity, bind: Bind::Animate(Anim::Frames {
+            frames, duration_ms: 200, iterations: Iterations::Count(1),
+        }) });
+        rig.apply(&mut patch);
+        assert_eq!(rig.scene.census().animations, before);
+        assert_eq!(rig.scene.nodes.chan(id, desc(Prop::Opacity).chan), 1.0);
+        let mut events = Vec::new();
+        rig.scene.drain_events(&mut events);
+        assert!(events.iter().any(|event| matches!(event,
+            SceneEvent::AnimationCompleted { node, prop: Prop::Opacity } if *node == id)));
+        patch.push(Op::Drop { id, exit: Exit::Fade { ms: 200 }, origin: Vector2::zero(), bounds: None });
+        rig.apply(&mut patch);
+        assert_eq!(rig.scene.census().animations, before);
     }
 
     #[test]
@@ -3171,6 +3685,63 @@ mod tests {
     }
 
     #[test]
+    fn collapse_exit_keeps_native_descendants_and_cancels_on_reopen_or_retirement() {
+        let Some(mut rig) = rig() else { return };
+        for finish in 0..4 {
+            let mut patch = SinkPatch::default();
+            let parent = rig.sprite(&mut patch, 200.0);
+            let root = rig.ids.mint();
+            let child = rig.ids.mint();
+            patch.push(Op::New { id: root, kind: NodeKind::Group, parent: Attach::Node(parent), after: None });
+            patch.push(Op::Bind { id: root, prop: Prop::Size, bind: Bind::Set(Value::Vec2(Vector2::new(100.0, 80.0))) });
+            patch.push(Op::New { id: child, kind: NodeKind::Sprite, parent: Attach::Node(root), after: None });
+            rig.apply(&mut patch);
+            let source = rig.scene.nodes.visual(root).unwrap().as_container().unwrap();
+            let group = rig.scene.nodes.visual(parent).unwrap().as_container().unwrap();
+            patch.clear();
+            patch.push(Op::Drop { id: root, exit: Exit::Collapse, origin: Vector2::zero(), bounds: None });
+            rig.apply(&mut patch);
+            assert!(!rig.scene.nodes.live(root));
+            assert!(!rig.scene.nodes.live(child));
+            assert_eq!(source.children().count(), 1);
+            assert_eq!(source.size(), Vector2::new(100.0, 80.0));
+            let carrier = rig.scene.motion.pending.iter().find_map(|pending| match &pending.holds {
+                PendingKind::Collapse { carrier, .. } => Some(carrier.clone()), _ => None,
+            }).expect("native exit remains under its original parent");
+            group.properties().insert_scalar("Identity", 1.0);
+            carrier.properties().insert_scalar("Identity", 2.0);
+            assert_eq!(carrier.parent().unwrap().properties().scalar("Identity"), Some(1.0));
+            assert_eq!(source.parent().unwrap().properties().scalar("Identity"), Some(2.0));
+            assert!(rig.scene.audit().agrees());
+            patch.clear();
+            match finish {
+                0 => {
+                    for pending in &rig.scene.motion.pending { pending.done.set(true); }
+                    rig.scene.retire();
+                }
+                1 => {
+                    let replacement = rig.ids.mint();
+                    patch.push(Op::New { id: replacement, kind: NodeKind::Group, parent: Attach::Node(parent), after: None });
+                    rig.apply(&mut patch);
+                }
+                2 => {
+                    patch.push(Op::Drop { id: parent, exit: Exit::None, origin: Vector2::zero(), bounds: None });
+                    rig.apply(&mut patch);
+                }
+                _ => rig.scene.cancel_exits(),
+            }
+            assert!(carrier.parent().is_none());
+            assert!(!rig.scene.motion.pending.iter().any(|p| matches!(p.holds, PendingKind::Collapse { .. })));
+            patch.clear();
+            if rig.scene.nodes.live(parent) {
+                patch.push(Op::Drop { id: parent, exit: Exit::None, origin: Vector2::zero(), bounds: None });
+                rig.apply(&mut patch);
+            }
+            assert_eq!(rig.scene.census().visuals_live, 0);
+        }
+    }
+
+    #[test]
     fn exit_capture_keeps_descendants_after_arena_retirement() {
         let Some(mut rig) = rig() else { return };
         let mut patch = SinkPatch::default();
@@ -3382,9 +3953,8 @@ mod tests {
             assert!(expression.contains("* m + c"), "{expression}");
             assert!(expression.starts_with("t."), "{expression}");
         }
-        // A follow expression is clamped, which is what stops an offset cycle closing.
         for expression in FOLLOW_EXPR {
-            assert!(expression.starts_with("Clamp(v.Offset."), "{expression}");
+            assert!(expression.starts_with("Clamp("), "{expression}");
             assert!(expression.ends_with(", lo, hi)"), "{expression}");
         }
     }

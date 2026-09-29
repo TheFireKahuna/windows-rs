@@ -141,6 +141,11 @@ impl<'a> Ui<'a> {
         self.host.scope_at(self.scope)
     }
 
+    /// The DIP-to-pixel factor the host rasterizes at.
+    pub fn scale(&self) -> f32 {
+        self.host.env.scale()
+    }
+
     pub fn window_size(&self) -> crate::signal::Cell<Vector2> {
         self.host.window
     }
@@ -272,6 +277,7 @@ impl<'a> Ui<'a> {
             theme: std::sync::Arc::new(crate::present::Published::new(scope)),
             build: Some(Box::new(build)),
             extent: None,
+            atlas: None,
             active: false,
             layout: None,
         });
@@ -284,6 +290,33 @@ impl<'a> Ui<'a> {
             1.0,
         );
         self.element(node)
+    }
+
+    /// Places one view of a fixed presented atlas in the retained layout.
+    ///
+    /// Views must be declared before the source first mounts. `view.rect` must lie inside
+    /// its fixed extent. Pixel bounds must not exceed that rectangle. Source retirement
+    /// clears every view, including views outside its subtree.
+    pub fn region_view(
+        &mut self,
+        region: windows_scene::RegionId,
+        view: windows_scene::RegionView,
+        radius: impl Into<Len>,
+    ) -> Element<'_> {
+        assert!(view.is_valid(), "a presented view needs a finite, positive source rectangle");
+        let at = self.host.region_view(region, view);
+        let node = self.mint(Preset::Layer, true);
+        self.host.declare_part(node, super::theme::Part::Ink,
+            super::theme::PaintSource::RegionView(region, at),
+            super::theme::PaintMask::Box { radius: radius.into() }, 1.0);
+        let element = self.element(node);
+        if view.sampling == windows_scene::RegionSampling::Pixels {
+            let [left, top, right, bottom] = view.rect;
+            element.width(Len::dip(right - left)).height(Len::dip(bottom - top))
+                .max_width(Len::dip(right - left)).max_height(Len::dip(bottom - top))
+        } else {
+            element
+        }
     }
 
     /// Returns absence for a retired generation.
@@ -360,6 +393,36 @@ impl<'a> Ui<'a> {
         create: impl Fn(&mut Ui<'_>, &K) + 'static,
     ) {
         self.switch_on(move || Some(key()), create);
+    }
+
+    /// Reveals conditional content inside a layout-driven clip and clips its retained exit.
+    ///
+    /// Closing removes input and layout ownership immediately. Native descendants remain
+    /// under the same clip ancestry until the compositor completes their contraction.
+    pub fn when_collapsing<M>(
+        &mut self,
+        condition: impl Signal<bool, M> + 'static,
+        create: impl Fn(&mut Ui<'_>) + 'static,
+    ) {
+        if condition.is_constant() {
+            if condition.read() { create(self); }
+            return;
+        }
+        self.stack(|ui| {
+            let anchor = ui.anchor();
+            let (parent, scope, control) = (ui.parent, ui.scope, ui.control);
+            let mut branch = Branch::<(), Mount>::new();
+            ui.host.binding(move || {
+                branch.set(condition.read().then_some(()), |_| {
+                    let mut mount = Ui::mount_interned(parent, Some(anchor), scope, control, |ui| {
+                        ui.stack(|ui| create(ui));
+                    });
+                    Host::with(|host| mount.place(host, parent, Some(anchor)));
+                    mount.set_exit(windows_scene::Exit::Collapse);
+                    mount
+                });
+            });
+        }).clip();
     }
 
     /// Mounts conditional content with a measured-size compositor slide on entry and exit.
@@ -904,6 +967,20 @@ impl<'a, K> Element<'a, K> {
 }
 
 impl Element<'_, super::Region> {
+    /// Uses a fixed producer extent and declares separately placed views of its pixels.
+    ///
+    /// `size` must be finite and positive. Source packing must remain fixed while mounted.
+    /// View children share this region's producer, clock, surface and teardown.
+    pub fn atlas(self, size: Vector2, create: impl FnOnce(&mut Ui<'_>, windows_scene::RegionId)) -> Self {
+        assert!(size.x.is_finite() && size.x > 0.0 && size.y.is_finite() && size.y > 0.0);
+        let node = self.node;
+        let region = self.ui.host.region_sink(node);
+        self.ui.host.region_source_size(node, size);
+        self.ui.host.declare_part(node, super::theme::Part::Ink,
+            super::theme::PaintSource::None, super::theme::PaintMask::Region, 1.0);
+        self.children(|ui| create(ui, region))
+    }
+
     /// Rounds the region's own corners.
     ///
     /// The mask is this side's, not the renderer's: the buffer is a rectangle and the

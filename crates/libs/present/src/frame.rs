@@ -190,6 +190,49 @@ impl Default for RegionInput {
     }
 }
 
+/// Native bounds owned by one mounted region, independent of shared telemetry input.
+#[derive(Default)]
+pub struct RegionGeometry {
+    geometry: Mutex<Option<(Extent, Extent, bool, Option<[f32; 2]>)>>,
+}
+
+impl RegionGeometry {
+    /// Publishes native local bounds and whether their animation is running.
+    /// The caller must invalidate the region's epoch when this returns true.
+    pub fn set_geometry(&self, extent: Extent, target: Extent, moving: bool) -> bool {
+        self.set_bounds(extent, target, moving, None)
+    }
+
+    /// Publishes a rectangle whose placement must be submitted with its pixels.
+    /// `origin` is in the scene's unscaled layout coordinates.
+    pub fn set_bounds(&self, extent: Extent, target: Extent, moving: bool, origin: Option<[f32;2]>) -> bool {
+        if !extent.w.is_finite() || !extent.h.is_finite() || !extent.dpi.is_finite()
+            || extent.w < 0.0 || extent.h < 0.0 || extent.dpi <= 0.0
+            || !target.w.is_finite() || !target.h.is_finite() || target.w < 0.0
+            || target.h < 0.0 || target.dpi != extent.dpi
+            || origin.is_some_and(|v| !v[0].is_finite() || !v[1].is_finite()) { return false; }
+        let mut held = self.geometry.lock().unwrap_or_else(|e| e.into_inner());
+        if *held == Some((extent, target, moving, origin)) { return false; }
+        *held = Some((extent, target, moving, origin));
+        true
+    }
+
+    pub(crate) fn geometry(&self) -> Option<(Extent, Extent, bool, Option<[f32;2]>)> {
+        *self.geometry.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Rebases both observed and target dimensions onto a new output DPI.
+    pub fn set_geometry_dpi(&self, dpi: f32) -> bool {
+        if !dpi.is_finite() || dpi <= 0.0 { return false; }
+        let mut held = self.geometry.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((extent, target, _, _)) = held.as_mut() else { return false; };
+        if extent.dpi == dpi { return false; }
+        extent.dpi = dpi;
+        target.dpi = dpi;
+        true
+    }
+}
+
 impl RegionInput {
     /// Creates an input with no hover, no active part and no cursor.
     #[must_use]

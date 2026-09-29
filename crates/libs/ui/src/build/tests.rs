@@ -93,6 +93,63 @@ fn a_flush_hands_over_what_moved_and_a_settled_tree_hands_over_nothing() {
 }
 
 #[test]
+fn unit_box_publishes_its_mask_without_a_second_paint_declaration() {
+    use windows_scene::{Mask, PathSpace, PathVerb};
+    let mut patch = super::rig::fixture_at(144.0);
+    let mut node = NodeId::NONE;
+    let (_owner, _held) = crate::signal::Owner::scope(|| Ui::mount_root(|ui| {
+        let geometry = ui.geometry(&[PathVerb::Segment { from: Vector2::zero(), to: Vector2::one() }]);
+        node = ui.path(geometry).ink_stroke(Len::dip(2.0)).unit_box().id().into();
+    }));
+    Host::flush(&mut patch);
+    let mask = patch.ops().iter().rev().find_map(|op| match op {
+        Op::Mask { id, mask } if id.0 == node => Some(mask),
+        _ => None,
+    }).unwrap();
+    assert!(matches!(mask, Mask::Shape { space: PathSpace::Unit, .. }), "{mask:?}");
+}
+
+#[test]
+fn unit_paths_keep_geometry_and_paint_space_while_their_container_animates() {
+    use windows_scene::{Mask, PathSpace, PathVerb, ResOp};
+    for dpi in [96.0, 144.0, 192.0] {
+        let mut patch = super::rig::fixture_at(dpi);
+        let width = Cell::new(240.0);
+        let mut node = NodeId::NONE;
+        let (owner, held) = crate::signal::Owner::scope(|| Ui::mount_root(|ui| {
+            let geometry = ui.geometry(&[PathVerb::Segment { from: Vector2::zero(), to: Vector2::one() }]);
+            ui.node(Preset::Layer).animate_layout().height(Len::dip(100.0))
+                .layout_from(move |layout| layout.width = Len::dip(width.get()))
+                .children(|ui| {
+                    node = ui.path(geometry).ink_stroke(Len::dip(2.0)).unit_box()
+                        .ink_stroke(Len::dip(3.0)).id().into();
+                });
+        }));
+        Host::flush(&mut patch);
+        assert!(patch.ops().iter().any(|op| matches!(op,
+            Op::Mask { id, mask: Mask::Shape { space: PathSpace::Unit, stroke: Some(stroke), .. } }
+            if id.0 == node && stroke.width == 3.0
+        )));
+        for target in [400.0, 120.0, 240.0] {
+            patch.clear();
+            width.set(target);
+            Host::flush(&mut patch);
+            assert!(patch.ops().iter().any(|op| matches!(op,
+                Op::Bind { id, prop: Prop::Size, bind: Bind::Animate(_) } if *id == node
+            )));
+            assert!(!patch.ops().iter().any(|op| matches!(op,
+                Op::Mask { id, .. } if id.0 == node
+            ) || matches!(op, Op::Res { op: ResOp::Geom { .. }, .. })));
+            patch.clear();
+            Host::flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
+        drop(held);
+        drop(owner);
+    }
+}
+
+#[test]
 fn layout_width_changes_animate_the_retained_row_and_its_clip() {
     let mut patch = fixture();
     let width = Cell::new(240.0);
@@ -130,6 +187,38 @@ fn layout_width_changes_animate_the_retained_row_and_its_clip() {
         Host::flush(&mut patch);
         assert!(patch.ops().is_empty());
     }
+    drop(held);
+}
+
+#[test]
+fn a_window_resize_sets_animated_layout_bounds_directly() {
+    let mut patch = fixture();
+    Host::with(|h| h.set_window(Vector2::new(800.0, 600.0)));
+    let width = Cell::new(240.0);
+    let mut pane = NodeId::NONE;
+    let held = Ui::mount_root(|ui| {
+        ui.node(Preset::Row).animate_layout().grow().children(|ui| {
+            ui.node(Preset::Layer).grow();
+            pane = ui.node(Preset::Layer).layout_from(move |l| l.width = Len::dip(width.get()))
+                .id().into();
+        });
+    });
+    Host::flush(&mut patch);
+    for size in [640.0, 900.0, 720.0] {
+        patch.clear();
+        Host::with(|h| h.set_window(Vector2::new(size, 600.0)));
+        Host::flush(&mut patch);
+        assert!(patch.ops().iter().any(|op| matches!(op,
+            Op::Bind { id, prop: Prop::Offset, bind: Bind::Set(_) } if *id == pane
+        )), "a resize published no direct pane offset: {:#?}", patch.ops());
+        assert!(!patch.ops().iter().any(|op| matches!(op, Op::Bind { bind: Bind::Animate(_), .. })));
+    }
+    patch.clear();
+    width.set(0.0);
+    Host::flush(&mut patch);
+    assert!(patch.ops().iter().any(|op| matches!(op,
+        Op::Bind { id, prop: Prop::Size, bind: Bind::Animate(Anim::Spring { tuning: windows_scene::Tuning::Layout, .. }) } if *id == pane
+    )));
     drop(held);
 }
 
@@ -174,35 +263,81 @@ fn shrinking_a_lane_repositions_unchanged_right_aligned_controls() {
 }
 
 #[test]
-fn a_window_resize_sets_animated_layout_bounds_directly() {
+fn changing_text_publishes_its_ink_extent_atomically_while_its_anchor_moves() {
+    for (dpi, flow) in [96.0, 144.0, 192.0].into_iter().flat_map(|dpi| {
+        [windows_text::Flow::Line, windows_text::Flow::Ellipsis, windows_text::Flow::Wrap]
+            .into_iter().map(move |flow| (dpi, flow))
+    }) {
+        let mut patch = super::rig::fixture_at(dpi);
+        let changed = Cell::new(false);
+        let mut run = NodeId::NONE;
+        let (owner, held) = crate::signal::Owner::scope(|| Ui::mount_root(|ui| {
+            ui.node(Preset::Layer).animate_layout().height(Len::dip(50.0))
+                .layout_from(move |l| l.width = Len::dip(if changed.get() { 220.0 } else { 300.0 }))
+                .children(|ui| {
+                    run = crate::widget::styled_text(ui, crate::widget::reactive(move |out| {
+                        out.push_str(if changed.get() { "-12.0 dB" } else { "0 dB" });
+                    }), crate::widget::TextStyle::new(crate::role::TypeRole::Label).flow(flow))
+                        .clip().anchor(1.0, 0.0, [Align::End, Align::Start]).node_id();
+                });
+        }));
+        Host::flush(&mut patch);
+        for value in [true, false, true] {
+            patch.clear();
+            changed.set(value);
+            Host::flush(&mut patch);
+            assert!(patch.ops().iter().any(|op| matches!(op,
+                Op::Bind { id, prop: Prop::Size, bind: Bind::Set(_) } if *id == run
+            )), "new glyph coverage must receive its full extent in the same patch");
+            assert!(patch.ops().iter().any(|op| matches!(op,
+                Op::Bind { id, prop: Prop::Offset, bind: Bind::Animate(_) } if *id == run
+            )), "text placement must retain native layout motion");
+            assert!(!patch.ops().iter().any(|op| matches!(op, Op::New { .. } | Op::Drop { .. })));
+            patch.clear();
+            Host::flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
+        drop((held, owner));
+    }
+}
+
+#[test]
+fn scalar_travel_inherits_container_motion_and_sets_mount_resize_and_reveal() {
     let mut patch = fixture();
-    Host::with(|h| h.set_window(Vector2::new(800.0, 600.0)));
-    let width = Cell::new(240.0);
-    let mut pane = NodeId::NONE;
-    let held = Ui::mount_root(|ui| {
-        ui.node(Preset::Row).animate_layout().grow().children(|ui| {
-            ui.node(Preset::Layer).grow();
-            pane = ui.node(Preset::Layer).layout_from(move |l| l.width = Len::dip(width.get()))
-                .id().into();
+    let (width, hidden) = (Cell::new(300.0), Cell::new(false));
+    let (owner, held) = crate::signal::Owner::scope(|| Ui::mount_root(|ui| {
+        ui.node(Preset::Layer).animate_layout()
+            .layout_from(move |l| l.width = Len::dip(width.get())).children(|ui| {
+            crate::widget::slider(ui, 0.5, Range::new(0.0, 1.0), crate::widget::SliderStyle::default())
+                .hide_if(hidden).grow();
         });
+    }));
+    let publication = |expected| Host::with(|h| {
+        let row = h.values.last().expect("slider publication").1;
+        assert_eq!(row.animate_layout, expected);
+        h.values.clear();
+        row.travel
     });
     Host::flush(&mut patch);
-    for size in [640.0, 900.0, 720.0] {
-        patch.clear();
-        Host::with(|h| h.set_window(Vector2::new(size, 600.0)));
-        Host::flush(&mut patch);
-        assert!(patch.ops().iter().any(|op| matches!(op,
-            Op::Bind { id, prop: Prop::Offset, bind: Bind::Set(_) } if *id == pane
-        )), "a resize published no direct pane offset: {:#?}", patch.ops());
-        assert!(!patch.ops().iter().any(|op| matches!(op, Op::Bind { bind: Bind::Animate(_), .. })));
-    }
-    patch.clear();
-    width.set(0.0);
+    let initial = publication(false);
+    width.set(200.0);
     Host::flush(&mut patch);
-    assert!(patch.ops().iter().any(|op| matches!(op,
-        Op::Bind { id, prop: Prop::Size, bind: Bind::Animate(Anim::Spring { tuning: windows_scene::Tuning::Layout, .. }) } if *id == pane
-    )));
+    assert!(publication(true) < initial);
+    Host::with(|h| h.set_window(Vector2::new(1000.0, 600.0)));
+    width.set(400.0);
+    Host::flush(&mut patch);
+    assert!(publication(false) > initial);
+    hidden.set(true);
+    Host::flush(&mut patch);
+    publication(false);
+    hidden.set(false);
+    Host::flush(&mut patch);
+    publication(false);
+    width.set(100.0);
+    Host::flush(&mut patch);
+    publication(true);
     drop(held);
+    drop(owner);
 }
 
 #[test]
@@ -1009,6 +1144,50 @@ fn stock_slider_centres_its_thumb_on_the_rail_in_both_orientations() {
 }
 
 #[test]
+fn presented_atlas_defers_hidden_mount_and_keeps_buffers_fixed_across_layout_changes() {
+    use crate::present::Live;
+    use crate::seam::RegionOp;
+    use windows_present::Queue;
+    assert_eq!(size_of::<super::theme::PaintSource>(), 16);
+    eprintln!("atlas storage: appearance={}, region={}, atlas={}, view={}",
+        size_of::<super::theme::Appearance>(), size_of::<crate::present::RegionRow>(),
+        size_of::<crate::present::Atlas>(), size_of::<windows_scene::RegionView>());
+    let mut rig = Rig::new();
+    let hidden = Cell::new(true);
+    let source_size = Vector2::new(320.0, 44.0);
+    rig.mount(|ui| {
+        ui.region(Queue::Shared("test atlas"), &Live::new().unwrap(), |_, _| unreachable!())
+            .height(Len::dip(44.0)).hide_if(hidden)
+            .atlas(source_size, |ui, region| {
+                ui.region_view(region, windows_scene::RegionView {
+                    rect: [0.0, 0.0, 100.0, 20.0], sampling: windows_scene::RegionSampling::Pixels,
+                }, Len::dip(0.0)).width(Len::dip(100.0)).height(Len::dip(20.0));
+            });
+    });
+    Host::with(|host| assert!(host.region_ops.is_empty()));
+    rig.set(hidden, false);
+    Host::with(|host| {
+        assert!(matches!(host.region_ops.as_slice(), [RegionOp::Mount { extent, .. }]
+            if extent.w == 320.0 && extent.h == 44.0));
+        host.region_ops.clear();
+    });
+    for width in [500.0, 900.0, 600.0] {
+        rig.resize(width, 600.0);
+        Host::with(|host| assert!(host.region_ops.is_empty()));
+    }
+    Host::with(|host| host.env = windows_scene::Env::new(144.0, host.env.output()));
+    rig.flush();
+    Host::with(|host| {
+        assert!(matches!(host.region_ops.as_slice(), [RegionOp::Resize { extent, .. }]
+            if extent.w == 320.0 && extent.h == 44.0 && extent.dpi == 144.0));
+        host.region_ops.clear();
+    });
+    assert!(rig.flush().patch().ops().is_empty());
+    rig.unmount();
+    Host::with(|host| assert_eq!(host.region_ops.len(), 1));
+}
+
+#[test]
 fn a_live_region_states_how_it_announces() {
     let mut rig = Rig::new();
     let mut frame = rig.mount(|ui| {
@@ -1447,6 +1626,39 @@ fn text_range_reveal_moves_the_field_view_without_moving_its_selection() {
 }
 
 #[test]
+fn conditional_collapse_releases_body_ownership_and_keeps_its_slot() {
+    let mut patch = fixture();
+    let shown = Cell::new(false);
+    let node = Cell::new(NodeId::NONE);
+    let _mount = Ui::mount_root(|ui| {
+        ui.when_collapsing(shown, move |ui| node.set(boxed(ui, 360.0, 240.0)));
+    });
+    Host::flush(&mut patch);
+    for _ in 0..3 {
+        shown.set(true);
+        crate::signal::flush();
+        Host::flush(&mut patch);
+        let id = node.get();
+        assert!(Host::with(|h| h.tree.is_live(id)));
+        let (root, slot) = Host::with(|h| {
+            let root = h.tree.parent(id);
+            (root, h.tree.parent(root))
+        });
+        patch.clear();
+        shown.set(false);
+        crate::signal::flush();
+        Host::flush(&mut patch);
+        assert!(!Host::with(|h| h.tree.is_live(id)));
+        assert!(Host::with(|h| h.tree.is_live(slot)));
+        assert!(patch.ops().iter().any(|op| matches!(op,
+            Op::Drop { id: target, exit: windows_scene::Exit::Collapse, .. } if *target == root)));
+        patch.clear();
+        Host::flush(&mut patch);
+        assert!(patch.ops().is_empty());
+    }
+}
+
+#[test]
 fn conditional_slide_releases_input_and_retires_during_entry() {
     let mut patch = fixture();
     let shown = Cell::new(false);
@@ -1497,6 +1709,25 @@ fn conditional_slide_releases_input_and_retires_during_entry() {
         assert!(!Host::with(|h| h.tree.is_live(id)));
         Host::with(|h| h.complete_overlay_entry(id));
     }
+}
+
+#[test]
+fn container_text_is_accessible_without_splitting_control_labels() {
+    let mut rig = Rig::new();
+    let mut frame = rig.mount(|ui| {
+        ui.node(Preset::Stack).key("surface").on_click(|| {}).children(|ui| {
+            text(ui, "Surface fact");
+            ui.node(Preset::Stack).role(UiaRole::Group).name("Facts").children(|ui| {
+                text(ui, "Nested fact");
+                button(ui, "Action");
+            });
+        });
+    });
+    assert_eq!(frame.uia("Surface fact").unwrap().role, UiaRole::Text);
+    assert_eq!(frame.uia("Nested fact").unwrap().role, UiaRole::Text);
+    assert_eq!(frame.uia("Action").unwrap().role, UiaRole::Button);
+    assert!(frame.uia("Action").unwrap().children.is_empty());
+    assert_eq!(frame.uia("Facts").unwrap().children, ["Nested fact", "Action"]);
 }
 
 #[test]

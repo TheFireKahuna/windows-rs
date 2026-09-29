@@ -13,6 +13,7 @@ mod translation;
 mod arena;
 mod realize;
 mod scene;
+mod size_observer;
 
 /// The child splice, which both halves run over their own storage.
 ///

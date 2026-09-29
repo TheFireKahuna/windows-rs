@@ -250,6 +250,8 @@ fn slider_row(thumb: NodeId) -> ValueRow {
         span: 48.0,
         rest: 13.0,
         travel: 100.0,
+        animate_layout: false,
+        extent: None,
         fraction: 0.5,
         step: 4.8,
         revision: 0,
@@ -297,6 +299,30 @@ fn native_an_idle_scalar_adopts_another_controls_edit_in_the_same_document() -> 
 }
 
 #[test]
+fn native_scalar_geometry_uses_layout_motion_without_restarting_on_republication() -> Result<()> {
+    let mut rig = Rig::new("scalar layout motion")?;
+    let thumb = rig.node()?;
+    let id = rig.ids.mint();
+    let row = ValueRow { animate_layout: true, ..slider_row(thumb) };
+    rig.adopt(&[(id, ChromeRow { flags: flag::SLIDE, ..ChromeRow::default() })], &[(id, row)], &[])?;
+    assert_eq!(rig.animations(), 0);
+    let resized = ValueRow { travel: 200.0, ..row };
+    rig.adopt(&[], &[(id, resized)], &[])?;
+    assert_eq!(rig.animations(), 1);
+    rig.adopt(&[], &[(id, resized)], &[])?;
+    assert_eq!(rig.animations(), 1);
+    rig.adopt(&[], &[(id, row)], &[])?;
+    assert_eq!(rig.animations(), 2);
+    assert_eq!(rig.controls.value(id).fraction, 0.5);
+    rig.adopt(&[], &[(id, ValueRow { animate_layout: false, ..resized })], &[])?;
+    let settled = rig.animations();
+    rig.scene.set_springs_enabled(false);
+    rig.adopt(&[], &[(id, row)], &[])?;
+    assert_eq!(rig.animations(), settled);
+    Ok(())
+}
+
+#[test]
 fn native_toggle_updates_spring_but_mount_resize_and_republication_do_not() -> Result<()> {
     let mut rig = Rig::new("toggle source motion")?;
     let thumb = rig.node()?;
@@ -325,10 +351,10 @@ fn native_toggle_updates_spring_but_mount_resize_and_republication_do_not() -> R
     assert_eq!(rig.animations(), 3, "reversal must retarget only the thumb spring");
     let resized = ValueRow { travel: 14.0, ..off };
     rig.adopt(&[], &[(id, resized)], &[])?;
-    assert_eq!(rig.animations(), 4, "resize must rebind the follower and place the thumb directly");
+    assert_eq!(rig.animations(), 6, "resize rebinds the follower and settles both thumb axes");
     rig.scene.set_springs_enabled(false);
     rig.adopt(&[], &[(id, ValueRow { fraction: 1.0, revision: 1, ..resized })], &[])?;
-    assert_eq!(rig.animations(), 4, "reduced motion must bypass the spring and retain the follower");
+    assert_eq!(rig.animations(), 6, "reduced motion must bypass the spring and retain the follower");
     assert_eq!(rig.visuals_minted(), minted);
     Ok(())
 }
@@ -364,8 +390,8 @@ fn native_one_writer_carries_every_value_and_a_changed_revision_supersedes_a_ges
         [-24.0, -24.0],
         "the hit box's half-thumb gutters are outside the value range"
     );
-    // The press sprang and the move carried, which is the whole of the two platform facts.
-    assert_eq!(rig.animations(), 1);
+    // Cancelling the press spring needs one finite settlement per offset axis.
+    assert_eq!(rig.animations(), 3);
     out.clear();
 
     rig.tick(&[moved(id, Point { x: 63.0, y: 8.0 })], &mut out)?;
@@ -492,6 +518,8 @@ fn native_a_turn_reads_the_rotation_about_its_own_centre_and_a_cancel_restores_i
         span: 1.0,
         rest: 0.0,
         travel: 0.0,
+        animate_layout: false,
+        extent: None,
         fraction: 0.5,
         step: 0.0,
         revision: 0,

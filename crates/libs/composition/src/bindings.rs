@@ -176,6 +176,29 @@ impl core::ops::Not for CompositionBatchTypes {
 }
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompositionBitmapInterpolationMode(pub i32);
+impl CompositionBitmapInterpolationMode {
+    pub const NearestNeighbor: Self = Self(0);
+    pub const Linear: Self = Self(1);
+    pub const MagLinearMinLinearMipLinear: Self = Self(2);
+    pub const MagLinearMinLinearMipNearest: Self = Self(3);
+    pub const MagLinearMinNearestMipLinear: Self = Self(4);
+    pub const MagLinearMinNearestMipNearest: Self = Self(5);
+    pub const MagNearestMinLinearMipLinear: Self = Self(6);
+    pub const MagNearestMinLinearMipNearest: Self = Self(7);
+    pub const MagNearestMinNearestMipLinear: Self = Self(8);
+    pub const MagNearestMinNearestMipNearest: Self = Self(9);
+}
+impl windows_core::TypeKind for CompositionBitmapInterpolationMode {
+    type TypeKind = windows_core::CopyType;
+}
+impl windows_core::RuntimeType for CompositionBitmapInterpolationMode {
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
+        b"enum(Windows.UI.Composition.CompositionBitmapInterpolationMode;i4)",
+    );
+}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompositionBorderMode(pub i32);
 impl CompositionBorderMode {
     pub const Inherit: Self = Self(0);
@@ -3317,6 +3340,18 @@ impl windows_core::RuntimeType for ICompositionSurfaceBrush {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl ICompositionSurfaceBrush {
+    pub(crate) fn SetBitmapInterpolationMode(
+        &self,
+        value: CompositionBitmapInterpolationMode,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetBitmapInterpolationMode)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
     pub(crate) fn SetHorizontalAlignmentRatio(&self, value: f32) -> windows_core::Result<()> {
         unsafe {
             (windows_core::Interface::vtable(self).SetHorizontalAlignmentRatio)(
@@ -3333,6 +3368,16 @@ impl ICompositionSurfaceBrush {
                 value,
             )
             .ok()
+        }
+    }
+    pub(crate) fn Surface(&self) -> windows_core::Result<ICompositionSurface> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Surface)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
     pub(crate) fn SetSurface<P0>(&self, value: P0) -> windows_core::Result<()>
@@ -3361,7 +3406,10 @@ impl ICompositionSurfaceBrush {
 pub struct ICompositionSurfaceBrush_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
     BitmapInterpolationMode: usize,
-    SetBitmapInterpolationMode: usize,
+    pub SetBitmapInterpolationMode: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        CompositionBitmapInterpolationMode,
+    ) -> windows_core::HRESULT,
     HorizontalAlignmentRatio: usize,
     pub SetHorizontalAlignmentRatio:
         unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
@@ -3370,7 +3418,10 @@ pub struct ICompositionSurfaceBrush_Vtbl {
         *mut core::ffi::c_void,
         CompositionStretch,
     ) -> windows_core::HRESULT,
-    Surface: usize,
+    pub Surface: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     pub SetSurface: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
@@ -4696,7 +4747,10 @@ impl IGeometrySource2DInterop_Vtbl {
                         value.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        value.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -4719,7 +4773,10 @@ impl IGeometrySource2DInterop_Vtbl {
                         value.write(core::mem::transmute(ok__));
                         windows_core::HRESULT(0)
                     }
-                    Err(err) => err.into(),
+                    Err(err) => {
+                        value.write(core::ptr::null_mut());
+                        err.into()
+                    }
                 }
             }
         }
@@ -5061,6 +5118,25 @@ impl IInteractionTracker {
             .map(|| result__)
         }
     }
+    pub(crate) fn TryUpdateScaleWithAnimation<P0>(
+        &self,
+        animation: P0,
+        centerpoint: windows_numerics::Vector3,
+    ) -> windows_core::Result<i32>
+    where
+        P0: windows_core::Param<CompositionAnimation>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).TryUpdateScaleWithAnimation)(
+                windows_core::Interface::as_raw(self),
+                animation.param().abi(),
+                centerpoint,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
     pub(crate) fn TryUpdateScaleWithAdditionalVelocity(
         &self,
         velocityinpercentpersecond: f32,
@@ -5155,7 +5231,12 @@ pub struct IInteractionTracker_Vtbl {
         windows_numerics::Vector3,
         *mut i32,
     ) -> windows_core::HRESULT,
-    TryUpdateScaleWithAnimation: usize,
+    pub TryUpdateScaleWithAnimation: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        windows_numerics::Vector3,
+        *mut i32,
+    ) -> windows_core::HRESULT,
     pub TryUpdateScaleWithAdditionalVelocity: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         f32,

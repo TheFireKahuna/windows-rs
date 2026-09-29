@@ -559,6 +559,12 @@ impl InteractionTracker {
         Ok(RequestId(tracker.TryUpdateScale(scale, center)?))
     }
 
+    /// Drives scale with a scalar animation about `center` until that animation finishes.
+    pub fn try_update_scale_with_animation(&self, animation: &impl Animation, center: Vector3) -> Result<RequestId> {
+        let tracker: bindings::IInteractionTracker = self.0.cast()?;
+        Ok(RequestId(tracker.TryUpdateScaleWithAnimation(&animation.as_animation().0, center)?))
+    }
+
     /// Enters scale inertia with the given velocity, in percent per second.
     pub fn try_update_scale_with_additional_velocity(
         &self,

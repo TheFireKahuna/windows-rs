@@ -149,12 +149,14 @@ Windows.Graphics.SizeInt32
 // Uniform; content-addressed atlases and gradient ramps need Fill.
 Windows.UI.Composition.CompositionStretch
 Windows.UI.Composition.ICompositionSurfaceBrush::{put_Stretch}
+Windows.UI.Composition.ICompositionSurfaceBrush::{put_BitmapInterpolationMode}
+Windows.UI.Composition.CompositionBitmapInterpolationMode
 // Re-pointing a brush at a new surface, rather than minting a brush per raster. A
 // shared resource — a gradient strip, a glyph coverage tile — is held by every sprite
 // that paints with it, so re-rasterizing has to reach them all: mutating the one brush
 // they share does that, where replacing it would leave every existing sprite on the
 // old surface. The same in-place move `put_Path` already gives shared geometry.
-Windows.UI.Composition.ICompositionSurfaceBrush::{put_Surface}
+Windows.UI.Composition.ICompositionSurfaceBrush::{put_Surface, get_Surface}
 // Sparsely-allocated surfaces, and the brush transform that addresses one tile of
 // one. A raster cache that mints a surface per entry pays a composition object, a
 // texture allocation and the engine's per-surface bookkeeping for every glyph it has
@@ -396,7 +398,7 @@ Windows.UI.Composition.Interactions.IInteractionTracker::{get_InteractionSources
 // Position and scale requests. Every one returns a request id and may be dropped
 // silently depending on the tracker's state, so the wrapper surfaces the id rather
 // than discarding it.
-Windows.UI.Composition.Interactions.IInteractionTracker::{TryUpdatePositionWithAdditionalVelocity, TryUpdatePositionWithAnimation, TryUpdateScale, TryUpdateScaleWithAdditionalVelocity, ConfigurePositionXInertiaModifiers, ConfigurePositionYInertiaModifiers}
+Windows.UI.Composition.Interactions.IInteractionTracker::{TryUpdatePositionWithAdditionalVelocity, TryUpdatePositionWithAnimation, TryUpdateScale, TryUpdateScaleWithAnimation, TryUpdateScaleWithAdditionalVelocity, ConfigurePositionXInertiaModifiers, ConfigurePositionYInertiaModifiers}
 // The clamping and position-update options are stated rather than defaulted, so the
 // option-free overloads are deliberately NOT carried: a defaulted clamping option is how a
 // correction silently lands outside the tracker's range. `IInteractionTracker5`'s overload

@@ -25,7 +25,7 @@ pub struct Region;
 /// An element whose text the input stack edits.
 pub struct Field;
 
-pub use control::Scalar;
+pub use control::{Scalar, Shortcut};
 pub use mount::{Stop, root_scope, set_geometry, set_ramp};
 pub use ui::{Element, Node, Ui};
 

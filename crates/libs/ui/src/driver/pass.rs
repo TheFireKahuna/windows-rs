@@ -51,7 +51,7 @@ trait Worker {
     fn park(&mut self) -> ControlFlow<()>;
     /// Drains every inbox, does one pass, publishes.
     fn pass(&mut self) -> Result<()>;
-    /// Services thread-affine callbacks after a pass, including under continuous input.
+    /// Services thread-affine callbacks before their work is drained by a pass.
     fn dispatch(&mut self) -> ControlFlow<()> {
         ControlFlow::Continue(())
     }
@@ -76,11 +76,11 @@ fn run<W: Worker>(links: &Links, bell: &Ring, mut worker: W) {
             break;
         }
         bell.disarm();
-        if let Err(e) = worker.pass() {
-            links.fail(&e);
+        if worker.dispatch().is_break() {
             break;
         }
-        if worker.dispatch().is_break() {
+        if let Err(e) = worker.pass() {
+            links.fail(&e);
             break;
         }
         if stopping {
@@ -222,6 +222,7 @@ impl Worker for App {
         // write the flush itself makes — a probe publishing — asks for another pass rather
         // than being folded into this one and forgotten.
         let mut work = self.first || self.woken.replace(false);
+        work |= signal::posts_pending();
         // A provider that asked for a tree is work: nothing else on this thread has a reason
         // to run the walk that builds one.
         work |= self.links.uia_requested.load(Acquire);
@@ -427,19 +428,25 @@ pub(super) fn deliver_field_commits(commits: &[crate::text_input::Commit]) {
     }
 }
 
-/// Turns `Enter` and `Space` on a focused control into the intent a tap produces.
+/// Routes control activation and window shortcuts through ordinary tap intents.
 ///
 /// The menu vocabulary answers first, because a row activated with `Enter` reaches the handler
 /// a click reaches through the one dispatch point; only a key the overlays left unclaimed
 /// falls through to the control under focus. A repeat, or either modifier, is not an
 /// activation.
-fn key_intents(
+pub(super) fn key_intents(
     overlays: &mut Overlays,
     reports: &[Report],
     focus: &mut Vec<FocusOp>,
     intents: &mut Vec<Intent>,
 ) {
     for report in reports {
+        if let Report::Key { target, event } = *report
+            && let Some(command) = Host::with(|h| h.shortcut_target(target, event))
+        {
+            intents.push(Intent { target: command, what: What::Tapped });
+            continue;
+        }
         if let Report::Key {
             target: Some(target),
             event,
@@ -536,6 +543,7 @@ struct SceneThread {
     back: Backends,
     controls: Controls,
     regions: present::Regions,
+    correlations: crate::correlation::Routes,
     scrolls: ScrollTable,
     scope: Scope,
     /// The control a caret belongs to, so only a field's own geometry change reaches TSF.
@@ -609,6 +617,7 @@ where
                     back,
                     controls: Controls::new(),
                     regions: present::Regions::default(),
+                    correlations: crate::correlation::Routes::default(),
                     scrolls: ScrollTable::default(),
                     scope,
                     text_focused: None,
@@ -699,7 +708,10 @@ impl Worker for SceneThread {
                 self.links.window.post(WM_FRAME, 0, 0);
             }
         }
-        self.regions.visibility(self.scene.hits());
+        self.regions.visibility(&mut self.scene, self.hidden)?;
+        self.regions.retire_exits(&mut Front {
+            scene: &mut self.scene, back: &self.back, env: self.env,
+        })?;
         let scrolls = &self.scrolls;
         self.up
             .events
@@ -735,7 +747,7 @@ impl Worker for SceneThread {
             back: &self.back,
             env: self.env,
         };
-        _ = present::apply(&mut self.regions, &mut ops, &mut front);
+        _ = present::apply(&mut self.regions, &mut ops, &mut front, None);
         present::uninstall();
     }
 }
@@ -781,7 +793,11 @@ impl SceneThread {
         // The row table before the presenter is told, and a sink cleared before its region is
         // unmounted: both orders live inside `present::apply`.
         let regions_changed = !down.regions.is_empty();
-        present::apply(&mut self.regions, &mut down.regions, &mut front)?;
+        let correlations_changed = !down.correlations.is_empty() || !down.declared.released.is_empty();
+        if correlations_changed {
+            self.correlations.adopt(&down.correlations, &down.declared.released);
+        }
+        present::apply(&mut self.regions, &mut down.regions, &mut front, Some(&down.patch))?;
         apply_control_patch(&mut self.controls, down, &mut front)?;
         self.scrolls.apply_ops(&mut down.scrolls);
         // A restated geometry replaces the map the thumb is bound through, so a container
@@ -796,6 +812,10 @@ impl SceneThread {
 
         // What the input thread must learn from this patch, appended to the batch held for it.
         let out = &mut self.down;
+        if correlations_changed {
+            self.correlations.copy_into(&mut out.correlations);
+            out.correlations_changed = true;
+        }
         if regions_changed {
             self.regions.picks_into(&mut out.regions);
             out.regions_changed = true;
@@ -942,6 +962,45 @@ mod tests {
     use crate::input::{KeyEvent, Mods};
 
     #[test]
+    fn app_pass_consumes_worker_posts_without_input_or_resize() {
+        let _patch = crate::build::tests::fixture();
+        let window = windows_window::Window::new("posted completion").hidden().create().unwrap();
+        let links = Arc::new(Links::new(&window).unwrap());
+        let posts = signal::arm_posts(Arc::clone(&links.app_bell));
+        let observed = Rc::new(Cell::new(0));
+        let (owner, value) = signal::Owner::scope(|| {
+            let value = signal::Cell::new(0_u32);
+            let observed = observed.clone();
+            signal::Effect::new(move || observed.set(value.get()));
+            value
+        });
+        let woken = Rc::new(Cell::new(false));
+        signal::set_waker({ let woken = woken.clone(); move || woken.set(true) });
+        let mut app = App {
+            links: links.clone(), owner: Some(owner), root: None, focus_outline: None,
+            preview_done: None,
+            overlays: Overlays::new(), focus: Vec::new(), uia_intents: Vec::new(),
+            held: None, owed: false, woken, first: false, census: AppCensus::default(),
+            _posts: posts,
+        };
+        for next in [1, 2, 3] {
+            app.woken.set(false);
+            std::thread::spawn(move || value.post(next)).join().unwrap();
+            assert!(links.app_bell.take_pending());
+            app.pass().unwrap();
+            assert_eq!(observed.get(), next, "a post alone must run the app pass");
+            while let Some(mut down) = links.down.take() {
+                down.clear();
+                links.down.give(down);
+            }
+        }
+        app.pass().unwrap();
+        let flushes = app.census.flushes;
+        app.pass().unwrap();
+        assert_eq!(app.census.flushes, flushes);
+    }
+
+    #[test]
     fn released_preview_ack_follows_callback_patch_and_survives_backpressure() {
         use crate::gesture::{DragDecl, DragUpdate, Phase};
         use crate::layout::Preset;
@@ -1014,6 +1073,44 @@ mod tests {
             assert_eq!(app.census.flushes, flushes);
             assert!(links.down.take().is_none());
         }
+    }
+
+    #[test]
+    fn a_dispatched_completion_is_consumed_before_parking() {
+        struct Completion {
+            queued: bool,
+            ready: bool,
+            applied: usize,
+        }
+        impl Worker for Completion {
+            fn park(&mut self) -> ControlFlow<()> {
+                assert!(!self.ready, "callback result stranded at idle");
+                assert_eq!(self.applied, 1);
+                ControlFlow::Break(())
+            }
+            fn dispatch(&mut self) -> ControlFlow<()> {
+                if core::mem::take(&mut self.queued) {
+                    self.ready = true;
+                }
+                ControlFlow::Continue(())
+            }
+            fn pass(&mut self) -> Result<()> {
+                if core::mem::take(&mut self.ready) {
+                    self.applied += 1;
+                }
+                Ok(())
+            }
+            fn finish(self) {
+                assert_eq!(self.applied, 1);
+            }
+        }
+        let window = windows_window::Window::new("worker completion")
+            .hidden().create().unwrap();
+        let links = Links::new(&window).unwrap();
+        links.scene_bell.ring();
+        run(&links, &links.scene_bell, Completion {
+            queued: true, ready: false, applied: 0,
+        });
     }
 
     fn key(target: ControlId, key: u16, kind: KeyKind, repeat: bool, mods: Mods) -> Report {
@@ -1107,6 +1204,114 @@ mod tests {
             &mut intents,
         );
         assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn shortcuts_use_live_commands_and_respect_fields_overlays_and_modifiers() {
+        use crate::build::Shortcut;
+        use crate::layout::{Len, Preset};
+        use crate::widget::{button, field};
+        const CTRL: Mods = Mods { ctrl: true, shift: false, alt: false };
+        const Z: &[Shortcut] = &[Shortcut { key: b'Z' as u16, mods: CTRL }];
+        const Y: &[Shortcut] = &[
+            Shortcut { key: b'Y' as u16, mods: CTRL },
+            Shortcut { key: b'Z' as u16, mods: Mods { shift: true, ..CTRL } },
+        ];
+        let mut patch = crate::build::tests::fixture();
+        let (_owner, (mount, count, disabled, hidden)) = signal::Owner::scope(|| {
+            let count = signal::Cell::new(0);
+            let disabled = signal::Cell::new(false);
+            let hidden = signal::Cell::new(false);
+            let mount = Ui::mount_root(|ui| {
+                ui.node(Preset::Stack).key("parent").hide_if(hidden).children(|ui| {
+                    button(ui, "Undo").key("undo").disabled(disabled)
+                        .shortcuts(Y).shortcuts(Z).on_click(move || count.set(count.get() + 1));
+                });
+                button(ui, "Redo").key("redo").shortcuts(Y)
+                    .on_click(move || count.set(count.get() + 10));
+                field(ui, "draft").key("field");
+                ui.node(Preset::Stack).width(Len::ZERO).clip().children(|ui| {
+                    button(ui, "clipped").shortcuts(Z).on_click(|| panic!("zero-width command"));
+                });
+            });
+            (mount, count, disabled, hidden)
+        });
+        Host::flush(&mut patch);
+        patch.clear();
+        let named = |name| Host::with(|h| h.controls.iter()
+            .find(|(_, row)| row.key.as_deref() == Some(name)).unwrap().0);
+        let undo = named("undo");
+        let redo = named("redo");
+        let field = named("field");
+        let parent = named("parent");
+        let parent = Host::with(|h| h.control(parent).unwrap().node);
+        let mut overlays = Overlays::new();
+        let mut focus = Vec::new();
+        let mut intents = Vec::new();
+        let send = |overlays: &mut Overlays, focus: &mut Vec<FocusOp>, intents: &mut Vec<Intent>, report| {
+            intents.clear();
+            key_intents(overlays, &[report], focus, intents);
+            Host::dispatch(intents);
+        };
+        send(&mut overlays, &mut focus, &mut intents, key(redo, b'Z' as u16, KeyKind::Down, false, CTRL));
+        assert_eq!(count.get(), 1);
+        for (kind, repeat, mods) in [
+            (KeyKind::Up, false, CTRL), (KeyKind::Char, false, CTRL),
+            (KeyKind::Down, true, CTRL), (KeyKind::Down, false, Mods::default()),
+            (KeyKind::Down, false, Mods { alt: true, ..CTRL }),
+        ] {
+            send(&mut overlays, &mut focus, &mut intents, key(redo, b'Z' as u16, kind, repeat, mods));
+        }
+        send(&mut overlays, &mut focus, &mut intents, key(field, b'Z' as u16, KeyKind::Down, false, CTRL));
+        assert_eq!(count.get(), 1);
+        for code in [b'Y', b'Z'] {
+            send(&mut overlays, &mut focus, &mut intents, key(undo, code as u16, KeyKind::Down, false,
+                Mods { shift: code == b'Z', ..CTRL }));
+        }
+        assert_eq!(count.get(), 21);
+        disabled.set(true);
+        signal::flush();
+        send(&mut overlays, &mut focus, &mut intents, key(redo, b'Z' as u16, KeyKind::Down, false, CTRL));
+        disabled.set(false);
+        hidden.set(true);
+        signal::flush();
+        send(&mut overlays, &mut focus, &mut intents, key(redo, b'Z' as u16, KeyKind::Down, false, CTRL));
+        hidden.set(false);
+        signal::flush();
+        Host::with(|h| h.suspend_input(parent, true));
+        send(&mut overlays, &mut focus, &mut intents, key(redo, b'Z' as u16, KeyKind::Down, false, CTRL));
+        Host::with(|h| h.suspend_input(parent, false));
+        assert_eq!(count.get(), 21);
+
+        overlays.open(&mut focus, crate::overlay::Spec::flyout(redo), |ui| {
+            button(ui, "menu command");
+        });
+        send(&mut overlays, &mut focus, &mut intents, key(redo, b'Z' as u16, KeyKind::Down, false, CTRL));
+        assert_eq!(count.get(), 21);
+        overlays.close_top(&mut focus);
+        let duplicate = Ui::mount_at(Host::with(|h| h.root()), None,
+            crate::build::root_scope(), ControlId::NONE, |ui| {
+            button(ui, "duplicate").shortcuts(Z).on_click(|| panic!("ambiguous chord"));
+        });
+        send(&mut overlays, &mut focus, &mut intents, key(redo, b'Z' as u16, KeyKind::Down, false, CTRL));
+        assert_eq!(count.get(), 21);
+        drop(duplicate);
+        send(&mut overlays, &mut focus, &mut intents, Report::Key {
+            target: None, event: KeyEvent { key: b'Z' as u16, kind: KeyKind::Down, repeat: false, mods: CTRL },
+        });
+        assert_eq!(count.get(), 22);
+        Host::with(|h| h.set_shortcuts(undo, &[]));
+        send(&mut overlays, &mut focus, &mut intents, key(redo, b'Z' as u16, KeyKind::Down, false, CTRL));
+        assert_eq!(count.get(), 22);
+        drop(mount);
+        send(&mut overlays, &mut focus, &mut intents, key(undo, b'Y' as u16, KeyKind::Down, false, CTRL));
+        assert!(intents.is_empty());
+        let replacement = Ui::mount_root(|ui| {
+            button(ui, "replacement").shortcuts(Y).on_click(|| panic!("stale focus"));
+        });
+        send(&mut overlays, &mut focus, &mut intents, key(undo, b'Y' as u16, KeyKind::Down, false, CTRL));
+        assert!(intents.is_empty());
+        drop(replacement);
     }
 
     /// A per-sample report stays on the scene thread and a discrete one goes up.

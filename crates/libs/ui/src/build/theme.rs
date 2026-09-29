@@ -15,7 +15,7 @@ use windows_color::Radiance;
 use windows_numerics::Vector2;
 use windows_scene::{
     BackdropSpec, Cap, ControlId, Corners, Env, Exit, GeomId, GroupId, Halo, Join, Mask, NodeId,
-    Paint, Prop, RampId, RegionId, Side, SinkPatch, SpriteId, Value,
+    Paint, PathSpace, Prop, RampId, RegionId, Side, SinkPatch, SpriteId, Value,
 };
 
 #[derive(Copy, Clone, Debug)]
@@ -91,6 +91,7 @@ pub(crate) enum PaintMask {
     Shape {
         geom: GeomId,
         stroke: Option<Len>,
+        space: PathSpace,
     },
     /// A square box a presented region paints its own buffer over.
     Region,
@@ -113,6 +114,8 @@ pub(crate) enum PaintSource {
     Owner(ControlId),
     Gradient(RampId),
     Region(RegionId),
+    RegionView(RegionId, u32),
+    None,
 }
 
 impl PaintSource {
@@ -709,7 +712,7 @@ impl Host {
                     .roles(row.state)
                     .and_then(|roles| paint.part.role(roles, surface.wash))
             }
-            PaintSource::Gradient(_) | PaintSource::Region(_) => None,
+            PaintSource::Gradient(_) | PaintSource::Region(_) | PaintSource::RegionView(..) | PaintSource::None => None,
         }
     }
 
@@ -728,6 +731,11 @@ impl Host {
         let fill = match paint.source {
             PaintSource::Gradient(id) => Paint::Ramp(id),
             PaintSource::Region(id) => Paint::Presented(id),
+            PaintSource::RegionView(region, at) => self.regions.iter()
+                .find(|(_, row)| row.sink == region)
+                .and_then(|(_, row)| row.atlas.as_ref()?.views.get(at as usize))
+                .map_or(Paint::None, |view| Paint::PresentedView { region, view: *view }),
+            PaintSource::None => Paint::None,
             _ => Paint::Solid(light),
         };
         // One write: a declared halo is what the sprite casts, and a role-painting sprite with
@@ -897,10 +905,10 @@ impl Host {
                 width: width.dips_at(scope, scale),
                 open: attached.map(side_of),
             },
-            PaintMask::Shape { geom, stroke } => {
+            PaintMask::Shape { geom, stroke, space } => {
                 let stroke =
                     stroke.map(|width| self.stroke(width.dips_at(scope, scale), Cap::Round, Join::Round, &[]));
-                Mask::Shape { geom, stroke }
+                Mask::Shape { geom, stroke, space }
             }
             PaintMask::Region => Mask::Box {
                 radius: Corners::default(),
@@ -1150,6 +1158,22 @@ impl<K> Element<'_, K> {
 }
 
 impl Element<'_, super::Path> {
+    /// Maps unit-box geometry to this path's live bounds without scaling its stroke width.
+    ///
+    /// Geometry radii scale with the box. The path must have declared its paint first.
+    pub fn unit_box(mut self) -> Self {
+        let node = self.node_id();
+        let paint = self.host().appearances.get_mut(node)
+            .expect("a unit path must declare its paint first");
+        let PaintMask::Shape { space, .. } = &mut paint.mask else {
+            unreachable!("a painted path carries a shape mask")
+        };
+        *space = PathSpace::Unit;
+        let paint = *paint;
+        self.host().publish_paint(paint, true);
+        self
+    }
+
     /// Fills this shape in a chromatic role.
     pub fn fill(self, role: DataRole) -> Self {
         self.shape(PaintSource::data(role), None, Part::Fill)
@@ -1205,7 +1229,11 @@ impl Element<'_, super::Path> {
         let Some(geom) = self.host().appearances.shape(node) else {
             return self;
         };
-        self.part(part, source, PaintMask::Shape { geom, stroke }, 1.0)
+        let space = match self.host().appearances.get(node).map(|paint| paint.mask) {
+            Some(PaintMask::Shape { space, .. }) => space,
+            _ => PathSpace::Local,
+        };
+        self.part(part, source, PaintMask::Shape { geom, stroke, space }, 1.0)
     }
 
     /// Paints this shape at `strength` of the alpha its role resolves to.
@@ -1319,40 +1347,6 @@ mod tests {
     }
 
     #[test]
-    fn pixel_borders_and_fill_insets_follow_dpi_without_idle_publication() {
-        use windows_scene::{Env, Op};
-        let mut patch = crate::build::rig::fixture();
-        let mut node = NodeId::NONE;
-        let (_owner, _mount) = crate::signal::Owner::scope(|| super::super::Ui::mount_root(|ui| {
-            node = ui.control(Some(Chrome::new(
-                roles(Some(Fill::Surface), Some(Stroke::Default)), Metric::Radius,
-            ).border(Len::px(1.0))), crate::widget::UiaRole::Button, |_| {})
-                .width(Len::dip(100.0)).height(Len::dip(24.0)).id().into();
-        }));
-        for scale in [1.0, 1.5, 2.0, 1.25, 1.0] {
-            Host::with(|host| host.set_env(Env::new(96.0 * scale, host.env.output().clone())));
-            patch.clear();
-            Host::flush(&mut patch);
-            Host::with(|host| {
-                let surface = host.appearances.surface(host.surface_row(node)).unwrap();
-                let border = surface.parts[0].unwrap();
-                let fill = surface.parts[1].unwrap();
-                assert!(patch.ops().iter().any(|op| matches!(op,
-                    Op::Mask { id, mask: Mask::Outline { width, .. } }
-                    if *id == border && (width * scale - 1.0).abs() < 0.001
-                )));
-                let outer = host.geom(node).size;
-                let inner = host.geom(fill.0).size;
-                assert!(((outer.x - inner.x) * scale - 2.0).abs() < 0.001);
-                assert!(((outer.y - inner.y) * scale - 2.0).abs() < 0.001);
-            });
-            patch.clear();
-            Host::flush(&mut patch);
-            assert!(patch.ops().is_empty());
-        }
-    }
-
-    #[test]
     fn outer_rims_follow_live_bounds_and_explicit_plates_receive_scoped_shadows() {
         use windows_scene::Op;
         assert_eq!(size_of::<super::super::host::Visual>(), 20);
@@ -1430,6 +1424,40 @@ mod tests {
         drop(owner);
         Host::flush(&mut patch);
         assert_eq!(Host::with(|host| host.live_nodes()), empty);
+    }
+
+    #[test]
+    fn pixel_borders_and_fill_insets_follow_dpi_without_idle_publication() {
+        use windows_scene::{Env, Op};
+        let mut patch = crate::build::rig::fixture();
+        let mut node = NodeId::NONE;
+        let (_owner, _mount) = crate::signal::Owner::scope(|| super::super::Ui::mount_root(|ui| {
+            node = ui.control(Some(Chrome::new(
+                roles(Some(Fill::Surface), Some(Stroke::Default)), Metric::Radius,
+            ).border(Len::px(1.0))), crate::widget::UiaRole::Button, |_| {})
+                .width(Len::dip(100.0)).height(Len::dip(24.0)).id().into();
+        }));
+        for scale in [1.0, 1.5, 2.0, 1.25, 1.0] {
+            Host::with(|host| host.set_env(Env::new(96.0 * scale, host.env.output().clone())));
+            patch.clear();
+            Host::flush(&mut patch);
+            Host::with(|host| {
+                let surface = host.appearances.surface(host.surface_row(node)).unwrap();
+                let border = surface.parts[0].unwrap();
+                let fill = surface.parts[1].unwrap();
+                assert!(patch.ops().iter().any(|op| matches!(op,
+                    Op::Mask { id, mask: Mask::Outline { width, .. } }
+                    if *id == border && (width * scale - 1.0).abs() < 0.001
+                )));
+                let outer = host.geom(node).size;
+                let inner = host.geom(fill.0).size;
+                assert!(((outer.x - inner.x) * scale - 2.0).abs() < 0.001);
+                assert!(((outer.y - inner.y) * scale - 2.0).abs() < 0.001);
+            });
+            patch.clear();
+            Host::flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
     }
 
     #[test]

@@ -61,6 +61,10 @@ impl Mount {
         self.exit = exit;
     }
 
+    pub(crate) fn exit(&self) -> Exit {
+        self.exit
+    }
+
     pub(crate) fn slide(&mut self, host: &mut Host, slide: crate::overlay::Slide) {
         self.exit = Exit::Slide { by: slide.by, ms: slide.ms, easing: slide.easing };
         for &node in &self.roots {

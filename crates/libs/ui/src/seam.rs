@@ -477,6 +477,7 @@ row! {
     Down,
     empty: |b| b.patch.is_empty()
         && b.chrome.is_empty()
+        && b.correlations.is_empty()
         && b.translations.is_empty()
         && b.previews.is_empty()
         && b.reorders.is_empty()
@@ -494,6 +495,7 @@ row! {
         patch: SinkPatch,
         /// Read by `Controls::adopt` on the scene thread.
         chrome: Vec<(ControlId, ChromeRow)>,
+        correlations: Vec<crate::correlation::Route>,
         translations: Vec<(ControlId, NodeId, windows_scene::Translation)>,
         previews: Vec<(ControlId, NodeId)>,
         reorders: Vec<crate::widget::ReorderRow>,
@@ -606,6 +608,7 @@ row! {
     empty: |b| !b.hits_changed
         && !b.trackers_changed
         && !b.regions_changed
+        && !b.correlations_changed
         && b.fields.is_empty()
         && b.scope.is_none()
         && !b.scroll_changed
@@ -624,6 +627,7 @@ row! {
         trackers: Vec<(NodeId, Arc<AtomicU64>)>,
         /// Read by `Picks::sync`: every region the pointer can be picked inside.
         regions: Vec<(ControlId, Live)>,
+        correlations: Vec<crate::correlation::Route>,
         /// Read by `TextInput::source` and `TextInput::layout`.
         fields: Fields,
         /// What the app thread declared, carried through the scene thread untouched.
@@ -637,6 +641,7 @@ row! {
         trackers_changed: bool,
         /// Whether `regions` is a full listing to install, replacing the set held.
         regions_changed: bool,
+        correlations_changed: bool,
         /// A new theme, so the input thread resolves its own metrics through the same scope.
         scope: Option<Scope>,
         /// Whether a tracker moved under a focused field, which is a layout change TSF must
@@ -712,6 +717,7 @@ pub(crate) enum RegionOp {
     /// carried rather than called, because it runs on the present thread.
     Mount {
         sink: RegionId,
+        size_node: Option<NodeId>,
         control: ControlId,
         queue: Queue,
         live: Live,

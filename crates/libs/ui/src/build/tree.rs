@@ -57,6 +57,8 @@ pub(crate) const SUNK: Bits = 1 << 25;
 pub(crate) const PLACED: Bits = 1 << 26;
 pub(crate) const ANIMATE_LAYOUT: Bits = 1 << 27;
 pub(crate) const INITIAL: Bits = 1 << 28;
+/// The sprite samples glyph coverage whose extent changes with the run resource.
+pub(crate) const RUN: Bits = 1 << 29;
 pub(crate) const ROUNDED_CLIP: Bits = 1 << 30;
 
 // ── the hit declaration, packed ─────────────────────────────────────────────────────
@@ -538,6 +540,25 @@ impl Tree {
         first(MEASURE).or_else(|| first(DESC))
     }
 
+    pub(crate) fn layout_scope(&self, mut id: NodeId) -> bool {
+        while !id.is_none() {
+            if self.c.flags[id.index()] & ANIMATE_LAYOUT != 0 {
+                return true;
+            }
+            id = self.parent(id);
+        }
+        false
+    }
+
+    pub(crate) fn animates_layout(&self, id: NodeId) -> bool {
+        let was = self.c.published[id.index()];
+        self.layout_scope(id)
+            && was.size.x.is_finite()
+            && !was.sunk
+            && self.c.flags[id.index()] & (SUNK | INITIAL) == 0
+            && !self.window_resized
+    }
+
     /// Emits the geometry the publication moved and takes the published column to now.
     ///
     /// Field-wise rather than one row: a value writer owns `OffsetX` on a driven part, and
@@ -553,23 +574,15 @@ impl Tree {
             let now = self.c.geom[id.index()];
             let was = self.c.published[id.index()];
             let bounded = self.c.flags[id.index()] & CLIP != 0;
-            let mut ancestor = id;
-            let mut animated = false;
-            while !ancestor.is_none() {
-                animated |= self.c.flags[ancestor.index()] & ANIMATE_LAYOUT != 0;
-                ancestor = self.parent(ancestor);
-            }
-            let live_clip = animated;
+            let live_clip = self.layout_scope(id);
             let sunk = self.c.flags[id.index()] & SUNK != 0;
-            animated &= was.size.x.is_finite()
-                && !was.sunk
-                && !sunk
-                && self.c.flags[id.index()] & INITIAL == 0
-                && !self.window_resized;
+            let animated = self.animates_layout(id);
+            let text = self.c.flags[id.index()] & RUN != 0
+                || self.c.text[id.index()] != MeasureKey::NONE;
             let write = |prop, value| Op::Bind {
                 id,
                 prop,
-                bind: if animated {
+                bind: if animated && !(prop == Prop::Size && text) {
                     Bind::Animate(Anim::Spring { to: value, tuning: Tuning::Layout, delay_ms: 0 })
                 } else {
                     Bind::Set(value)

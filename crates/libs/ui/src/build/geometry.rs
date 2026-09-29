@@ -24,11 +24,14 @@ pub enum Source {
     Anchors(Anchors),
 }
 
-/// What a fill callback is handed: the box, and the keyed table where the source is a set.
+/// What a fill callback is handed: the box, the scope, and the DPI the figure is
+/// rasterized at.
 pub struct Inputs<'a> {
     pub size: Vector2,
     pub scope: crate::role::Scope,
     pub anchors: Option<&'a crate::layout::Table>,
+    /// The DIP-to-pixel factor, so a figure can sample at its rasterized density.
+    pub scale: f32,
 }
 
 struct Job {
@@ -94,17 +97,19 @@ impl Host {
                 // A probe read before its node's first solve has no scope yet; the root's is what that
                 // node would inherit.
                 let scope = placed.scope.unwrap_or_else(|| self.root_scope());
-                Inputs { size: placed.size, scope, anchors: None }
+                Inputs { size: placed.size, scope, anchors: None, scale: self.env.scale() }
             }
             Source::Own(own) => Inputs {
                 size: self.tree.c.geom[own.index()].size,
                 scope: self.scope_of(own),
                 anchors: None,
+                scale: self.env.scale(),
             },
             Source::Anchors(_) => Inputs {
                 size: self.tree.c.geom[node.index()].size,
                 scope: self.scope_of(node),
                 anchors: None,
+                scale: self.env.scale(),
             },
         }
     }
@@ -133,7 +138,8 @@ impl Host {
             match source {
                 Source::Anchors(set) => set.with(|table| {
                     let Some(scope) = table.published() else { return };
-                    let inputs = Inputs { size: table.size(), scope, anchors: Some(table) };
+                    let scale = Host::with(|h| h.env.scale());
+                    let inputs = Inputs { size: table.size(), scope, anchors: Some(table), scale };
                     crate::signal::read_only(|| fill(&inputs, &mut buffers));
                 }),
                 _ => {

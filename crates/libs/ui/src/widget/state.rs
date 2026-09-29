@@ -72,6 +72,8 @@ enum How {
     Carried,
     /// The value jumped on its own and springs to where it landed.
     Sprung,
+    /// The control's geometry follows its container's bounds motion.
+    Layout,
     /// The gesture ended here, so the application is told to commit.
     Settled,
 }
@@ -112,6 +114,12 @@ impl Front<'_> {
         if how == How::Carried {
             let bind = Bind::Set(Value::Scalar(to));
             self.scene.retarget(node, prop, bind, self.back)
+        } else if how == How::Layout {
+            self.scene.retarget(node, prop, Bind::Animate(Anim::Spring {
+                to: Value::Scalar(to),
+                tuning: Tuning::Layout,
+                delay_ms: 0,
+            }), self.back)
         } else {
             self.spring(node, prop, Value::Scalar(to))
         }
@@ -169,6 +177,10 @@ pub struct ValueRow {
     /// The inset a value part rests at, and the travel the last solve measured beyond it.
     pub rest: f32,
     pub travel: f32,
+    /// Changed geometry follows the enclosing layout motion policy.
+    pub animate_layout: bool,
+    /// The control visual and axial inset excluded from its live travel.
+    pub extent: Option<(NodeId, f32)>,
     /// Where the value stands, `0..=1`. Seeded by the mount and advanced here: a turned control
     /// has no absolute position on the pointer, so its value accumulates on this thread.
     pub fraction: f32,
@@ -302,8 +314,8 @@ pub struct Controls {
     /// because adoption has no intent buffer.
     superseded: ControlId,
     superseded_at: u64,
-    /// The scopes whose reveal targets are up, deduplicated in fixed storage.
-    revealed: [ControlId; 3],
+    /// The active controls and their scopes, deduplicated for hover, press and focus.
+    revealed: [ControlId; 6],
     translations: Vec<(ControlId, NodeId, windows_scene::Translation)>,
     previews: Vec<(ControlId, NodeId)>,
     preview_release: Option<u64>,
@@ -345,8 +357,8 @@ impl Controls {
     /// adopts a changed source even within the same revision. A changed revision adopts the
     /// application's value and supersedes a gesture standing on it, so another control or a
     /// document load reaches this control through the same front-side writer as a pointer.
-    /// Mounted press-only controls spring to changed values. Mounts, geometry corrections,
-    /// sliders and rotary controls adopt their positions immediately.
+    /// Mounted press-only controls spring to changed values. Geometry corrections follow
+    /// the container's layout policy; mounts and direct input set positions immediately.
     ///
     /// Geometry that moved is re-driven and re-bound here. These tables are the only writer of the
     /// properties the router owns, so changed geometry reaches the pixels through this call and no
@@ -385,13 +397,16 @@ impl Controls {
                 self.grabbed = ControlId::NONE;
                 (self.superseded, self.superseded_at) = (id, row.revision);
             }
-            let moved = (held.rest, held.travel, held.parts) != (row.rest, row.travel, row.parts);
+            let moved = (held.rest, held.travel, held.parts, held.extent)
+                != (row.rest, row.travel, row.parts, row.extent);
             self.values.place(id, HeldValue { row, source });
             if moved {
                 self.bind_followers(row, front)?;
             }
             if moved || held.fraction != row.fraction {
-                let how = if mounted && !moved && self.flags(id) & flag::VALUED == 0 {
+                let how = if mounted && moved && row.animate_layout && held.parts == row.parts {
+                    How::Layout
+                } else if mounted && !moved && self.flags(id) & flag::VALUED == 0 {
                     How::Sprung
                 } else {
                     How::Carried
@@ -503,7 +518,10 @@ impl Controls {
                 ScalarPart::Fade => [Some((Prop::Opacity, [0.0, 1.0])), None],
                 _ => continue,
             };
-            let m = if row.travel > 0.0 {
+            let extent = matches!(part, ScalarPart::Trail { .. }).then_some(row.extent).flatten();
+            let m = if extent.is_some() {
+                1.0
+            } else if row.travel > 0.0 {
                 1.0 / row.travel
             } else {
                 0.0
@@ -523,6 +541,7 @@ impl Controls {
                     source,
                     vertical,
                     affine,
+                    extent,
                     clamp,
                 };
                 front.scene.retarget(node, prop, bind, front.back)?;
@@ -1106,14 +1125,15 @@ impl Controls {
     /// is a spring rather than a two-keyframe hold, because step easing takes a segment's end
     /// value immediately and would jump at the start of the hold rather than at its end.
     fn reveals(&mut self, front: &mut Front<'_>) -> Result<()> {
-        let mut next = [ControlId::NONE; 3];
+        let mut next = [ControlId::NONE; 6];
         for (slot, source) in [self.hovered, self.pressed, self.focused]
             .into_iter()
             .enumerate()
         {
-            let scope = self.chrome_of(source).scope;
-            if !self.chrome_of(scope).reveal.is_none() && !next.contains(&scope) {
-                next[slot] = scope;
+            for (at, owner) in [source, self.chrome_of(source).scope].into_iter().enumerate() {
+                if !self.chrome_of(owner).reveal.is_none() && !next.contains(&owner) {
+                    next[slot * 2 + at] = owner;
+                }
             }
         }
         for (these, others, to) in [(self.revealed, next, 0.0), (next, self.revealed, 1.0)] {

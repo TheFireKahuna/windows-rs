@@ -39,7 +39,7 @@ pub(crate) use std::rc::Rc;
 pub(crate) use windows_core::Interface;
 
 pub use device::{Flushed, PresentationDevice};
-pub use frame::{DrawCtx, Epoch, Frame, GateCtx, Part, RegionInput, RegionParts, SubId};
+pub use frame::{DrawCtx, Epoch, Frame, GateCtx, Part, RegionGeometry, RegionInput, RegionParts, SubId};
 pub use gate::{Cached, Gate, Layer, Sources};
 pub use group::{
     Instance, Interrupt, Outcome, PresentStatistic, PresentTally, PresentationGroup, Queue,

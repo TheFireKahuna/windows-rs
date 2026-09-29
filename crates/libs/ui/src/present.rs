@@ -196,8 +196,14 @@ pub(crate) struct RegionRow {
     /// pending. It is the only record of whether the box moved, so a solve that moved nothing
     /// sends nothing.
     pub(crate) extent: Option<Extent>,
+    pub(crate) atlas: Option<Box<Atlas>>,
     pub(crate) active: bool,
     pub(crate) layout: Option<(crate::layout::Anchors, Arc<Published<crate::layout::Table>>)>,
+}
+
+pub(crate) struct Atlas {
+    pub(crate) size: Vector2,
+    pub(crate) views: Vec<windows_scene::RegionView>,
 }
 
 impl Element<'_, Region> {
@@ -331,10 +337,12 @@ pub(crate) fn emit(host: &mut Host, out: &mut Vec<RegionOp>) {
         }
         row.active = active;
         if !active { continue; }
+        let size = row.atlas.as_ref().map_or(size, |atlas| atlas.size);
         let extent = Extent::new(size.x, size.y, env.dpi());
         match (row.build.take(), row.extent) {
             (Some(build), _) => out.push(RegionOp::Mount {
                 sink: row.sink,
+                size_node: (row.atlas.is_none() && row.layout.is_none()).then_some(row.node),
                 control: row.control,
                 queue: row.queue,
                 live: row.live.clone(),
@@ -369,6 +377,11 @@ struct Waiting {
 
 /// One mounted region, as the half that binds its surface holds it.
 struct Mounted {
+    retiring: Option<NodeId>,
+    size_node: Option<NodeId>,
+    geometry: Option<Arc<windows_present::RegionGeometry>>,
+    dpi: std::rc::Rc<std::cell::Cell<f32>>,
+    observed: bool,
     layout_active: bool,
     active: bool,
     sink: RegionId,
@@ -392,6 +405,24 @@ pub(crate) struct Regions {
 }
 
 impl Regions {
+    pub(crate) fn retire_exits(&mut self, front: &mut Front<'_>) -> Result<()> {
+        let mut first = Ok(());
+        let mut at = 0;
+        while at < self.rows.len() {
+            if !self.rows[at].retiring.is_some_and(|node| !front.scene.collapsing(node)) {
+                at += 1;
+                continue;
+            }
+            let row = self.rows.swap_remove(at);
+            if row.bound {
+                let step = front.scene.clear_region(row.sink, front.back, front.env);
+                if first.is_ok() { first = step; }
+            }
+            with(|p, _| p.unmount(key_of(row.sink)));
+        }
+        first
+    }
+
     /// Appends a drop for every region still mounted, for the thread shutting down to apply
     /// through [`apply`] so each is released in the order a mount's own drop would take.
     pub(crate) fn drops_into(&self, out: &mut Vec<RegionOp>) {
@@ -403,14 +434,17 @@ impl Regions {
     }
 
     /// Publishes activity transitions after layout or tracker events.
-    pub(crate) fn visibility(&mut self, hits: &HitTable) {
+    pub(crate) fn visibility(&mut self, scene: &mut windows_scene::Scene, hidden: bool) -> Result<()> {
         for row in &mut self.rows {
-            let active = row.layout_active && hits.visible(row.control);
+            if row.retiring.is_some() { continue; }
+            let active = !hidden && row.layout_active && scene.hits().visible(row.control);
             if active != row.active {
                 row.active = active;
+                if let Some(node) = row.size_node { scene.observe_size_active(node, active)?; }
                 with(|p, _| p.set_active(key_of(row.sink), active));
             }
         }
+        Ok(())
     }
 
     /// Rebases every mounted region's scope on a new theme and wakes its renderer, which
@@ -425,7 +459,8 @@ impl Regions {
     /// Restates every region the pointer can be picked inside, for the input thread.
     pub(crate) fn picks_into(&self, out: &mut Vec<(ControlId, Live)>) {
         out.clear();
-        out.extend(self.rows.iter().map(|row| (row.control, row.live.clone())));
+        out.extend(self.rows.iter().filter(|row| row.retiring.is_none())
+            .map(|row| (row.control, row.live.clone())));
     }
 }
 
@@ -518,6 +553,7 @@ pub(crate) fn apply(
     regions: &mut Regions,
     ops: &mut Vec<RegionOp>,
     front: &mut Front<'_>,
+    patch: Option<&windows_scene::SinkPatch>,
 ) -> Result<()> {
     let mut first = Ok(());
     // Drained rather than borrowed: a mount carries the builder that makes the renderer, and a
@@ -526,6 +562,7 @@ pub(crate) fn apply(
         let step = match op {
             RegionOp::Mount {
                 sink,
+                size_node,
                 control,
                 queue,
                 live,
@@ -534,6 +571,11 @@ pub(crate) fn apply(
                 theme,
             } => {
                 regions.rows.push(Mounted {
+                    retiring: None,
+                    size_node,
+                    geometry: None,
+                    dpi: std::rc::Rc::new(std::cell::Cell::new(extent.dpi)),
+                    observed: false,
                     layout_active: true,
                     active: true,
                     sink,
@@ -551,8 +593,9 @@ pub(crate) fn apply(
                 // The build closure is consumed whether or not a present thread is installed,
                 // so a region declared without one is inert rather than mounted by a later
                 // batch.
-                with(move |p, _| {
-                    p.mount(spec, epoch, input, move |gpu: &Gpu| build(gpu, theme));
+                with(|p, _| {
+                    let geometry = p.mount(spec, epoch, input, move |gpu: &Gpu| build(gpu, theme));
+                    regions.rows.last_mut().unwrap().geometry = Some(geometry);
                 });
                 Ok(())
             }
@@ -560,7 +603,12 @@ pub(crate) fn apply(
             // applied is untouched and no frame is dropped. Destroy-and-create would reallocate
             // the buffers and re-issue a handle that is already bound.
             RegionOp::Resize { sink, extent } => {
-                with(|p, _| p.resize(key_of(sink), extent));
+                let observed = regions.rows.iter_mut().find(|row| row.sink == sink).is_some_and(|row| {
+                    row.dpi.set(extent.dpi);
+                    if row.geometry.as_ref().is_some_and(|geometry| geometry.set_geometry_dpi(extent.dpi)) { row.live.epoch.invalidate(); }
+                    row.observed
+                });
+                if !observed { with(|p, _| p.resize(key_of(sink), extent)); }
                 Ok(())
             }
             RegionOp::Active { sink, active } => {
@@ -570,11 +618,24 @@ pub(crate) fn apply(
                 Ok(())
             }
             RegionOp::Drop { sink } => {
+                if let Some(root) = patch.and_then(|patch| front.scene.collapsing_region(sink, patch))
+                    && let Some(row) = regions.rows.iter_mut().find(|row| row.sink == sink)
+                {
+                    row.retiring = Some(root);
+                    row.active = false;
+                    if let Some(node) = row.size_node { front.scene.forget_size(node); }
+                    with(|p, _| p.set_active(key_of(sink), false));
+                    continue;
+                }
                 let bound = regions
                     .rows
                     .iter()
                     .position(|row| row.sink == sink)
-                    .map(|at| regions.rows.swap_remove(at).bound);
+                    .map(|at| {
+                        let row = regions.rows.swap_remove(at);
+                        if let Some(node) = row.size_node { front.scene.forget_size(node); }
+                        row.bound
+                    });
                 let step = match bound {
                     Some(true) => front.scene.clear_region(sink, front.back, front.env),
                     _ => Ok(()),
@@ -637,12 +698,31 @@ pub(crate) fn bind(regions: &mut Regions, front: &mut Front<'_>) -> Result<()> {
                         .scene
                         .set_region(row.sink, handle as *mut _, front.back, front.env);
                 row.bound = step.is_ok();
+                if row.bound && !row.observed && row.retiring.is_none() {
+                    if let Some(node) = row.size_node {
+                        let input = row.geometry.as_ref().expect("mounted geometry").clone();
+                        let epoch = row.live.epoch.clone();
+                        let dpi = row.dpi.clone();
+                        front.scene.observe_size(node, Some(row.sink), move |origin, size, target, moving| {
+                            let scale = dpi.get() / 96.0;
+                            let x = (origin.x * scale).round();
+                            let y = (origin.y * scale).round();
+                            let extent = Extent::new(((origin.x+size.x)*scale).round()/scale-x/scale, ((origin.y+size.y)*scale).round()/scale-y/scale, dpi.get());
+                            let reserve = Extent::new(target.x, target.y, dpi.get());
+                            if input.set_bounds(extent, reserve, moving, Some([x/scale,y/scale])) { epoch.invalidate(); }
+                        }, front.back)?;
+                        row.observed = true;
+                        front.scene.observe_size_active(node, row.active)?;
+                    }
+                }
                 step
             },
             // Both mean the handle is about to close, and both leave the region drawing nothing
             // rather than sampling a brush over a dead one. They are distinct to the producer
             // and identical here.
             Bound::Released | Bound::Failed => {
+                if let Some(node) = row.size_node { front.scene.forget_size(node); }
+                row.observed = false;
                 row.bound = false;
                 front.scene.clear_region(row.sink, front.back, front.env)
             }
@@ -679,8 +759,17 @@ impl Picks {
     /// Makes the table hold exactly `rows`: regions that are gone are removed, new ones are
     /// added, and a region already held keeps the part copy it has scanned.
     pub(crate) fn sync(&mut self, rows: &[(ControlId, Live)]) {
-        self.0
-            .retain(|pick| rows.iter().any(|row| row.0 == pick.control));
+        self.0.retain(|pick| {
+            let retained = rows.iter().any(|row| row.0 == pick.control);
+            if !retained && (pick.live.input.hover().is_some()
+                || pick.live.input.active().is_some() || pick.live.input.cursor().is_some()) {
+                pick.live.input.set_hover(None);
+                pick.live.input.set_active(None);
+                pick.live.input.set_cursor(None);
+                pick.live.epoch.invalidate();
+            }
+            retained
+        });
         for (control, live) in rows {
             if !self.0.iter().any(|pick| pick.control == *control) {
                 self.0.push(Pick {
@@ -841,6 +930,85 @@ fn hover(picks: &mut Picks, id: ControlId, at: Vector2, hits: &HitTable) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::Published;
+
+    #[test]
+    fn retiring_a_pick_clears_input_before_the_live_handle_is_reused() {
+        use super::{Live, Picks};
+        use windows_present::SubId;
+        use windows_scene::ControlId;
+
+        let live = Live::new().unwrap();
+        let rows = [(ControlId::FIRST, live.clone())];
+        let mut picks = Picks::default();
+        picks.sync(&rows);
+        live.input.set_cursor(Some((42.0, 17.0)));
+        live.input.set_hover(Some(SubId(3)));
+        live.input.set_active(Some(SubId(3)));
+        let seq = live.epoch.seq();
+        picks.sync(&rows);
+        assert_eq!(live.epoch.seq(), seq);
+        assert_eq!(live.input.cursor(), Some((42.0, 17.0)));
+        picks.sync(&[]);
+        assert_eq!(live.input.cursor(), None);
+        assert_eq!(live.input.hover(), None);
+        assert_eq!(live.input.active(), None);
+        assert_ne!(live.epoch.seq(), seq);
+        let seq = live.epoch.seq();
+        picks.sync(&[]);
+        picks.sync(&rows);
+        assert_eq!(live.epoch.seq(), seq);
+        assert_eq!(live.input.cursor(), None);
+        assert_eq!(picks.0.len(), 1);
+        picks.sync(&[]);
+        assert_eq!(live.epoch.seq(), seq, "an empty retired input needs no wake");
+    }
+
+    #[test]
+    fn region_hover_routes_local_coordinates_without_application_intents() {
+        use super::{Live, Picks, pick};
+        use crate::input::Report;
+        use windows_numerics::Vector2;
+        use windows_present::{Part, SubId};
+        use windows_scene::{ControlId, HitEntry, HitFlags, HitTable, NodeId, NO_ENTRY};
+
+        let live = Live::new().unwrap();
+        live.parts.publish(&[Part { id: SubId(7), rect: windows_d2d::Rect::new(0.0, 0.0, 100.0, 80.0) }]);
+        let id = ControlId::FIRST;
+        let mut picks = Picks::default();
+        picks.sync(&[(id, live.clone())]);
+        let entry = HitEntry {
+            x0: 100.0, y0: 200.0, x1: 400.0, y1: 500.0,
+            touch_inflate: 0.0, clip_parent: NO_ENTRY, parent: NO_ENTRY,
+            flags: HitFlags::INTERACTIVE, scroll_src: NodeId::FIRST, id,
+        };
+        let mut hits = HitTable::default();
+        hits.replace(&[entry], &[(id, 0)]);
+        hits.set_scroll(NodeId::FIRST, Vector2::new(0.0, 30.0));
+        let mut intents = Vec::new();
+        let seq = live.epoch.seq();
+        pick(&[Report::HoverChanged {
+            from: None, to: Some(id), at: Vector2::new(140.0, 190.0), qpc: 0,
+        }], &hits, &mut picks, &mut intents);
+        assert_eq!(live.input.cursor(), Some((40.0, 20.0)));
+        assert_eq!(live.input.hover(), Some(SubId(7)));
+        assert_ne!(live.epoch.seq(), seq);
+        assert!(intents.is_empty());
+        live.parts.publish(&[]);
+        pick(&[Report::HoverChanged {
+            from: Some(id), to: Some(id), at: Vector2::new(150.0, 200.0), qpc: 0,
+        }], &hits, &mut picks, &mut intents);
+        assert_eq!(live.input.cursor(), Some((50.0, 30.0)));
+        assert_eq!(live.input.hover(), None, "a passive region still publishes its cursor");
+        assert!(intents.is_empty());
+        let seq = live.epoch.seq();
+        pick(&[Report::HoverChanged {
+            from: Some(id), to: None, at: Vector2::new(450.0, 190.0), qpc: 0,
+        }], &hits, &mut picks, &mut intents);
+        assert_eq!(live.input.cursor(), None);
+        assert_eq!(live.input.hover(), None);
+        assert_ne!(live.epoch.seq(), seq);
+        assert!(intents.is_empty());
+    }
 
     /// A reader sees the version move with the value, and both reads answer the same one.
     ///
