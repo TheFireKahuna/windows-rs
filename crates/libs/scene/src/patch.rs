@@ -22,7 +22,16 @@ pub struct Span {
 /// than by an ordering every caller has to keep.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Attach {
+    /// Under the node, as its content: bounded by the node's clip.
     Node(NodeId),
+    /// Under the node, as its chrome: a paint of the node's own box, beneath all of its
+    /// content and outside its clip.
+    ///
+    /// A clip bounds what a node contains, not the node itself, so the border, fill and wash
+    /// that paint its box — and the halo that fill casts past the box — are not cut by it,
+    /// as an element's own shadow is not cut by its own overflow clip. Chrome paints below
+    /// every content child whatever `after` says, and `after` orders it among the chrome.
+    Chrome(NodeId),
     Window,
     Overlay,
 }
@@ -32,7 +41,7 @@ impl Attach {
     #[must_use]
     pub const fn node(self) -> Option<NodeId> {
         match self {
-            Self::Node(id) => Some(id),
+            Self::Node(id) | Self::Chrome(id) => Some(id),
             Self::Window | Self::Overlay => None,
         }
     }

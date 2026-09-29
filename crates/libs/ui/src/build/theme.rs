@@ -500,7 +500,7 @@ impl Host {
             true => SpriteId(node),
             // A group paints through a derived sprite spanning its own box.
             false => {
-                let id = self.visual(GroupId(node), None);
+                let id = self.chrome_visual(GroupId(node), None);
                 self.visual_insets(id, [0.0; 4]);
                 id
             }
@@ -661,7 +661,7 @@ impl Host {
     ) -> Option<SpriteId> {
         match (owned, held) {
             (true, Some(id)) => Some(id),
-            (true, None) => Some(self.visual(GroupId(node), after)),
+            (true, None) => Some(self.chrome_visual(GroupId(node), after)),
             (false, Some(id)) => {
                 self.drop_part(row, node, slot, id);
                 None

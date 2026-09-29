@@ -1405,7 +1405,7 @@ impl Scene {
                 parent,
                 after,
             } => {
-                if let Attach::Node(parent) = parent {
+                if let Some(parent) = parent.node() {
                     self.pending_retain(|pending| !matches!(pending.holds,
                         PendingKind::Collapse { parent: held, .. } if held == parent));
                 }
@@ -1474,34 +1474,111 @@ impl Scene {
         let Some(visual) = self.nodes.visual(id).cloned() else {
             return;
         };
+        let chrome = matches!(parent, Attach::Chrome(_));
+        if let Some(at) = parent.node()
+            && !self.nodes.visual(at).is_some_and(|group| group.as_container().is_some())
+        {
+            return;
+        }
+        // Fallible: a caller can hold a node whose parent was torn down between two
+        // operations, and already-removed is the wanted state. Removed from whichever
+        // collection holds it, because a node can move between a group's two bands.
+        let _ = self.content.children().try_remove(&visual);
+        let _ = self.overlay.children().try_remove(&visual);
+        if let Some(held) = visual.parent() {
+            let _ = held.children().try_remove(&visual);
+        }
         let collection = match parent {
             Attach::Window => self.content.children(),
             Attach::Overlay => self.overlay.children(),
-            Attach::Node(at) => match self.nodes.visual(at).and_then(Visual::as_container) {
-                Some(group) => group.children(),
-                None => return,
-            },
+            Attach::Node(at) | Attach::Chrome(at) => {
+                // Linked before the visual is placed, so the chain already holds this node
+                // when the split below asks whether the group carries chrome.
+                self.nodes.set_chrome(id, chrome);
+                self.roots.retain(|root| *root != id);
+                let after = after.map(|sibling| sibling.index() as u32);
+                link(&mut self.nodes, id.index() as u32, at.index() as u32, after);
+                // Chrome arriving under a clipped group is what makes the group need its
+                // two bands; content arriving never does.
+                if chrome {
+                    self.split_bands(at);
+                }
+                match self.nodes.band(at, chrome) {
+                    Some(collection) => collection,
+                    None => return,
+                }
+            }
         };
-        // Fallible: a caller can hold a node whose parent was torn down between two
-        // operations, and already-removed is the wanted state.
-        let _ = self.content.children().try_remove(&visual);
-        let _ = self.overlay.children().try_remove(&visual);
-        let _ = collection.try_remove(&visual);
-        match after.and_then(|sibling| self.nodes.visual(sibling).cloned()) {
+        let below = match parent {
+            Attach::Node(at) | Attach::Chrome(at) => self.nodes.below_in_band(at, after, chrome),
+            Attach::Window | Attach::Overlay => after,
+        }
+        .and_then(|sibling| self.nodes.visual(sibling).cloned());
+        match below {
             Some(sibling) => collection.insert_above(&visual, &sibling),
             None if matches!(parent, Attach::Overlay) => collection.insert_at_top(&visual),
             None => collection.insert_at_bottom(&visual),
         }
-        if let Attach::Node(at) = parent {
-            self.roots.retain(|root| *root != id);
-            let after = after.map(|sibling| sibling.index() as u32);
-            link(&mut self.nodes, id.index() as u32, at.index() as u32, after);
-        } else {
+        if parent.node().is_none() {
             unlink(&mut self.nodes, id.index() as u32);
             if !self.roots.contains(&id) {
                 self.roots.push(id);
             }
         }
+    }
+
+    /// Splits a clipped group carrying chrome into its two bands: the chrome stays on the
+    /// group's own visual, and the content and the clip move onto a carrier above it.
+    ///
+    /// A no-op for a group already split, unclipped, or carrying no chrome, so it is
+    /// called from both of the transitions that can make one need splitting — a clip
+    /// arriving and chrome arriving — without either knowing about the other.
+    ///
+    /// The carrier states no transform and no size of its own: its extent is the group's
+    /// through a relative size adjustment, so the group's own channels — offset, size,
+    /// scale, rotation, opacity, and the springs and expressions driving any of them — go
+    /// on moving chrome and content as one. The clip object moves rather than being
+    /// rebuilt, so a clip side or radius mid-animation keeps running on the carrier.
+    fn split_bands(&mut self, at: NodeId) {
+        let Some(group) = self.nodes.visual(at).and_then(Visual::as_container) else {
+            return;
+        };
+        let Some(aux) = self.nodes.aux(at) else {
+            return;
+        };
+        if aux.content.is_some() || aux.clip.is_none() {
+            return;
+        }
+        let kids: Vec<NodeId> = children(&self.nodes, at.index() as u32).collect();
+        if !kids.iter().any(|kid| self.nodes.is_chrome(*kid)) {
+            return;
+        }
+        let carrier = group.compositor().create_container_visual();
+        carrier.set_relative_size_adjustment(Vector2 { x: 1.0, y: 1.0 });
+        let band = carrier.children();
+        let own = group.children();
+        // Bottom to top, so the carrier holds its content in the order the chain states.
+        // Only a visual the group itself holds moves: one lifted into a drag preview or
+        // held by a collapse carrier is somewhere else for now, and returns to the band
+        // its parent resolves when that ends.
+        for kid in kids.iter().filter(|kid| !self.nodes.is_chrome(**kid)) {
+            if let Some(visual) = self.nodes.visual(*kid)
+                && own.try_remove(visual).is_ok()
+                && visual.parent().is_none()
+            {
+                band.insert_at_top(visual);
+            }
+        }
+        own.insert_at_top(&carrier);
+        let aux = self.nodes.aux_mut(at);
+        if let Some(clip) = &aux.clip {
+            group.clear_clip();
+            clip.apply(&carrier);
+        }
+        aux.content = Some(carrier);
+        note!("scene", "clip id={} split: chrome stays on the group, content and clip move to a carrier", at.index());
+        self.census.visuals_minted += 1;
+        self.census.visuals_live += 1;
     }
 
     /// Raises a detached overlay visual above the other overlays.
@@ -1522,12 +1599,12 @@ impl Scene {
             return;
         };
         let parent = self.nodes.links(id.index() as u32).parent;
+        // The band the node was attached in: a split group holds its content in a carrier.
         let held = (parent != NO_LINK)
             .then(|| self.nodes.id_at(parent))
-            .and_then(|at| self.nodes.visual(at))
-            .and_then(Visual::as_container);
-        if let Some(group) = held {
-            let _ = group.children().try_remove(&visual);
+            .and_then(|at| self.nodes.band(at, self.nodes.is_chrome(id)));
+        if let Some(band) = held {
+            let _ = band.try_remove(&visual);
         } else {
             // A root sits in a band rather than under a node, and which band is not recorded.
             let _ = self.content.children().try_remove(&visual);
@@ -1561,6 +1638,10 @@ impl Scene {
             |pending| !matches!(pending.holds, PendingKind::Frames(node, _) if node == id),
         );
         let (aux, painted) = self.nodes.free(id);
+        // A split group's content carrier goes with its visual.
+        if aux.as_ref().is_some_and(|aux| aux.content.is_some()) {
+            self.census.visuals_live = self.census.visuals_live.saturating_sub(1);
+        }
         if let (Some(aux), Some(resources)) = (aux, resources) { resources.push(aux); }
         self.prune_settlements();
         if let Some(painted) = painted {
@@ -1686,7 +1767,10 @@ impl Scene {
         let parent = self.nodes.id_at(at);
         let Some(group) = source.parent() else { return Ok(()); };
         let carrier = back.compositor.create_container_visual();
-        let parent_size = group.size();
+        // The parent node's box, from the shadow: the collection holding the source can be
+        // a split group's content carrier, whose own `Size` is zero because it takes the
+        // group's extent through a relative size adjustment.
+        let parent_size = self.nodes.size(parent);
         carrier.set_size(parent_size.x, parent_size.y);
         let offset = source.offset();
         let clip = back.compositor.create_rectangle_clip();
@@ -1819,6 +1903,9 @@ impl Scene {
                 self.nodes.stop(id, desc(prop));
             }
         }
+        // Where the clip lands: a split group's content carrier, a lit sprite's paint, or
+        // the node's own visual. Never the visual that holds the node's own chrome or halo.
+        let host = self.nodes.clip_host(id).unwrap_or_else(|| visual.clone());
         let next = match clip {
             Clip::None => None,
             Clip::Bounds => Some(ClipObj::Bounds(back.compositor.create_inset_clip())),
@@ -1826,26 +1913,24 @@ impl Scene {
             // its own radii.
             Clip::Rect { .. } | Clip::RoundedBounds(_) => Some(ClipObj::Rect(back.compositor.create_rectangle_clip())),
             Clip::Geom(geom) => self.res.geom(geom).map(|geometry| {
-                // Soft border mode antialiases the clip edge, which is what makes a
-                // geometric clip usable as a shape.
-                visual.set_border_mode(windows_composition::BorderMode::Soft);
                 ClipObj::Geom(back.compositor.create_geometric_clip(geometry))
             }),
         };
         match &next {
-            Some(ClipObj::Bounds(clip)) => visual.set_clip(Some(clip)),
-            Some(ClipObj::Rect(clip)) => visual.set_clip(Some(clip)),
-            Some(ClipObj::Geom(clip)) => visual.set_clip(Some(clip)),
+            Some(next) => next.apply(&host),
             // Clears only what the *sink* established: a clip-route shape mask writes its
             // geometric clip straight onto the visual without claiming this slot.
             None if was_rect || self.nodes.aux(id).is_some_and(|aux| aux.clip.is_some()) => {
-                visual.clear_clip();
+                host.clear_clip();
             }
             None => {}
         }
         let aux = self.nodes.aux_mut(id);
         aux.clip = next;
         aux.decl = clip;
+        // A clip arriving on a group that already paints its own box is the other way a
+        // group comes to need its two bands; chrome arriving is the first.
+        self.split_bands(id);
         self.write_clip(id, clip)?;
         if rounded {
             self.bind_rounded_bounds(id, back);
@@ -3307,6 +3392,86 @@ mod tests {
         rig.scene.device_lost(&rig.back, rig.env).expect("rebuilt");
         assert_eq!(rig.scene.nodes.chan(id, sigma + 1), 0.3);
         assert_eq!(rig.scene.nodes.chan(id, sigma), 12.0);
+    }
+
+    /// A group's clip bounds its content and not its own chrome: once a clipped group
+    /// carries chrome, the chrome stays on the group's visual and the content moves onto a
+    /// carrier holding the clip, in either order of arrival, and later content lands in
+    /// the carrier whatever sibling its `after` names.
+    #[test]
+    fn a_clipped_group_keeps_its_chrome_and_halo_outside_its_content_clip() {
+        let Some(mut rig) = rig() else { return };
+        for clip_first in [true, false] {
+            let mut patch = SinkPatch::default();
+            let group = rig.ids.mint();
+            patch.push(Op::New { id: group, kind: NodeKind::Group, parent: Attach::Window, after: None });
+            patch.push(Op::Bind { id: group, prop: Prop::Size, bind: Bind::Set(Value::Vec2(Vector2::new(120.0, 80.0))) });
+            let content = rig.ids.mint();
+            patch.push(Op::New { id: content, kind: NodeKind::Sprite, parent: Attach::Node(group), after: None });
+            let clip = Op::Clip { id: group, clip: Clip::RoundedBounds(Corners::all(8.0)) };
+            if clip_first {
+                patch.push(clip);
+            }
+            let fill = rig.ids.mint();
+            patch.push(Op::New { id: fill, kind: NodeKind::Sprite, parent: Attach::Chrome(group), after: None });
+            patch.push(Op::Bind { id: fill, prop: Prop::Size, bind: Bind::Set(Value::Vec2(Vector2::new(120.0, 80.0))) });
+            patch.push(Op::Mask { id: SpriteId(fill), mask: FILL });
+            patch.push(Op::Paint {
+                id: SpriteId(fill),
+                paint: Paint::Solid(Radiance::new(0.5, 0.5, 0.5, 1.0)),
+                halo: Some(Halo { sigma: 8.0, tint: Radiance::new(0.2, 0.6, 0.9, 1.0), offset: Vector2::zero() }),
+            });
+            if !clip_first {
+                patch.push(clip);
+            }
+            rig.apply(&mut patch);
+
+            let own = rig.scene.nodes.visual(group).and_then(Visual::as_container).expect("a group");
+            let carrier = rig.scene.nodes.aux(group).and_then(|aux| aux.content.clone())
+                .expect("a clipped group with chrome is split");
+            assert!(rig.scene.nodes.is_chrome(fill) && !rig.scene.nodes.is_chrome(content));
+            // The group holds its chrome, beneath the carrier; the carrier holds the content.
+            assert_eq!(own.children().count(), 2, "chrome and the carrier");
+            assert_eq!(carrier.children().count(), 1, "the content alone");
+            assert!(rig.scene.nodes.visual(content).and_then(Visual::parent).is_some_and(|held| held.children().count() == 1));
+            assert!(rig.scene.nodes.visual(fill).and_then(Visual::parent).is_some_and(|held| held.children().count() == 2));
+            // The lit chrome kept its halo, and its clip host is its paint, not the group.
+            assert!(rig.scene.nodes.aux(fill).is_some_and(|aux| aux.glow.is_some()));
+
+            // Later content whose `after` names the chrome still lands in the carrier.
+            let late = rig.ids.mint();
+            patch.push(Op::New { id: late, kind: NodeKind::Sprite, parent: Attach::Node(group), after: Some(fill) });
+            rig.apply(&mut patch);
+            assert_eq!(carrier.children().count(), 2);
+            assert_eq!(own.children().count(), 2);
+
+            // Unclipping keeps the carrier, cleared, and destroying content empties it.
+            patch.push(Op::Clip { id: group, clip: Clip::None });
+            patch.push(Op::Drop { id: late, exit: Exit::None, origin: Point::default(), bounds: None });
+            rig.apply(&mut patch);
+            assert!(rig.scene.nodes.aux(group).is_some_and(|aux| aux.content.is_some()));
+            assert_eq!(carrier.children().count(), 1);
+
+            patch.push(Op::Drop { id: group, exit: Exit::None, origin: Point::default(), bounds: None });
+            rig.apply(&mut patch);
+        }
+    }
+
+    /// A group with a clip and no chrome is not split: an ordinary clipped container pays
+    /// no carrier.
+    #[test]
+    fn a_clipped_group_without_chrome_stays_one_visual() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let group = rig.ids.mint();
+        patch.push(Op::New { id: group, kind: NodeKind::Group, parent: Attach::Window, after: None });
+        let content = rig.ids.mint();
+        patch.push(Op::New { id: content, kind: NodeKind::Sprite, parent: Attach::Node(group), after: None });
+        patch.push(Op::Clip { id: group, clip: Clip::Bounds });
+        rig.apply(&mut patch);
+        assert!(rig.scene.nodes.aux(group).is_some_and(|aux| aux.content.is_none()));
+        let own = rig.scene.nodes.visual(group).and_then(Visual::as_container).expect("a group");
+        assert_eq!(own.children().count(), 1);
     }
 
     /// Renders two haloed sprites and the glow pipeline's every intermediate, so the

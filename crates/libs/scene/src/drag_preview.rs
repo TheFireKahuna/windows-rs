@@ -46,13 +46,24 @@ impl Scene {
         let links = self.nodes.links(node.index() as u32);
         if links.parent == NO_LINK { return false; }
         let prev = links.prev;
-        let previous_id = (prev != NO_LINK).then(|| self.nodes.id_at(prev));
+        // The sibling the source is restored above is the nearest one in its own band: a
+        // split group holds its chrome and its content in two collections, and the chain's
+        // previous sibling can be in the other. That sibling is the one watched, since it
+        // is the one whose removal would leave the restore nowhere to go.
+        let previous_id = self.nodes.below_in_band(
+            self.nodes.id_at(links.parent),
+            (prev != NO_LINK).then(|| self.nodes.id_at(prev)),
+            self.nodes.is_chrome(node),
+        );
         let previous = previous_id.and_then(|id| self.nodes.visual(id)).cloned();
         let carrier = back.compositor.create_container_visual();
         carrier.set_parent_for_transform(&parent);
         carrier.set_pixel_snapping(true);
+        // The parent node's own visual, which a split group's content carrier shares its
+        // space with but whose `Size` is the one that holds the extent.
+        let sized = self.nodes.visual(self.nodes.id_at(links.parent)).cloned().unwrap_or_else(|| (*parent).clone());
         let extent = back.compositor.create_expression_animation("parent.Size");
-        extent.set_reference_parameter("parent", &*parent);
+        extent.set_reference_parameter("parent", &sized);
         carrier.start_animation("Size", &extent);
         parent.children().try_remove(&source).expect("the source belongs to its parent");
         carrier.children().insert_at_top(&source);
@@ -81,8 +92,13 @@ impl Scene {
         // Capture ignores its root transform. Scaling inside that root rasterizes
         // text at device resolution; the reciprocal outer scale preserves the lift.
         content.set_scale(Vector3::new(scale, scale, 1.0));
+        let links = self.nodes.links(lift.node.index() as u32);
+        let sized = (links.parent != NO_LINK)
+            .then(|| self.nodes.visual(self.nodes.id_at(links.parent)).cloned())
+            .flatten()
+            .unwrap_or_else(|| (*lift.parent).clone());
         let extent = back.compositor.create_expression_animation("parent.Size");
-        extent.set_reference_parameter("parent", &*lift.parent);
+        extent.set_reference_parameter("parent", &sized);
         content.start_animation("Size", &extent);
         lift.carrier.set_scale(Vector3::new(1.0 / scale, 1.0 / scale, 1.0));
         lift.carrier.children().remove_all();
@@ -146,12 +162,26 @@ impl Scene {
     pub fn end_drag_preview(&mut self) {
         let Some(lift) = self.lift.take() else { return; };
         lift.carrier.children().remove_all();
-        let children = lift.parent.children();
         if let Some(placeholder) = lift.placeholder {
             drop(placeholder);
             self.census.visuals_live -= 2;
         }
-        match lift.previous {
+        // Resolved again rather than read from the lift: a clip or chrome that arrived
+        // during the drag can have split the parent, moving its content into a carrier.
+        let links = self.nodes.links(lift.node.index() as u32);
+        let parent = (links.parent != NO_LINK).then(|| self.nodes.id_at(links.parent));
+        let chrome = self.nodes.is_chrome(lift.node);
+        let children = parent
+            .and_then(|parent| self.nodes.band(parent, chrome))
+            .unwrap_or_else(|| lift.parent.children());
+        let previous = match parent {
+            Some(parent) => self
+                .nodes
+                .below_in_band(parent, lift.previous_id, chrome)
+                .and_then(|id| self.nodes.visual(id).cloned()),
+            None => lift.previous,
+        };
+        match previous {
             Some(previous) => children.insert_above(&lift.source, &previous),
             None => children.insert_at_bottom(&lift.source),
         }

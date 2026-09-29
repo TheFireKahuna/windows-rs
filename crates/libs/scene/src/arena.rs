@@ -176,6 +176,25 @@ pub enum ClipObj {
     Geom(CompositionGeometricClip),
 }
 
+impl ClipObj {
+    /// Puts this clip on `visual`, which is whichever visual [`Arena::clip_host`] names.
+    ///
+    /// The clip object is the thing its channels animate, so moving it between hosts keeps
+    /// every running side and radius animation: nothing here restarts one.
+    pub fn apply(&self, visual: &Visual) {
+        match self {
+            Self::Bounds(clip) => visual.set_clip(Some(clip)),
+            Self::Rect(clip) => visual.set_clip(Some(clip)),
+            Self::Geom(clip) => {
+                // Soft border mode antialiases the clip edge, which is what makes a
+                // geometric clip usable as a shape; it belongs to the visual the clip is on.
+                visual.set_border_mode(windows_composition::BorderMode::Soft);
+                visual.set_clip(Some(clip));
+            }
+        }
+    }
+}
+
 /// The off-tree capture a stroked or trimmed shape mask is built from.
 ///
 /// A sprite shape's fill and stroke brushes do not accept a surface brush, so an FP16 colour
@@ -368,6 +387,20 @@ pub struct Aux {
     /// The last clip declared. A clip is declared rather than diffed, so layout re-states it
     /// on every node it touches and comparing here makes an unchanged re-statement free.
     pub decl: Clip,
+    /// The carrier a clipped group's content lives in, beneath which its chrome sits
+    /// unclipped.
+    ///
+    /// **A node's clip bounds its content, not its own box.** A group's chrome — the
+    /// border, fill and wash that paint the group's own box — and the light that chrome
+    /// casts past the box are not content, so they stay on the group's own visual while
+    /// the clip and every content child move onto this carrier. Minted only for a group
+    /// that is clipped *and* carries chrome, and kept once minted: a clip that goes away
+    /// leaves an unclipped carrier rather than a second migration of the children.
+    ///
+    /// It adds no transform, offset or size of its own: its extent is the group's through
+    /// a relative size adjustment, so an animated resize, a layout spring or a transform
+    /// on the group moves chrome and content as one, and the clip still bounds the box.
+    pub content: Option<ContainerVisual>,
 }
 
 /// Which of the two constructions realizes a shape mask. Derived, never authored.
@@ -442,6 +475,9 @@ impl Painted {
 // ── the arena ───────────────────────────────────────────────────────────────────────
 
 const F_SPRITE: u16 = 1 << 0;
+/// Attached through [`Attach::Chrome`](crate::patch::Attach::Chrome): paints its parent's own box, outside the parent's
+/// content clip.
+const F_CHROME: u16 = 1 << 1;
 
 /// How many bytes one node costs, across every column.
 pub const NODE_ROW_BYTES: usize = size_of::<u32>()
@@ -564,6 +600,79 @@ impl Arena {
         self.flags
             .get(id.index())
             .is_some_and(|flags| flags & F_SPRITE != 0)
+    }
+
+    /// Whether the node is its parent's chrome rather than its content.
+    #[must_use]
+    pub fn is_chrome(&self, id: NodeId) -> bool {
+        self.flags
+            .get(id.index())
+            .is_some_and(|flags| flags & F_CHROME != 0)
+    }
+
+    /// Records which band of its parent the node attaches in. Written on every attach, so
+    /// a node moved between bands is never left carrying the other's flag.
+    pub fn set_chrome(&mut self, id: NodeId, chrome: bool) {
+        if let Some(flags) = self.flags.get_mut(id.index()) {
+            match chrome {
+                true => *flags |= F_CHROME,
+                false => *flags &= !F_CHROME,
+            }
+        }
+    }
+
+    /// The collection a child of `id` in the given band is held in: the group's own
+    /// visual for its chrome, and its content carrier, where it has one, for its content.
+    #[must_use]
+    pub fn band(&self, id: NodeId, chrome: bool) -> Option<windows_composition::VisualCollection> {
+        let carrier = (!chrome)
+            .then(|| self.aux(id).and_then(|aux| aux.content.as_ref()))
+            .flatten();
+        match carrier {
+            Some(carrier) => Some(carrier.children()),
+            None => self.visual(id)?.as_container().map(|group| group.children()),
+        }
+    }
+
+    /// The nearest sibling at or below `after` that the same collection holds, which is
+    /// the sibling a visual in that band is inserted above.
+    ///
+    /// The arena's child chain interleaves both bands, while a carrier splits them across
+    /// two collections: a content child's `after` can name a chrome sibling, which is not
+    /// in the carrier and cannot be inserted above. Walking down to the nearest sibling in
+    /// the child's own band keeps the relative order the chain states within each band.
+    #[must_use]
+    pub fn below_in_band(&self, parent: NodeId, after: Option<NodeId>, chrome: bool) -> Option<NodeId> {
+        let split = self.aux(parent).is_some_and(|aux| aux.content.is_some());
+        let mut at = after.filter(|id| self.live(*id))?.index() as u32;
+        loop {
+            let id = self.id_at(at);
+            if !split || self.is_chrome(id) == chrome {
+                return Some(id);
+            }
+            at = self.links(at).prev;
+            if at == NO_LINK {
+                return None;
+            }
+        }
+    }
+
+    /// The visual a node's clip is set on.
+    ///
+    /// A group split into chrome and content clips its content carrier; a lit sprite
+    /// clips the child its paint moved to, so the halo beside that child escapes the
+    /// sprite's own clip as a group's chrome escapes the group's; anything else clips its
+    /// own visual.
+    #[must_use]
+    pub fn clip_host(&self, id: NodeId) -> Option<Visual> {
+        let aux = self.aux(id);
+        if let Some(carrier) = aux.and_then(|aux| aux.content.as_ref()) {
+            return Some((**carrier).clone());
+        }
+        if let Some(glow) = aux.and_then(|aux| aux.glow.as_ref()) {
+            return Some((**glow.paint).clone());
+        }
+        self.visual(id).cloned()
     }
 
     /// Frees the row and hands back what the caller must release.

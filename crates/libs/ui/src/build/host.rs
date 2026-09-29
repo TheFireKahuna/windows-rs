@@ -473,6 +473,19 @@ impl Host {
         kind: NodeKind,
         bits: tree::Bits,
     ) -> NodeId {
+        self.mint_in(Attach::Node(parent), after, kind, bits)
+    }
+
+    /// Mints a node attached through `attach`, which names its parent and the band of that
+    /// parent it sits in.
+    fn mint_in(
+        &mut self,
+        attach: Attach,
+        after: Option<NodeId>,
+        kind: NodeKind,
+        bits: tree::Bits,
+    ) -> NodeId {
+        let parent = attach.node().expect("a minted node attaches under a parent");
         let id = self.tree.mint(self.tree.c.scope[parent.index()]);
         self.tree.c.flags[id.index()] |= bits;
         self.tree.link(id, parent, after);
@@ -482,7 +495,7 @@ impl Host {
         self.pending.push(Op::New {
             id,
             kind,
-            parent: Attach::Node(parent),
+            parent: attach,
             after,
         });
         id
@@ -549,6 +562,16 @@ impl Host {
     pub(crate) fn visual(&mut self, parent: GroupId, after: Option<NodeId>) -> SpriteId {
         let bits = tree::SPRITE | tree::DERIVED;
         SpriteId(self.mint_under(parent.0, after, NodeKind::Sprite, bits))
+    }
+
+    /// Mints a derived sprite painting `parent`'s own box: its border, fill or wash.
+    ///
+    /// Attached as chrome rather than content, so the parent's clip — which bounds what the
+    /// parent contains — does not cut the box's own paint or the halo it casts. `after`
+    /// orders it among the parent's chrome, which paints beneath all of its content.
+    pub(crate) fn chrome_visual(&mut self, parent: GroupId, after: Option<NodeId>) -> SpriteId {
+        let bits = tree::SPRITE | tree::DERIVED;
+        SpriteId(self.mint_in(Attach::Chrome(parent.0), after, NodeKind::Sprite, bits))
     }
 
     /// Places a derived sprite at its own box.

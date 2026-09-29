@@ -1979,6 +1979,13 @@ fn cast_glow(
     kids.remove_all();
     kids.insert_at_bottom(&paint_sprite);
     kids.insert_at_bottom(&glow_sprite);
+    // A clip bounds the node's paint and not the light it casts, so the node's own clip
+    // follows the paint onto its child: left on the host it would cut the halo off at the
+    // box. The clip object moves, so its animated sides and radii keep running.
+    if let Some(clip) = arena.aux(id).and_then(|aux| aux.clip.as_ref()) {
+        sprite.clear_clip();
+        clip.apply(&paint_sprite);
+    }
 
     let target = paint_sprite.clone();
     let glow = GlowState {
@@ -2045,6 +2052,10 @@ fn unlight(arena: &mut Arena, id: NodeId, sprite: &SpriteVisual, ctx: &mut Ctx<'
         note!("scene", "glow id={} dropped: four visuals freed", id.index());
         sprite.children().remove_all();
         arena.aux_mut(id).glow = None;
+        // The paint returns to the node, and its clip with it.
+        if let Some(clip) = arena.aux(id).and_then(|aux| aux.clip.as_ref()) {
+            clip.apply(sprite);
+        }
         ctx.freed += 4;
     }
 }
