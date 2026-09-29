@@ -103,7 +103,10 @@ impl SurfaceDraw for CompositionDrawingSurface {
     fn draw(&self, dpi: f32, opacity: Opacity, f: impl FnOnce(&Draw<'_>)) -> Result<bool> {
         match self.begin_draw::<ID2D1DeviceContext>() {
             Ok((ctx, offset)) => paint(&ctx, offset, dpi, opacity, f, || self.end_draw()),
-            Err(e) if classify(e.code()) != Loss::None => Ok(false),
+            Err(e) if classify(e.code()) != Loss::None => {
+                note!("d2d", "BeginDraw lost on a drawing surface — carried as Ok(false): {}", e);
+                Ok(false)
+            }
             Err(e) => Err(e),
         }
     }
@@ -115,7 +118,10 @@ impl SurfaceDraw for CompositionDrawHandle {
     fn draw(&self, dpi: f32, opacity: Opacity, f: impl FnOnce(&Draw<'_>)) -> Result<bool> {
         match self.begin_draw::<ID2D1DeviceContext>() {
             Ok((ctx, offset)) => paint(&ctx, offset, dpi, opacity, f, || self.end_draw()),
-            Err(e) if classify(e.code()) != Loss::None => Ok(false),
+            Err(e) if classify(e.code()) != Loss::None => {
+                note!("d2d", "BeginDraw lost on a draw handle — carried as Ok(false): {}", e);
+                Ok(false)
+            }
             Err(e) => Err(e),
         }
     }
@@ -168,7 +174,10 @@ fn paint(
 
     match publish() {
         Ok(()) => Ok(true),
-        Err(e) if classify(e.code()) != Loss::None => Ok(false),
+        Err(e) if classify(e.code()) != Loss::None => {
+            note!("d2d", "EndDraw lost — carried as Ok(false): {}", e);
+            Ok(false)
+        }
         Err(e) => Err(e),
     }
 }

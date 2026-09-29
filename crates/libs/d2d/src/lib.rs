@@ -30,6 +30,7 @@ mod blur;
 mod brush;
 mod device;
 mod geometry;
+mod note;
 mod pass;
 mod target;
 

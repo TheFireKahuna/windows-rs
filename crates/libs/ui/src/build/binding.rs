@@ -147,7 +147,7 @@ impl Host {
     pub(crate) fn publish_channels(&mut self) {
         let mut queued = core::mem::take(&mut self.queued);
         for (node, prop, bind) in queued.drain(..) {
-            let target = if matches!(prop, Prop::ShadowOpacity | Prop::BlurRadius) {
+            let target = if matches!(prop, Prop::GlowOpacity | Prop::GlowSigma) {
                 let head = self.tree.c.paints[node.index()];
                 let bearer = self.appearances.halo_bearer(head);
                 if bearer.is_none() { node } else { bearer }

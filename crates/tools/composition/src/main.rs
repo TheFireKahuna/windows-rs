@@ -27,6 +27,10 @@ fn main() {
             "Windows.UI.Composition.Interactions.IInteractionTrackerOwner",
             "Windows.Graphics.IGeometrySource2D",
             "Windows.Win32.IGeometrySource2DInterop",
+            // The effect-graph node interfaces: `effects.rs` implements them, so the
+            // `_Impl` traits and vtable constructors have to be emitted.
+            "Windows.Graphics.Effects.IGraphicsEffect",
+            "Windows.Graphics.Effects.IGraphicsEffectSource",
         ])
         .minimal()
         .dead_code()

@@ -346,6 +346,31 @@ Windows.UI.Composition.IDropShadow2::{put_SourcePolicy}
 Windows.UI.Composition.CompositionDropShadowSourcePolicy
 Windows.UI.Composition.ISpriteVisual2::{put_Shadow}
 
+// Effect brushes. A compositor-evaluated Direct2D effect graph over named brush sources.
+// The graph is described as plain data in `effects.rs`, which also hand-declares
+// `IGraphicsEffectD2D1Interop` — the interop the compositor walks the graph through —
+// because the interface is absent from both the Win32 corpus and Windows.Graphics.Effects'
+// generated projection (see that module). The point of the graph over a shadow plus a
+// mask brush is that the blur's OUTPUT stays in the compositor's float pipeline: a mask
+// brush can only take an already-rendered result, which the visual-surface capture
+// delivers 8 bits wide.
+Windows.UI.Composition.ICompositor::{CreateEffectFactory, CreateEffectFactoryWithProperties}
+Windows.UI.Composition.CompositionEffectFactory
+Windows.UI.Composition.ICompositionEffectFactory::{CreateBrush, get_LoadStatus, get_ExtendedError}
+Windows.UI.Composition.CompositionEffectBrush
+Windows.UI.Composition.ICompositionEffectBrush::{SetSourceParameter, GetSourceParameter}
+// The graph-walk interfaces and the named brush slot an effect source binds to at run
+// time. The first two are also in the tool's `--implement` list, which is what emits
+// the `_Impl` scaffolding the effect nodes implement.
+Windows.Graphics.Effects.IGraphicsEffect
+Windows.Graphics.Effects.IGraphicsEffectSource
+Windows.UI.Composition.CompositionEffectSourceParameter
+Windows.UI.Composition.ICompositionEffectSourceParameterFactory::Create
+// Property values the walk reads out of a node: a composite's mode is a u32, a
+// Gaussian's standard deviation is a float.
+Windows.Foundation.PropertyValue::{CreateUInt32, CreateSingle}
+Windows.Foundation.IPropertyValue
+
 Windows.UI.Composition.ICompositionNineGridBrush::{SetInsetScales}
 Windows.UI.Composition.IVisualCollection::{InsertAbove}
 

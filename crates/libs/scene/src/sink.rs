@@ -590,7 +590,7 @@ pub enum Paint {
     Ramp(RampId),
     Captured {
         group: GroupId,
-        blur: f32,
+        sigma: f32,
         tint: Radiance,
     },
     Presented(RegionId),
@@ -628,11 +628,15 @@ pub enum RegionSampling {
 
 /// A blurred copy of the sprite's own silhouette, cast behind it.
 ///
-/// The compositor derives it from the brush already bound, so it costs no visual, no capture
-/// and no second mask.
+/// The halo is an effect graph the compositor evaluates: a Gaussian of sigma `sigma` DIPs
+/// over the sprite's brush alpha, multiplied by the tint. The construction costs the
+/// census four visuals ([16 §10](16-SCENE-INTERNALS.md) of the GUI spec records why), and
+/// the sigma animates as a channel like any other.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct Halo {
-    pub blur: f32,
+    /// Gaussian sigma, in DIPs. The capture that feeds the blur is sized at `3·sigma +
+    /// |offset|` past the node's box on every side, fixed at the construction.
+    pub sigma: f32,
     pub tint: Radiance,
     pub offset: Vector2,
 }
@@ -873,8 +877,11 @@ pub enum Prop {
     TrimEnd,
     StrokeThickness,
     DashOffset,
-    BlurRadius,
-    ShadowOpacity,
+    /// The glow's Gaussian sigma, in DIPs. The channel drives the effect property, whose
+    /// own name is the platform's `"blur.BlurAmount"`.
+    GlowSigma,
+    /// The glow's opacity, on the halo sprite alone.
+    GlowOpacity,
     /// Horizontal anchor fraction, independent of the layout offset.
     AnchorX,
     /// Vertical anchor fraction, independent of the layout offset.

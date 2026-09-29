@@ -319,7 +319,7 @@ impl Appearances {
 
     /// The sprite a node's declared halo hangs on, or [`NodeId::NONE`].
     ///
-    /// A halo's opacity and blur belong to the sprite casting it rather than to the node that
+    /// A halo's opacity and sigma belong to the sprite casting it rather than to the node that
     /// declared it, and a node's paints are a chain, so this is where the two are joined.
     pub(crate) fn halo_bearer(&self, head: NodeId) -> NodeId {
         let mut at = head;
@@ -951,7 +951,7 @@ impl Host {
                     },
                 };
                 Some(Halo {
-                    blur: shadow.sigma,
+                    sigma: shadow.sigma,
                     tint: shadow.light,
                     offset,
                 })
@@ -1147,7 +1147,7 @@ impl<K> Element<'_, K> {
 
     /// How much of its halo this element is spending now.
     pub fn halo_lit<M>(self, value: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::ShadowOpacity, value)
+        self.channel(Prop::GlowOpacity, value)
     }
 
     fn halo_style(mut self, halo: HaloStyle) -> Self {
@@ -1288,7 +1288,7 @@ impl Host {
 fn halo_of(emission: Emission, of: Silhouette, light: Radiance) -> Option<Halo> {
     let spend = emission.of(of);
     spend.is_lit().then(|| Halo {
-        blur: spend.sigma,
+        sigma: spend.sigma,
         tint: light.with_alpha(light.a * spend.strength),
         offset: Vector2::default(),
     })
@@ -1379,8 +1379,8 @@ mod tests {
                     if paint.part == Part::Fill {
                         fills += 1;
                         assert!(patch.ops().iter().any(|op| matches!(op,
-                            Op::Paint { id, halo: Some(Halo { blur, tint, offset }), .. }
-                            if *id == paint.id && *blur == 10.0 && tint.a == 0.3
+                            Op::Paint { id, halo: Some(Halo { sigma, tint, offset }), .. }
+                            if *id == paint.id && *sigma == 10.0 && tint.a == 0.3
                                 && *offset == Vector2::new(0.0, 6.0)
                         )));
                     } else { assert!(paint.halo.is_none()); }

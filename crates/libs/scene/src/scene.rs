@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::rc::Rc;
 use std::sync::Arc;
+use windows_d2d::note;
 use windows_composition::{
     Animatable, Animation, BatchKind, ChainingMode, Clamping, CompositionAnimation,
     CompositionEasingFunction, CompositionPropertySet, CompositionScopedBatch, ContainerVisual,
@@ -1337,6 +1338,7 @@ impl Scene {
     ///
     /// Fails if the ground or a sprite's chain cannot be rebuilt.
     pub fn device_lost(&mut self, back: &Backends, env: Env) -> Result<()> {
+        note!("scene", "device loss recovery: the device generation bumps and every cell re-rasterizes");
         self.end_drag_preview();
         self.generation.device = self.generation.device.wrapping_add(1);
         self.cache.clear();
@@ -1709,7 +1711,7 @@ impl Scene {
     /// Three sigmas covers a Gaussian's visible tail, and an offset shadow moves that tail
     /// with it.
     fn halo_margin(&self, id: NodeId) -> f32 {
-        let blur = PROPS[Prop::BlurRadius as usize].chan;
+        let sigma = PROPS[Prop::GlowSigma as usize].chan;
         let own = match self.nodes.aux(id).and_then(|aux| aux.glow.as_ref()) {
             Some(_) => {
                 let offset = self
@@ -1717,7 +1719,7 @@ impl Scene {
                     .painted(id)
                     .and_then(|painted| painted.halo)
                     .map_or(0.0, |halo| halo.offset.x.abs().max(halo.offset.y.abs()));
-                self.nodes.chan(id, blur).max(0.0) * 3.0 + offset
+                self.nodes.chan(id, sigma).max(0.0) * 3.0 + offset
             }
             None => 0.0,
         };
@@ -2805,8 +2807,7 @@ mod tests {
             eprintln!("skipped: no window in this session");
             return None;
         };
-        let Ok(gpu) = windows_d2d::Gpu::for_window() else {
-            eprintln!("skipped: no Direct2D device in this session");
+        let Ok(gpu) = windows_d2d::Gpu::for_window() else {            eprintln!("skipped: no Direct2D device in this session");
             return None;
         };
         let comp = Compositor::new().expect("a compositor");
@@ -3270,7 +3271,7 @@ mod tests {
         assert!(rig.scene.nodes.has_aux(clipped), "a clip needs one");
     }
 
-    /// A halo casts at the blur it declared and at full opacity until a channel says
+    /// A halo casts at the sigma it declared and at full opacity until a channel says
     /// otherwise, and a rebind under a lost device restates the channel rather than the
     /// declaration.
     #[test]
@@ -3286,26 +3287,205 @@ mod tests {
             id: SpriteId(id),
             paint: Paint::Solid(Radiance::new(0.5, 0.5, 0.5, 1.0)),
             halo: Some(Halo {
-                blur: 12.0,
+                sigma: 12.0,
                 tint: Radiance::new(0.2, 0.6, 0.9, 1.0),
                 offset: Vector2::zero(),
             }),
         });
         rig.apply(&mut patch);
-        let blur = PROPS[Prop::BlurRadius as usize].chan;
-        assert_eq!(rig.scene.nodes.chan(id, blur), 12.0);
-        assert_eq!(rig.scene.nodes.chan(id, blur + 1), 1.0);
+        let sigma = PROPS[Prop::GlowSigma as usize].chan;
+        assert_eq!(rig.scene.nodes.chan(id, sigma), 12.0);
+        assert_eq!(rig.scene.nodes.chan(id, sigma + 1), 1.0);
         assert!(rig.scene.nodes.aux(id).is_some_and(|aux| aux.glow.is_some()));
 
         patch.push(Op::Bind {
             id,
-            prop: Prop::ShadowOpacity,
+            prop: Prop::GlowOpacity,
             bind: Bind::Set(Value::Scalar(0.3)),
         });
         rig.apply(&mut patch);
         rig.scene.device_lost(&rig.back, rig.env).expect("rebuilt");
-        assert_eq!(rig.scene.nodes.chan(id, blur + 1), 0.3);
-        assert_eq!(rig.scene.nodes.chan(id, blur), 12.0);
+        assert_eq!(rig.scene.nodes.chan(id, sigma + 1), 0.3);
+        assert_eq!(rig.scene.nodes.chan(id, sigma), 12.0);
+    }
+
+    /// Renders two haloed sprites and the glow pipeline's every intermediate, so the
+    /// pipeline can be bisected by eye in one capture.
+    ///
+    /// Ignored because the window stays open: run it alone, capture the window with
+    /// guishot while the five-second hold runs, and read the panels:
+    ///
+    /// 1. the glow the full graph paints,
+    /// 2. the raw capture, the blur's input, painted sharp,
+    /// 3. the caster's brush — the silhouette — painted sharp.
+    ///
+    /// A panel dark where the one above it is bright names the first dead link.
+    #[test]
+    #[ignore]
+    fn glow_pipeline_debug() {
+        let Ok(queue) = DispatcherQueueController::create_on_current_thread() else {
+            eprintln!("skipped: no dispatcher queue in this session");
+            return;
+        };
+        let Ok(window) = windows_window::Window::new("glow pipeline debug")
+            .size(1100, 900)
+            .create()
+        else {
+            eprintln!("skipped: no window in this session");
+            return;
+        };
+        let Ok(gpu) = windows_d2d::Gpu::for_window() else {
+            eprintln!("skipped: no Direct2D device in this session");
+            return;
+        };
+        let comp = Compositor::new().expect("a compositor");
+        let back = Backends::new(comp.clone(), &gpu, FontLadder::default()).expect("the backends");
+        // Display scale 1.5, the case the GUI cards run at.
+        let env = Env::new(
+            144.0,
+            OutputTransform::for_display(DisplayCapability::Sdr, 203.0),
+        );
+        let mut scene =
+            Scene::new_at(window.handle(), &back, env, BackdropSpec::default()).expect("a scene");
+
+        // A ramp resource, the paint the GUI's card headers carry.
+        let ramp = RampId::raw(3, 1);
+        let ramp_stops = [
+            (0u16, Radiance::new(0.5, 0.55, 0.65, 1.0)),
+            (65535, Radiance::new(0.2, 0.6, 0.9, 1.0)),
+        ];
+        let ramp_surface = back
+            .raster_ramp(&ramp_stops, Spread::Vertical, env, None)
+            .expect("the ramp rasterized")
+            .expect("a ramp surface");
+        scene.res.declare(
+            ramp.erased(),
+            ResObj::Brush(back.brush(&ramp_surface, Stretch::Fill), Some(ramp_surface.clone())),
+        );
+
+        // Four sprite nodes: [1] the solid control, [2] the ramp paint, [3] a displaced
+        // halo, [4] one that stage two re-points and drives through the channels.
+        let mut patch = SinkPatch::default();
+        let mut ids = Ids::default();
+        let mut node = |paint: Paint, offset: (f32, f32), halo: Halo, patch: &mut SinkPatch| {
+            let id = ids.mint();
+            patch.push(Op::New { id, kind: NodeKind::Sprite, parent: Attach::Window, after: None });
+            patch.push(Op::Bind { id, prop: Prop::Offset, bind: Bind::Set(Value::Vec2(Vector2 { x: offset.0, y: offset.1 })) });
+            patch.push(Op::Bind { id, prop: Prop::Size, bind: Bind::Set(Value::Vec2(Vector2 { x: 300.0, y: 200.0 })) });
+            patch.push(Op::Mask { id: SpriteId(id), mask: Mask::Box { radius: Corners::all(12.0) } });
+            patch.push(Op::Paint {
+                id: SpriteId(id),
+                paint,
+                halo: Some(halo),
+            });
+            id
+        };
+        let control = node(
+            Paint::Solid(Radiance::new(0.5, 0.55, 0.65, 1.0)),
+            (40.0, 40.0),
+            Halo { sigma: 14.0, tint: Radiance::new(0.2, 0.6, 0.9, 1.0), offset: Vector2::zero() },
+            &mut patch,
+        );
+        let ramp_node = node(
+            Paint::Ramp(ramp),
+            (40.0, 320.0),
+            Halo { sigma: 14.0, tint: Radiance::new(0.2, 0.6, 0.9, 1.0), offset: Vector2::zero() },
+            &mut patch,
+        );
+        let displaced = node(
+            Paint::Solid(Radiance::new(0.5, 0.55, 0.65, 1.0)),
+            (40.0, 700.0),
+            Halo { sigma: 14.0, tint: Radiance::new(0.2, 0.6, 0.9, 1.0), offset: Vector2::new(10.0, 6.0) },
+            &mut patch,
+        );
+        let repoint = node(
+            Paint::Solid(Radiance::new(0.5, 0.55, 0.65, 1.0)),
+            (640.0, 700.0),
+            Halo { sigma: 14.0, tint: Radiance::new(0.2, 0.6, 0.9, 1.0), offset: Vector2::zero() },
+            &mut patch,
+        );
+        scene.apply(&mut patch, &back, env).expect("the pass applied");
+
+        // The pipeline laid out beside itself for the ramp and the re-point nodes, one row
+        // each: [left] the silhouette the caster paints, [middle] the glow as built,
+        // [right] the raw capture, the blur's input.
+        fn facts(scene: &Scene, back: &Backends, id: NodeId, tag: &str) {
+            let Some(glow) = scene.nodes.aux(id).and_then(|aux| aux.glow.as_ref()) else {
+                println!("{tag}: no glow minted");
+                return;
+            };
+            let (host, caster, halo) = (glow.host.size(), glow.caster.size(), glow.sprite.size());
+            let sigma = glow.props.scalar("Sigma");
+            let status = back
+                .minted_glow_factory()
+                .map_or_else(|| "no factory".to_string(), |f| format!("{:?}", f.load_status()));
+            println!(
+                "{tag}: host=({:.0},{:.0}) caster=({:.0},{:.0}) halo=({:.0},{:.0}) sigma={sigma:?} opacity={:.2} factory-load={status}",
+                host.x, host.y, caster.x, caster.y, halo.x, halo.y, glow.sprite.opacity(),
+            );
+        }
+        fn panels(scene: &Scene, comp: &Compositor, id: NodeId, tag: &str) {
+            let Some(glow) = scene.nodes.aux(id).and_then(|aux| aux.glow.as_ref()) else {
+                return;
+            };
+            let bleed = glow.bleed;
+            let (span_x, span_y) = (300.0 + 2.0 * bleed, 200.0 + 2.0 * bleed);
+            let base = glow.sprite.offset();
+            let content = scene.content.children();
+            if let Some(chain) = scene.nodes.painted(id).and_then(|row| row.chain.clone()) {
+                let sprite = comp.create_sprite_visual();
+                sprite.set_size(span_x, span_y);
+                sprite.set_offset(base.x, base.y + 260.0, 0.0);
+                sprite.set_brush(&chain);
+                content.insert_at_top(&sprite);
+            } else {
+                println!("{tag}: no chain to paint");
+            }
+            let sprite = comp.create_sprite_visual();
+            sprite.set_size(span_x, span_y);
+            sprite.set_offset(base.x + 400.0, base.y + 260.0, 0.0);
+            sprite.set_brush(&glow.brush);
+            content.insert_at_top(&sprite);
+            let sprite = comp.create_sprite_visual();
+            sprite.set_size(span_x, span_y);
+            sprite.set_offset(base.x + 800.0, base.y + 260.0, 0.0);
+            sprite.set_brush(&glow.capture.brush);
+            content.insert_at_top(&sprite);
+        }
+
+        // Commit and pump: the effect factory's load completes with the commit, and
+        // the window draws only while this thread pumps.
+        fn pump_hold(comp: &Compositor, seconds: u64, tag: &str, scene: &Scene, back: &Backends, nodes: &[NodeId]) {
+            let until = std::time::Instant::now() + core::time::Duration::from_secs(seconds);
+            while std::time::Instant::now() < until {
+                let _ = comp.request_commit();
+                windows_window::pump();
+                std::thread::sleep(core::time::Duration::from_millis(10));
+            }
+            for (i, id) in nodes.iter().enumerate() {
+                facts(scene, back, *id, &format!("{tag} node{i}"));
+            }
+        }
+
+        // First hold: the panel row sits 260 below each node, so stage two's captures
+        // land after this one.
+        panels(&scene, &comp, ramp_node, "ramp");
+        panels(&scene, &comp, repoint, "repoint");
+        pump_hold(&comp, 5, "stage1", &scene, &back, &[control, ramp_node, displaced, repoint]);
+
+        // Stage two: a re-point of the control through a changed paint, and channel-driven
+        // sigma and opacity writes on it — its panel row is the one on the backdrop, so the
+        // widening and the dimming land where the capture can read them.
+        let mut patch = SinkPatch::default();
+        patch.push(Op::Paint {
+            id: SpriteId(control),
+            paint: Paint::Solid(Radiance::new(0.45, 0.5, 0.6, 1.0)),
+            halo: Some(Halo { sigma: 14.0, tint: Radiance::new(0.2, 0.6, 0.9, 1.0), offset: Vector2::zero() }),
+        });
+        patch.push(Op::Bind { id: control, prop: Prop::GlowSigma, bind: Bind::Set(Value::Scalar(24.0)) });
+        patch.push(Op::Bind { id: control, prop: Prop::GlowOpacity, bind: Bind::Set(Value::Scalar(0.68)) });
+        scene.apply(&mut patch, &back, env).expect("the pass applied");
+        pump_hold(&comp, 10, "stage2", &scene, &back, &[control, ramp_node, displaced, repoint]);
     }
 
     #[test]

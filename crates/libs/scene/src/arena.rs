@@ -13,10 +13,12 @@
 use crate::realize::BoxKey;
 use crate::sink::*;
 use core::num::NonZeroU32;
+use windows_d2d::note;
 use windows_composition::{
-    Animatable, Captured, CompositionAnimation, CompositionBrush, CompositionGeometricClip,
-    CompositionMaskBrush, CompositionPathGeometry, CompositionPropertySet, CompositionSpriteShape, ContainerVisual,
-    DropShadow, Geometry, InsetClip, RectangleClip, ShapeVisual, SpriteVisual, Visual,
+    Animatable, Captured, CompositionAnimation, CompositionBrush, CompositionEffectBrush,
+    CompositionGeometricClip, CompositionMaskBrush, CompositionPathGeometry,
+    CompositionPropertySet, CompositionSpriteShape, ContainerVisual, ExpressionAnimation,
+    Geometry, InsetClip, RectangleClip, ShapeVisual, SpriteVisual, Visual,
 };
 use windows_numerics::{Vector2, Vector3};
 
@@ -226,30 +228,36 @@ impl Drop for ShapeState {
 
 /// The blurred light a node casts past its own silhouette.
 ///
-/// **The blur carries alpha and never colour.** A `DropShadow`'s colour is a
-/// `Windows.UI.Color`: eight bits, SDR-referred and sRGB-encoded, so it holds nothing above
-/// the display's white and nothing outside Rec.709 — and a glow is authored above white,
-/// often in a chromatic role. So the shadow is cast in white on an off-tree sprite, that
-/// halo is captured, and the capture masks an FP16 cell. It is the same rule the rest of
-/// this crate follows for every paint: the silhouette carries alpha, a float surface carries
-/// colour, and a mask brush multiplies them.
+/// **The blur carries alpha and never colour.** The caster paints the silhouette in the
+/// alpha it already has, a compositor-evaluated Gaussian blurs it, and a composite node
+/// in the same effect graph multiplies the coverage into an FP16 cell — the multiply the
+/// rest of this crate performs with a mask brush happens inside the compositor's float
+/// pipeline here, so the halo crosses no 8-bit surface after the blur. The silhouette
+/// carries alpha, a float surface carries colour, and the graph multiplies them.
 ///
 /// Its objects are one construction and are built, resized and dropped together.
-pub struct ShadowState {
+pub struct GlowState {
     /// The off-tree root the capture reads, in physical pixels.
     ///
     /// A visual surface captures its source's content and not the source's own transform,
     /// so the display scale goes on the caster beneath it, as a shape capture puts it on the
     /// shape.
     pub host: ContainerVisual,
-    /// The sprite the blur is cast by, sized in DIPs and scaled to physical pixels.
+    /// The sprite the blur reads, sized in DIPs, scaled to physical pixels and displaced
+    /// by the halo's offset.
     ///
-    /// It paints nothing. The capture has to hold the halo alone: a caster that also drew the
-    /// silhouette would put a second, unblurred copy of it under the real paint.
+    /// It paints the silhouette alone. The capture has to hold the light's input alone: a
+    /// caster that drew anything else would put it, blurred or not, under the real paint.
     pub caster: SpriteVisual,
-    pub shadow: DropShadow,
     /// The halo's alpha, read `bleed` DIPs outside the node's own box on every side.
     pub capture: Captured,
+    /// The property set the effect's sigma expression reads: the direct-write frontier
+    /// for the blur channel, which an effect brush takes only by animation.
+    pub props: CompositionPropertySet,
+    /// The sigma expression the construction started on the effect brush. Restated after
+    /// every direct write, because a spring that settled displaced it and a settled
+    /// spring is stopped before the write lands.
+    pub sigma_expr: ExpressionAnimation,
     /// The group a [`Paint::Captured`] paints with, and the silhouette this blur reads.
     /// `None` for a halo, whose silhouette is the node's own brush.
     ///
@@ -262,12 +270,11 @@ pub struct ShadowState {
     /// The tree holds it while it is mounted, so this is the construction staying whole
     /// rather than a second owner: the construction's objects are built, resized and dropped together,
     /// and one of them living only in a child collection is how a glow half-survives an
-    /// unlight.
-    #[expect(dead_code, reason = "held so the construction is dropped as one")]
+    /// unlight. Its opacity is the halo's own channel.
     pub sprite: SpriteVisual,
-    /// The halo's alpha multiplied by the tint cell. Held so a re-declared tint re-points
-    /// one brush rather than minting the whole construction again.
-    pub brush: CompositionMaskBrush,
+    /// The effect brush painting blurred coverage multiplied by the tint cell. Held so a
+    /// re-declared tint re-points one source rather than minting the construction again.
+    pub brush: CompositionEffectBrush,
     /// The sprite the node's paint moved to, which is the child above the halo.
     ///
     /// A visual's own brush draws *under* its children, so a node that paints itself and
@@ -277,17 +284,58 @@ pub struct ShadowState {
     /// How far past the node's box the capture reads, in DIPs. Fixed at the blur it was
     /// built for, because the region is a property write and the blur is animatable.
     pub bleed: f32,
+    /// The halo's displacement from the node's box, in DIPs. The caster carries it scaled
+    /// into the capture's physical space, so a re-point restates it rather than animating
+    /// it.
+    pub offset: Vector2,
 }
 
-impl ShadowState {
-    /// Restates the capture's pixel scale and the separately captured group's extent.
+impl GlowState {
+    /// Writes sigma through the frontier the effect's expression reads, and takes the
+    /// effect property back: the restart is a no-op while the expression already owns
+    /// it, and a spring that owned it was stopped before this write landed.
+    pub fn set_sigma(&self, sigma: f32) {
+        self.props.insert_scalar("Sigma", sigma);
+        self.brush.start_animation("blur.BlurAmount", &self.sigma_expr);
+    }
+
+    /// Restates the capture's pixel scale, the caster's displacement and the separately
+    /// captured group's extent.
+    ///
+    /// The three extents are stated here as authored values and not left to the
+    /// expressions that track them: the host, the caster and the capture surface sit
+    /// off the tree the node's sprite belongs to, and an extent nothing owns statically
+    /// reads and renders as zero until an expression lands. The caster's size is DIPs
+    /// because its scale carries the pixel factor, the host's is pixels because the
+    /// capture reads the source's coordinate space in pixels, and the capture region is
+    /// the node grown by the bleed on every side.
     pub fn resize(&self, size: Vector2, scale: f32) {
+        let sigma = self.props.scalar("Sigma").unwrap_or(f32::NAN);
+        let opacity = self.sprite.opacity();
+        let host_size = self.host.size();
+        let caster_size = self.caster.size();
+        note!(
+            "glow",
+            "resize size=({:.0},{:.0}) sigma={} opacity={:.2} host=({:.0},{:.0}) caster=({:.0},{:.0})",
+            size.x, size.y, sigma, opacity, host_size.x, host_size.y, caster_size.x, caster_size.y
+        );
+        self.host.set_size(size.x * scale, size.y * scale);
+        self.caster.set_size(size.x, size.y);
+        self.capture.surface.set_source_size(Vector2 {
+            x: (size.x + 2.0 * self.bleed) * scale,
+            y: (size.y + 2.0 * self.bleed) * scale,
+        });
         self.host.properties().insert_scalar("Dpi", scale);
         self.caster.set_scale(Vector3 {
             x: scale,
             y: scale,
             z: 1.0,
         });
+        self.caster.set_offset(
+            self.offset.x * scale,
+            self.offset.y * scale,
+            0.0,
+        );
         self.capture.surface.set_source_offset(Vector2::new(-self.bleed * scale, -self.bleed * scale));
         self.capture.brush.set_source_transform(Vector2::zero(), Vector2::new(1.0 / scale, 1.0 / scale));
         if let Some(group) = &self.group {
@@ -296,11 +344,12 @@ impl ShadowState {
     }
 }
 
-impl Drop for ShadowState {
+impl Drop for GlowState {
     fn drop(&mut self) {
         self.host.stop_animation("Size");
         self.caster.stop_animation("Size");
         self.capture.surface.stop_animation("SourceSize");
+        self.brush.stop_animation("blur.BlurAmount");
     }
 }
 
@@ -315,7 +364,7 @@ pub struct Aux {
     pub chans: [f32; AUX_CHANS as usize],
     pub clip: Option<ClipObj>,
     pub shape: Option<ShapeState>,
-    pub glow: Option<ShadowState>,
+    pub glow: Option<GlowState>,
     /// The last clip declared. A clip is declared rather than diffed, so layout re-states it
     /// on every node it touches and comparing here makes an unchanged re-statement free.
     pub decl: Clip,
@@ -631,7 +680,12 @@ pub enum Owner {
     Trim,
     /// The sprite shape, which carries the stroke width and the dash phase.
     Stroke,
+    /// The effect brush the glow's sigma animates on. An effect property is reachable
+    /// only by animation, so a direct write goes through the property set its expression
+    /// reads instead.
     Shadow,
+    /// The sprite painting the halo, whose opacity scales the halo alone.
+    Glow,
 }
 
 /// Describes one animatable channel.
@@ -692,7 +746,7 @@ const fn d(path: &'static str, owner: Owner, group: u8, chan: u8, count: u8) -> 
     }
 }
 
-use Owner::{Clip as C, Shadow as H, Stroke as S, Trim as T, Visual as V};
+use Owner::{Clip as C, Glow as G, Shadow as H, Stroke as S, Trim as T, Visual as V};
 
 /// Positional: a row's place here equals its [`Prop`] discriminant.
 pub const PROPS: [PropDesc; 36] = [
@@ -726,8 +780,8 @@ pub const PROPS: [PropDesc; 36] = [
     d("TrimEnd", T, 8, 23, 1),
     d("StrokeThickness", S, 9, 24, 1),
     d("StrokeDashOffset", S, 10, 25, 1),
-    d("BlurRadius", H, 11, 26, 1),
-    d("Opacity", H, 12, 27, 1),
+    d("blur.BlurAmount", H, 11, 26, 1),
+    d("Opacity", G, 12, 27, 1),
     d("AnchorPoint.X", V, 13, 28, 1),
     d("AnchorPoint.Y", V, 13, 29, 1),
     d("TransformMatrix._41", V, 14, 30, 1),
@@ -811,7 +865,7 @@ pub const fn absent(owner: Owner) -> Absent {
         Owner::Trim | Owner::Stroke => Absent::Promote,
         // A visual always exists, so its absence is unreachable; a glow has nothing to
         // address before its paint exists.
-        Owner::Visual | Owner::Shadow => Absent::Refuse,
+        Owner::Visual | Owner::Shadow | Owner::Glow => Absent::Refuse,
     }
 }
 
@@ -827,7 +881,7 @@ impl Arena {
             // A geometric clip carries no animatable channel, so it is not an owner.
             Owner::Clip => matches!(aux.clip, Some(ClipObj::Rect(_))),
             Owner::Trim | Owner::Stroke => aux.shape.is_some(),
-            Owner::Shadow => aux.glow.is_some(),
+            Owner::Shadow | Owner::Glow => aux.glow.is_some(),
         }
     }
 
@@ -1048,7 +1102,17 @@ impl Arena {
                     None => Some(&shape.shape),
                 }
             }
-            Owner::Shadow => Some(&self.aux(id)?.glow.as_ref()?.shadow),
+            // The effect brush, whose blur animates as an effect property rather than a
+            // visual one.
+            Owner::Shadow => Some(&self.aux(id)?.glow.as_ref()?.brush),
+            // The halo sprite paints the halo alone, so its opacity scales the halo and
+            // nothing else. The state's field is the sprite the tree holds; the property
+            // lives on the visual base type.
+            Owner::Glow => {
+                let glow = self.aux(id)?.glow.as_ref()?;
+                let sprite: &Visual = &glow.sprite;
+                Some(sprite)
+            }
         }
     }
 
@@ -1119,12 +1183,20 @@ impl Arena {
             }
             11 => {
                 if let Some(glow) = aux.and_then(|aux| aux.glow.as_ref()) {
-                    glow.shadow.set_blur_radius(c(26));
+                    note!("glow", "id={} sigma write {} lands on the effect property", id.index(), c(26));
+                    glow.set_sigma(c(26));
+                }
+                else {
+                    note!("glow", "id={} sigma write {} had no glow to land on", id.index(), c(26));
                 }
             }
             12 => {
                 if let Some(glow) = aux.and_then(|aux| aux.glow.as_ref()) {
-                    glow.shadow.set_opacity(c(27));
+                    note!("glow", "id={} opacity write {} lands on the halo sprite", id.index(), c(27));
+                    glow.sprite.set_opacity(c(27));
+                }
+                else {
+                    note!("glow", "id={} opacity write {} had no glow to land on", id.index(), c(27));
                 }
             }
             _ => debug_assert!(false, "group {group} has no writer"),
@@ -1323,8 +1395,8 @@ mod tests {
             Prop::TrimEnd,
             Prop::StrokeThickness,
             Prop::DashOffset,
-            Prop::BlurRadius,
-            Prop::ShadowOpacity,
+            Prop::GlowSigma,
+            Prop::GlowOpacity,
             Prop::AnchorX,
             Prop::AnchorY,
             Prop::TranslationX,
@@ -1434,7 +1506,16 @@ mod tests {
         let clip = comp.create_rectangle_clip();
         let geometry = comp.create_ellipse_geometry();
         let shape = comp.create_sprite_shape(&geometry);
-        let shadow = comp.create_drop_shadow();
+        // The blur row's object: an effect brush whose sigma is animatable by name.
+        let graph = windows_composition::EffectGraph::GaussianBlur {
+            name: "blur",
+            sigma: 4.0,
+            input: Box::new(windows_composition::EffectGraph::Parameter("s")),
+        };
+        let factory = comp
+            .create_effect_factory(&graph, &["blur.BlurAmount"])
+            .expect("the blur graph loads");
+        let effect = factory.create_brush();
 
         for (at, row) in PROPS.iter().enumerate() {
             let target: &dyn AnimatableRef = match row.owner {
@@ -1442,7 +1523,8 @@ mod tests {
                 Owner::Clip => &clip,
                 Owner::Trim => &geometry,
                 Owner::Stroke => &shape,
-                Owner::Shadow => &shadow,
+                Owner::Shadow => &effect,
+                Owner::Glow => visual,
             };
             // The animation kind the row declares: the platform answers a mismatched type
             // and a misspelt name with the same error.
@@ -1576,7 +1658,7 @@ mod tests {
         };
         let (mut arena, id) = one_sprite(&comp);
         // A clip, a trim and a blur all address an object this node does not carry.
-        for prop in [Prop::ClipL, Prop::TrimStart, Prop::BlurRadius] {
+        for prop in [Prop::ClipL, Prop::TrimStart, Prop::GlowSigma] {
             assert!(!arena.has_owner(id, desc(prop).owner));
             assert!(!arena.set(id, prop, Value::Scalar(4.0)));
             assert_eq!(arena.chan(id, desc(prop).chan), 0.0);

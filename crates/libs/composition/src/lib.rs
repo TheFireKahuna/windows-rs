@@ -65,6 +65,8 @@ mod animatable;
 #[cfg(feature = "system")]
 mod clip;
 #[cfg(feature = "system")]
+mod effects;
+#[cfg(feature = "system")]
 mod idiom;
 #[cfg(feature = "system")]
 mod interactions;
@@ -129,6 +131,11 @@ pub use target::DesktopWindowTarget;
 pub use animatable::{Animatable, CompositionObject};
 #[cfg(feature = "system")]
 pub use clip::{Clip, CompositionClip, CompositionGeometricClip, InsetClip, RectangleClip};
+#[cfg(feature = "system")]
+pub use effects::{
+    CompositionEffectBrush, CompositionEffectFactory, CompositeMode, EffectGraph,
+    PropertyMapping,
+};
 #[cfg(feature = "system")]
 pub use idiom::Captured;
 #[cfg(feature = "system")]

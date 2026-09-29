@@ -14,17 +14,20 @@
 //! [`Cache`], because a drag-resize or an animated fill can mint one key per frame; those
 //! two families are exactly the ones quantized, so the key population stays bounded.
 
-use crate::arena::{Arena, Held, PROPS, Route, ShadowState, ShapeState};
+use crate::arena::{Arena, GlowState, Held, PROPS, Route, ShapeState};
 use crate::sink::*;
 use rustc_hash::FxHashMap;
 use windows_color::{Radiance, Scrgb};
 use windows_composition::{
     Animatable, BorderMode, Brush, Color, CompositionBrush, CompositionDrawingSurface,
-    CompositionGraphicsDevice, CompositionPath, CompositionPathGeometry, CompositionSurfaceBrush,
-    Compositor, SpriteVisual, Stretch, StrokeCap, StrokeJoin, Surface, Visual,
+    CompositionEffectFactory, CompositionGraphicsDevice,
+    CompositionPath, CompositionPathGeometry, CompositionSurfaceBrush, CompositeMode,
+    Compositor, EffectGraph, SpriteVisual, Stretch, StrokeCap, StrokeJoin, Surface, Visual,
 };
 use windows_core::{Interface, Result};
-use windows_d2d::{Draw, Extend, GlyphRun, Gpu, Opacity, SceneSurface, Solid, Stop, SurfaceDraw};
+use windows_d2d::{
+    Draw, Extend, GlyphRun, Gpu, Opacity, SceneSurface, Solid, Stop, SurfaceDraw, note,
+};
 use windows_numerics::Vector2;
 use windows_text::TextEngine;
 
@@ -49,6 +52,9 @@ pub struct Backends {
     /// Opaque white, a mask's multiplicative identity, so a coverage cell is never retinted
     /// and one instance serves every tile for the life of the device.
     white: core::cell::OnceCell<Solid>,
+    /// The glow graph's factory, minted once per compositor. The graph is fixed; only its
+    /// brushes' sources and sigma move, so every lit node shares the one factory.
+    glow: core::cell::OnceCell<CompositionEffectFactory>,
 }
 
 /// Opaque white, the only colour a coverage cell draws in.
@@ -63,6 +69,12 @@ impl Backends {
     /// Requests publication of pending composition changes without waiting for completion.
     pub fn request_commit(&self) -> Result<()> {
         self.compositor.request_commit().map(drop)
+    }
+
+    /// The minted glow factory, for a probe to read its load status. `None` until the
+    /// first lit node minted it.
+    pub(crate) fn minted_glow_factory(&self) -> Option<&CompositionEffectFactory> {
+        self.glow.get()
     }
 
     /// Binds a compositor, a GPU and a font ladder together.
@@ -83,6 +95,7 @@ impl Backends {
             gpu: gpu.clone(),
             masks_a8: core::cell::Cell::new(true),
             white: core::cell::OnceCell::new(),
+            glow: core::cell::OnceCell::new(),
         })
     }
 
@@ -99,6 +112,7 @@ impl Backends {
         self.graphics = gpu.graphics_device(&self.compositor)?;
         self.gpu = gpu.clone();
         self.white = core::cell::OnceCell::new();
+        note!("scene", "graphics device adopted: brushes, cells and masks rebuild on the next pass");
         Ok(())
     }
 
@@ -128,7 +142,10 @@ impl Backends {
         if coverage && self.masks_a8.get() {
             match self.graphics.mask(px) {
                 Ok(surface) => return Ok(surface),
-                Err(_) => self.masks_a8.set(false),
+                Err(e) => {
+                    note!("scene", "a8 mask probe failed — falling back to a colour surface, every mask after is fp16: {}", e);
+                    self.masks_a8.set(false);
+                }
             }
         }
         // The only surface allocator this crate names, so no UINT8 composition surface can
@@ -144,6 +161,19 @@ impl Backends {
         Ok(self.white.get_or_init(|| white))
     }
 
+    /// The glow graph's factory, minted on the first lit node and shared by every one
+    /// after. The graph is fixed ([`glow_graph`]); a re-pointed tint or silhouette is a
+    /// `set_source_parameter` on the brush, so the factory never re-keys.
+    fn glow_factory(&self) -> Result<&CompositionEffectFactory> {
+        if let Some(factory) = self.glow.get() {
+            return Ok(factory);
+        }
+        let factory = self
+            .compositor
+            .create_effect_factory(&glow_graph(), &["blur.BlurAmount"])?;
+        Ok(self.glow.get_or_init(|| factory))
+    }
+
     /// Rasterizes one cell, surfacing the callback's error alongside the bridge's.
     ///
     /// One `BeginDraw` per graphics device at a time: a concurrent second fails
@@ -153,9 +183,8 @@ impl Backends {
     ///
     /// The bridge's callback cannot fail, so the callback's error travels out in a slot and
     /// is raised once the bracket has closed: the surface publishes whatever the cell
-    /// managed and the frame is not failed over one cell. `Ok(None)` is device loss, which
-    /// the caller answers by dropping its binding and rebinding down the path a first bind
-    /// takes.
+    /// managed and the frame is not failed over one cell. `Ok(None)` is device loss; the
+    /// cell is not cached, so a later pass rasterizes it again.
     fn rasterize(
         &self,
         px: (i32, i32),
@@ -168,6 +197,9 @@ impl Backends {
         let mut raised = Ok(());
         let live = surface.draw(dpi, o, |d| raised = draw(d))?;
         raised?;
+        if !live {
+            note!("scene", "rasterize loss: the {}x{} cell (coverage {}) did not publish and nothing owns its recovery here", px.0, px.1, coverage);
+        }
         Ok(live.then_some(surface))
     }
 
@@ -1473,6 +1505,21 @@ pub fn realize(
         None => target.clear_brush(),
     }
 
+    // The one line naming what the glow's caster would paint, if it lit: the silhouette
+    // content is what the blur reads, and a capture-source paint is the case that has to
+    // be watched.
+    if has_halo {
+        note!(
+            "scene",
+            "glow id={} inputs: paint={:?}, route={:?}, alpha-cell={}, silhouette-from={}",
+            id.index(),
+            paint,
+            route,
+            alpha.is_some(),
+            if chain.is_some() { "chain" } else { "source" },
+        );
+    }
+
     let built = ctx.generation;
     if let Some(row) = arena.painted_mut(id) {
         row.chain = chain;
@@ -1770,14 +1817,13 @@ fn presented_view(
 
 /// Casts, or removes, the light this node spends past its own silhouette.
 ///
-/// **The blur carries alpha and never colour.** A `DropShadow` tints its own output through
-/// a `Windows.UI.Color`, which is eight bits, SDR-referred and sRGB-encoded: it holds
-/// nothing above the display's white and nothing outside Rec.709, and a glow is authored
-/// above white in a chromatic role. So the shadow is cast in white on an off-tree sprite,
-/// the halo that leaves it is captured, and the capture masks an FP16 cell drawn at the same
-/// draw choke every other paint goes through. It is the same rule as the rest of
-/// the crate: the silhouette carries alpha, a float surface carries colour, and a mask brush
-/// multiplies them.
+/// **The blur carries alpha and never colour.** So the caster paints the silhouette in
+/// the alpha it already has, the compositor blurs it through a Gaussian whose output
+/// never leaves its own float pipeline, and a composite node multiplies that coverage
+/// into an FP16 cell drawn at the same draw choke every other paint goes through. There
+/// is no mask brush and no 8-bit read-back of a blurred result: the multiply happens
+/// inside the effect graph, which is why the halo keeps the chroma and the above-white
+/// range the tint is authored with ([07-COLOR.md §6.1] of the GUI spec).
 ///
 /// The silhouette is whatever the node paints, so a node with no paint yet casts nothing and
 /// the op that brings the paint builds the glow. A captured glow blurs the group it paints
@@ -1788,7 +1834,7 @@ fn presented_view(
 ///
 /// # Errors
 ///
-/// Fails if the tint's cell cannot be rasterized.
+/// Fails if the tint's cell cannot be rasterized or the glow factory cannot be created.
 fn cast_glow(
     arena: &mut Arena,
     id: NodeId,
@@ -1800,14 +1846,25 @@ fn cast_glow(
     ctx: &mut Ctx<'_>,
 ) -> Result<Option<SpriteVisual>> {
     let lit = match (paint, halo) {
-        (Paint::Captured { blur, tint, .. }, _) => {
+        (Paint::Captured { sigma, tint, .. }, _) => {
             debug_assert!(halo.is_none(), "a captured glow and a halo on one sprite");
-            Some((*blur, *tint, Vector2::default()))
+            Some((*sigma, *tint, Vector2::default()))
         }
-        (_, Some(halo)) => Some((halo.blur, halo.tint, halo.offset)),
+        (_, Some(halo)) => Some((halo.sigma, halo.tint, halo.offset)),
         _ => None,
     };
-    let Some(((blur, tint, offset), silhouette)) = lit.zip(silhouette) else {
+    let Some(((sigma, tint, offset), silhouette)) = lit.zip(silhouette) else {
+        // A node with no halo and no captured paint unlights by design. A lit one whose
+        // silhouette never arrived is the failure family: the mask or the paint half of the
+        // chain came back `None`, and the glow goes with it.
+        if lit.is_some() {
+            let kind = match paint {
+                Paint::Captured { .. } => "captured",
+                _ => "halo",
+            };
+            let size = arena.size(id);
+            note!("scene", "glow id={} unlit: silhouette none, paint={}, size=({:.0},{:.0})", id.index(), kind, size.x, size.y);
+        }
         unlight(arena, id, sprite, ctx);
         return Ok(None);
     };
@@ -1819,14 +1876,15 @@ fn cast_glow(
         .brush(key, ctx.back, ctx.env, ctx.generation)?
         .map(Brush::as_brush)
     else {
+        note!("scene", "glow id={} unlit: the tint cell did not rasterize", id.index());
         unlight(arena, id, sprite, ctx);
         return Ok(None);
     };
-    // A Gaussian is spent by three sigma, and a displaced shadow carries that reach with it.
-    // Fixed at the blur the construction was built for: the captured region is a property
-    // write and the blur is animatable, so a spring overshooting its declaration reaches past
-    // what was allocated for it rather than resizing the capture every frame.
-    let bleed = 3.0 * blur + offset.x.abs().max(offset.y.abs());
+    // A Gaussian is spent by three sigma, and a displaced silhouette carries that reach
+    // with it. Fixed at the sigma the construction was built for: the captured region is a
+    // property write and the sigma is animatable, so a spring overshooting its declaration
+    // reaches past what was allocated for it rather than resizing the capture every frame.
+    let bleed = 3.0 * sigma + offset.x.abs().max(offset.y.abs());
     let size = arena.size(id);
     let scale = ctx.env.scale();
 
@@ -1838,41 +1896,51 @@ fn cast_glow(
         .and_then(|aux| aux.glow.as_ref())
         .is_some_and(|glow| glow.bleed == bleed);
     if fits {
+        note!("scene", "glow id={} re-pointed: sigma stays, the silhouette and tint are restated", id.index());
         let glow = arena
             .aux(id)
             .and_then(|aux| aux.glow.as_ref())
             .expect("the branch above found one");
-        glow.shadow.set_mask(silhouette);
-        glow.shadow.set_offset(offset.x, offset.y, 0.0);
-        glow.brush.set_source(&cell);
+        glow.caster.set_brush(silhouette);
+        glow.brush.set_source_parameter("tint", &cell);
         let target = glow.paint.clone();
-        arena.aux_mut(id).glow.as_mut().expect("the branch above found one").group = group;
+        if let Some(glow) = arena.aux_mut(id).glow.as_mut() {
+            glow.group = group;
+            glow.offset = offset;
+        }
         if let Some(glow) = arena.aux(id).and_then(|aux| aux.glow.as_ref()) {
             glow.resize(size, scale);
         }
-        drive_blur(arena, id, blur, false);
+        drive_blur(arena, id, sigma, false);
         return Ok(Some(target));
     }
 
     let comp = &ctx.back.compositor;
-    // Paints nothing: the capture below has to hold the halo alone, and a caster that drew the
-    // silhouette too would put a second, unblurred copy of it under the real paint. The
-    // capture reads the host in physical pixels, so the caster carries the display scale and
-    // the blur and offset stay in DIPs, where their channels animate them.
+    // The caster paints the silhouette alone: it is the blur's input, and nothing the
+    // halo sprite shows is sharp. The capture reads the host in physical pixels, so the
+    // caster carries the display scale and the displacement, and the blur and offset
+    // stay in DIPs, where their channels animate them.
     let host = comp.create_container_visual();
     let caster = comp.create_sprite_visual();
+    caster.set_brush(silhouette);
     host.children().insert_at_top(&caster);
-    let shadow = comp.create_drop_shadow();
-    // White, and never the tint. This is the alpha generator; the colour is the cell below.
-    shadow.set_color(Color::rgb(255, 255, 255));
-    shadow.set_blur_radius(blur);
-    shadow.set_offset(offset.x, offset.y, 0.0);
-    shadow.set_mask(silhouette);
-    caster.set_shadow(&shadow);
+    let factory = ctx.back.glow_factory()?;
+    note!("scene", "glow id={} rebuilt: sigma={}, bleed={}, four visuals minted", id.index(), sigma, bleed);
+    let brush = factory.create_brush();
 
     let capture = comp.capture_bleeding(&host, bleed, size, scale);
     capture.brush.set_stretch(Stretch::None);
     capture.brush.set_nearest_sampling();
+    brush.set_source_parameter("silhouette", &capture.brush);
+    brush.set_source_parameter("tint", &cell);
+    // One expression the construction starts once: the channels write the property set
+    // it reads, so a sigma restated by CPU or driven by a spring reaches the graph
+    // without a second StartAnimation on the brush.
+    let props = comp.create_property_set();
+    props.insert_scalar("Sigma", sigma);
+    let sigma_expr = comp.create_expression_animation("glow.Sigma");
+    sigma_expr.set_reference_parameter("glow", &props);
+    brush.start_animation("blur.BlurAmount", &sigma_expr);
     let metrics = host.properties();
     metrics.insert_scalar("Dpi", scale);
     let bounds: &Visual = sprite;
@@ -1888,9 +1956,6 @@ fn cast_glow(
     extent.set_reference_parameter("metrics", &metrics);
     extent.set_scalar_parameter("pad", 2.0 * bleed);
     capture.surface.start_animation("SourceSize", &extent);
-    let brush = comp.create_mask_brush();
-    brush.set_mask(&capture.brush);
-    brush.set_source(&cell);
 
     // Both children are stated relative to the node, so the compositor re-derives them from
     // the one extent it already carries and a resize writes no property for either. A
@@ -1904,8 +1969,8 @@ fn cast_glow(
     glow_sprite.set_brush(&brush);
     let paint_sprite = comp.create_sprite_visual();
     paint_sprite.set_relative_size_adjustment(whole);
-    // The host, the caster, the halo and the paint. The capture and the two brushes are not
-    // visuals and cost the tree walk nothing.
+    // The host, the caster, the halo and the paint. The capture, the property set and the
+    // two brushes are not visuals and cost the tree walk nothing.
     ctx.minted += 4;
 
     // The node stops painting itself and becomes the host of the two.
@@ -1916,39 +1981,58 @@ fn cast_glow(
     kids.insert_at_bottom(&glow_sprite);
 
     let target = paint_sprite.clone();
-    let glow = ShadowState {
+    let glow = GlowState {
         host,
         caster,
-        shadow,
         capture,
+        props,
+        sigma_expr,
         group,
         sprite: glow_sprite,
         brush,
         paint: paint_sprite,
         bleed,
+        offset,
     };
     glow.resize(size, scale);
     arena.aux_mut(id).glow = Some(glow);
-    drive_blur(arena, id, blur, true);
+    drive_blur(arena, id, sigma, true);
     Ok(Some(target))
 }
 
-/// Writes the two channels the shadow owns onto it.
+/// The glow graph, the one factory's description: the silhouette Gaussian-blurred, the
+/// tint multiplied onto its coverage, both sources named. The sigma animates as
+/// `"blur.BlurAmount"`, and the construction drives it through a property set rather
+/// than by restarting the expression.
+fn glow_graph() -> EffectGraph {
+    EffectGraph::Composite {
+        mode: CompositeMode::SourceIn,
+        source: Box::new(EffectGraph::Parameter("tint")),
+        destination: Box::new(EffectGraph::GaussianBlur {
+            name: "blur",
+            sigma: 4.0,
+            input: Box::new(EffectGraph::Parameter("silhouette")),
+        }),
+    }
+}
+
+/// Writes the two channels the glow owns onto it.
 ///
 /// A fresh construction seeds them from what the declaration asked for. After that the
 /// channels outlive the object they drive, so a rebind restates them rather than resetting to
 /// the declaration: a device loss part way through a hover must not snap the halo back to its
-/// authored width.
+/// authored width. Sigma goes through the property set the effect's expression reads;
+/// opacity is the halo sprite's own.
 fn drive_blur(arena: &mut Arena, id: NodeId, declared: f32, fresh: bool) {
-    let blur = PROPS[Prop::BlurRadius as usize].chan;
+    let sigma = PROPS[Prop::GlowSigma as usize].chan;
     if fresh {
-        arena.set_chan(id, blur, declared);
-        arena.set_chan(id, blur + 1, 1.0);
+        arena.set_chan(id, sigma, declared);
+        arena.set_chan(id, sigma + 1, 1.0);
     }
-    let (radius, opacity) = (arena.chan(id, blur), arena.chan(id, blur + 1));
+    let (value, opacity) = (arena.chan(id, sigma), arena.chan(id, sigma + 1));
     if let Some(glow) = arena.aux(id).and_then(|aux| aux.glow.as_ref()) {
-        glow.shadow.set_blur_radius(radius);
-        glow.shadow.set_opacity(opacity);
+        glow.props.insert_scalar("Sigma", value);
+        glow.sprite.set_opacity(opacity);
     }
 }
 
@@ -1958,6 +2042,7 @@ fn drive_blur(arena: &mut Arena, id: NodeId, declared: f32, fresh: bool) {
 /// leaving its paint on a child would keep a visual in the tree for nothing.
 fn unlight(arena: &mut Arena, id: NodeId, sprite: &SpriteVisual, ctx: &mut Ctx<'_>) {
     if arena.aux(id).is_some_and(|aux| aux.glow.is_some()) {
+        note!("scene", "glow id={} dropped: four visuals freed", id.index());
         sprite.children().remove_all();
         arena.aux_mut(id).glow = None;
         ctx.freed += 4;

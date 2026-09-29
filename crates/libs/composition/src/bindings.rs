@@ -463,6 +463,133 @@ unsafe impl Send for CompositionEasingFunction {}
 unsafe impl Sync for CompositionEasingFunction {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionEffectBrush(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionEffectBrush,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(CompositionEffectBrush, CompositionBrush, CompositionObject);
+impl windows_core::RuntimeType for CompositionEffectBrush {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionEffectBrush>();
+}
+unsafe impl windows_core::Interface for CompositionEffectBrush {
+    type Vtable = <ICompositionEffectBrush as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <ICompositionEffectBrush as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionEffectBrush {
+    type Target = ICompositionEffectBrush;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionEffectBrush {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionEffectBrush";
+}
+unsafe impl Send for CompositionEffectBrush {}
+unsafe impl Sync for CompositionEffectBrush {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionEffectFactory(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionEffectFactory,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(CompositionEffectFactory, CompositionObject);
+impl windows_core::RuntimeType for CompositionEffectFactory {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionEffectFactory>();
+}
+unsafe impl windows_core::Interface for CompositionEffectFactory {
+    type Vtable = <ICompositionEffectFactory as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <ICompositionEffectFactory as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionEffectFactory {
+    type Target = ICompositionEffectFactory;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionEffectFactory {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionEffectFactory";
+}
+unsafe impl Send for CompositionEffectFactory {}
+unsafe impl Sync for CompositionEffectFactory {}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompositionEffectFactoryLoadStatus(pub i32);
+impl CompositionEffectFactoryLoadStatus {
+    pub const Success: Self = Self(0);
+    pub const EffectTooComplex: Self = Self(1);
+    pub const Pending: Self = Self(2);
+    pub const Other: Self = Self(-1);
+}
+impl windows_core::TypeKind for CompositionEffectFactoryLoadStatus {
+    type TypeKind = windows_core::CopyType;
+}
+impl windows_core::RuntimeType for CompositionEffectFactoryLoadStatus {
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
+        b"enum(Windows.UI.Composition.CompositionEffectFactoryLoadStatus;i4)",
+    );
+}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionEffectSourceParameter(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionEffectSourceParameter,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(CompositionEffectSourceParameter, IGraphicsEffectSource);
+impl CompositionEffectSourceParameter {
+    pub(crate) fn Create(name: &str) -> windows_core::Result<Self> {
+        Self::ICompositionEffectSourceParameterFactory(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).Create)(
+                windows_core::Interface::as_raw(this),
+                core::mem::transmute_copy(&windows_core::HSTRING::from(name)),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        })
+    }
+    fn ICompositionEffectSourceParameterFactory<
+        R,
+        F: FnOnce(&ICompositionEffectSourceParameterFactory) -> windows_core::Result<R>,
+    >(
+        callback: F,
+    ) -> windows_core::Result<R> {
+        static SHARED: windows_core::imp::FactoryCache<
+            CompositionEffectSourceParameter,
+            ICompositionEffectSourceParameterFactory,
+        > = windows_core::imp::FactoryCache::new();
+        SHARED.call(callback)
+    }
+}
+impl windows_core::RuntimeType for CompositionEffectSourceParameter {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionEffectSourceParameter>();
+}
+unsafe impl windows_core::Interface for CompositionEffectSourceParameter {
+    type Vtable = <ICompositionEffectSourceParameter as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <ICompositionEffectSourceParameter as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionEffectSourceParameter {
+    type Target = ICompositionEffectSourceParameter;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionEffectSourceParameter {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionEffectSourceParameter";
+}
+unsafe impl Send for CompositionEffectSourceParameter {}
+unsafe impl Sync for CompositionEffectSourceParameter {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionEllipseGeometry(windows_core::IUnknown);
 windows_core::imp::interface_hierarchy!(
     CompositionEllipseGeometry,
@@ -2071,6 +2198,143 @@ pub struct ICompositionEasingFunction_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
+    ICompositionEffectBrush,
+    ICompositionEffectBrush_Vtbl,
+    0xbf7f795e_83cc_44bf_a447_3e3c071789ec
+);
+impl windows_core::RuntimeType for ICompositionEffectBrush {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionEffectBrush {
+    pub(crate) fn GetSourceParameter(&self, name: &str) -> windows_core::Result<CompositionBrush> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetSourceParameter)(
+                windows_core::Interface::as_raw(self),
+                core::mem::transmute_copy(&windows_core::HSTRING::from(name)),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) fn SetSourceParameter<P1>(&self, name: &str, source: P1) -> windows_core::Result<()>
+    where
+        P1: windows_core::Param<CompositionBrush>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetSourceParameter)(
+                windows_core::Interface::as_raw(self),
+                core::mem::transmute_copy(&windows_core::HSTRING::from(name)),
+                source.param().abi(),
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionEffectBrush_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub GetSourceParameter: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub SetSourceParameter: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICompositionEffectFactory,
+    ICompositionEffectFactory_Vtbl,
+    0xbe5624af_ba7e_4510_9850_41c0b4ff74df
+);
+impl windows_core::RuntimeType for ICompositionEffectFactory {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionEffectFactory {
+    pub(crate) fn CreateBrush(&self) -> windows_core::Result<CompositionEffectBrush> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateBrush)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) fn ExtendedError(&self) -> windows_core::Result<windows_core::HRESULT> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).ExtendedError)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn LoadStatus(&self) -> windows_core::Result<CompositionEffectFactoryLoadStatus> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).LoadStatus)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionEffectFactory_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub CreateBrush: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub ExtendedError: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::HRESULT,
+    ) -> windows_core::HRESULT,
+    pub LoadStatus: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut CompositionEffectFactoryLoadStatus,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICompositionEffectSourceParameter,
+    ICompositionEffectSourceParameter_Vtbl,
+    0x858ab13a_3292_4e4e_b3bb_2b6c6544a6ee
+);
+impl windows_core::RuntimeType for ICompositionEffectSourceParameter {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICompositionEffectSourceParameter_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
+    ICompositionEffectSourceParameterFactory,
+    ICompositionEffectSourceParameterFactory_Vtbl,
+    0xb3d9f276_aba3_4724_acf3_d0397464db1c
+);
+impl windows_core::RuntimeType for ICompositionEffectSourceParameterFactory {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICompositionEffectSourceParameterFactory_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub Create: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
     ICompositionEllipseGeometry,
     ICompositionEllipseGeometry_Vtbl,
     0x4801f884_f6ad_4b93_afa9_897b64e57b1f
@@ -3655,6 +3919,43 @@ impl ICompositor {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) fn CreateEffectFactory<P0>(
+        &self,
+        graphicseffect: P0,
+    ) -> windows_core::Result<CompositionEffectFactory>
+    where
+        P0: windows_core::Param<IGraphicsEffect>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateEffectFactory)(
+                windows_core::Interface::as_raw(self),
+                graphicseffect.param().abi(),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) fn CreateEffectFactoryWithProperties<P0, P1>(
+        &self,
+        graphicseffect: P0,
+        animatableproperties: P1,
+    ) -> windows_core::Result<CompositionEffectFactory>
+    where
+        P0: windows_core::Param<IGraphicsEffect>,
+        P1: windows_core::Param<windows_collections::IIterable<windows_core::HSTRING>>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateEffectFactoryWithProperties)(
+                windows_core::Interface::as_raw(self),
+                graphicseffect.param().abi(),
+                animatableproperties.param().abi(),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
     pub(crate) fn CreateExpressionAnimationWithExpression(
         &self,
         expression: &str,
@@ -3797,8 +4098,17 @@ pub struct ICompositor_Vtbl {
         windows_numerics::Vector2,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
-    CreateEffectFactory: usize,
-    CreateEffectFactoryWithProperties: usize,
+    pub CreateEffectFactory: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub CreateEffectFactoryWithProperties: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     CreateExpressionAnimation: usize,
     pub CreateExpressionAnimationWithExpression: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -4791,6 +5101,141 @@ impl IGeometrySource2DInterop_Vtbl {
     }
 }
 impl windows_core::RuntimeName for IGeometrySource2DInterop {}
+windows_core::imp::define_interface!(
+    IGraphicsEffect,
+    IGraphicsEffect_Vtbl,
+    0xcb51c0ce_8fe6_4636_b202_861faa07d8f3
+);
+impl windows_core::RuntimeType for IGraphicsEffect {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+    const NAME: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::from_slice(b"Windows.Graphics.Effects.IGraphicsEffect");
+}
+windows_core::imp::interface_hierarchy!(
+    IGraphicsEffect,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(IGraphicsEffect, IGraphicsEffectSource);
+impl IGraphicsEffect {
+    pub(crate) fn Name(&self) -> windows_core::Result<String> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Name)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| {
+                let hstring: windows_core::HSTRING = core::mem::transmute(result__);
+                hstring.to_string_lossy()
+            })
+        }
+    }
+    pub(crate) fn SetName(&self, value: &str) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetName)(
+                windows_core::Interface::as_raw(self),
+                core::mem::transmute_copy(&windows_core::HSTRING::from(value)),
+            )
+            .ok()
+        }
+    }
+}
+impl windows_core::RuntimeName for IGraphicsEffect {
+    const NAME: &'static str = "Windows.Graphics.Effects.IGraphicsEffect";
+}
+pub trait IGraphicsEffect_Impl: IGraphicsEffectSource_Impl {
+    fn Name(&self) -> windows_core::Result<windows_core::HSTRING>;
+    fn SetName(&self, value: &windows_core::HSTRING) -> windows_core::Result<()>;
+}
+impl IGraphicsEffect_Vtbl {
+    pub const fn new<Identity: IGraphicsEffect_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn Name<Identity: IGraphicsEffect_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            result__: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IGraphicsEffect_Impl::Name(this) {
+                    Ok(ok__) => {
+                        result__.write(core::mem::transmute_copy(&ok__));
+                        core::mem::forget(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn SetName<Identity: IGraphicsEffect_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            value: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                IGraphicsEffect_Impl::SetName(this, core::mem::transmute(&value)).into()
+            }
+        }
+        Self {
+            base__: windows_core::IInspectable_Vtbl::new::<Identity, IGraphicsEffect, OFFSET>(),
+            Name: Name::<Identity, OFFSET>,
+            SetName: SetName::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<IGraphicsEffect as windows_core::Interface>::IID
+    }
+}
+#[repr(C)]
+pub struct IGraphicsEffect_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub Name: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub SetName: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IGraphicsEffectSource,
+    IGraphicsEffectSource_Vtbl,
+    0x2d8f9ddc_4339_4eb9_9216_f9deb75658a2
+);
+impl windows_core::RuntimeType for IGraphicsEffectSource {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+    const NAME: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
+        b"Windows.Graphics.Effects.IGraphicsEffectSource",
+    );
+}
+windows_core::imp::interface_hierarchy!(
+    IGraphicsEffectSource,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeName for IGraphicsEffectSource {
+    const NAME: &'static str = "Windows.Graphics.Effects.IGraphicsEffectSource";
+}
+pub trait IGraphicsEffectSource_Impl: windows_core::IUnknownImpl {}
+impl IGraphicsEffectSource_Vtbl {
+    pub const fn new<Identity: IGraphicsEffectSource_Impl, const OFFSET: isize>() -> Self {
+        Self {
+            base__: windows_core::IInspectable_Vtbl::new::<Identity, IGraphicsEffectSource, OFFSET>(
+            ),
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<IGraphicsEffectSource as windows_core::Interface>::IID
+    }
+}
+#[repr(C)]
+pub struct IGraphicsEffectSource_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
 windows_core::imp::define_interface!(
     IImplicitAnimationCollection,
     IImplicitAnimationCollection_Vtbl,
@@ -6389,6 +6834,651 @@ pub struct INaturalMotionAnimation_Vtbl {
     pub SetDelayTime: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         windows_time::TimeSpan,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IPropertyValue,
+    IPropertyValue_Vtbl,
+    0x4bd682dd_7554_40e9_9a9b_82654ede7e62
+);
+impl windows_core::RuntimeType for IPropertyValue {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+windows_core::imp::interface_hierarchy!(
+    IPropertyValue,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl IPropertyValue {
+    pub(crate) fn Type(&self) -> windows_core::Result<PropertyType> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Type)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn IsNumericScalar(&self) -> windows_core::Result<bool> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).IsNumericScalar)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetUInt8(&self) -> windows_core::Result<u8> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetUInt8)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetInt16(&self) -> windows_core::Result<i16> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetInt16)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetUInt16(&self) -> windows_core::Result<u16> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetUInt16)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetInt32(&self) -> windows_core::Result<i32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetInt32)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetUInt32(&self) -> windows_core::Result<u32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetUInt32)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetInt64(&self) -> windows_core::Result<i64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetInt64)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetUInt64(&self) -> windows_core::Result<u64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetUInt64)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetSingle(&self) -> windows_core::Result<f32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetSingle)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetDouble(&self) -> windows_core::Result<f64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetDouble)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetChar16(&self) -> windows_core::Result<u16> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetChar16)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetBoolean(&self) -> windows_core::Result<bool> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetBoolean)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetString(&self) -> windows_core::Result<String> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetString)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| {
+                let hstring: windows_core::HSTRING = core::mem::transmute(result__);
+                hstring.to_string_lossy()
+            })
+        }
+    }
+    pub(crate) fn GetGuid(&self) -> windows_core::Result<windows_core::GUID> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetGuid)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetDateTime(&self) -> windows_core::Result<windows_time::DateTime> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetDateTime)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetTimeSpan(&self) -> windows_core::Result<windows_time::TimeSpan> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetTimeSpan)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetPoint(&self) -> windows_core::Result<Point> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetPoint)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetSize(&self) -> windows_core::Result<Size> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetSize)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetRect(&self) -> windows_core::Result<Rect> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetRect)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GetUInt8Array(
+        &self,
+        value: &mut windows_core::Array<u8>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetUInt8Array)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetInt16Array(
+        &self,
+        value: &mut windows_core::Array<i16>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetInt16Array)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetUInt16Array(
+        &self,
+        value: &mut windows_core::Array<u16>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetUInt16Array)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetInt32Array(
+        &self,
+        value: &mut windows_core::Array<i32>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetInt32Array)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetUInt32Array(
+        &self,
+        value: &mut windows_core::Array<u32>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetUInt32Array)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetInt64Array(
+        &self,
+        value: &mut windows_core::Array<i64>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetInt64Array)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetUInt64Array(
+        &self,
+        value: &mut windows_core::Array<u64>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetUInt64Array)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetSingleArray(
+        &self,
+        value: &mut windows_core::Array<f32>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetSingleArray)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetDoubleArray(
+        &self,
+        value: &mut windows_core::Array<f64>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetDoubleArray)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetChar16Array(
+        &self,
+        value: &mut windows_core::Array<u16>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetChar16Array)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetBooleanArray(
+        &self,
+        value: &mut windows_core::Array<bool>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetBooleanArray)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetStringArray(
+        &self,
+        value: &mut windows_core::Array<windows_core::HSTRING>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetStringArray)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetInspectableArray(
+        &self,
+        value: &mut windows_core::Array<windows_core::IInspectable>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetInspectableArray)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetGuidArray(
+        &self,
+        value: &mut windows_core::Array<windows_core::GUID>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetGuidArray)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetDateTimeArray(
+        &self,
+        value: &mut windows_core::Array<windows_time::DateTime>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetDateTimeArray)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetTimeSpanArray(
+        &self,
+        value: &mut windows_core::Array<windows_time::TimeSpan>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetTimeSpanArray)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetPointArray(
+        &self,
+        value: &mut windows_core::Array<Point>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetPointArray)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetSizeArray(
+        &self,
+        value: &mut windows_core::Array<Size>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetSizeArray)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn GetRectArray(
+        &self,
+        value: &mut windows_core::Array<Rect>,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetRectArray)(
+                windows_core::Interface::as_raw(self),
+                value.set_abi_len(),
+                value as *mut _ as _,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct IPropertyValue_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub Type: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut PropertyType,
+    ) -> windows_core::HRESULT,
+    pub IsNumericScalar:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+    pub GetUInt8:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u8) -> windows_core::HRESULT,
+    pub GetInt16:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut i16) -> windows_core::HRESULT,
+    pub GetUInt16:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u16) -> windows_core::HRESULT,
+    pub GetInt32:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut i32) -> windows_core::HRESULT,
+    pub GetUInt32:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> windows_core::HRESULT,
+    pub GetInt64:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut i64) -> windows_core::HRESULT,
+    pub GetUInt64:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u64) -> windows_core::HRESULT,
+    pub GetSingle:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f32) -> windows_core::HRESULT,
+    pub GetDouble:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f64) -> windows_core::HRESULT,
+    pub GetChar16:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u16) -> windows_core::HRESULT,
+    pub GetBoolean:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+    pub GetString: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetGuid: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::GUID,
+    ) -> windows_core::HRESULT,
+    pub GetDateTime: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_time::DateTime,
+    ) -> windows_core::HRESULT,
+    pub GetTimeSpan: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_time::TimeSpan,
+    ) -> windows_core::HRESULT,
+    pub GetPoint:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Point) -> windows_core::HRESULT,
+    pub GetSize:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Size) -> windows_core::HRESULT,
+    pub GetRect:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Rect) -> windows_core::HRESULT,
+    pub GetUInt8Array: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut u8,
+    ) -> windows_core::HRESULT,
+    pub GetInt16Array: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut i16,
+    ) -> windows_core::HRESULT,
+    pub GetUInt16Array: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut u16,
+    ) -> windows_core::HRESULT,
+    pub GetInt32Array: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut i32,
+    ) -> windows_core::HRESULT,
+    pub GetUInt32Array: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut u32,
+    ) -> windows_core::HRESULT,
+    pub GetInt64Array: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut i64,
+    ) -> windows_core::HRESULT,
+    pub GetUInt64Array: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut u64,
+    ) -> windows_core::HRESULT,
+    pub GetSingleArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut f32,
+    ) -> windows_core::HRESULT,
+    pub GetDoubleArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut f64,
+    ) -> windows_core::HRESULT,
+    pub GetChar16Array: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut u16,
+    ) -> windows_core::HRESULT,
+    pub GetBooleanArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut bool,
+    ) -> windows_core::HRESULT,
+    pub GetStringArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut windows_core::HSTRING,
+    ) -> windows_core::HRESULT,
+    pub GetInspectableArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut windows_core::IInspectable,
+    ) -> windows_core::HRESULT,
+    pub GetGuidArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut windows_core::GUID,
+    ) -> windows_core::HRESULT,
+    pub GetDateTimeArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut windows_time::DateTime,
+    ) -> windows_core::HRESULT,
+    pub GetTimeSpanArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut windows_time::TimeSpan,
+    ) -> windows_core::HRESULT,
+    pub GetPointArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut Point,
+    ) -> windows_core::HRESULT,
+    pub GetSizeArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut Size,
+    ) -> windows_core::HRESULT,
+    pub GetRectArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut Rect,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IPropertyValueStatics,
+    IPropertyValueStatics_Vtbl,
+    0x629bdbc8_d932_4ff4_96b9_8d96c5c1e858
+);
+impl windows_core::RuntimeType for IPropertyValueStatics {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct IPropertyValueStatics_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    CreateEmpty: usize,
+    CreateUInt8: usize,
+    CreateInt16: usize,
+    CreateUInt16: usize,
+    CreateInt32: usize,
+    pub CreateUInt32: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        u32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    CreateInt64: usize,
+    CreateUInt64: usize,
+    pub CreateSingle: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        f32,
+        *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
@@ -8584,12 +9674,128 @@ pub struct POINTER_INFO {
 }
 pub type POINTER_INPUT_TYPE = u32;
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+}
+impl windows_core::TypeKind for Point {
+    type TypeKind = windows_core::CopyType;
+}
+impl windows_core::RuntimeType for Point {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::from_slice(b"struct(Windows.Foundation.Point;f4;f4)");
+}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PropertyType(pub i32);
+impl PropertyType {
+    pub const Empty: Self = Self(0);
+    pub const UInt8: Self = Self(1);
+    pub const Int16: Self = Self(2);
+    pub const UInt16: Self = Self(3);
+    pub const Int32: Self = Self(4);
+    pub const UInt32: Self = Self(5);
+    pub const Int64: Self = Self(6);
+    pub const UInt64: Self = Self(7);
+    pub const Single: Self = Self(8);
+    pub const Double: Self = Self(9);
+    pub const Char16: Self = Self(10);
+    pub const Boolean: Self = Self(11);
+    pub const String: Self = Self(12);
+    pub const Inspectable: Self = Self(13);
+    pub const DateTime: Self = Self(14);
+    pub const TimeSpan: Self = Self(15);
+    pub const Guid: Self = Self(16);
+    pub const Point: Self = Self(17);
+    pub const Size: Self = Self(18);
+    pub const Rect: Self = Self(19);
+    pub const OtherType: Self = Self(20);
+    pub const UInt8Array: Self = Self(1025);
+    pub const Int16Array: Self = Self(1026);
+    pub const UInt16Array: Self = Self(1027);
+    pub const Int32Array: Self = Self(1028);
+    pub const UInt32Array: Self = Self(1029);
+    pub const Int64Array: Self = Self(1030);
+    pub const UInt64Array: Self = Self(1031);
+    pub const SingleArray: Self = Self(1032);
+    pub const DoubleArray: Self = Self(1033);
+    pub const Char16Array: Self = Self(1034);
+    pub const BooleanArray: Self = Self(1035);
+    pub const StringArray: Self = Self(1036);
+    pub const InspectableArray: Self = Self(1037);
+    pub const DateTimeArray: Self = Self(1038);
+    pub const TimeSpanArray: Self = Self(1039);
+    pub const GuidArray: Self = Self(1040);
+    pub const PointArray: Self = Self(1041);
+    pub const SizeArray: Self = Self(1042);
+    pub const RectArray: Self = Self(1043);
+    pub const OtherTypeArray: Self = Self(1044);
+}
+impl windows_core::TypeKind for PropertyType {
+    type TypeKind = windows_core::CopyType;
+}
+impl windows_core::RuntimeType for PropertyType {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::from_slice(b"enum(Windows.Foundation.PropertyType;i4)");
+}
+pub struct PropertyValue;
+impl PropertyValue {
+    pub(crate) fn CreateUInt32(value: u32) -> windows_core::Result<windows_core::IInspectable> {
+        Self::IPropertyValueStatics(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).CreateUInt32)(
+                windows_core::Interface::as_raw(this),
+                value,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        })
+    }
+    pub(crate) fn CreateSingle(value: f32) -> windows_core::Result<windows_core::IInspectable> {
+        Self::IPropertyValueStatics(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).CreateSingle)(
+                windows_core::Interface::as_raw(this),
+                value,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        })
+    }
+    fn IPropertyValueStatics<R, F: FnOnce(&IPropertyValueStatics) -> windows_core::Result<R>>(
+        callback: F,
+    ) -> windows_core::Result<R> {
+        static SHARED: windows_core::imp::FactoryCache<PropertyValue, IPropertyValueStatics> =
+            windows_core::imp::FactoryCache::new();
+        SHARED.call(callback)
+    }
+}
+impl windows_core::RuntimeName for PropertyValue {
+    const NAME: &'static str = "Windows.Foundation.PropertyValue";
+}
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RECT {
     pub left: i32,
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+impl windows_core::TypeKind for Rect {
+    type TypeKind = windows_core::CopyType;
+}
+impl windows_core::RuntimeType for Rect {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::from_slice(b"struct(Windows.Foundation.Rect;f4;f4;f4;f4)");
 }
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]

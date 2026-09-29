@@ -113,6 +113,7 @@ composition_object!(
     Visual,
     CompositionBrush,
     CompositionColorBrush,
+    CompositionEffectBrush,
     CompositionMaskBrush,
     CompositionLinearGradientBrush,
     CompositionNineGridBrush,
