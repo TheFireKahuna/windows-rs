@@ -2096,6 +2096,12 @@ impl Scene {
                 // Permanent: nothing but an explicit stop leaves `Bound`.
                 self.nodes.start(id, row, &animation, None, Held::Bound);
                 self.census.animations += 1;
+                // The same gate a set and an animation take: only a size move can invalidate a
+                // capture, and a channel a tracker drives skips the setter that restates it.
+                if matches!(prop, Prop::Size | Prop::SizeX | Prop::SizeY) {
+                    self.resize_captures(id, env);
+                    self.reclamp_box_mask(id, back, env)?;
+                }
             }
             Bind::FollowOffset {
                 source,
