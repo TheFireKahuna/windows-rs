@@ -396,7 +396,8 @@ pub enum EffectGraph {
         sigma: f32,
         input: Box<Self>,
     },
-    /// A D2D composite of two inputs.
+    /// A D2D composite of two inputs: `source` composited onto `destination` by `mode`.
+    /// Named by role rather than by D2D input index, which puts the destination first.
     Composite {
         mode: CompositeMode,
         source: Box<Self>,
@@ -445,12 +446,17 @@ fn materialize(graph: &EffectGraph) -> Result<IGraphicsEffectSource> {
             source,
             destination,
         } => {
+            // D2D's composite reads input 0 as the destination and input 1 as the source,
+            // bottom to top, which is the reverse of how the description names them.
+            // Swapped, `SourceIn` shows the destination where the source has alpha: a glow
+            // then paints the blurred silhouette's own colour at the tint's alpha, which is
+            // right only where the paint happens to be the tint.
             let node = EffectNode {
                 name: windows_core::HSTRING::new(),
                 kind: Kind::Composite {
                     mode: (*mode).into(),
                 },
-                sources: vec![materialize(source)?, materialize(destination)?],
+                sources: vec![materialize(destination)?, materialize(source)?],
             };
             Ok(node.into())
         }
