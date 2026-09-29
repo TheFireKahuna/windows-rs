@@ -134,6 +134,46 @@ fn layout_width_changes_animate_the_retained_row_and_its_clip() {
 }
 
 #[test]
+fn shrinking_a_lane_repositions_unchanged_right_aligned_controls() {
+    for dpi in [96.0, 144.0, 192.0] {
+        let mut patch = super::rig::fixture_at(dpi);
+        let width = Cell::new(50.0);
+        let mut action = NodeId::NONE;
+        let held = Ui::mount_root(|ui| {
+            ui.node(Preset::Row).animate_layout().width(Len::dip(1000.0)).height(Len::dip(300.0))
+                .children(|ui| {
+                    ui.node(Preset::Layer).layout_from(move |l| l.width = Len::dip(width.get()));
+                    ui.node(Preset::Stack).grow().children(|ui| {
+                        ui.node(Preset::Row).height(Len::dip(36.0)).children(|ui| {
+                            ui.node(Preset::Layer).grow();
+                            action = button(ui, "Add processor").id().into();
+                        });
+                    });
+                });
+        });
+        Host::flush(&mut patch);
+        let before = Host::with(|h| h.geom(action));
+        for target in [182.0, 50.0, 118.0, 182.0, 50.0] {
+            patch.clear();
+            width.set(target);
+            Host::flush(&mut patch);
+            let after = Host::with(|h| h.geom(action));
+            assert_eq!(after.rect.x1, before.rect.x1);
+            assert_eq!(after.local.x, before.local.x - (target - 50.0));
+            assert!(patch.ops().iter().any(|op| matches!(op,
+                Op::Bind { id, prop: Prop::Offset, bind: Bind::Animate(Anim::Spring { to: Value::Vec2(to), .. }) }
+                if *id == action && *to == after.local
+            )), "right-aligned control must receive its changed local position");
+            assert!(!patch.ops().iter().any(|op| matches!(op, Op::New { .. } | Op::Drop { .. })));
+            patch.clear();
+            Host::flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
+        drop(held);
+    }
+}
+
+#[test]
 fn a_window_resize_sets_animated_layout_bounds_directly() {
     let mut patch = fixture();
     Host::with(|h| h.set_window(Vector2::new(800.0, 600.0)));

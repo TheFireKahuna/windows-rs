@@ -577,7 +577,7 @@ impl Solver<'_> {
         *flags = if hidden { *flags | tree::SUNK } else { *flags & !tree::SUNK };
         let placed = *flags & tree::PLACED != 0;
         let settled = !self.dirty(n) && self.published(n) && sunk == hidden;
-        if settled && rect == held.rect {
+        if settled && !placed && rect == held.rect && local == held.at {
             return;
         }
         if settled && h == held.at_h && !placed {
