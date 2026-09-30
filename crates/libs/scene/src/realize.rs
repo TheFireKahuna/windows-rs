@@ -55,6 +55,9 @@ pub struct Backends {
     /// The glow graph's factory, minted once per compositor. The graph is fixed; only its
     /// brushes' sources and sigma move, so every lit node shares the one factory.
     glow: core::cell::OnceCell<CompositionEffectFactory>,
+    /// The smooth-stroke graph's factory, minted on the first smooth stroke and shared by
+    /// every one after; its brushes differ only in their sources and their sigma.
+    smooth: core::cell::OnceCell<CompositionEffectFactory>,
 }
 
 /// Opaque white, the only colour a coverage cell draws in.
@@ -97,6 +100,7 @@ impl Backends {
             masks_a8: core::cell::Cell::new(true),
             white: core::cell::OnceCell::new(),
             glow: core::cell::OnceCell::new(),
+            smooth: core::cell::OnceCell::new(),
         })
     }
 
@@ -173,6 +177,17 @@ impl Backends {
             .compositor
             .create_effect_factory(&glow_graph(), &["blur.BlurAmount"])?;
         Ok(self.glow.get_or_init(|| factory))
+    }
+
+    /// The smooth-stroke graph's factory, minted on first use. See [`smooth_graph`].
+    fn smooth_factory(&self) -> Result<&CompositionEffectFactory> {
+        if let Some(factory) = self.smooth.get() {
+            return Ok(factory);
+        }
+        let factory = self
+            .compositor
+            .create_effect_factory(&smooth_graph(), &["edge.BlurAmount"])?;
+        Ok(self.smooth.get_or_init(|| factory))
     }
 
     /// Rasterizes one cell, surfacing the callback's error alongside the bridge's.
@@ -370,12 +385,16 @@ impl Backends {
     /// alpha ramp (0.02 to 0.06) to almost nothing and need normalizing; FP16 alpha has no
     /// such floor, so that step does not exist. The strip is stretched to fill, so it
     /// carries none of the sprite's extent and a resize re-points nothing.
+    ///
+    /// `gain` multiplies every stop's presented colour, after the display transform, where
+    /// the value is linear in the light the display emits.
     pub(crate) fn raster_ramp(
         &self,
         stops: &[(u16, Radiance)],
         spread: Spread,
         env: Env,
         beneath: Option<Beneath>,
+        gain: f32,
     ) -> Result<Option<CompositionDrawingSurface>> {
         // The wire quantizes a stop's position to bound the identity that keys it; the
         // sampler takes a fraction. One pass per ramp declaration, not per frame.
@@ -384,7 +403,7 @@ impl Backends {
             .map(|&(at, light)| (stop_fraction(at), light))
             .collect();
         if let Spread::Conic { center, start } = spread {
-            return self.raster_conic(&ladder, center, start, env, beneath);
+            return self.raster_conic(&ladder, center, start, env, beneath, gain);
         }
         // Along the axis for the two cardinal directions; square for a diagonal, which has
         // no single axis to lay a strip along, and for a radial, which has none at all. The
@@ -409,7 +428,7 @@ impl Backends {
         let sampled: Vec<Stop> = (0..SAMPLES)
             .map(|at| {
                 let t = at as f32 / (SAMPLES - 1) as f32;
-                let color = env.apply(Radiance::sample(&ladder, t));
+                let color = brighter(env.apply(Radiance::sample(&ladder, t)), gain);
                 Stop {
                     at: t,
                     color: beneath.map_or(color, |b| b.apply(color)),
@@ -482,6 +501,7 @@ impl Backends {
         start: f32,
         env: Env,
         beneath: Option<Beneath>,
+        gain: f32,
     ) -> Result<Option<CompositionDrawingSurface>> {
         const SIDE: u32 = 256;
         let pixels: Vec<Scrgb> = (0..SIDE * SIDE)
@@ -490,7 +510,7 @@ impl Backends {
                 let y = (at / SIDE) as f32 + 0.5 - center[1] * SIDE as f32;
                 let t = (y.atan2(x) - start).rem_euclid(core::f32::consts::TAU)
                     / core::f32::consts::TAU;
-                let color = env.apply(Radiance::sample(stops, t));
+                let color = brighter(env.apply(Radiance::sample(stops, t)), gain);
                 beneath.map_or(color, |b| b.apply(color))
             })
             .collect();
@@ -1211,10 +1231,44 @@ pub enum ResObj {
     /// everything this crate rasterizes and `None` for a region, whose buffer the producer
     /// owns.
     Brush(CompositionSurfaceBrush, Option<CompositionDrawingSurface>),
+    /// A ramp strip, with what it was drawn from so a smooth stroke can have it drawn
+    /// brighter.
+    Ramp(CompositionSurfaceBrush, CompositionDrawingSurface, Box<RampSource>),
     Dash([f32; 8], u8),
     /// A region slot declared but not yet pointed at a buffer. The buffer arrives out of
     /// band, as the one kernel handle that legitimately crosses from the present thread.
     Pending,
+}
+
+/// The stops and spread a ramp strip was drawn from, and the brighter strips drawn from them.
+pub struct RampSource {
+    pub stops: Vec<(u16, Radiance)>,
+    pub spread: Spread,
+    /// One strip per quantized gain a smooth stroke has asked for. A re-declared ramp
+    /// re-surfaces each, so a sprite holding one follows the ramp as it would the base.
+    pub brighter: Vec<(u16, CompositionSurfaceBrush, CompositionDrawingSurface)>,
+}
+
+/// A gain quantized for a key: 1/64 of a stop is well under a visible step in light.
+#[must_use]
+pub fn gain_key(gain: f32) -> u16 {
+    (gain * 64.0).round().clamp(1.0, f32::from(u16::MAX)) as u16
+}
+
+/// A quantized gain's value.
+#[must_use]
+pub fn gain_of(key: u16) -> f32 {
+    f32::from(key) / 64.0
+}
+
+/// A presented colour multiplied by `gain`, alpha unchanged.
+///
+/// Applied after the display transform, where scRGB is linear in emitted light, so the
+/// display shows exactly `gain` times the light; the transform's tone stage is not run
+/// again, and a colour near the display's peak is left to the compositor's clip.
+#[must_use]
+pub fn brighter(c: Scrgb, gain: f32) -> Scrgb {
+    Scrgb { r: c.r * gain, g: c.g * gain, b: c.b * gain, a: c.a }
 }
 
 /// A resource and the two independent claims on it.
@@ -1255,9 +1309,48 @@ impl Resources {
     #[must_use]
     pub fn brush(&self, id: ResId) -> Option<&CompositionSurfaceBrush> {
         match self.obj(id)? {
-            ResObj::Brush(brush, _) => Some(brush),
+            ResObj::Brush(brush, _) | ResObj::Ramp(brush, ..) => Some(brush),
             _ => None,
         }
+    }
+
+    /// The gains a ramp's brighter strips are held at, so a re-declaration can draw them
+    /// again from the new stops.
+    #[must_use]
+    pub fn ramp_gains(&self, id: ResId) -> Vec<u16> {
+        match self.obj(id) {
+            Some(ResObj::Ramp(_, _, source)) => source.brighter.iter().map(|b| b.0).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Returns ramp `id` drawn at `gain`, drawing and holding the strip on first use.
+    ///
+    /// `Ok(None)` where the ramp is not declared yet, or its strip was lost with the
+    /// device; the sprite waits, as it does for a ramp it paints at its own light.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the strip cannot be rasterized.
+    pub fn brighter_ramp(
+        &mut self,
+        id: ResId,
+        gain: u16,
+        back: &Backends,
+        env: Env,
+    ) -> Result<Option<CompositionSurfaceBrush>> {
+        let Some(ResObj::Ramp(_, _, source)) = self.row_mut(id).map(|row| &mut row.obj) else {
+            return Ok(None);
+        };
+        if let Some(held) = source.brighter.iter().find(|b| b.0 == gain) {
+            return Ok(Some(held.1.clone()));
+        }
+        let Some(surface) = back.raster_ramp(&source.stops, source.spread, env, None, gain_of(gain))? else {
+            return Ok(None);
+        };
+        let brush = back.brush(&surface, Stretch::Fill);
+        source.brighter.push((gain, brush.clone(), surface));
+        Ok(Some(brush))
     }
 
     #[must_use]
@@ -1293,6 +1386,21 @@ impl Resources {
                     (ResObj::Brush(held, surface), ResObj::Brush(_, Some(next))) => {
                         held.set_surface(&next);
                         *surface = Some(next);
+                    }
+                    (ResObj::Ramp(held, surface, source), ResObj::Ramp(_, next, next_source)) => {
+                        held.set_surface(&next);
+                        *surface = next;
+                        // The declaration drew a strip for every gain held; each brush a
+                        // sprite already paints with takes its replacement.
+                        let RampSource { stops, spread, brighter } = *next_source;
+                        for (gain, _, next) in brighter {
+                            if let Some(held) = source.brighter.iter_mut().find(|b| b.0 == gain) {
+                                held.1.set_surface(&next);
+                                held.2 = next;
+                            }
+                        }
+                        source.stops = stops;
+                        source.spread = spread;
                     }
                     // A region slot re-declared keeps whatever it already points at.
                     (ResObj::Brush(_, None), ResObj::Pending) => {}
@@ -1470,24 +1578,31 @@ pub fn realize(
         )),
         _ => None,
     };
+    let smooth = match mask {
+        Mask::Shape { stroke: Some(style @ StrokeStyle { smooth: true, .. }), .. }
+            if route == Route::Capture => Some(style.width),
+        _ => None,
+    };
     let source = if let Paint::PresentedView { region, view } = paint {
         presented_view(arena, id, region, view, ctx)
     } else {
         if arena.has_aux(id) {
             arena.aux_mut(id).region_view = None;
         }
-        paint_brush(&paint, captured.as_ref(), ctx)?
+        let gain = smooth.map_or(1.0, |width| smooth_edge().boost(width * ctx.env.scale()));
+        paint_brush(&paint, captured.as_ref(), gain, ctx)?
     };
 
     // A mask and a paint arrive as separate ops in either order, so a half-declared sprite
     // waits rather than failing. `Mask::None` skips the outer brush entirely, because a mask
     // brush in the chain disqualifies a presented buffer from a display plane.
-    let chain = match (&alpha, &source) {
-        (Some(alpha), Some(source)) => {
+    let chain = match (&alpha, &source, smooth) {
+        (Some(alpha), Some(source), Some(_)) => Some(smooth_chain(alpha, source, ctx)?),
+        (Some(alpha), Some(source), None) => {
             let chain = ctx.back.compositor.create_mask_brush();
             chain.set_mask(alpha);
             chain.set_source(source);
-            Some(chain)
+            Some(chain.as_brush())
         }
         _ => None,
     };
@@ -1495,7 +1610,7 @@ pub fn realize(
     // reads, and to decide where the paint goes. A lit node paints through a child of its
     // own, since a visual's own brush draws under its children.
     let brush = match (&chain, &source) {
-        (Some(chain), _) => Some(chain.as_brush()),
+        (Some(chain), _) => Some(chain.clone()),
         (None, Some(source)) => Some(source.clone()),
         _ => None,
     };
@@ -1733,20 +1848,29 @@ fn fit_capture(state: &mut ShapeState, visual: &Visual, geom: GeomId, style: Opt
 }
 
 /// Resolves a shared paint source. Presented views own their mapping brush on the sprite.
+///
+/// `gain` multiplies a solid's or a ramp's presented colour: a smooth
+/// stroke's paint is drawn brighter by the light its edge filter spreads out of the centre.
+/// A captured or presented paint has no light of its own to scale and ignores it.
 fn paint_brush(
     paint: &Paint,
     captured: Option<&windows_composition::Captured>,
+    gain: f32,
     ctx: &mut Ctx<'_>,
 ) -> Result<Option<CompositionBrush>> {
     Ok(match *paint {
         Paint::Solid(light) => {
             // The retained path's draw choke: the one place in this crate a scene-referred
             // value becomes a display-referred one.
-            let key = CellKey::Solid(Q::new(ctx.env.apply(light)));
+            let key = CellKey::Solid(Q::new(brighter(ctx.env.apply(light), gain)));
             ctx.cache
                 .brush(key, ctx.back, ctx.env, ctx.generation)?
                 .map(Brush::as_brush)
         }
+        Paint::Ramp(id) if gain_key(gain) != gain_key(1.0) => ctx
+            .res
+            .brighter_ramp(id.erased(), gain_key(gain), ctx.back, ctx.env)?
+            .map(|brush| brush.as_brush()),
         Paint::Ramp(id) => ctx.res.brush(id.erased()).map(Brush::as_brush),
         Paint::Presented(id) => ctx.res.brush(id.erased()).map(Brush::as_brush),
         Paint::PresentedView { .. } => unreachable!("view brushes are owned by their sprite"),
@@ -2034,6 +2158,115 @@ fn glow_graph() -> EffectGraph {
             input: Box::new(EffectGraph::Parameter("silhouette")),
         }),
     }
+}
+
+/// How a smooth stroke's edge is filtered: a Gaussian of `sigma_px` physical pixels over
+/// the captured coverage, and the colour gain that holds the stroke's centre at its
+/// authored light. `boost` of `None` derives the gain from the stroke's width.
+#[derive(Copy, Clone, Debug)]
+struct SmoothEdge {
+    sigma_px: f32,
+    boost: Option<f32>,
+}
+
+/// The edge filter every smooth stroke uses.
+///
+/// `NEWAPO_SMOOTH_STROKE="<sigma_px> [boost]"` overrides it for the life of the process,
+/// read once, so it can be tuned on the panel without a rebuild.
+fn smooth_edge() -> SmoothEdge {
+    static EDGE: std::sync::OnceLock<SmoothEdge> = std::sync::OnceLock::new();
+    *EDGE.get_or_init(|| {
+        let default = SmoothEdge { sigma_px: 0.65, boost: None };
+        let Ok(text) = std::env::var("NEWAPO_SMOOTH_STROKE") else {
+            return default;
+        };
+        let mut numbers = text.split_whitespace().map(str::parse::<f32>);
+        match numbers.next() {
+            Some(Ok(sigma_px)) if sigma_px >= 0.0 => SmoothEdge {
+                sigma_px,
+                boost: numbers.next().and_then(|b| b.ok()).filter(|b| *b > 0.0),
+            },
+            _ => default,
+        }
+    })
+}
+
+/// The deviation, in physical pixels, of the filtering a captured stroke already carries
+/// from the rasterizer's antialiasing and the capture's sampling, and the fraction of its
+/// nominal width the captured stroke's profile spans. Both are fitted to the centre light
+/// of 1-, 1.5- and 2-DIP captured strokes at 150% on the linear frame, to within 3%.
+const RASTER_SIGMA_PX: f32 = 0.49;
+const RASTER_WIDTH: f32 = 0.845;
+
+impl SmoothEdge {
+    /// The gain on a `width_px` stroke's paint that returns its centre to the light it had
+    /// before the Gaussian.
+    ///
+    /// A stroke `w` wide under a Gaussian of deviation `s` peaks at `erf(w / (2√2 s))` of
+    /// full coverage, so the gain is the ratio of that peak with and without this filter's
+    /// deviation added to the rasterizer's. The total light rises by the same factor; the
+    /// width, and so the shape the blur gave the edge, is unchanged.
+    fn boost(self, width_px: f32) -> f32 {
+        if let Some(boost) = self.boost {
+            return boost;
+        }
+        let width = RASTER_WIDTH * width_px;
+        let peak = |s: f32| erf(width / (2.0 * core::f32::consts::SQRT_2 * s.max(1e-3)));
+        let with = (RASTER_SIGMA_PX * RASTER_SIGMA_PX + self.sigma_px * self.sigma_px).sqrt();
+        peak(RASTER_SIGMA_PX) / peak(with).max(1e-3)
+    }
+}
+
+/// The error function, to 1.5e-7 (Abramowitz and Stegun 7.1.26).
+fn erf(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
+    let poly = t * (0.254_829_6 + t * (-0.284_496_7 + t * (1.421_413_7 + t * (-1.453_152 + t * 1.061_405_4))));
+    (1.0 - poly * (-x * x).exp()).copysign(x)
+}
+
+/// The smooth-stroke graph: `paint` shown through the stroke's coverage after a
+/// sub-pixel Gaussian.
+///
+/// The Gaussian widens the filter across the edge and conserves coverage, which lowers the
+/// centre of a stroke only a few pixels wide; the paint arrives already brighter by
+/// [`SmoothEdge::boost`], leaving the coverage profile, and so the edge, as the blur
+/// shaped it.
+///
+/// Composition evaluates an effect graph on encoded values, so the graph scales no
+/// colour: it multiplies the paint by coverage alone, which holds in any encoding, and an
+/// FP16 value above paper white reaches the screen unclamped.
+fn smooth_graph() -> EffectGraph {
+    EffectGraph::Composite {
+        mode: CompositeMode::SourceIn,
+        source: Box::new(EffectGraph::Parameter("paint")),
+        destination: Box::new(EffectGraph::GaussianBlur {
+            name: "edge",
+            sigma: 0.0,
+            input: Box::new(EffectGraph::Parameter("coverage")),
+        }),
+    }
+}
+
+/// Builds a smooth stroke's brush over its coverage capture and its paint.
+///
+/// The blur's deviation is in DIPs, so the pixel sigma is divided by the display scale the
+/// capture was taken at; a scale change rebuilds the chain.
+///
+/// # Errors
+///
+/// Fails if the graph's factory cannot be created.
+fn smooth_chain(
+    coverage: &CompositionBrush,
+    paint: &CompositionBrush,
+    ctx: &Ctx<'_>,
+) -> Result<CompositionBrush> {
+    let brush = ctx.back.smooth_factory()?.create_brush();
+    brush.set_source_parameter("paint", paint);
+    brush.set_source_parameter("coverage", coverage);
+    let sigma = ctx.back.compositor.create_expression_animation("sigma");
+    sigma.set_scalar_parameter("sigma", smooth_edge().sigma_px / ctx.env.scale());
+    brush.start_animation("edge.BlurAmount", &sigma);
+    Ok(brush.as_brush())
 }
 
 /// Writes the two channels the glow owns onto it.
@@ -2378,6 +2611,7 @@ mod tests {
                 cap: Cap::Flat,
                 join: Join::Miter,
                 dash: DashId::NONE,
+                smooth: false,
             }),
         };
         assert_eq!(route(&stroked, false, false, false), Route::Capture);

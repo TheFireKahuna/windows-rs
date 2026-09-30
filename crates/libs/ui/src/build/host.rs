@@ -780,6 +780,7 @@ impl Host {
         cap: Cap,
         join: Join,
         dashes: &[f32],
+        smooth: bool,
     ) -> StrokeStyle {
         let dash = if dashes.is_empty() {
             DashId::NONE
@@ -797,6 +798,7 @@ impl Host {
             cap,
             join,
             dash,
+            smooth,
         }
     }
 

@@ -92,6 +92,7 @@ pub(crate) enum PaintMask {
         geom: GeomId,
         stroke: Option<Len>,
         space: PathSpace,
+        smooth: bool,
     },
     /// A square box a presented region paints its own buffer over.
     Region,
@@ -1013,9 +1014,10 @@ impl Host {
                 width: width.dips_at(scope, scale),
                 open: attached.map(side_of),
             },
-            PaintMask::Shape { geom, stroke, space } => {
-                let stroke =
-                    stroke.map(|width| self.stroke(width.dips_at(scope, scale), Cap::Round, Join::Round, &[]));
+            PaintMask::Shape { geom, stroke, space, smooth } => {
+                let stroke = stroke.map(|width| {
+                    self.stroke(width.dips_at(scope, scale), Cap::Round, Join::Round, &[], smooth)
+                });
                 Mask::Shape { geom, stroke, space }
             }
             PaintMask::Region => Mask::Box {
@@ -1284,6 +1286,23 @@ impl Element<'_, super::Path> {
         self
     }
 
+    /// Filters this path's stroke edge wider than exact coverage, for a data curve.
+    ///
+    /// The path must have declared its stroke first. A rule or an icon that sits on the
+    /// pixel grid must not take it: the filter softens a pixel-aligned edge.
+    pub fn smooth(mut self) -> Self {
+        let node = self.node_id();
+        let paint = self.host().appearances.get_mut(node)
+            .expect("a smooth path must declare its stroke first");
+        let PaintMask::Shape { smooth, .. } = &mut paint.mask else {
+            unreachable!("a painted path carries a shape mask")
+        };
+        *smooth = true;
+        let paint = *paint;
+        self.host().publish_paint(paint, true);
+        self
+    }
+
     /// Fills this shape in a chromatic role.
     pub fn fill(self, role: DataRole) -> Self {
         self.shape(PaintSource::data(role), None, Part::Fill)
@@ -1339,11 +1358,11 @@ impl Element<'_, super::Path> {
         let Some(geom) = self.host().appearances.shape(node) else {
             return self;
         };
-        let space = match self.host().appearances.get(node).map(|paint| paint.mask) {
-            Some(PaintMask::Shape { space, .. }) => space,
-            _ => PathSpace::Local,
+        let (space, smooth) = match self.host().appearances.get(node).map(|paint| paint.mask) {
+            Some(PaintMask::Shape { space, smooth, .. }) => (space, smooth),
+            _ => (PathSpace::Local, false),
         };
-        self.part(part, source, PaintMask::Shape { geom, stroke, space }, 1.0)
+        self.part(part, source, PaintMask::Shape { geom, stroke, space, smooth }, 1.0)
     }
 
     /// Paints this shape at `strength` of the alpha its role resolves to.
