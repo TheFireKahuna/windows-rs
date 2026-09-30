@@ -50,7 +50,7 @@ impl Interp {
 /// Build it once and rewrite it per frame with [`set`](Self::set): the batch keeps its
 /// allocation, so a field that changes every frame allocates nothing after the first. It is
 /// a device resource — rebuild it when the device is lost.
-pub struct SpriteBatch(ID2D1SpriteBatch, core::cell::Cell<bool>);
+pub struct SpriteBatch(ID2D1SpriteBatch, core::cell::Cell<bool>, core::cell::Cell<u32>);
 
 impl SpriteBatch {
     /// The sprite count some drivers cap a batch at.
@@ -64,7 +64,7 @@ impl SpriteBatch {
     /// Returns the number of sprites in the batch.
     #[must_use]
     pub fn len(&self) -> usize {
-        unsafe { self.0.GetSpriteCount() as usize }
+        self.2.get() as usize
     }
 
     /// Returns `true` when the batch holds no sprites.
@@ -101,12 +101,14 @@ impl SpriteBatch {
         // atlas entries to the whole-source default. Steady-mode updates keep storage.
         if self.1.replace(sources.is_some()) != sources.is_some() {
             unsafe { self.0.Clear() };
+            self.2.set(0);
         }
         let have = self.len();
         let want = rects.len();
         if want == 0 {
             if have > 0 {
                 unsafe { self.0.Clear() };
+                self.2.set(0);
             }
             return Ok(());
         }
@@ -129,6 +131,7 @@ impl SpriteBatch {
         };
         if want < have {
             unsafe { self.0.Clear() };
+            self.2.set(0);
             return self.add(ptr, src, want as u32, stride, src_stride);
         }
         let overlap = have.min(want) as u32;
@@ -181,8 +184,10 @@ impl SpriteBatch {
                     0,
                     0,
                 )
-                .ok()
+                .ok()?;
         }
+        self.2.set(self.2.get() + count);
+        Ok(())
     }
 
     pub(crate) fn raw(&self) -> &ID2D1SpriteBatch {
@@ -196,6 +201,7 @@ impl Gpu {
         Ok(SpriteBatch(
             unsafe { self.ctx().CreateSpriteBatch()? },
             core::cell::Cell::new(false),
+            core::cell::Cell::new(0),
         ))
     }
 }

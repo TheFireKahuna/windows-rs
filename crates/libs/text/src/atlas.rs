@@ -157,6 +157,7 @@ impl Tiles {
             destinations,
             sources,
             used: 0,
+            dirty: false,
         })
     }
 
@@ -216,14 +217,14 @@ pub struct Placements {
     destinations: Vec<Rect>,
     sources: Vec<[u32; 4]>,
     used: usize,
+    dirty: bool,
 }
 
 impl Placements {
     /// Starts a placement pass, retiring the previous one.
     ///
-    /// Real-time: clears reserved storage in place and allocates nothing.
+    /// Real-time: resets the placement cursor and allocates nothing.
     pub fn begin(&mut self) {
-        self.destinations.fill(Rect::default());
         self.used = 0;
     }
 
@@ -246,8 +247,12 @@ impl Placements {
         let snap = |v: f32| (v * scale).round() / scale;
         let pad = 1.0 / scale;
         let (x, y) = (snap(at.x) - pad, snap(at.y) - pad);
-        self.destinations[self.used] = Rect::new(x, y, x + tile.size.x, y + tile.size.y);
-        self.sources[self.used] = tile.source;
+        let destination = Rect::new(x, y, x + tile.size.x, y + tile.size.y);
+        if self.destinations[self.used] != destination || self.sources[self.used] != tile.source {
+            self.destinations[self.used] = destination;
+            self.sources[self.used] = tile.source;
+            self.dirty = true;
+        }
         self.used += 1;
     }
 
@@ -258,12 +263,23 @@ impl Placements {
     }
 
     /// Publishes this pass's placements to the batch.
+    /// Leaves native storage untouched when all placements match the committed pass.
     ///
     /// # Errors
     ///
     /// Fails when the sprite batch refuses the set.
     pub fn commit(&mut self) -> Result<()> {
-        self.batch.set_tiles(&self.destinations, &self.sources)
+        for destination in &mut self.destinations[self.used..] {
+            if *destination != Rect::default() {
+                *destination = Rect::default();
+                self.dirty = true;
+            }
+        }
+        if self.dirty {
+            self.batch.set_tiles(&self.destinations, &self.sources)?;
+            self.dirty = false;
+        }
+        Ok(())
     }
 }
 
@@ -341,6 +357,49 @@ mod tests {
             // An advance is the run's own, and it is the same word for word whatever the
             // scale: a caller lays text out in DIPs.
             assert!(tiles.advance(2).x > tiles.advance(0).x);
+        }
+    }
+
+    #[test]
+    fn unchanged_placements_stay_clean_and_shorter_passes_hide_retired_tiles() {
+        let gpu = Gpu::for_presentation().expect("native Direct2D device");
+        for dpi in [96.0, 144.0, 192.0] {
+            let tiles = build(&gpu, dpi);
+            let mut placements = tiles.placements(&gpu, 4).unwrap();
+            for _ in 0..2 {
+                placements.begin();
+                placements.place(&tiles, 0, Vector2::new(4.0, 4.0));
+                placements.place(&tiles, 1, Vector2::new(20.0, 4.0));
+                placements.commit().unwrap();
+                assert!(!placements.dirty);
+            }
+            placements.begin();
+            placements.place(&tiles, 0, Vector2::new(4.0, 4.0));
+            placements.place(&tiles, 1, Vector2::new(20.0, 4.0));
+            assert!(!placements.dirty, "identical text must not rewrite native sprites");
+            placements.commit().unwrap();
+
+            placements.begin();
+            placements.place(&tiles, 2, Vector2::new(4.0, 4.0));
+            assert!(placements.dirty, "a replacement glyph must be published");
+            placements.commit().unwrap();
+            assert_eq!(placements.destinations[1], Rect::default());
+            placements.begin();
+            placements.commit().unwrap();
+
+            let target = gpu.offscreen((64, 32), dpi, Opacity::Translucent).unwrap();
+            let mut pass = gpu.pass().unwrap();
+            let draw = pass.draw(&target);
+            draw.clear(Scrgb::TRANSPARENT);
+            tiles.draw(&draw, &placements);
+            drop(draw);
+            pass.end().unwrap();
+            let pixels = gpu.read(&target).unwrap();
+            for y in 0..32 {
+                for x in 0..64 {
+                    assert_eq!(pixels.pixel(x, y)[3], 0.0, "retired glyph remains visible");
+                }
+            }
         }
     }
 

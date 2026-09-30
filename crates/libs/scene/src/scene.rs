@@ -2698,7 +2698,7 @@ impl Scene {
     /// requests one cleanup pass; nothing here keeps the clock awake through playback.
     fn retire(&mut self) {
         let mut reports = Vec::new();
-        let overlay = self.overlay.children();
+        let overlay = &self.overlay;
         let census = &mut self.census;
         let nodes = &mut self.nodes;
         self.motion.pending.retain(|pending| {
@@ -2707,7 +2707,8 @@ impl Scene {
             }
             match &pending.holds {
                 PendingKind::Ghost(visual) => {
-                    let _ = overlay.try_remove(visual);
+                    // Collection access schedules dispatcher work; only completed ghosts need it.
+                    let _ = overlay.children().try_remove(visual);
                     census.visuals_live = census.visuals_live.saturating_sub(1);
                 }
                 PendingKind::Collapse { carrier, .. } => {
