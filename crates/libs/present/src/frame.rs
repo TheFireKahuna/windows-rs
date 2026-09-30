@@ -396,6 +396,15 @@ box_accessors!(DrawCtx);
 /// state — which it must, because every device resource it draws with belongs to that
 /// thread.
 pub trait Frame {
+    /// Reports whether rendering follows every observed animated size.
+    ///
+    /// Returning `false` holds the previous render extent during native layout motion.
+    /// Placement and source clipping still follow observed bounds without scaling pixels;
+    /// content beyond those bounds is clipped, and newly exposed space must be cleared.
+    /// Settlement and DPI changes adopt the observed extent and force a redraw.
+    /// Read once at mount. Renderers must clear the full acquired target.
+    fn follows_animated_extent(&self) -> bool { true }
+
     /// Advances live state and reports whether this frame would differ from the one already
     /// on screen. `false` skips the tick entirely: no draw and no present, so the compositor
     /// is not woken.

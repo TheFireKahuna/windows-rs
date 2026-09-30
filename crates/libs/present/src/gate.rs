@@ -139,7 +139,7 @@ pub enum Cached {
     Failed,
 }
 
-/// Holds an offscreen the size of the region and the key its contents were drawn for.
+/// Holds an offscreen allocation and the key and logical extent its contents were drawn for.
 ///
 /// Rasterizes through the supplied pass and keeps its key provisional until
 /// [`Layer::finish_batch`] confirms a successful flush.
@@ -148,6 +148,8 @@ pub struct Layer<K: Copy + PartialEq> {
     key: Option<K>,
     pending: Option<K>,
     opacity: Opacity,
+    capacity: bool,
+    extent: Option<Extent>,
 }
 
 impl<K: Copy + PartialEq> Layer<K> {
@@ -159,10 +161,19 @@ impl<K: Copy + PartialEq> Layer<K> {
             key: None,
             pending: None,
             opacity,
+            capacity: false,
+            extent: None,
         }
     }
 
-    /// Redraws the layer when `key` or the region's allocation moved, and reports whether it
+    /// Creates a layer whose allocation grows in 128-pixel blocks and survives shrinking.
+    /// Callers must blit the logical source rectangle explicitly and clear unused pixels.
+    #[must_use]
+    pub fn with_capacity(opacity: Opacity) -> Self {
+        Self { capacity: true, ..Self::new(opacity) }
+    }
+
+    /// Redraws the layer when `key` or the region's logical extent moved, and reports whether it
     /// now holds `key`'s contents.
     ///
     /// `paint` is handed an open pass and the layer's target; it draws by retargeting that
@@ -181,19 +192,28 @@ impl<K: Copy + PartialEq> Layer<K> {
         let sized = self
             .target
             .as_ref()
-            .is_some_and(|t| t.size_px() == px && t.dpi() == ctx.extent.dpi);
+            .is_some_and(|t| {
+                let size = t.size_px();
+                (if self.capacity { size.0 >= px.0 && size.1 >= px.1 } else { size == px })
+                    && t.dpi() == ctx.extent.dpi
+            });
         if !sized {
-            let Ok(target) = ctx.device.offscreen(px, ctx.extent.dpi, self.opacity) else {
+            let allocation = if self.capacity {
+                let prior = self.target.as_ref().filter(|t| t.dpi() == ctx.extent.dpi)
+                    .map_or((0, 0), Target::size_px);
+                (px.0.max(prior.0).div_ceil(128) * 128, px.1.max(prior.1).div_ceil(128) * 128)
+            } else { px };
+            let Ok(target) = ctx.device.offscreen(allocation, ctx.extent.dpi, self.opacity) else {
                 self.target = None;
                 self.key = None;
-        self.pending = None;
+                self.pending = None;
                 return Cached::Failed;
             };
             self.target = Some(target);
             self.key = None;
-        self.pending = None;
+            self.pending = None;
         }
-        if self.pending.or(self.key) == Some(key) {
+        if self.pending.or(self.key) == Some(key) && self.extent == Some(ctx.extent) {
             return Cached::Held;
         }
         let Some(target) = self.target.as_ref() else {
@@ -203,6 +223,7 @@ impl<K: Copy + PartialEq> Layer<K> {
         // so nothing blits it and the next gate retries.
         self.key = None;
         self.pending = None;
+        self.extent = Some(ctx.extent);
         if paint(pass, target).is_err() {
             return Cached::Failed;
         }
@@ -229,6 +250,7 @@ impl<K: Copy + PartialEq> Layer<K> {
         self.target = None;
         self.key = None;
         self.pending = None;
+        self.extent = None;
     }
 }
 
@@ -252,6 +274,42 @@ mod tests {
             out: OutputTransform::for_display(windows_color::DisplayCapability::Sdr, 1000.0),
             input,
         }
+    }
+
+    #[test]
+    fn capacity_layer_repaints_logical_resizes_and_reuses_pixel_capacity() {
+        let gpu = Gpu::for_presentation().unwrap();
+        let input = RegionInput::default();
+        let mut layer = Layer::<u32>::with_capacity(Opacity::Translucent);
+        for (width, dpi, expected, result) in [
+            (100.0, 96.0, (128, 128), Cached::Drawn),
+            (80.0, 96.0, (128, 128), Cached::Drawn),
+            (80.0, 96.0, (128, 128), Cached::Held),
+            (120.0, 96.0, (128, 128), Cached::Drawn),
+            (180.0, 96.0, (256, 128), Cached::Drawn),
+            (100.0, 96.0, (256, 128), Cached::Drawn),
+            (100.0, 144.0, (256, 128), Cached::Drawn),
+        ] {
+            let ctx = ctx(&gpu, &input, width, dpi);
+            let mut pass = gpu.pass().unwrap();
+            assert_eq!(layer.ensure(ctx, 1, &mut pass, |pass, target| {
+                let draw = pass.draw(target);
+                draw.clear(windows_color::Scrgb::TRANSPARENT);
+                let ink = gpu.solid(windows_color::Scrgb { r: 1.0, g: 0.0, b: 0.0, a: 1.0 })?;
+                draw.fill(Rect::sized(0.0, 0.0, width, 40.0), &ink);
+                Ok(())
+            }), result);
+            pass.end().unwrap();
+            layer.finish_batch(true);
+            let target = layer.target().unwrap();
+            assert_eq!(target.size_px(), expected);
+            assert_eq!(target.dpi(), dpi);
+            let pixels = gpu.read(target).unwrap();
+            assert!(pixels.pixel(ctx.extent.px().0 - 2, 2)[3] > 0.99);
+            assert_eq!(pixels.pixel(ctx.extent.px().0 + 2, 2)[3], 0.0);
+        }
+        layer.finish_batch(false);
+        assert!(layer.target().is_none());
     }
 
     #[test]

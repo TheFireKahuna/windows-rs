@@ -19,6 +19,7 @@ use core::mem::ManuallyDrop;
 /// number of brackets.
 pub struct Pass<'g> {
     gpu: &'g Gpu,
+    dpi: Option<f32>,
 }
 
 /// A pass that latched an error, and the tag that names where.
@@ -39,7 +40,7 @@ pub struct PassError {
 
 impl<'g> Pass<'g> {
     pub(crate) fn new(gpu: &'g Gpu) -> Self {
-        Self { gpu }
+        Self { gpu, dpi: None }
     }
 
     /// Binds `target` and returns the drawing surface for it, in DIPs at the target's own
@@ -51,14 +52,17 @@ impl<'g> Pass<'g> {
     ///
     /// The context DPI comes from the target rather than from an argument, so the DPI the
     /// content is drawn at and the DPI the bitmap was built for cannot disagree — and it is
-    /// restated at every bind rather than once at construction, because each target in a
-    /// pass may be at a different scale.
+    /// updated when a bind changes scale, because each target in a pass may be at a
+    /// different scale.
     pub fn draw(&mut self, target: &Target) -> Draw<'_> {
         let ctx = self.gpu.ctx();
         let dpi = target.dpi();
         unsafe {
             ctx.SetTarget(&target.bitmap);
-            ctx.SetDpi(dpi, dpi);
+            if self.dpi != Some(dpi) {
+                ctx.SetDpi(dpi, dpi);
+                self.dpi = Some(dpi);
+            }
         }
         Draw {
             ctx,
@@ -112,6 +116,35 @@ impl<'g> Pass<'g> {
 impl Drop for Pass<'_> {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+#[cfg(test)]
+mod dpi_tests {
+    use super::*;
+
+    #[test]
+    fn retargeting_preserves_each_targets_scale() {
+        let gpu = Gpu::for_presentation().unwrap();
+        let ink = gpu.solid(Scrgb { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }).unwrap();
+        let targets: Vec<_> = [96.0, 96.0, 144.0, 144.0, 96.0].into_iter()
+            .map(|dpi| gpu.offscreen((16,16), dpi, Opacity::Translucent).unwrap()).collect();
+        for _ in 0..2 {
+            let mut pass = gpu.pass().unwrap();
+            for target in &targets {
+                let draw = pass.draw(target);
+                draw.clear(Scrgb::TRANSPARENT);
+                let _aa = draw.aliased();
+                draw.fill(Rect::sized(0.0,0.0,4.0,4.0), &ink);
+            }
+            pass.end().unwrap();
+            for target in &targets {
+                let pixels = gpu.read(target).unwrap();
+                let edge = (4.0 * target.dpi() / 96.0) as u32;
+                assert_eq!(pixels.pixel(edge-1,1), [1.0,0.0,0.0,1.0]);
+                assert_eq!(pixels.pixel(edge,1), [0.0;4]);
+            }
+        }
     }
 }
 

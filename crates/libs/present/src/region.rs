@@ -122,6 +122,7 @@ pub struct PresentationRegion {
     extent: Extent,
     capacity: (u32, u32),
     origin: Option<[f32; 2]>,
+    content_layout: Cell<Option<((u32, u32), [f32; 2])>>,
     opacity: Opacity,
     displayable: bool,
     pool: u32,
@@ -188,6 +189,7 @@ impl PresentationRegion {
             extent,
             capacity: extent.px(),
             origin: None,
+            content_layout: Cell::new(None),
             opacity,
             displayable: opacity == Opacity::Opaque && device.can_flip(),
             pool,
@@ -396,6 +398,11 @@ impl PresentationRegion {
     /// transform are therefore stated at creation and restated on every resize.
     fn state_content_layout(&self) -> Result<()> {
         let (w, h) = if self.origin.is_some() { self.extent.px() } else { self.capacity };
+        let origin = self.origin.map_or([0.0; 2], |v| [v[0] * self.extent.scale(), v[1] * self.extent.scale()]);
+        let layout = ((w, h), origin);
+        if self.content_layout.get() == Some(layout) {
+            return Ok(());
+        }
         let source = RECT {
             left: 0,
             top: 0,
@@ -407,15 +414,18 @@ impl PresentationRegion {
             M12: 0.0,
             M21: 0.0,
             M22: 1.0,
-            M31: self.origin.map_or(0.0,|v| v[0] * self.extent.scale()),
-            M32: self.origin.map_or(0.0,|v| v[1] * self.extent.scale()),
+            M31: origin[0],
+            M32: origin[1],
         };
+        // A failed setter may leave only half the layout applied; retries restate both.
+        self.content_layout.set(None);
         // SAFETY: `surface` is live; both parameters are stack locals that outlive the
         // calls, and neither is retained.
         unsafe {
             self.surface.SetSourceRect(&source).ok()?;
             self.surface.SetTransform(&mut identity).ok()?;
         }
+        self.content_layout.set(Some(layout));
         Ok(())
     }
 
@@ -513,7 +523,26 @@ fn dxgi_alpha(opacity: Opacity) -> DXGI_ALPHA_MODE {
 
 #[cfg(test)]
 mod tests {
-    use super::Extent;
+    use super::*;
+
+    #[test]
+    fn cached_layout_tracks_origin_logical_resize_and_dpi() {
+        let device = PresentationDevice::new().unwrap();
+        let group = device.create_group(false).unwrap();
+        let mut region = PresentationRegion::new(&device, group, Extent::new(16.0,16.0,96.0),
+            Opacity::Translucent, RegionKey(1), 5).unwrap();
+        region.place(Some([3.0,4.0]));
+        region.state_content_layout().unwrap();
+        assert_eq!(region.content_layout.get(), Some(((16,16),[3.0,4.0])));
+        region.resize(Extent::new(12.0,10.0,96.0)).unwrap();
+        region.state_content_layout().unwrap();
+        assert_eq!(region.content_layout.get(), Some(((12,10),[3.0,4.0])));
+        region.resize(Extent::new(12.0,10.0,144.0)).unwrap();
+        assert_eq!(region.content_layout.get(), Some(((18,15),[4.5,6.0])));
+        region.place(None);
+        region.state_content_layout().unwrap();
+        assert_eq!(region.content_layout.get(), Some((region.capacity,[0.0,0.0])));
+    }
 
     /// The allocation follows the scale and never reaches zero: a region is legitimately
     /// laid out at zero before its first solve, and a zero-sized texture is refused.

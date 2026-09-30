@@ -283,7 +283,7 @@ impl Drop for Presenter {
 
 /// Identifies the queue a group serves. `Solo` is keyed by the region, so asking for one
 /// always yields a group of one.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum GroupKey {
     Solo(RegionKey),
     Shared(&'static str),
@@ -309,6 +309,8 @@ struct Mounted {
     geometry: Arc<RegionGeometry>,
     geometry_moving: bool,
     geometry_revision: u64,
+    render_extent: Extent,
+    follows_animated_extent: bool,
     input: Arc<RegionInput>,
     frame: Box<dyn Frame>,
     region: PresentationRegion,
@@ -373,6 +375,7 @@ struct Pump {
     // Reused across wakes so a pass allocates nothing.
     handles: Vec<HANDLE>,
     due: Vec<usize>,
+    due_groups: Vec<(usize, core::ops::Range<usize>)>,
     slots: Vec<u64>,
     poisoned: Vec<RegionKey>,
 }
@@ -413,6 +416,7 @@ impl Pump {
             replace_queued: false,
             handles: Vec::new(),
             due: Vec::new(),
+            due_groups: Vec::new(),
             slots: Vec::new(),
             poisoned: Vec::new(),
         })
@@ -582,6 +586,7 @@ impl Pump {
             device,
             mounted,
             due,
+            due_groups,
             slots,
             poisoned,
             out,
@@ -594,10 +599,18 @@ impl Pump {
         poisoned.clear();
         for (i, m) in mounted.iter_mut().enumerate() {
             if !m.active { continue; }
+            let observed = m.region.extent();
+            let rendered = m.render_extent.px();
+            let capacity = m.region.size_px();
+            if m.follows_animated_extent || !m.geometry_moving || m.render_extent.dpi != observed.dpi
+                || rendered.0 > capacity.0 || rendered.1 > capacity.1 {
+                m.resize_pending |= m.render_extent != observed;
+                m.render_extent = observed;
+            }
             m.observed_epoch = m.epoch.seq();
             m.observed_urgent = m.geometry_revision;
             let ctx = GateCtx {
-                extent: m.region.extent(),
+                extent: m.render_extent,
                 tick: *tick_count,
                 at: instant,
                 interval,
@@ -657,7 +670,7 @@ impl Pump {
                 );
                 let gate = GateCtx {
                     device: device.gpu(),
-                    extent: m.region.extent(),
+                    extent: m.render_extent,
                     tick: *tick_count,
                     at: instant + interval * k as u32,
                     interval,
@@ -701,25 +714,23 @@ impl Pump {
             }
         };
 
+        due.sort_unstable_by_key(|&i| mounted[i].group);
         let mut at = 0;
         while at < due.len() {
             let group = mounted[due[at]].group;
-            let stale = due.iter().any(|&i| mounted[i].group == group
-                && mounted[i].epoch.urgent() != mounted[i].observed_urgent);
+            let end = at + due[at..].partition_point(|&i| mounted[i].group == group);
+            let stale = due[at..end].iter().any(|&i|
+                mounted[i].epoch.urgent() != mounted[i].observed_urgent);
             if stale {
-                for j in (0..due.len()).rev() {
-                    let i = due[j];
-                    if mounted[i].group == group {
-                        mounted[i].region.discard();
-                        if guarded(|| mounted[i].frame.finish_batch(false)).is_none() {
-                            poisoned.push(mounted[i].spec.key);
-                        }
-                        due.remove(j);
+                for i in due.drain(at..end) {
+                    mounted[i].region.discard();
+                    if guarded(|| mounted[i].frame.finish_batch(false)).is_none() {
+                        poisoned.push(mounted[i].spec.key);
                     }
                 }
                 wake.signal();
             } else {
-                at += 1;
+                at = end;
             }
         }
         if due.is_empty() {
@@ -748,16 +759,21 @@ impl Pump {
         // A solo queue is a group of one, so the same shape is correct for both and there
         // is no second ordering to pick between.
         let last = slots.len().saturating_sub(1);
+        due_groups.clear();
+        for (index, (key, _)) in self.groups.iter().enumerate() {
+            let start = due.partition_point(|&i| mounted[i].group < *key);
+            let end = due.partition_point(|&i| mounted[i].group <= *key);
+            if start != end { due_groups.push((index, start..end)); }
+        }
         let mut failed_group = None;
         'submission: for (k, at) in slots.iter().enumerate() {
-            for (key, group) in &self.groups {
+            for (index, range) in &*due_groups {
+                let (key, group) = &self.groups[*index];
                 let mut bound = false;
-                for &i in &*due {
-                    if mounted[i].group == *key {
-                        match mounted[i].region.submit(&flushed) {
-                            Ok(submitted) => bound |= submitted,
-                            Err(_) => { failed_group = Some(*key); break 'submission; }
-                        }
+                for &i in &due[range.clone()] {
+                    match mounted[i].region.submit(&flushed) {
+                        Ok(submitted) => bound |= submitted,
+                        Err(_) => { failed_group = Some(*key); break 'submission; }
                     }
                 }
                 if !bound {
@@ -907,6 +923,7 @@ impl Pump {
         )?;
         let px = region.size_px();
         let raw = region.surface_handle() as isize;
+        let follows_animated_extent = frame.follows_animated_extent();
         self.mounted.push(Mounted {
             active: true,
             spec,
@@ -917,6 +934,8 @@ impl Pump {
             geometry,
             geometry_moving: false,
             geometry_revision: u64::MAX,
+            render_extent: spec.extent,
+            follows_animated_extent,
             epoch,
             input,
             frame,
@@ -1229,6 +1248,51 @@ mod tests {
         }
         assert!(Arc::ptr_eq(&pump.mounted[0].input, &pump.mounted[1].input));
         assert!(!Arc::ptr_eq(&pump.mounted[0].geometry, &pump.mounted[1].geometry));
+    }
+
+    #[test]
+    fn held_render_extent_tracks_placement_and_adopts_settlement_and_dpi() {
+        struct Held(Arc<Mutex<Vec<Extent>>>);
+        impl Frame for Held {
+            fn follows_animated_extent(&self) -> bool { false }
+            fn should_draw(&mut self, _: GateCtx<'_>) -> bool { false }
+            fn prepare(&mut self, ctx: GateCtx<'_>, _: &mut Pass<'_>) -> Result<()> {
+                self.0.lock().unwrap().push(ctx.extent);
+                Ok(())
+            }
+            fn draw(&mut self, _: DrawCtx<'_>, draw: &Draw<'_>) {
+                draw.clear(windows_color::Scrgb::TRANSPARENT);
+            }
+        }
+        let mut pump = pump();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let frame = Held(seen.clone());
+        let original = Extent::new(100.0, 44.0, 96.0);
+        pump.mount(RegionSpec { key: RegionKey(1), queue: Queue::Solo, extent: original },
+            Arc::new(Epoch::new().unwrap()), Arc::default(), Arc::default(),
+            Box::new(move |_| Ok(Box::new(frame)))).unwrap();
+        let geometry = pump.mounted[0].geometry.clone();
+        let epoch = pump.mounted[0].epoch.clone();
+        let wake = Event::auto_reset().unwrap();
+        let target = Extent::new(140.0, 44.0, 96.0);
+        for (width, x) in [(80.0, 10.0), (80.0, 20.0), (60.0, 20.0), (120.0, 5.0), (140.0, 0.0)] {
+            let observed = Extent::new(width, 44.0, 96.0);
+            geometry.set_bounds(observed, target, true, Some([x, 0.0]));
+            epoch.invalidate();
+            assert!(pump.pass(interrupt_time_now(), 100_000, &wake));
+            assert_eq!(seen.lock().unwrap().last(), Some(&original));
+            assert_eq!(pump.mounted[0].region.extent(), observed);
+        }
+        geometry.set_geometry(target, target, false);
+        epoch.invalidate();
+        assert!(pump.pass(interrupt_time_now(), 100_000, &wake));
+        assert_eq!(seen.lock().unwrap().last(), Some(&target));
+        assert!(!pump.pass(interrupt_time_now(), 100_000, &wake));
+        let next = Extent::new(120.0, 44.0, 144.0);
+        geometry.set_geometry(next, next, true);
+        epoch.invalidate();
+        assert!(pump.pass(interrupt_time_now(), 100_000, &wake));
+        assert_eq!(seen.lock().unwrap().last(), Some(&next));
     }
 
     #[test]

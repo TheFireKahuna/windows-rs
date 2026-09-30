@@ -264,9 +264,12 @@ impl PresentationGroup {
                 return Ok(false);
             }
             hr.ok()?;
-            let now = interrupt_time_now();
             let mut scheduled = inner.scheduled.borrow_mut();
-            scheduled.retain(|&(_, time)| time > now);
+            // Cancellation filters expired entries; storage is compacted only when full.
+            if scheduled.len() == scheduled.capacity() {
+                let now = interrupt_time_now();
+                scheduled.retain(|&(_, time)| time > now);
+            }
             scheduled.push((id, at));
         }
         Ok(true)
