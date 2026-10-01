@@ -108,7 +108,14 @@ pub struct Part {
 #[derive(Default)]
 pub struct RegionParts {
     version: AtomicU64,
-    parts: Mutex<Vec<Part>>,
+    state: Mutex<PartsState>,
+}
+
+#[derive(Default)]
+struct PartsState {
+    parts: Vec<Part>,
+    wake: Option<windows_window::Wake>,
+    pending: Option<windows_window::Tick>,
 }
 
 impl RegionParts {
@@ -121,13 +128,31 @@ impl RegionParts {
     /// Replaces the published set. Called on the present thread, when the renderer's
     /// mapping moves.
     pub fn publish(&self, parts: &[Part]) {
-        if let Ok(mut held) = self.parts.lock() {
-            held.clear();
-            held.extend_from_slice(parts);
-        }
+        let mut held = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        held.parts.clear();
+        held.parts.extend_from_slice(parts);
         // release: pairs with the acquire in `version`, so the new set is in place before
         // the version that advertises it becomes visible.
         self.version.fetch_add(1, Ordering::Release);
+        if held.pending.is_none() {
+            held.pending = held.wake.as_ref().map(windows_window::Wake::tick);
+        }
+    }
+
+    /// Requests an input refresh when geometry changes while a pointer is over the region.
+    ///
+    /// One input owner may watch a region. It must pass `None` when the pointer leaves or
+    /// the region retires, and acknowledge each refreshed version with [`Self::refreshed`].
+    pub fn watch(&self, wake: Option<windows_window::Wake>) {
+        let mut held = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        held.wake = wake;
+        if held.wake.is_none() { held.pending = None; }
+    }
+
+    /// Releases the input request only if `version` still names the published geometry.
+    pub fn refreshed(&self, version: u64) {
+        let mut held = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if self.version() == version { held.pending = None; }
     }
 
     /// Returns the published version. Compare it against the version your copy holds, and
@@ -148,9 +173,9 @@ impl RegionParts {
         // Reversed, it would leave a stale copy under the current version and never
         // refresh.
         let version = self.version();
-        if let Ok(held) = self.parts.lock() {
+        if let Ok(held) = self.state.lock() {
             out.clear();
-            out.extend_from_slice(&held);
+            out.extend_from_slice(&held.parts);
         }
         version
     }
@@ -520,5 +545,35 @@ mod tests {
         seen = parts.read_into(&mut mine);
         assert_eq!(mine.len(), 1);
         assert_eq!(parts.version(), seen);
+    }
+
+    #[test]
+    fn watched_parts_coalesce_and_a_stale_ack_cannot_lose_a_publish() {
+        let window = windows_window::Window::new("parts wake").create().unwrap();
+        let pacer = window.pacer().unwrap();
+        let wake = pacer.wake();
+        let parts = RegionParts::new();
+        let part = Part { id: SubId(1), rect: Rect::new(0.0, 0.0, 10.0, 4.0) };
+        parts.publish(&[part]);
+        assert_eq!(wake.requesters(), 0);
+        parts.watch(Some(wake.clone()));
+        parts.publish(&[part]);
+        assert_eq!(wake.requesters(), 1);
+        let mut mine = Vec::new();
+        let read = parts.read_into(&mut mine);
+        assert_eq!(wake.requesters(), 1, "another reader cannot acknowledge input's request");
+        parts.publish(&[]);
+        parts.refreshed(read);
+        assert_eq!(wake.requesters(), 1, "the newer geometry must still wake input");
+        let read = parts.read_into(&mut mine);
+        assert!(mine.is_empty());
+        parts.refreshed(read);
+        assert_eq!(wake.requesters(), 0);
+        for _ in 0..32 { parts.publish(&[part]); }
+        assert_eq!(wake.requesters(), 1);
+        parts.watch(None);
+        assert_eq!(wake.requesters(), 0);
+        parts.publish(&[]);
+        assert_eq!(wake.requesters(), 0);
     }
 }

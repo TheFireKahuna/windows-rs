@@ -93,6 +93,38 @@ impl windows_core::RuntimeName for CompositionAnimationGroup {
 unsafe impl Send for CompositionAnimationGroup {}
 unsafe impl Sync for CompositionAnimationGroup {}
 #[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionBackdropBrush(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionBackdropBrush,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(
+    CompositionBackdropBrush,
+    CompositionBrush,
+    CompositionObject
+);
+impl windows_core::RuntimeType for CompositionBackdropBrush {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionBackdropBrush>();
+}
+unsafe impl windows_core::Interface for CompositionBackdropBrush {
+    type Vtable = <ICompositionBackdropBrush as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <ICompositionBackdropBrush as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionBackdropBrush {
+    type Target = ICompositionBackdropBrush;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionBackdropBrush {
+    const NAME: &'static str = "Microsoft.UI.Composition.CompositionBackdropBrush";
+}
+unsafe impl Send for CompositionBackdropBrush {}
+unsafe impl Sync for CompositionBackdropBrush {}
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompositionBatchTypes(pub u32);
 impl CompositionBatchTypes {
@@ -692,6 +724,19 @@ pub struct ICompositionAnimationGroup_Vtbl {
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    ICompositionBackdropBrush,
+    ICompositionBackdropBrush_Vtbl,
+    0x6c866bb3_172a_570c_82ac_bf9848d99a59
+);
+impl windows_core::RuntimeType for ICompositionBackdropBrush {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICompositionBackdropBrush_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
     ICompositionBrush,
     ICompositionBrush_Vtbl,
     0x483924e7_99a5_5377_968b_dec6d40bbccd
@@ -1267,6 +1312,16 @@ impl ICompositor2 {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) fn CreateBackdropBrush(&self) -> windows_core::Result<CompositionBackdropBrush> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateBackdropBrush)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
     pub(crate) fn CreateImplicitAnimationCollection(
         &self,
     ) -> windows_core::Result<ImplicitAnimationCollection> {
@@ -1298,7 +1353,10 @@ pub struct ICompositor2_Vtbl {
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
-    CreateBackdropBrush: usize,
+    pub CreateBackdropBrush: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     CreateDistantLight: usize,
     CreateDropShadow: usize,
     pub CreateImplicitAnimationCollection: unsafe extern "system" fn(

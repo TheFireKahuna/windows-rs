@@ -420,6 +420,7 @@ pub struct Spec {
     anchor: Anchor,
     viewport: Option<[Len; 4]>,
     scrim: Option<(Role, f32)>,
+    backdrop_sigma: f32,
     fade: Option<u32>,
     slide: Option<Slide>,
     animate_resize: bool,
@@ -450,6 +451,7 @@ impl Spec {
             anchor,
             viewport: None,
             scrim: None,
+            backdrop_sigma: 0.0,
             fade: None,
             slide: None,
             animate_resize: false,
@@ -502,6 +504,13 @@ impl Spec {
     #[must_use]
     pub const fn scrim(self, role: Role, strength: f32) -> Self {
         Self { scrim: Some((role, strength)), ..self }
+    }
+
+    /// Blurs the content behind the overlay, beneath its scrim. Sigma must be in 0..=250 DIPs.
+    #[must_use]
+    pub const fn backdrop_blur(self, sigma: f32) -> Self {
+        assert!(sigma >= 0.0 && sigma <= 250.0, "invalid backdrop sigma");
+        Self { backdrop_sigma: sigma, ..self }
     }
 
     /// Fades the content and scrim on entry and exit without transforming text.
@@ -713,7 +722,8 @@ impl Overlays {
         let (blocker, root, scope, scrim_root) = Host::with(|host| {
             let blocker = spec.kind.takes_focus().map(|_| host.mint_blocker());
             let scope = host.intern(host.root_scope());
-            let scrim_root = spec.scrim.map(|_| host.overlay_root(scope).0);
+            let scrim_root = (spec.scrim.is_some() || spec.backdrop_sigma > 0.0)
+                .then(|| host.overlay_root(scope).0);
             let root = host.overlay_root(scope).0;
             // The slot root is the element its contents are announced inside: a menu, so its
             // rows report as menu items, or a description, or a dialog a reader announces
@@ -742,11 +752,24 @@ impl Overlays {
             ControlId::NONE
         };
         let (owner, (mut mount, mut scrim)) = Owner::scope(|| {
-            let scrim = scrim_root.zip(spec.scrim).map(|(root, (role, strength))| {
+            let scrim = scrim_root.map(|root| {
                 let mount = Ui::mount_interned(root, None, scope, ControlId::NONE, |ui| {
-                    ui.node(crate::layout::Preset::Layer)
-                        .width(Len::pct(1.0)).height(Len::pct(1.0))
-                        .plate(Len::ZERO, role, strength);
+                    if spec.backdrop_sigma > 0.0 {
+                        ui.node(crate::layout::Preset::Layer)
+                            .width(Len::pct(1.0)).height(Len::pct(1.0)).children(|ui| {
+                                ui.sprite(crate::layout::Preset::Layer)
+                                    .width(Len::pct(1.0)).height(Len::pct(1.0))
+                                    .backdrop_blur(spec.backdrop_sigma);
+                                if let Some((role, strength)) = spec.scrim {
+                                    ui.plate(Len::ZERO, role, strength)
+                                        .width(Len::pct(1.0)).height(Len::pct(1.0));
+                                }
+                            });
+                    } else if let Some((role, strength)) = spec.scrim {
+                        ui.node(crate::layout::Preset::Layer)
+                            .width(Len::pct(1.0)).height(Len::pct(1.0))
+                            .plate(Len::ZERO, role, strength);
+                    }
                 });
                 (root, mount)
             });
@@ -973,6 +996,18 @@ impl Overlays {
         }
     }
 
+    fn focus_depth(&self) -> Option<usize> {
+        self.open.iter().rposition(|open| open.blocker.is_some())
+    }
+
+    /// Rejects keyboard targets outside the innermost focus-taking overlay.
+    pub(crate) fn accepts_key(&self, target: Option<ControlId>) -> bool {
+        self.focus_depth().is_none_or(|depth| {
+            target.is_some_and(|target|
+                Host::with(|host| host.slot_of(target)) == Some(self.open[depth].root))
+        })
+    }
+
     /// Applies the keyboard vocabulary an open overlay owns. Runs before the front table
     /// consumes the tick.
     ///
@@ -991,7 +1026,9 @@ impl Overlays {
             let Report::Key { target, event } = *report else {
                 continue;
             };
-            if event.kind != KeyKind::Down {
+            if event.kind != KeyKind::Down || event.mods.ctrl || event.mods.alt
+                || (event.repeat && matches!(i32::from(event.key), VK_RETURN | VK_RIGHT))
+            {
                 continue;
             }
             // The router raises `Report::Escape` only where a focus scope is open, and a tooltip
@@ -1000,15 +1037,16 @@ impl Overlays {
                 self.hide(focus);
                 continue;
             }
-            // The menu vocabulary applies only while a focus-taking overlay is topmost;
-            // otherwise the arrow keys belong to whatever has focus in the window's content.
-            if self.open.last().is_some_and(|open| open.blocker.is_some()) {
-                self.key(target, i32::from(event.key), focus, intents);
+            // A tooltip owns no focus scope; keys still belong to the flyout beneath it.
+            if let Some(depth) = self.focus_depth()
+                && self.open[depth].kind == Kind::Flyout
+            {
+                self.key(depth, target, i32::from(event.key), focus, intents);
             }
         }
     }
 
-    /// Handles one keystroke while a focus-taking overlay is topmost.
+    /// Handles one keystroke in the innermost focus-taking flyout.
     ///
     /// `Tab` and `Esc` never reach here, because the router takes both before any control sees
     /// them. What is left is the menu vocabulary: `Down` is `Tab`, `Up` is `Shift-Tab`, and
@@ -1016,6 +1054,7 @@ impl Overlays {
     /// rather than performed, because the ring belongs to the half that routes input.
     fn key(
         &mut self,
+        depth: usize,
         target: Option<ControlId>,
         vk: i32,
         focus: &mut Vec<FocusOp>,
@@ -1031,7 +1070,7 @@ impl Overlays {
             focus.push(*op);
         } else if vk == VK_LEFT {
             // One level up, which is what `Esc` does through the router.
-            self.close_top(focus);
+            self.truncate(depth, focus);
         } else if vk == VK_RIGHT || vk == VK_RETURN {
             // Invoked through the ordinary tap path, so a row carrying a flyout opens its
             // submenu the same way a pointer tap on that row does.
@@ -1039,19 +1078,19 @@ impl Overlays {
                 intents.push(Intent::invoke_focused(target));
             }
         } else if let Some(letter) = type_ahead(vk) {
-            self.type_ahead(letter, focus);
+            self.type_ahead(depth, letter, focus);
         }
     }
 
-    /// Focuses the next item of the topmost overlay whose accessible name begins with `letter`,
+    /// Focuses the next item of the overlay at `depth` whose accessible name begins with `letter`,
     /// and emits nothing where none does.
     ///
     /// The candidates are that overlay's own interactive controls in tree order, which is the
     /// order [`FocusOp::Step`] walks. The cycle runs from the item this overlay last typed onto
     /// rather than from the focused control, because the focused control is held by the half
     /// that routes input and cannot be read here.
-    fn type_ahead(&mut self, letter: char, focus: &mut Vec<FocusOp>) {
-        let Some(open) = self.open.last_mut() else {
+    fn type_ahead(&mut self, depth: usize, letter: char, focus: &mut Vec<FocusOp>) {
+        let Some(open) = self.open.get_mut(depth) else {
             return;
         };
         let mut items = Vec::new();
@@ -1197,7 +1236,12 @@ impl Overlays {
             return;
         };
         let spec = if spec.anchor == Anchor::below(target) {
-            spec.anchor(Anchor::below(target).align(align))
+            let anchor = if self.slot_depth(target).is_some_and(|depth| self.open[depth].kind == Kind::Flyout) {
+                Anchor::below(target).side(Side::Right)
+            } else {
+                Anchor::below(target).align(align)
+            };
+            spec.anchor(anchor)
         } else {
             spec
         };
@@ -1260,25 +1304,18 @@ impl Overlays {
         }
         self.dwell.showing = None;
         self.dwell.settled = None;
-        for open in self.open.drain(..).rev() {
-            let Open {
-                mut mount,
-                blocker,
-                root,
-                owner,
-                ..
-            } = open;
-            mount.retire(host);
-            if let Some(blocker) = blocker {
+        for mut open in self.open.drain(..).rev() {
+            open.mount.retire(host);
+            if let Some((root, mount)) = &mut open.scrim {
+                mount.retire(host);
+                host.unplace(*root);
+            }
+            if let Some(blocker) = open.blocker {
                 host.release_control(blocker);
             }
-            host.unplace(root);
-            // Dropped after the borrow: the owner disposes every signal the body created, and
-            // a payload of one may hold a mount, whose drop reaches for the host again.
-            host.retired
-                .push(crate::build::binding::Retired::new(owner));
-            host.retired
-                .push(crate::build::binding::Retired::new(mount));
+            host.unplace(open.root);
+            // Owners, bindings and scrim mounts may re-enter the host when dropped.
+            host.retired.push(crate::build::binding::Retired::new(open));
         }
     }
 }
@@ -1506,11 +1543,21 @@ impl Overlays {
         let mut resolved = String::new();
         text.append(&mut resolved);
         let id = self.open(focus, spec, move |ui| {
-            // Neither element declares a hit entry, so a description contributes nothing to the
-            // array every pointer sample is resolved against and cannot be a target.
-            crate::widget::flyout(ui).stack(|ui| {
-                crate::widget::text(ui, resolved.clone());
-            });
+            use crate::layout::{Edge, Len};
+            use crate::widget::{Chrome, Flow, TextStyle};
+            let style = crate::role::tooltip(ui.scope());
+            // Neither the surface nor its text declares a pointer target.
+            crate::widget::flyout(ui)
+                .appearance(Chrome::new(crate::widget::roles::SURFACE[
+                    crate::widget::roles::SURFACE_FLYOUT as usize], style.radius)
+                    .border(Len::px(1.0)))
+                .padding_xy(Len::dip(style.padding_x), Len::dip(style.padding_y))
+                .max_width(Len::dip(style.max_width))
+                .shadowed(Edge::Bottom)
+                .stack(|ui| {
+                    crate::widget::styled_text(ui, resolved.clone(),
+                        TextStyle::new(style.typography).flow(Flow::Wrap));
+                });
         });
         self.dwell.showing = Some((id, target));
     }
@@ -2024,6 +2071,46 @@ mod tests {
         overlays.escape(&mut focus);
     }
 
+    #[test]
+    fn nested_flyouts_use_the_same_side_for_invoke_expand_and_hover() {
+        let mut patch = fixture();
+        let mut overlays = Overlays::new();
+        let mut ops = Ops::default();
+        overlays.open(&mut ops.0, Spec::flyout(ControlId::NONE), |ui| {
+            button(ui, "Scope").flyout(body);
+        });
+        Host::flush(&mut patch);
+        let target = rows_of(&overlays, 0)[0];
+        for what in [What::Tapped, What::Expanded(true)] {
+            overlays.settle(&[], &[Intent { target, what }], &mut ops.0);
+            Host::with(|host| {
+                let anchor = host.overlays.last().unwrap().anchor;
+                assert_eq!(anchor.side, Side::Right);
+                assert_eq!(anchor.align, Align::Start);
+            });
+            assert_eq!(overlays.depth(), 2);
+            overlays.close_top(&mut ops.0);
+        }
+        dwell_open(&mut overlays, &mut patch, target, &mut ops);
+        Host::with(|host| assert_eq!(host.overlays.last().unwrap().anchor.side, Side::Right));
+        overlays.close_top(&mut ops.0);
+        overlays.close_top(&mut ops.0);
+
+        overlays.open(&mut ops.0, Spec::popup(), |ui| {
+            button(ui, "Selector").flyout_aligned(Align::End, body);
+        });
+        Host::flush(&mut patch);
+        let target = rows_of(&overlays, 0)[0];
+        overlays.settle(&[], &[Intent { target, what: What::Expanded(true) }], &mut ops.0);
+        Host::with(|host| {
+            let anchor = host.overlays.last().unwrap().anchor;
+            assert_eq!(anchor.side, Side::Bottom);
+            assert_eq!(anchor.align, Align::End);
+        });
+        overlays.close_top(&mut ops.0);
+        overlays.close_top(&mut ops.0);
+    }
+
     /// Returns the interactive controls of the overlay at `depth`, in tree order.
     fn rows_of(overlays: &Overlays, depth: usize) -> Vec<ControlId> {
         let root = overlays.open[depth].root;
@@ -2201,6 +2288,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn long_descriptions_wrap_without_pointer_targets() {
+        let mut patch = fixture();
+        let mut target = ControlId::NONE;
+        let _mount = mounted(&mut patch, |ui| {
+            target = button(ui, "Details").tip(
+                "This description explains a control with enough words to require several lines while remaining inside the tooltip width limit."
+            ).control_id();
+        });
+        let mut overlays = Overlays::new();
+        let mut ops = Ops::default();
+        dwell_open(&mut overlays, &mut patch, target, &mut ops);
+        let node = overlays.open[0].mount.node();
+        Host::with(|host| {
+            let bounds = host.tree.c.geom[node.index()].size;
+            assert!(bounds.x <= 320.0 && bounds.x > 0.0, "{bounds:?}");
+            assert!(bounds.y > 40.0, "the description did not wrap: {bounds:?}");
+        });
+        assert!(rows_of(&overlays, 0).is_empty());
+        assert!(ops.pushed().is_empty());
+    }
+
+    #[test]
+    fn teardown_retires_an_open_modal_and_its_scrim() {
+        let mut patch = fixture();
+        let (_mount, _) = invoker(&mut patch);
+        let baseline = live_nodes();
+        let mut overlays = Overlays::new();
+        overlays.open(&mut Vec::new(), Spec::popup()
+            .scrim(Role::Fill(crate::role::Fill::Surface), 0.6), body);
+        Host::flush(&mut patch);
+        drop(overlays);
+        Host::flush(&mut patch);
+        assert_eq!(live_nodes(), baseline);
+    }
+
     /// A press on a light overlay's blocker dismisses it, and a modal's does nothing.
     #[test]
     fn a_blocker_press_dismisses_a_light_overlay_and_not_a_modal() {
@@ -2370,6 +2493,159 @@ mod tests {
         );
     }
 
+    #[test]
+    fn focus_outline_stacks_above_its_scope_and_below_descriptions() {
+        use windows_scene::Attach;
+        let mut patch = fixture();
+        let (_mount, anchor) = invoker(&mut patch);
+        let ring = Host::with(Host::focus_outline);
+        Host::flush(&mut patch);
+        assert!(patch.ops().iter().any(|op| matches!(op,
+            Op::New { id, parent: Attach::Window, .. } if *id == ring)));
+        patch.clear();
+        let mut overlays = Overlays::new();
+        let mut ops = Ops::default();
+        overlays.open(&mut ops.0, Spec::flyout(anchor), |ui| {
+            button(ui, "Command").tip("Description");
+        });
+        Host::flush(&mut patch);
+        let menu = overlays.open[0].root;
+        assert!(patch.ops().contains(&Op::Move {
+            id: ring, parent: Attach::Overlay, after: Some(menu),
+        }));
+        patch.clear();
+        let target = rows_of(&overlays, 0)[0];
+        dwell_open(&mut overlays, &mut patch, target, &mut ops);
+        Host::flush(&mut patch);
+        assert!(!patch.ops().iter().any(|op| matches!(op,
+            Op::Move { id, .. } if *id == ring)));
+        patch.clear();
+        let count = Host::with(|host| host.live_nodes());
+        for _ in 0..100 {
+            Host::flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
+        assert_eq!(Host::with(|host| host.live_nodes()), count);
+        overlays.escape(&mut ops.0);
+        overlays.open(&mut ops.0, Spec::flyout(target), body);
+        Host::flush(&mut patch);
+        assert!(patch.ops().contains(&Op::Move {
+            id: ring, parent: Attach::Overlay, after: Some(overlays.open[1].root),
+        }));
+        patch.clear();
+        overlays.close_top(&mut ops.0);
+        Host::flush(&mut patch);
+        assert!(patch.ops().contains(&Op::Move {
+            id: ring, parent: Attach::Overlay, after: Some(menu),
+        }));
+        patch.clear();
+        overlays.close_top(&mut ops.0);
+        Host::flush(&mut patch);
+        assert!(patch.ops().contains(&Op::Move {
+            id: ring, parent: Attach::Window, after: Some(Host::with(|host| host.root())),
+        }));
+    }
+
+    #[test]
+    fn tooltip_keeps_menu_navigation_and_closes_with_its_menu() {
+        let mut patch = fixture();
+        let (_mount, anchor) = invoker(&mut patch);
+        let mut overlays = Overlays::new();
+        let mut ops = Ops::default();
+        let mut intents = Vec::new();
+        overlays.open(&mut ops.0, Spec::flyout(anchor), |ui| {
+            flyout(ui).stack(|ui| {
+                button(ui, "Alpha").name("Alpha").tip("First command");
+                button(ui, "Beta").name("Beta");
+            });
+        });
+        Host::flush(&mut patch);
+        let rows = rows_of(&overlays, 0);
+        dwell_open(&mut overlays, &mut patch, rows[0], &mut ops);
+        assert_eq!(overlays.depth(), 2);
+        assert!(overlays.accepts_key(Some(rows[0])));
+        assert!(!overlays.accepts_key(Some(anchor)));
+        ops.clear();
+        overlays.keys(&[key(VK_DOWN), key(VK_UP), key(VK_HOME), key(VK_END)],
+            &mut ops.0, &mut intents);
+        assert_eq!(ops.0, [
+            FocusOp::Step { forward: true }, FocusOp::Step { forward: false },
+            FocusOp::End { last: false }, FocusOp::End { last: true },
+        ]);
+        ops.clear();
+        overlays.keys(&[key(0x42)], &mut ops.0, &mut intents);
+        assert_eq!(ops.0, [FocusOp::Focus(Some(rows[1]))]);
+        ops.clear();
+        overlays.keys(&[key(VK_LEFT)], &mut ops.0, &mut intents);
+        assert!(overlays.is_empty());
+        assert_eq!(ops.popped().len(), 1);
+        assert!(overlays.dwell.showing.is_none());
+        assert!(overlays.dwell.pending.is_none());
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn nested_menu_with_tooltip_closes_one_focus_scope_and_escape_takes_the_tip_first() {
+        let mut patch = fixture();
+        let (_mount, anchor) = invoker(&mut patch);
+        let mut overlays = Overlays::new();
+        let mut ops = Ops::default();
+        let mut intents = Vec::new();
+        overlays.open(&mut ops.0, Spec::flyout(anchor), body);
+        Host::flush(&mut patch);
+        let parent = rows_of(&overlays, 0)[0];
+        overlays.open(&mut ops.0, Spec::flyout(parent), |ui| {
+            button(ui, "Nested").tip("Nested description");
+        });
+        Host::flush(&mut patch);
+        let nested = rows_of(&overlays, 1)[0];
+        dwell_open(&mut overlays, &mut patch, nested, &mut ops);
+        assert_eq!(overlays.depth(), 3);
+        assert!(overlays.accepts_key(Some(nested)));
+        assert!(!overlays.accepts_key(Some(parent)));
+        ops.clear();
+        overlays.escape(&mut ops.0);
+        assert_eq!(overlays.depth(), 2);
+        assert!(ops.popped().is_empty());
+        dwell_open(&mut overlays, &mut patch, nested, &mut ops);
+        ops.clear();
+        overlays.keys(&[key(VK_LEFT)], &mut ops.0, &mut intents);
+        assert_eq!(overlays.depth(), 1);
+        assert_eq!(ops.popped().len(), 1);
+        assert!(overlays.accepts_key(Some(parent)));
+        assert!(!overlays.accepts_key(Some(nested)));
+        assert!(overlays.dwell.showing.is_none());
+        overlays.escape(&mut ops.0);
+        assert!(overlays.is_empty());
+    }
+
+    #[test]
+    fn menu_activation_ignores_repeats_and_modified_keys() {
+        let mut patch = fixture();
+        let (_mount, anchor) = invoker(&mut patch);
+        let mut overlays = Overlays::new();
+        let mut ops = Ops::default();
+        let mut intents = Vec::new();
+        overlays.open(&mut ops.0, Spec::flyout(anchor), body);
+        Host::flush(&mut patch);
+        let target = rows_of(&overlays, 0)[0];
+        ops.clear();
+        for code in [VK_RETURN, VK_RIGHT] {
+            for (repeat, ctrl, alt) in [(true, false, false), (false, true, false), (false, false, true)] {
+                overlays.keys(&[Report::Key { target: Some(target), event: KeyEvent {
+                    key: code as u16, kind: KeyKind::Down, repeat,
+                    mods: Mods { ctrl, alt, ..Mods::default() },
+                } }], &mut ops.0, &mut intents);
+            }
+        }
+        assert!(intents.is_empty());
+        assert!(ops.0.is_empty());
+        overlays.keys(&[Report::Key { target: Some(target), event: KeyEvent {
+            key: VK_DOWN as u16, kind: KeyKind::Down, repeat: true, mods: Mods::default(),
+        } }], &mut ops.0, &mut intents);
+        assert_eq!(ops.0, [FocusOp::Step { forward: true }]);
+    }
+
     /// The arrow keys emit the step they mean, and `Left` closes one level.
     #[test]
     fn the_arrow_keys_emit_the_step_they_mean_and_left_closes_a_level() {
@@ -2440,11 +2716,12 @@ mod tests {
     #[test]
     fn type_ahead_walks_the_items_of_the_topmost_overlay_and_cycles() {
         let mut patch = fixture();
+        let (_mount, anchor) = invoker(&mut patch);
         let mut overlays = Overlays::new();
         let mut ops = Ops::default();
         let mut intents = Vec::new();
 
-        overlays.open(&mut ops.0, Spec::popup(), |ui| {
+        overlays.open(&mut ops.0, Spec::flyout(anchor), |ui| {
             flyout(ui).stack(|ui| {
                 button(ui, "Alpha").name("Alpha");
                 button(ui, "Almond").name("Almond");
@@ -2587,6 +2864,48 @@ mod tests {
             overlays.is_empty(),
             "a cancelled delay still opened a submenu"
         );
+    }
+
+    #[test]
+    fn blurred_scrim_is_passive_and_retires_without_idle_work() {
+        let mut patch = fixture();
+        let (_mount, _) = invoker(&mut patch);
+        let baseline = live_nodes();
+        let mut overlays = Overlays::new();
+        let mut ops = Ops::default();
+        for _ in 0..8 {
+            let opened = overlays.open(&mut ops.0, Spec::popup()
+                .scrim(Role::Fill(crate::role::Fill::Surface), 0.6)
+                .backdrop_blur(8.0).fade(200), body);
+            Host::flush(&mut patch);
+            let blur = patch.ops().iter().find_map(|op| match op {
+                Op::Paint { id, paint: windows_scene::Paint::Backdrop { sigma: 8.0 }, halo: None } => Some(id.0),
+                _ => None,
+            }).expect("one retained backdrop paint");
+            assert!(patch.ops().iter().any(|op| matches!(op,
+                Op::Mask { id, mask: windows_scene::Mask::None } if id.0 == blur)));
+            patch.clear();
+            for window in [size(900.0, 600.0), size(600.0, 420.0)] {
+                Host::with(|host| host.set_window(window));
+                overlays.sync(&mut ops.0);
+                Host::flush(&mut patch);
+                Host::with(|host| {
+                    assert_eq!(host.tree.c.geom[blur.index()].size, window);
+                    assert_eq!(host.control_of(blur), ControlId::NONE);
+                });
+                patch.clear();
+                Host::flush(&mut patch);
+                assert!(patch.ops().is_empty(), "settled backdrop emits no work");
+            }
+            overlays.close(opened, &mut ops.0);
+            Host::flush(&mut patch);
+            assert_eq!(live_nodes(), baseline);
+            Host::with(|host| assert!(!host.tree.is_live(blur)));
+            patch.clear();
+        }
+        for sigma in [f32::NAN, f32::INFINITY, -1.0, 251.0] {
+            assert!(std::panic::catch_unwind(|| Spec::popup().backdrop_blur(sigma)).is_err());
+        }
     }
 
     #[test]

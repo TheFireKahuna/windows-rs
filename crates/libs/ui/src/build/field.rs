@@ -130,7 +130,7 @@ struct Plan {
     node: NodeId,
     geometry: Geometry,
     caret: Rect,
-    line_h: f32,
+    size: Vector2,
 }
 
 /// Removes the separators a single-line field cannot hold: CR, LF, NEL, LINE SEPARATOR and
@@ -262,6 +262,12 @@ impl Host {
         };
         let based_on = row.callback_revision.unwrap_or(row.revision);
         let scope = row.scope;
+        // Before first publication input has no working document for this node. Both
+        // halves receive the same sanitized text and initial selection at revision zero.
+        if self.tree.c.flags[row.group.0.index()] & super::tree::INITIAL != 0 {
+            self.fields.get_mut(id).unwrap().selection = Selection::at(text.len() as u32);
+            self.field_text(id, Arc::clone(&text));
+        }
         match self.field_sources.iter_mut().find(|held| held.id == id) {
             Some(held) => (held.text, held.based_on, held.scope) = (text, based_on, scope),
             None => self.field_sources.push(Source {
@@ -294,16 +300,8 @@ impl Host {
         row.composition.clone_from(&update.composition);
         row.focused = update.focused;
         row.dirty = true;
-        let (key, replaced) = (row.key, update.text.clone());
-        if let Some(value) = replaced {
-            row.text = Arc::clone(&value);
-            row.geometry = None;
-            // The fold is the run's, so a masked field draws its dots from this same string
-            // and the plaintext goes no further than the row.
-            let display = String::from_utf16_lossy(&value);
-            if let Some(node) = self.text.set_text(key, &display) {
-                self.tree.mark(node);
-            }
+        if let Some(value) = &update.text {
+            self.field_text(update.id, Arc::clone(value));
         }
         if let Some(value) = &update.commit {
             // Coalescing visuals must preserve all completed-edit callbacks in order, so the
@@ -315,6 +313,18 @@ impl Host {
             });
         }
         self.uia_stale.set(true);
+    }
+
+    fn field_text(&mut self, id: ControlId, text: Arc<[u16]>) {
+        let Some(row) = self.fields.get_mut(id) else { return; };
+        row.text = text;
+        row.geometry = None;
+        row.dirty = true;
+        // The run's fold masks passwords before shaping, coverage and automation.
+        let display = String::from_utf16_lossy(&row.text);
+        if let Some(node) = self.text.set_text(row.key, &display) {
+            self.tree.mark(node);
+        }
     }
 
     pub(crate) fn field_reveal(&mut self, id: ControlId, revision: u64, start: u32, end: u32) {
@@ -362,7 +372,9 @@ impl Host {
         self.tree.c.driven[plan.node.index()] |=
             (1 << Prop::OffsetX as u32) | (1 << Prop::OffsetY as u32);
         self.write_channel(plan.node, Prop::Offset, Value::Vec2(plan.geometry.origin));
-        self.place_caret(id, plan.caret, plan.line_h, plan.geometry.origin);
+        // The parent clips the viewport; the scrolling sprite must cover the whole run.
+        self.write_channel(plan.node, Prop::Size, Value::Vec2(plan.size));
+        self.place_caret(id, plan.caret, plan.size.y, plan.geometry.origin);
         self.decorate(id, &plan.geometry, false);
         self.decorate(id, &plan.geometry, true);
         let Self {
@@ -476,7 +488,7 @@ impl Host {
             node,
             geometry,
             caret,
-            line_h: line.y,
+            size: Vector2 { x: right.max(line.x), y: line.y },
         })
     }
 
@@ -613,6 +625,96 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_publication_shapes_the_source_before_input_echo_and_later_sources_wait() {
+        use crate::build::rig::Rig;
+        use crate::layout::Len;
+        use crate::signal::Cell;
+        let mut rig = Rig::new();
+        let source = Cell::new("20\n000");
+        let mut target = ControlId::NONE;
+        let frame = rig.mount(|ui| {
+            target = crate::widget::field(ui, crate::widget::reactive(move |out| out.push_str(source.get())))
+                .width(Len::dip(120.0)).height(Len::dip(24.0)).control_id();
+        });
+        let node = Host::with(|host| {
+            let row = host.fields.get(target).unwrap();
+            assert_eq!(String::from_utf16_lossy(&row.text), "20000");
+            assert_eq!(row.revision, 0);
+            let geometry = row.geometry.as_ref().unwrap();
+            assert_eq!(geometry.revision, 0);
+            assert!(geometry.end.x > 0.0);
+            assert_eq!(row.selection, Selection::at(5));
+            host.text.field_view(row.key, &mut Vec::new()).unwrap().0
+        });
+        assert!(matches!(frame.bound(node, Prop::Size), Some(Value::Vec2(size)) if size.x > 0.0));
+        rig.set(source, "15000");
+        Host::with(|host| {
+            assert_eq!(String::from_utf16_lossy(&host.fields.get(target).unwrap().text), "20000");
+            host.field_update(&Update { id: target, revision: 1, selection: Selection::at(3),
+                text: Some("123".encode_utf16().collect::<Vec<_>>().into()), composition: None,
+                focused: true, commit: None });
+        });
+        rig.flush();
+        rig.set(source, "9000");
+        Host::with(|host| {
+            let row = host.fields.get(target).unwrap();
+            assert_eq!(String::from_utf16_lossy(&row.text), "123");
+            assert_eq!(row.revision, 1);
+            assert_eq!(row.selection, Selection::at(3));
+        });
+    }
+
+    #[test]
+    fn revealed_text_covers_the_field_after_edit_and_resize() {
+        use crate::build::rig::Rig;
+        use crate::layout::Len;
+        use crate::signal::Cell;
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let mut rig = Rig::at(400.0, 160.0, scale);
+            let width = Cell::new(120.0);
+            let mut target = ControlId::NONE;
+            rig.mount(|ui| {
+                target = crate::widget::field(ui, "")
+                    .height(Len::dip(24.0))
+                    .layout_from(move |l| l.width = Len::dip(width.get()))
+                    .control_id();
+            });
+            for (revision, value) in [(1, "C:/a/long/path/whose/file/name/must/remain/visible.toml"), (2, "short")] {
+                let text: Arc<[u16]> = value.encode_utf16().collect::<Vec<_>>().into();
+                Host::with(|host| host.field_update(&Update {
+                    id: target,
+                    revision,
+                    selection: Selection::at(text.len() as u32),
+                    text: Some(text),
+                    composition: None,
+                    focused: true,
+                    commit: None,
+                }));
+                let frame = rig.flush();
+                let (node, right) = Host::with(|host| {
+                    let row = host.fields.get(target).unwrap();
+                    let geometry = row.geometry.as_ref().unwrap();
+                    assert_eq!(host.geom(row.group.0).size.x, width.get());
+                    let right = geometry.clusters.iter().fold(geometry.end.x, |r, c| r.max(c.rect.x + c.rect.w));
+                    assert!(geometry.origin.x + right <= width.get() + 0.01);
+                    (host.text.field_view(row.key, &mut Vec::new()).unwrap().0, right)
+                });
+                assert!(matches!(frame.bound(node, Prop::Size), Some(Value::Vec2(size)) if size.x >= right));
+                let resized = rig.set(width, if revision == 1 { 160.0 } else { 80.0 });
+                assert!(matches!(resized.bound(node, Prop::Size), Some(Value::Vec2(size)) if size.x >= right));
+                Host::with(|host| {
+                    let row = host.fields.get(target).unwrap();
+                    let geometry = row.geometry.as_ref().unwrap();
+                    assert_eq!(host.geom(row.group.0).size.x, width.get());
+                    assert!(geometry.origin.x + right <= width.get() + 0.01);
+                    assert!(host.plan_field(target).is_none());
+                });
+                assert!(rig.flush().patch().ops().is_empty());
+            }
+        }
+    }
 
     #[test]
     fn fields_honor_authored_padding_and_alignment_without_reshaping() {

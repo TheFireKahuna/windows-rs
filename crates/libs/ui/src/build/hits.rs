@@ -217,12 +217,13 @@ pub(crate) fn walk(walk: &Walk<'_>, out: &mut Out<'_>, node: NodeId, depth: usiz
             id: control,
             touch_inflate: Some(walk.tree.c.inflate[node.index()]).filter(|v| !v.is_nan()),
         };
-        if walk
-            .controls
-            .get(control)
-            .is_some_and(|row| display_only(row, walk.handlers.get(row.handlers)))
-        {
-            decl.flags = HitFlags::from_bits(decl.flags.bits() & !HitFlags::INTERACTIVE.bits());
+        if let Some(row) = walk.controls.get(control) {
+            if row.disabled {
+                decl.flags = HitFlags::from_bits(decl.flags.bits() & HitFlags::UIA.bits());
+            } else if display_only(row, walk.handlers.get(row.handlers)) {
+                decl.flags = HitFlags::from_bits(decl.flags.bits() & !HitFlags::INTERACTIVE.bits());
+                if row.uia == UiaRole::Graph { decl.flags = decl.flags | HitFlags::HOVER; }
+            }
         }
         emit_hit(out, depth, &geom, bounded, flags, decl);
     }

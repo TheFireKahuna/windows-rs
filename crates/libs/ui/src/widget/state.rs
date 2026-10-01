@@ -94,7 +94,7 @@ impl Front<'_> {
     /// One of the shared spring templates, so a state change allocates nothing, and the motion
     /// plays to completion on the compositor with no further frames on any thread of ours. A
     /// retarget mid-ramp continues from where the spring had reached.
-    fn spring(&mut self, node: NodeId, prop: Prop, to: Value) -> Result<()> {
+    pub(crate) fn spring(&mut self, node: NodeId, prop: Prop, to: Value) -> Result<()> {
         let bind = Bind::Animate(Anim::Spring {
             to,
             tuning: Tuning::Chrome,
@@ -470,9 +470,36 @@ impl Controls {
         Ok(())
     }
 
+    pub(crate) fn reorder_pointer(&self) -> Option<(ControlId, Point, [f32; 2])> {
+        let update = self.drag_last?;
+        let span = self.reorders.span()?;
+        (!self.dragged.is_none() && self.decided).then_some((self.dragged, update.at, span))
+    }
+
+    pub(crate) fn refresh_reorder(&mut self, front: &mut Front<'_>, out: &mut Vec<Intent>) -> Result<()> {
+        let Some((target, at, _)) = self.reorder_pointer() else { return Ok(()); };
+        let (update, changed) = self.reorders.moved(at, false, front)?;
+        self.translation_changed |= changed;
+        let delta = self.drag_last.unwrap().delta;
+        self.translation_changed |= self.reorders.follow_preview(Vector2::new(delta.x, delta.y), front.scene.hits());
+        if let Some(update) = update { out.push(Intent { target, what: What::Reordered(update) }); }
+        Ok(())
+    }
+
     pub(crate) fn finish_reorder(&mut self, epoch: u64, front: &mut Front<'_>) -> Result<()> {
         self.translation_changed |= self.reorders.finish(epoch, front)?;
         Ok(())
+    }
+
+    pub(crate) fn reorder_landing(&self, epoch: u64, accepted: ControlId, scene: &windows_scene::Scene,
+        patch: &windows_scene::SinkPatch)
+        -> Option<reorder::Landing>
+    {
+        self.reorders.landing(epoch, accepted, scene, patch)
+    }
+
+    pub(crate) fn land_reorder(&self, landing: reorder::Landing, front: &mut Front<'_>) -> Result<()> {
+        self.reorders.land(landing, front)
     }
 
     fn translate(&mut self, front: &mut Front<'_>) -> Result<()> {
@@ -777,7 +804,7 @@ impl Controls {
                 if self.flags(target) & flag::DRAG_PREVIEW != 0 {
                     if update.decided {
                         if let Some(&(_, node)) = self.previews.iter().find(|row| row.0 == target) {
-                            front.scene.begin_drag_preview(node, front.back);
+                            front.scene.begin_drag_preview(node, target, front.back);
                             if self.reorders.contains(target) { self.reorders.begin(target, front)?; }
                         }
                     }
@@ -789,7 +816,7 @@ impl Controls {
                 if self.reorders.contains(target) {
                     let (reorder, changed) = self.reorders.moved(update.at, update.decided, front)?;
                     self.translation_changed |= changed;
-                    self.translation_changed |= self.reorders.follow_preview(Vector2::new(update.delta.x, update.delta.y));
+                    self.translation_changed |= self.reorders.follow_preview(Vector2::new(update.delta.x, update.delta.y), front.scene.hits());
                     if let Some(update) = reorder {
                         out.push(Intent { target, what: What::Reordered(update) });
                     }
@@ -861,6 +888,7 @@ impl Controls {
             // compile here. None of these moves a control's chrome: they belong to the overlay
             // layer, the text stack, the scroll front and the recogniser.
             Report::Redirect { .. }
+            | Report::HoverMoved { .. }
             | Report::Moved { .. }
             | Report::Buttons { .. }
             | Report::Gesture { .. }
@@ -1156,7 +1184,6 @@ impl Controls {
         if self.ring.is_none() {
             return Ok(());
         }
-        front.scene.raise_overlay(self.ring);
         let scroll = if entry.flags.contains(HitFlags::UNSCROLLED) {
             Vector2::default()
         } else {

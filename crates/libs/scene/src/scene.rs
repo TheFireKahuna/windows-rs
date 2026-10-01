@@ -31,6 +31,9 @@ use windows_numerics::{Vector2, Vector3};
 
 #[path = "drag_preview.rs"]
 mod drag_preview;
+#[path = "translation_carry.rs"]
+mod translation_carry;
+pub use translation_carry::TranslationCarry;
 
 // ── the census ──────────────────────────────────────────────────────────────────────
 
@@ -426,6 +429,8 @@ enum PendingKind {
     Frames(NodeId, Prop),
     /// Scalar settlement identities, released only after their finite animations finish.
     Restate(Vec<u64>),
+    DragLanding(u64),
+    TranslationCarry { node: NodeId, axes: u8, source: TranslationCarry },
 }
 
 /// A batch whose completion is the only report that the work it holds has run.
@@ -453,12 +458,12 @@ impl Motion {
     ///
     /// Released on the batch's own completion signal, never on a timer or an estimated
     /// deadline.
-    fn watch(&mut self, back: &Backends, holds: PendingKind, start: impl FnOnce()) -> Result<()> {
+    fn watch(&mut self, back: &Backends, holds: PendingKind, start: impl FnOnce(&Templates)) -> Result<()> {
         let batch = back.compositor.create_scoped_batch(BatchKind::Animation);
         let done = Rc::new(Cell::new(false));
         let signal = Rc::clone(&done);
         let revoker = batch.on_completed(move || signal.set(true))?;
-        start();
+        start(&self.templates);
         batch.try_end()?;
         self.pending.push(Pending {
             done,
@@ -1034,6 +1039,13 @@ pub struct Scene {
     _not_send: core::marker::PhantomData<*const ()>,
 }
 
+impl Drop for Scene {
+    fn drop(&mut self) {
+        // The placeholder removes native children before the desktop target closes them.
+        self.end_drag_preview();
+    }
+}
+
 impl Scene {
     /// Observes native layout bounds without writing layout or animated properties.
     pub fn observe_size(&mut self, node: NodeId, region: Option<RegionId>, publish: impl FnMut(Vector2, Vector2, Vector2, bool) + 'static, back: &Backends) -> Result<()> {
@@ -1581,15 +1593,6 @@ impl Scene {
         self.census.visuals_live += 1;
     }
 
-    /// Raises a detached overlay visual above the other overlays.
-    ///
-    /// `id` must identify a root attached to the overlay band.
-    pub fn raise_overlay(&mut self, id: NodeId) {
-        if self.roots.contains(&id) {
-            self.reparent(id, Attach::Overlay, None);
-        }
-    }
-
     /// Destroys a node *and its subtree*, releasing every resource on the way down, so a
     /// subtree removal is one op and a partial destroy is unrepresentable.
     ///
@@ -1635,7 +1638,8 @@ impl Scene {
         unlink(&mut self.nodes, id.index() as u32);
         self.roots.retain(|root| *root != id);
         self.pending_retain(
-            |pending| !matches!(pending.holds, PendingKind::Frames(node, _) if node == id),
+            |pending| !matches!(pending.holds,
+                PendingKind::Frames(node, _) | PendingKind::TranslationCarry { node, .. } if node == id),
         );
         let (aux, painted) = self.nodes.free(id);
         // A split group's content carrier goes with its visual.
@@ -1756,7 +1760,7 @@ impl Scene {
             scalar,
         );
         self.census.animations += 1;
-        self.motion.watch(back, PendingKind::Ghost(mounted), || {
+        self.motion.watch(back, PendingKind::Ghost(mounted), |_| {
             sprite.start_animation(path, &animation);
         })
     }
@@ -1785,7 +1789,7 @@ impl Scene {
         self.census.visuals_minted += 1;
         self.census.visuals_live += 1;
         self.census.animations += 1;
-        self.motion.watch(back, PendingKind::Collapse { id, parent, carrier, resources: Vec::new() }, || {
+        self.motion.watch(back, PendingKind::Collapse { id, parent, carrier, resources: Vec::new() }, |_| {
             clip.start_animation("Bottom", &animation);
         })
     }
@@ -1840,8 +1844,19 @@ impl Scene {
             paint.map_or(was.1, |(paint, _)| paint),
             paint.map_or(was.2, |(_, halo)| halo),
         );
+        if let Paint::Backdrop { sigma } = next.1
+            && (!sigma.is_finite() || !(0.0..=250.0).contains(&sigma)
+                || next.0 != Mask::None || next.2.is_some())
+        {
+            return Err(invalid_arg());
+        }
         if let Paint::PresentedView { view, .. } = next.1
             && !view.is_valid()
+        {
+            return Err(invalid_arg());
+        }
+        if let Paint::Presented { origin, .. } = next.1
+            && !(origin.x.is_finite() && origin.y.is_finite() && origin.x >= 0.0 && origin.y >= 0.0)
         {
             return Err(invalid_arg());
         }
@@ -2043,6 +2058,7 @@ impl Scene {
         }
         // Replacing an overlapping channel cancels the held subscription, so a completion
         // cannot report for a run another binding has already displaced.
+        self.cancel_translation_carry(id, prop);
         self.pending_retain(|pending| {
             !matches!(pending.holds, PendingKind::Frames(node, held)
                 if node == id && desc(held).overlaps(row))
@@ -2215,7 +2231,7 @@ impl Scene {
                 }
                 // The start must occur inside the scoped batch for completion to cover it.
                 let nodes = &mut self.nodes;
-                self.motion.watch(back, PendingKind::Frames(id, prop), || {
+                self.motion.watch(back, PendingKind::Frames(id, prop), |_| {
                     nodes.start(id, row, &animation, None, Held::Playing);
                 })
             }
@@ -2524,6 +2540,33 @@ impl Scene {
         }
     }
 
+    /// Moves an observed tracker linearly to `to` over `duration`.
+    /// The destination is clamped to its stated bounds. A later position request
+    /// interrupts the animation; progress arrives through ordinary tracker events.
+    ///
+    /// # Errors
+    /// Returns an error for a retired tracker, nonfinite destination, zero duration,
+    /// or a rejected compositor request.
+    pub fn animate_tracker(
+        &mut self, id: TrackerId<Observed>, to: Vector2, duration: Duration, back: &Backends,
+    ) -> Result<i32> {
+        if !to.x.is_finite() || !to.y.is_finite() || duration.is_zero() { return Err(invalid_arg()); }
+        let state = self.trackers.get_mut(id.id()).ok_or_else(invalid_arg)?;
+        let to = Vector2::new(
+            to.x.clamp(state.bounds.0.x, state.bounds.1.x + state.extra.x),
+            to.y.clamp(state.bounds.0.y, state.bounds.1.y + state.extra.y),
+        );
+        let animation = back.compositor.create_vector3_key_frame_animation();
+        let easing = back.compositor.create_linear_easing_function();
+        animation.insert_expression_key_frame_with_easing(0.0, "this.StartingValue", &easing);
+        animation.insert_key_frame_with_easing(1.0, v3(to), &easing);
+        animation.set_duration(duration);
+        let request = state.inner.try_update_position_with_animation(&animation)?.0;
+        state.remember(request, TrackerRequest::To(to));
+        self.census.animations += 1;
+        Ok(request)
+    }
+
     /// Offers a captured contact to a live tracker's compositor-owned input source.
     ///
     /// Touch and pen must be explicitly redirected and mouse cannot be redirected at all, so
@@ -2623,7 +2666,7 @@ impl Scene {
         animation.set_duration(Duration::from_millis(DELAY_RUN_MS));
         let started = target.clone();
         self.census.animations += 1;
-        self.motion.watch(back, PendingKind::Delay(id, target), || {
+        self.motion.watch(back, PendingKind::Delay(id, target), |_| {
             started.start_animation(DELAY_KEY, &animation);
         })
     }
@@ -2688,6 +2731,9 @@ impl Scene {
                 }
                 census.visuals_live = census.visuals_live.saturating_sub(1);
             }
+            if matches!(pending.holds, PendingKind::TranslationCarry { .. }) {
+                census.visuals_live = census.visuals_live.saturating_sub(1);
+            }
             false
         });
     }
@@ -2698,6 +2744,7 @@ impl Scene {
     /// requests one cleanup pass; nothing here keeps the clock awake through playback.
     fn retire(&mut self) {
         let mut reports = Vec::new();
+        let mut landed = None;
         let overlay = &self.overlay;
         let census = &mut self.census;
         let nodes = &mut self.nodes;
@@ -2727,10 +2774,21 @@ impl Scene {
                         census.count(nodes.finish_settle(token));
                     }
                 }
+                PendingKind::DragLanding(epoch) => landed = Some(*epoch),
+                PendingKind::TranslationCarry { node, axes, source } => {
+                    for (prop, bit) in [(Prop::TranslationX, 1), (Prop::TranslationY, 2)] {
+                        source.visual.stop_animation(desc(prop).path);
+                        if axes & bit == 0 || !nodes.live(*node) { continue; }
+                        nodes.stop(*node, desc(prop));
+                        census.count(nodes.set(*node, prop, Value::Scalar(0.0)));
+                    }
+                    census.visuals_live = census.visuals_live.saturating_sub(1);
+                }
             }
             false
         });
         self.events.borrow_mut().extend(reports);
+        if let Some(epoch) = landed { self.finish_drag_preview(epoch); }
     }
 
     /// Retargets a channel from the front thread, inside the pass that decided to.
@@ -2957,6 +3015,74 @@ mod tests {
     };
 
     #[test]
+    #[ignore = "opens a window for raw FP16 capture"]
+    fn backdrop_hdr_probe() {
+        let _queue = DispatcherQueueController::create_on_current_thread().unwrap();
+        let window = windows_window::Window::new("NewAPO backdrop HDR probe")
+            .size(940, 740).create().unwrap();
+        let gpu = windows_d2d::Gpu::for_window().unwrap();
+        let back = Backends::new(Compositor::new().unwrap(), &gpu, FontLadder::default()).unwrap();
+        let env = Env::new(144.0, OutputTransform::for_display(
+            DisplayCapability::HighDynamicRange {
+                gamut: windows_color::Gamut::REC709, white_nits: 203.0, peak_nits: 1000.0,
+            }, 400.0,
+        ));
+        let mut scene = Scene::new_at(window.handle(), &back, env, BackdropSpec::default()).unwrap();
+        let mut patch = SinkPatch::default();
+        let mut ids = Ids::default();
+        let mut previous = None;
+        let mut sprite = |paint, offset, extent| {
+            let id = ids.mint();
+            patch.push(Op::New { id, kind: NodeKind::Sprite, parent: Attach::Window, after: previous });
+            previous = Some(id);
+            patch.push(Op::Bind { id, prop: Prop::Offset, bind: Bind::Set(Value::Vec2(offset)) });
+            patch.push(Op::Bind { id, prop: Prop::Size, bind: Bind::Set(Value::Vec2(extent)) });
+            let mask = if matches!(paint, Paint::Backdrop { .. }) { Mask::None }
+                else { Mask::Box { radius: Corners::all(0.0) } };
+            patch.push(Op::Mask { id: SpriteId(id), mask });
+            patch.push(Op::Paint { id: SpriteId(id), paint, halo: None });
+        };
+        for (column, nits) in [40.0, 200.0, 400.0].into_iter().enumerate() {
+            sprite(Paint::Solid(Radiance::new(nits, nits, nits, 1.0)),
+                Vector2::new(column as f32 * 200.0, 0.0), Vector2::new(200.0, 400.0));
+        }
+        sprite(Paint::Backdrop { sigma: 8.0 }, Vector2::new(0.0, 200.0), Vector2::new(600.0, 200.0));
+        scene.apply(&mut patch, &back, env).unwrap();
+        back.request_commit().unwrap();
+        println!("HDR probe pid={} dpi=144: top=source, bottom=blur; columns=40,200,400 nits", std::process::id());
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        while std::time::Instant::now() < until {
+            windows_window::pump();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn backdrop_paint_retires_its_visuals_and_idles() {
+        let Some(mut rig) = rig() else { return };
+        let baseline = rig.scene.census().visuals_live;
+        let mut patch = SinkPatch::default();
+        for _ in 0..8 {
+            let node = rig.sprite(&mut patch, 200.0);
+            patch.push(Op::Mask { id: SpriteId(node), mask: Mask::None });
+            patch.push(Op::Paint { id: SpriteId(node), paint: Paint::Backdrop { sigma: 8.0 }, halo: None });
+            rig.apply(&mut patch);
+            patch.clear();
+            assert!(!rig.apply(&mut patch), "an idle backdrop produces no commit");
+            for sigma in [f32::NAN, f32::INFINITY, -1.0, 251.0] {
+                assert!(rig.scene.declare(node, None, Some((Paint::Backdrop { sigma }, None)),
+                    &rig.back, rig.env).is_err());
+            }
+            assert!(rig.scene.declare(node, Some(FILL), None, &rig.back, rig.env).is_err());
+            let held = rig.scene.nodes.painted(node).unwrap();
+            assert_eq!(held.mask, Mask::None);
+            assert_eq!(held.paint, Paint::Backdrop { sigma: 8.0 });
+            rig.scene.release_subtree(node);
+            assert_eq!(rig.scene.census().visuals_live, baseline);
+        }
+    }
+
+    #[test]
     fn native_size_observer_suspends_resumes_and_detaches() {
         let Some(mut rig) = rig() else { return };
         let mut patch = SinkPatch::default();
@@ -3111,15 +3237,22 @@ mod tests {
         let region = RegionId::raw(20, 1);
         rig.scene.res.declare(region.erased(), ResObj::Brush(rig.back.brush(&surface, Stretch::None), None));
         let mut patch = SinkPatch::default();
-        let ids = [rig.sprite(&mut patch, 100.0), rig.sprite(&mut patch, 200.0)];
-        for (id, sampling) in ids.into_iter().zip([RegionSampling::Pixels, RegionSampling::Fit]) {
+        let ids = [rig.sprite(&mut patch, 100.0), rig.sprite(&mut patch, 200.0), rig.sprite(&mut patch, 300.0)];
+        for (id, sampling) in ids[..2].iter().copied().zip([RegionSampling::Pixels, RegionSampling::Fit]) {
             patch.push(Op::Paint { id: SpriteId(id), paint: Paint::PresentedView {
                 region, view: RegionView { rect: [10.0, 2.0, 110.0, 22.0], sampling },
             }, halo: None });
         }
+        patch.push(Op::Paint { id: SpriteId(ids[2]), paint: Paint::Presented {
+            region, origin: Vector2::new(0.0, 32.0),
+        }, halo: None });
         rig.apply(&mut patch);
         let brushes = ids.map(|id| rig.scene.nodes.aux(id).unwrap().region_view.as_ref().unwrap().brush.clone());
         let live = rig.scene.census().visuals_live;
+        for origin in [Vector2::new(0.0, f32::NAN), Vector2::new(-1.0, 0.0), Vector2::new(0.0, f32::INFINITY)] {
+            assert!(rig.scene.declare(ids[2], None, Some((Paint::Presented { region, origin }, None)),
+                &rig.back, rig.env).is_err());
+        }
         for rect in [[f32::NAN, 0.0, 10.0, 10.0], [0.0, 0.0, 0.0, 10.0], [-1.0, 0.0, 10.0, 10.0]] {
             assert!(rig.scene.declare(ids[0], None, Some((Paint::PresentedView {
                 region, view: RegionView { rect, sampling: RegionSampling::Fit },
@@ -3875,6 +4008,100 @@ mod tests {
     }
 
     #[test]
+    fn translation_carry_retires_after_native_completion_and_preserves_rebound_axes() {
+        let mut rig = rig().expect("native compositor");
+        let mut patch = SinkPatch::default();
+        let parent = rig.sprite(&mut patch, 80.0);
+        let old = rig.ids.mint();
+        patch.push(Op::New { id: old, kind: NodeKind::Group, parent: Attach::Node(parent), after: None });
+        let child = rig.ids.mint();
+        patch.push(Op::New { id: child, kind: NodeKind::Group, parent: Attach::Node(old), after: None });
+        rig.apply(&mut patch);
+        for (prop, value) in [(Prop::TranslationX, -100.0), (Prop::TranslationY, 60.0)] {
+            rig.scene.retarget(old, prop, Bind::Animate(Anim::Spring {
+                to: Value::Scalar(value), tuning: Tuning::Chrome, delay_ms: 0,
+            }), &rig.back).unwrap();
+        }
+        patch.clear();
+        assert!(rig.scene.hold_translation(old, &patch).is_none());
+        patch.push(Op::Drop { id: parent, exit: Exit::None, origin: Vector2::zero(), bounds: None });
+        let carry = rig.scene.hold_translation(old, &patch).expect("animated source");
+        let source = carry.visual.as_container().unwrap();
+        assert_eq!(source.children().count(), 1);
+        let replacement = rig.sprite(&mut patch, 40.0);
+        rig.apply(&mut patch);
+        let live = rig.scene.census().visuals_live;
+        rig.scene.continue_translation(carry, replacement, &rig.back).unwrap();
+        assert_eq!(source.children().count(), 0);
+        assert_eq!(rig.scene.census().visuals_live, live + 1);
+        assert_eq!(rig.scene.motion.pending.len(), 1);
+        rig.scene.retarget(replacement, Prop::TranslationX, Bind::Set(Value::Scalar(7.0)), &rig.back).unwrap();
+        assert!(rig.scene.motion.pending.iter().any(|pending| matches!(pending.holds,
+            PendingKind::TranslationCarry { node, axes: 2, .. } if node == replacement)));
+        rig.back.request_commit().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let mut events = Vec::new();
+        while !rig.scene.motion.pending.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "unparented translation did not complete");
+            windows_window::pump();
+            rig.scene.drain_events(&mut events);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(rig.scene.census().visuals_live, live);
+        assert_eq!(rig.scene.nodes.chan(replacement, desc(Prop::TranslationX).chan), 7.0);
+        assert_eq!(rig.scene.nodes.held(replacement, desc(Prop::TranslationY)), Held::Free);
+        assert_eq!(rig.scene.nodes.visual(replacement).unwrap().transform_matrix().m42, 0.0);
+        let parked = *rig.scene.census();
+        for _ in 0..100 { rig.scene.drain_events(&mut events); }
+        assert_eq!(*rig.scene.census(), parked);
+        assert!(rig.scene.hold_translation(replacement, &patch).is_none());
+    }
+
+    #[test]
+    fn translation_carry_cancellation_releases_the_source_without_late_writes() {
+        let mut rig = rig().expect("native compositor");
+        let mut patch = SinkPatch::default();
+        for drop_target in [false, true] {
+            let old = rig.sprite(&mut patch, 40.0);
+            rig.apply(&mut patch);
+            rig.scene.retarget(old, Prop::TranslationX, Bind::Animate(Anim::Spring {
+                to: Value::Scalar(100.0), tuning: Tuning::Chrome, delay_ms: 0,
+            }), &rig.back).unwrap();
+            patch.push(Op::Drop { id: old, exit: Exit::None, origin: Vector2::zero(), bounds: None });
+            rig.scene.set_springs_enabled(false);
+            assert!(rig.scene.hold_translation(old, &patch).is_none());
+            rig.scene.set_springs_enabled(true);
+            let carry = rig.scene.hold_translation(old, &patch).unwrap();
+            let replacement = rig.sprite(&mut patch, 40.0);
+            rig.apply(&mut patch);
+            let live = rig.scene.census().visuals_live;
+            rig.scene.continue_translation(carry, replacement, &rig.back).unwrap();
+            assert_eq!(rig.scene.census().visuals_live, live + 1);
+            let late = rig.scene.motion.pending.iter().find_map(|pending| matches!(pending.holds,
+                PendingKind::TranslationCarry { .. }).then(|| Rc::clone(&pending.done))).unwrap();
+            if drop_target {
+                patch.push(Op::Drop { id: replacement, exit: Exit::None, origin: Vector2::zero(), bounds: None });
+                rig.apply(&mut patch);
+                assert_eq!(rig.scene.census().visuals_live, live - 1);
+            } else {
+                for prop in [Prop::TranslationX, Prop::TranslationY] {
+                    rig.scene.retarget(replacement, prop, Bind::Set(Value::Scalar(9.0)), &rig.back).unwrap();
+                }
+                assert_eq!(rig.scene.census().visuals_live, live);
+            }
+            assert!(!rig.scene.motion.pending.iter().any(|pending| matches!(pending.holds,
+                PendingKind::TranslationCarry { .. })));
+            late.set(true);
+            rig.scene.retire();
+            if !drop_target {
+                for prop in [Prop::TranslationX, Prop::TranslationY] {
+                    assert_eq!(rig.scene.nodes.chan(replacement, desc(prop).chan), 9.0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn local_translation_survives_layout_and_anchor_writes_without_scaling() {
         let mut rig = rig().expect("native compositor");
         let mut patch = SinkPatch::default();
@@ -4002,7 +4229,7 @@ mod tests {
         let source_size = source.size();
         let count = rig.scene.census().visuals_live;
         for _ in 0..3 {
-            assert!(rig.scene.begin_drag_preview(ids[1], &rig.back));
+            assert!(rig.scene.begin_drag_preview(ids[1], ControlId::NONE, &rig.back));
             assert_eq!(original.children().count(), 2);
             assert_eq!(rig.scene.census().visuals_live, count + 1);
             assert_eq!(source.as_container().unwrap().children().count(), 1);
@@ -4022,7 +4249,7 @@ mod tests {
             assert_eq!(original.children().count(), 3);
             assert_eq!(source.parent().unwrap().children().count(), 3);
         }
-        assert!(rig.scene.begin_drag_preview(ids[1], &rig.back));
+        assert!(rig.scene.begin_drag_preview(ids[1], ControlId::NONE, &rig.back));
         let unrelated = rig.ids.mint();
         patch.push(Op::New { id: unrelated, kind: NodeKind::Group, parent: Attach::Overlay, after: None });
         patch.push(Op::Drop { id: unrelated, exit: Exit::None, origin: Point::zero(), bounds: None });
@@ -4031,17 +4258,17 @@ mod tests {
         patch.push(Op::Bind { id: parent, prop: Prop::Size, bind: Bind::Set(Value::Vec2(Vector2::new(300.0, 100.0))) });
         rig.apply(&mut patch);
         assert!(rig.scene.lift.is_none());
-        assert!(rig.scene.begin_drag_preview(ids[1], &rig.back));
+        assert!(rig.scene.begin_drag_preview(ids[1], ControlId::NONE, &rig.back));
         rig.env = Env::new(144.0, rig.env.output());
         rig.apply(&mut patch);
         assert!(rig.scene.lift.is_none());
-        assert!(rig.scene.begin_drag_preview(ids[1], &rig.back));
+        assert!(rig.scene.begin_drag_preview(ids[1], ControlId::NONE, &rig.back));
         patch.push(Op::Drop { id: parent, exit: Exit::None, origin: Point::zero(), bounds: None });
         rig.apply(&mut patch);
         assert!(rig.scene.lift.is_none());
         assert_eq!(rig.scene.census().visuals_live, 0);
         assert!(rig.scene.audit().agrees());
-        assert!(!rig.scene.begin_drag_preview(ids[1], &rig.back));
+        assert!(!rig.scene.begin_drag_preview(ids[1], ControlId::NONE, &rig.back));
     }
 
     #[test]

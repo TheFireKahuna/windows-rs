@@ -37,8 +37,6 @@ const GAUSSIAN_OPTIMIZATION: u32 = 1;
 const GAUSSIAN_BORDER_MODE: u32 = 2;
 /// `D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED`, the D2D default.
 const GAUSSIAN_OPTIMIZATION_BALANCED: u32 = 1;
-/// `D2D1_BORDER_MODE_SOFT`, the D2D default.
-const D2D1_BORDER_MODE_SOFT: u32 = 0;
 /// `D2D1_COMPOSITE_MODE_SOURCE_IN`.
 const D2D1_COMPOSITE_MODE_SOURCE_IN: u32 = 2;
 
@@ -283,7 +281,7 @@ struct EffectNode {
 
 enum Kind {
     /// A Gaussian blur. `sigma` is the initial standard deviation, in DIPs.
-    GaussianBlur { sigma: f32 },
+    GaussianBlur { sigma: f32, border: EffectBorderMode },
     /// A D2D composite of two inputs.
     Composite { mode: u32 },
 }
@@ -298,16 +296,14 @@ impl Kind {
 
     fn property(&self, index: u32) -> Result<windows_core::IInspectable> {
         match (self, index) {
-            (Self::GaussianBlur { sigma }, BLUR_STANDARD_DEVIATION) => {
+            (Self::GaussianBlur { sigma, .. }, BLUR_STANDARD_DEVIATION) => {
                 bindings::PropertyValue::CreateSingle(*sigma)
             }
-            // The two properties the walk reads beyond the deviation, at the D2D
-            // defaults: balanced optimization and a soft border.
             (Self::GaussianBlur { .. }, GAUSSIAN_OPTIMIZATION) => {
                 bindings::PropertyValue::CreateUInt32(GAUSSIAN_OPTIMIZATION_BALANCED)
             }
-            (Self::GaussianBlur { .. }, GAUSSIAN_BORDER_MODE) => {
-                bindings::PropertyValue::CreateUInt32(D2D1_BORDER_MODE_SOFT)
+            (Self::GaussianBlur { border, .. }, GAUSSIAN_BORDER_MODE) => {
+                bindings::PropertyValue::CreateUInt32(*border as u32)
             }
             (Self::Composite { mode }, COMPOSITE_MODE) => {
                 bindings::PropertyValue::CreateUInt32(*mode)
@@ -394,6 +390,7 @@ pub enum EffectGraph {
     GaussianBlur {
         name: &'static str,
         sigma: f32,
+        border: EffectBorderMode,
         input: Box<Self>,
     },
     /// A D2D composite of two inputs: `source` composited onto `destination` by `mode`.
@@ -403,6 +400,16 @@ pub enum EffectGraph {
         source: Box<Self>,
         destination: Box<Self>,
     },
+}
+
+/// Specifies how a Gaussian samples outside its source bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum EffectBorderMode {
+    /// Samples transparency outside the source.
+    Soft = 0,
+    /// Keeps the output within the source bounds.
+    Hard = 1,
 }
 
 /// The composite's blend mode. Only the modes this crate's constructions need are
@@ -433,10 +440,10 @@ fn materialize(graph: &EffectGraph) -> Result<IGraphicsEffectSource> {
             let parameter = bindings::CompositionEffectSourceParameter::Create(name)?;
             Ok(parameter.cast()?)
         }
-        EffectGraph::GaussianBlur { name, sigma, input } => {
+        EffectGraph::GaussianBlur { name, sigma, border, input } => {
             let node = EffectNode {
                 name: windows_core::HSTRING::from(*name),
-                kind: Kind::GaussianBlur { sigma: *sigma },
+                kind: Kind::GaussianBlur { sigma: *sigma, border: *border },
                 sources: vec![materialize(input)?],
             };
             Ok(node.into())
@@ -556,6 +563,7 @@ mod tests {
             destination: Box::new(EffectGraph::GaussianBlur {
                 name: "blur",
                 sigma: 4.0,
+                border: EffectBorderMode::Soft,
                 input: Box::new(EffectGraph::Parameter("silhouette")),
             }),
         };
@@ -619,6 +627,7 @@ mod spring_tests {
         let graph = EffectGraph::GaussianBlur {
             name: "blur",
             sigma: 4.0,
+            border: EffectBorderMode::Soft,
             input: Box::new(EffectGraph::Parameter("s")),
         };
         let factory = compositor.create_effect_factory(&graph, &["blur.BlurAmount"])?;

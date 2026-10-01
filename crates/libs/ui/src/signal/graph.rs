@@ -28,10 +28,10 @@ use windows_window::{Tick, Wake};
 
 use crate::seam::Ring;
 
-/// How many passes a flush may take before it stops.
+/// Bounds feedback passes over existing effects within one flush.
 ///
-/// An effect that writes a cell adds a pass; one that writes a cell it also reads never
-/// settles. A flush that has not settled after this many passes trips a debug assertion.
+/// Fresh deferred descendants run in their parent's pass. Requeued effects consume the
+/// bound; pending work after the final pass trips a debug assertion.
 const MAX_PASSES: u32 = 8;
 
 pub(crate) const CELL: u8 = 0;
@@ -562,21 +562,36 @@ fn run_phase(phase: usize) -> bool {
     let (graph, mut queued) = with(|g| {
         let mut queued = core::mem::take(&mut g.spare);
         core::mem::swap(&mut queued, &mut g.queue[phase]);
-        // Creation order is the contract: a parent's effect writes the container a child's
-        // effect fills. Sorting in place allocates nothing.
-        queued.sort_unstable_by_key(|e| g.order[e.index as usize]);
-        for &e in &queued {
-            if let Some(i) = g.slot(e) {
-                g.flags[i] &= !QUEUED;
-            }
-        }
         (g.id, queued)
     });
     let ran = !queued.is_empty();
-    for edge in queued.drain(..) {
-        // Resolved rather than run: an effect marked only `Check` re-asks its dependencies and
-        // does not run if none of them moved, which is the memo's cutoff one level down.
-        resolve(SignalId { graph, edge });
+    while !queued.is_empty() {
+        let born = with(|g| {
+            // Creation order puts a parent's effect before its children.
+            queued.sort_unstable_by_key(|e| g.order[e.index as usize]);
+            for &e in &queued {
+                if let Some(i) = g.slot(e) {
+                    g.flags[i] &= !QUEUED;
+                }
+            }
+            g.next_order
+        });
+        for edge in queued.drain(..) {
+            // Resolving a Check node preserves its memo dependencies' equality cutoff.
+            resolve(SignalId { graph, edge });
+        }
+        with(|g| {
+            let (generation, order) = (&g.generation, &g.order);
+            // Fresh descendants run in this pass; feedback to an existing node waits
+            // for the next bounded pass. Both queues keep their capacity.
+            g.queue[phase].retain(|edge| {
+                let i = edge.index as usize;
+                if generation[i] != edge.generation { return false; }
+                if order[i] < born { return true; }
+                queued.push(*edge);
+                false
+            });
+        });
     }
     with(|g| g.spare = queued);
     ran

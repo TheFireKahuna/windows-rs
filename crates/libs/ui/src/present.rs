@@ -205,6 +205,7 @@ pub(crate) struct RegionRow {
 
 pub(crate) struct Atlas {
     pub(crate) size: Vector2,
+    pub(crate) canvas: bool,
     pub(crate) views: Vec<windows_scene::RegionView>,
 }
 
@@ -345,7 +346,9 @@ pub(crate) fn emit(host: &mut Host, out: &mut Vec<RegionOp>) {
         }
         row.active = active;
         if !active { continue; }
-        let size = row.atlas.as_ref().map_or(size, |atlas| atlas.size);
+        let size = row.atlas.as_ref().map_or(size, |atlas| if atlas.canvas {
+            Vector2::new(size.x.max(atlas.size.x), size.y + atlas.size.y)
+        } else { atlas.size });
         let extent = Extent::new(size.x, size.y, env.dpi());
         match (row.build.take(), row.extent) {
             (Some(build), _) => out.push(RegionOp::Mount {
@@ -757,13 +760,17 @@ struct Pick {
     /// is copied rather than skipped.
     seen: u64,
     parts: Vec<Part>,
+    wake: Option<windows_window::Wake>,
+    watching: bool,
 }
 
 /// Every region the pointer can be picked inside, as the thread routing a contact holds them.
 #[derive(Default)]
-pub(crate) struct Picks(Vec<Pick>);
+pub(crate) struct Picks(Vec<Pick>, Option<windows_window::Wake>);
 
 impl Picks {
+    pub(crate) fn new(wake: windows_window::Wake) -> Self { Self(Vec::new(), Some(wake)) }
+
     /// Makes the table hold exactly `rows`: regions that are gone are removed, new ones are
     /// added, and a region already held keeps the part copy it has scanned.
     pub(crate) fn sync(&mut self, rows: &[(ControlId, Live)]) {
@@ -785,6 +792,8 @@ impl Picks {
                     live: live.clone(),
                     seen: u64::MAX,
                     parts: Vec::new(),
+                    wake: self.1.clone(),
+                    watching: false,
                 });
             }
         }
@@ -797,9 +806,33 @@ impl Picks {
     fn row(&mut self, id: ControlId) -> Option<&mut Pick> {
         self.0.iter_mut().find(|pick| pick.control == id)
     }
+
+    /// Repicks changed geometry at the last cursor position without an application intent.
+    pub(crate) fn refresh(&mut self) -> bool {
+        let mut changed = false;
+        for row in &mut self.0 {
+            if !row.watching { continue; }
+            let Some((x, y)) = row.live.input.cursor() else { continue; };
+            if row.live.parts.version() == row.seen { continue; }
+            let part = row.at(Vector2::new(x, y));
+            if row.live.input.hover() != part {
+                row.live.input.set_hover(part);
+                row.live.epoch.invalidate();
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 impl Pick {
+    fn watch(&mut self, watching: bool) {
+        if self.watching != watching {
+            self.watching = watching;
+            self.live.parts.watch(if watching { self.wake.clone() } else { None });
+        }
+    }
+
     /// Returns the part at `local`, refreshing the copy first if the renderer republished.
     ///
     /// `local` is in the region's own DIPs, which is the space the renderer publishes in.
@@ -810,6 +843,7 @@ impl Pick {
     fn at(&mut self, local: Vector2) -> Option<SubId> {
         if self.live.parts.version() != self.seen {
             self.seen = self.live.parts.read_into(&mut self.parts);
+            self.live.parts.refreshed(self.seen);
         }
         self.parts
             .iter()
@@ -820,6 +854,10 @@ impl Pick {
             })
             .map(|part| part.id)
     }
+}
+
+impl Drop for Pick {
+    fn drop(&mut self) { self.watch(false); }
 }
 
 /// Converts a client-DIP point into the region's own space.
@@ -864,17 +902,19 @@ pub(crate) fn pick(reports: &[Report], hits: &HitTable, picks: &mut Picks, out: 
                 if let Some(from) = from
                     && let Some(row) = picks.row(from)
                 {
+                    row.watch(false);
                     row.live.input.set_hover(None);
                     row.live.input.set_cursor(None);
                     row.live.epoch.invalidate();
                 }
                 if let Some(to) = to {
-                    hover(picks, to, at, hits);
+                    hover(picks, to, at, hits, true);
                 }
             }
+            Report::HoverMoved { target, at } => hover(picks, target, at, hits, true),
             Report::Moved {
                 target, ref sample, ..
-            } => hover(picks, target, sample.raw, hits),
+            } => hover(picks, target, sample.raw, hits, false),
             Report::Pressed {
                 target, ref sample, ..
             } => {
@@ -922,13 +962,14 @@ pub(crate) fn pick(reports: &[Report], hits: &HitTable, picks: &mut Picks, out: 
 }
 
 /// Publishes the hovered part and the cursor for the region `id` names.
-fn hover(picks: &mut Picks, id: ControlId, at: Vector2, hits: &HitTable) {
+fn hover(picks: &mut Picks, id: ControlId, at: Vector2, hits: &HitTable, watching: bool) {
     let Some(at) = local(hits, id, at) else {
         return;
     };
     let Some(row) = picks.row(id) else {
         return;
     };
+    if watching { row.watch(true); }
     let part = row.at(at);
     row.live.input.set_hover(part);
     row.live.input.set_cursor(Some((at.x, at.y)));
@@ -1002,8 +1043,8 @@ pub(crate) mod tests {
         assert_ne!(live.epoch.seq(), seq);
         assert!(intents.is_empty());
         live.parts.publish(&[]);
-        pick(&[Report::HoverChanged {
-            from: Some(id), to: Some(id), at: Vector2::new(150.0, 200.0), qpc: 0,
+        pick(&[Report::HoverMoved {
+            target: id, at: Vector2::new(150.0, 200.0),
         }], &hits, &mut picks, &mut intents);
         assert_eq!(live.input.cursor(), Some((50.0, 30.0)));
         assert_eq!(live.input.hover(), None, "a passive region still publishes its cursor");
@@ -1016,6 +1057,71 @@ pub(crate) mod tests {
         assert_eq!(live.input.hover(), None);
         assert_ne!(live.epoch.seq(), seq);
         assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn stationary_region_hover_repicks_and_parks_without_application_work() {
+        use super::{Live, Picks, pick};
+        use crate::{correlation::{Correlation, Member, Route, Router}, input::Report};
+        use windows_numerics::Vector2;
+        use windows_present::{Part, SubId};
+        use windows_scene::{ControlId, HitEntry, HitFlags, HitTable, NodeId, NO_ENTRY};
+
+        let window = windows_window::Window::new("stationary region hover").create().unwrap();
+        let pacer = window.pacer().unwrap();
+        let wake = pacer.wake();
+        let live = Live::new().unwrap();
+        let group = Correlation::new(&live);
+        let id = ControlId::FIRST;
+        let mut picks = Picks::new(wake.clone());
+        picks.sync(&[(id, live.clone())]);
+        let mut hits = HitTable::default();
+        hits.replace(&[HitEntry {
+            x0: 100.0, y0: 200.0, x1: 400.0, y1: 500.0,
+            touch_inflate: 0.0, clip_parent: NO_ENTRY, parent: NO_ENTRY,
+            flags: HitFlags::HOVER, scroll_src: NodeId::NONE, id,
+        }], &[(id, 0)]);
+        let mut router = Router::default();
+        router.sync(&[Route { source: id,
+            member: Member { group: group.clone(), key: None, reveal: NodeId::NONE },
+        }], &hits);
+        let mut part = Part { id: SubId(7), rect: windows_d2d::Rect::new(0.0, 0.0, 100.0, 80.0) };
+        live.parts.publish(&[part]);
+        let enter = Report::HoverChanged {
+            from: None, to: Some(id), at: Vector2::new(140.0, 220.0), qpc: 0,
+        };
+        let mut intents = Vec::new();
+        pick(&[enter.clone()], &hits, &mut picks, &mut intents);
+        assert!(router.route(&[enter], &hits));
+        assert_eq!(group.selected(), Some(SubId(7)));
+        assert_eq!(wake.requesters(), 0);
+        let allocations = crate::counting::allocations();
+        for key in [9, 7].into_iter().cycle().take(64) {
+            part.id = SubId(key);
+            live.parts.publish(&[part]);
+            assert_eq!(wake.requesters(), 1);
+            assert!(picks.refresh());
+            assert!(router.refresh(&hits));
+            assert_eq!(group.selected(), Some(SubId(key)));
+            assert_eq!(live.input.cursor(), Some((40.0, 20.0)));
+            assert_eq!(wake.requesters(), 0);
+            let epoch = live.epoch.seq();
+            assert!(!picks.refresh());
+            assert_eq!(live.epoch.seq(), epoch);
+        }
+        assert_eq!(crate::counting::allocations(), allocations);
+        live.parts.publish(&[]);
+        assert!(picks.refresh());
+        assert!(router.refresh(&hits));
+        assert_eq!(group.selected(), None);
+        assert_eq!(wake.requesters(), 0);
+        assert!(intents.is_empty());
+        live.parts.publish(&[part]);
+        assert_eq!(wake.requesters(), 1);
+        picks.sync(&[]);
+        assert_eq!(wake.requesters(), 0, "retirement releases the pending request");
+        live.parts.publish(&[part]);
+        assert_eq!(wake.requesters(), 0, "a retained producer cannot wake retired input");
     }
 
     /// A reader sees the version move with the value, and both reads answer the same one.

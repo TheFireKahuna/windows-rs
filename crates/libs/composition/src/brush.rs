@@ -15,6 +15,26 @@ pub trait Brush: Sealed {
     fn as_brush(&self) -> CompositionBrush;
 }
 
+/// Samples the composited content behind the visual painted by this brush.
+#[derive(Clone)]
+pub struct CompositionBackdropBrush(pub(crate) bindings::CompositionBackdropBrush);
+
+impl Sealed for CompositionBackdropBrush {}
+
+impl Brush for CompositionBackdropBrush {
+    fn as_brush(&self) -> CompositionBrush {
+        CompositionBrush(self.0.cast().unwrap())
+    }
+}
+
+impl Compositor {
+    /// Creates a brush sampling the content behind its consuming visual.
+    pub fn create_backdrop_brush(&self) -> Result<CompositionBackdropBrush> {
+        let compositor: bindings::ICompositor2 = self.0.cast()?;
+        Ok(CompositionBackdropBrush(compositor.CreateBackdropBrush()?))
+    }
+}
+
 /// A brush that paints with a single solid color.
 #[derive(Clone)]
 pub struct CompositionColorBrush(pub(crate) bindings::CompositionColorBrush);

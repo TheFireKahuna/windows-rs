@@ -19,6 +19,7 @@ use super::snapshot::{ColFlags as F, Entry, NONE, Part, ScrollView, State as S, 
 use super::snapshot::{ColFlags, State};
 use super::variant::{self, bool as vb, i4 as vi, wide as vw};
 use crate::bindings::*;
+use crate::layout::SMALL_STEP;
 use crate::widget::{Range, UiaRole};
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
@@ -60,9 +61,6 @@ const FRAMEWORK: &str = "windows-ui";
 /// `UIA_ScrollPatternNoScroll`, the percentage an axis that cannot move reports and the one a
 /// client passes to leave an axis where it is.
 const NO_SCROLL: f32 = -1.0;
-
-/// A small scroll step, as a fraction of one page.
-const SMALL_STEP: f32 = 0.1;
 
 /// Everything a provider can reach, and the only state shared across threads.
 ///

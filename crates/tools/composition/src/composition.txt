@@ -24,7 +24,7 @@ Windows.UI.Composition.Compositor
 Windows.UI.Composition.Compositor::CreateInstance
 // endregion
 Windows.UI.Composition.ICompositor::{CreateContainerVisual, CreateSpriteVisual, CreateColorBrushWithColor, CreateScopedBatch, CreateScalarKeyFrameAnimation, CreateVector3KeyFrameAnimation, CreateLinearEasingFunction, CreateCubicBezierEasingFunction}
-Windows.UI.Composition.ICompositor2::{CreateAnimationGroup, CreateNineGridBrush, CreateImplicitAnimationCollection}
+Windows.UI.Composition.ICompositor2::{CreateAnimationGroup, CreateNineGridBrush, CreateImplicitAnimationCollection, CreateBackdropBrush}
 Windows.UI.Composition.ICompositor5::{CreateShapeVisual, CreateSpriteShapeWithGeometry, CreateContainerShape, CreateEllipseGeometry}
 Windows.UI.Composition.ICompositor5::RequestCommitAsync
 
@@ -58,6 +58,7 @@ Windows.UI.Composition.SpriteVisual
 Windows.UI.Composition.ISpriteVisual::{put_Brush}
 
 Windows.UI.Composition.CompositionBrush
+Windows.UI.Composition.CompositionBackdropBrush
 Windows.UI.Composition.CompositionColorBrush
 Windows.UI.Composition.ICompositionColorBrush::{put_Color, get_Color}
 

@@ -201,6 +201,7 @@ pub struct Host {
     anchors_owed: bool,
     shortcuts: Vec<(ControlId, &'static [super::Shortcut])>,
     pub(crate) overlays: Vec<Placement>,
+    pub(super) focus_outline: Option<(NodeId, Option<NodeId>)>,
     entrances: Vec<Entrance>,
     /// The authored stops of every live ramp, so a theme change re-resolves them.
     ramps: Slots<RAMP, (Vec<super::Stop>, Spread)>,
@@ -307,6 +308,7 @@ impl Host {
                 anchors_owed: false,
                 shortcuts: Vec::new(),
                 overlays: Vec::new(),
+                focus_outline: None,
                 entrances: Vec::new(),
                 ramps: Slots::default(),
                 scratch_stops: Vec::new(),
@@ -1058,12 +1060,13 @@ impl Host {
         self.regions.get(at).map_or(RegionId::NONE, |row| row.sink)
     }
 
-    pub(crate) fn region_source_size(&mut self, node: NodeId, size: Vector2) {
+    pub(crate) fn region_source_size(&mut self, node: NodeId, size: Vector2, canvas: bool) {
         let at = self.side(node).map_or(tree::NONE, |side| side.region);
         if let Some(row) = self.regions.get_mut(at) {
             assert!(row.atlas.is_none() && row.extent.is_none(), "source packing is fixed at mount");
-            row.atlas = Some(Box::new(crate::present::Atlas { size, views: Vec::new() }));
+            row.atlas = Some(Box::new(crate::present::Atlas { size, canvas, views: Vec::new() }));
         }
+        if canvas { self.republish_paints(node); }
     }
 
     pub(crate) fn region_view(&mut self, region: RegionId, view: windows_scene::RegionView) -> u32 {
@@ -1224,6 +1227,9 @@ impl Host {
                 .push(crate::seam::FocusOp::TabIndex(id, if on { 0 } else { -1 }));
         }
         self.uia_stale.set(true);
+        if state == ModelState::Disabled {
+            self.tree.hits_dirty = true;
+        }
         if repaint {
             self.repaint_control(id);
         }
@@ -1285,8 +1291,21 @@ impl Host {
     /// An intent queued before its control unmounted is skipped: the generation half of the
     /// id does not match the slot's. The handler is cloned out before it runs, since running
     /// it is application code and must not hold the borrow.
-    pub fn dispatch(intents: &[Intent]) {
+    /// Returns the control whose last committed reorder was accepted.
+    pub fn dispatch(intents: &[Intent]) -> Option<ControlId> {
+        let mut accepted = None;
         for intent in intents {
+            if let What::ReorderEnded(Some(update)) = intent.what {
+                accepted = None;
+                let call = Self::with(|h| {
+                    let row = h.control(intent.target)?;
+                    Some(h.handlers.get(row.handlers)?.reorder.as_ref()?.call.clone())
+                });
+                if call.is_some_and(|call| call(Gesturing::Committed(update))) {
+                    accepted = Some(intent.target);
+                }
+                continue;
+            }
             let Some(call) = Self::with(|h| h.handler_for(intent)) else {
                 continue;
             };
@@ -1295,6 +1314,7 @@ impl Host {
                 crate::signal::flush();
             }
         }
+        accepted
     }
 
     pub(crate) fn set_shortcuts(&mut self, id: ControlId, keys: &'static [super::Shortcut]) {
@@ -1546,11 +1566,11 @@ impl Host {
             }
             What::Reordered(update) => {
                 let call = handlers?.reorder.as_ref()?.call.clone();
-                Some(Box::new(move || call(Gesturing::Moved(update))))
+                Some(Box::new(move || { call(Gesturing::Moved(update)); }))
             }
             What::ReorderEnded(update) => {
                 let call = handlers?.reorder.as_ref()?.call.clone();
-                Some(Box::new(move || call(update.map_or(Gesturing::Canceled, Gesturing::Committed))))
+                Some(Box::new(move || { call(update.map_or(Gesturing::Canceled, Gesturing::Committed)); }))
             }
             // A presented region reports the part a gesture finished on. It reaches the same
             // handler a committed value does, carrying the part's index.
@@ -1690,6 +1710,7 @@ impl Host {
             h.publish_text();
             h.publish_scrolls();
             h.place_overlays();
+            h.place_focus_outline();
             h.publish_anchors();
             h.publish_regions();
             h.publish_masks();
@@ -1934,6 +1955,20 @@ impl Host {
                 self.overlays[at].at = to;
                 solve::shift(self, held.root, to);
             }
+        }
+    }
+
+    fn place_focus_outline(&mut self) {
+        let Some((id, held)) = self.focus_outline else { return; };
+        let scope = self.overlays.iter().rev()
+            .find(|placement| placement.blocker.is_some()).map(|placement| placement.root);
+        if scope != held {
+            self.pending.push(Op::Move {
+                id,
+                parent: if scope.is_some() { Attach::Overlay } else { Attach::Window },
+                after: Some(scope.unwrap_or(self.root())),
+            });
+            self.focus_outline = Some((id, scope));
         }
     }
 

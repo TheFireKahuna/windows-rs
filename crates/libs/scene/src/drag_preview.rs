@@ -9,6 +9,7 @@ pub(super) struct Lift {
     previous: Option<Visual>,
     previous_id: Option<NodeId>,
     offset: Vector2,
+    scroll: Option<CompositionPropertySet>,
     placeholder: Option<Placeholder>,
 }
 
@@ -33,11 +34,12 @@ impl Scene {
     /// Lifts a retained subtree into the overlay band until `end_drag_preview`.
     ///
     /// One carrier preserves the original parent's transform and size. The subtree's
-    /// brushes, text tiles, channels and arena ownership remain unchanged. Its original
-    /// hit geometry remains the drop-target geometry; the input owner retains capture.
+    /// brushes, text tiles, channels and arena ownership remain unchanged. `owner` must name
+    /// the subtree's hit root; its descendants share the lift's clip and paint order.
+    /// A visual-only preview uses `ControlId::NONE`. The input owner retains capture.
     /// Window/overlay roots and empty or retired nodes are declined. Only one preview
     /// may be live in a scene. Beginning another restores the first.
-    pub fn begin_drag_preview(&mut self, node: NodeId, back: &Backends) -> bool {
+    pub fn begin_drag_preview(&mut self, node: NodeId, owner: ControlId, back: &Backends) -> bool {
         self.end_drag_preview();
         let Some(source) = self.nodes.visual(node).cloned() else { return false };
         let Some(parent) = source.parent() else { return false };
@@ -70,10 +72,12 @@ impl Scene {
         self.overlay.children().insert_at_top(&carrier);
         self.census.visuals_minted += 1;
         self.census.visuals_live += 1;
+        self.hits.lift(owner);
         self.lift_epoch = self.lift_epoch.checked_add(1).expect("drag preview epoch exhausted");
         self.lift = Some(Box::new(Lift {
             epoch: self.lift_epoch, node, source, parent, carrier, previous, previous_id,
             offset: Vector2::zero(),
+            scroll: None,
             placeholder: None,
         }));
         true
@@ -154,13 +158,39 @@ impl Scene {
         let Some(lift) = self.lift.as_mut() else { return; };
         if lift.offset == by { return; }
         lift.offset = by;
-        lift.carrier.set_offset(by.x, by.y, 0.0);
+        if let Some(properties) = &lift.scroll {
+            properties.insert_vector3("PointerOffset", v3(by));
+        } else {
+            lift.carrier.set_offset(by.x, by.y, 0.0);
+        }
         self.census.props_written += 1;
+    }
+
+    /// Keeps the lifted subtree under its pointer while `viewport` scrolls.
+    /// The compensation runs in the compositor and lasts until the preview ends.
+    /// A preview accepts one viewport; an absent tracker leaves it unchanged.
+    pub fn follow_drag_scroll(&mut self, viewport: NodeId, back: &Backends) {
+        let Some(lift) = self.lift.as_mut().filter(|lift| lift.scroll.is_none()) else { return; };
+        let Some((_, tracker)) = self.trackers.iter().find(|(_, state)| state.viewport == viewport) else { return; };
+        let properties = lift.carrier.properties();
+        properties.insert_vector3("PointerOffset", v3(lift.offset));
+        let animation = back.compositor.create_expression_animation(
+            "pointer.PointerOffset + tracker.Position - origin");
+        animation.set_reference_parameter("pointer", &properties);
+        animation.set_reference_parameter("tracker", &tracker.inner);
+        animation.set_vector3_parameter("origin", v3(tracker.position));
+        lift.carrier.start_animation("Offset", &animation);
+        lift.scroll = Some(properties);
+        self.census.animations += 1;
     }
 
     /// Restores the lifted subtree's native parent and paint order.
     pub fn end_drag_preview(&mut self) {
         let Some(lift) = self.lift.take() else { return; };
+        self.motion.pending.retain(|pending| !matches!(pending.holds,
+            PendingKind::DragLanding(epoch) if epoch == lift.epoch));
+        self.hits.lift(ControlId::NONE);
+        if lift.scroll.is_some() { lift.carrier.stop_animation("Offset"); }
         lift.carrier.children().remove_all();
         if let Some(placeholder) = lift.placeholder {
             drop(placeholder);
@@ -198,6 +228,30 @@ impl Scene {
     /// Acknowledgements for an earlier gesture cannot restore a newer preview.
     pub fn finish_drag_preview(&mut self, epoch: u64) {
         if self.drag_preview_epoch() == Some(epoch) { self.end_drag_preview(); }
+    }
+
+    /// Lands a replacement subtree from `by` DIPs away using the shared chrome springs.
+    /// Input resolves at the target. Completion restores the native parent, and a new
+    /// preview or structural invalidation cancels the landing. Zero travel parks directly.
+    pub fn land_drag_preview(&mut self, node: NodeId, by: Vector2, back: &Backends) -> Result<()> {
+        if !self.springs_enabled || by == Vector2::zero() || !by.x.is_finite() || !by.y.is_finite() {
+            return Ok(());
+        }
+        if !self.begin_drag_preview(node, ControlId::NONE, back) { return Ok(()); }
+        self.move_drag_preview(by);
+        let lift = self.lift.as_ref().unwrap();
+        let epoch = lift.epoch;
+        let carrier = lift.carrier.clone();
+        let result = self.motion.watch(back, PendingKind::DragLanding(epoch), |templates| {
+            for (property, travel) in [("Offset.X", by.x), ("Offset.Y", by.y)] {
+                if travel == 0.0 { continue; }
+                let animation = templates.spring(1, Tuning::Chrome, Value::Scalar(0.0), travel, Duration::ZERO);
+                carrier.start_animation(property, &animation);
+            }
+        });
+        if let Err(error) = result { self.end_drag_preview(); return Err(error); }
+        self.census.animations += u64::from(by.x != 0.0) + u64::from(by.y != 0.0);
+        Ok(())
     }
 
     pub(super) fn preview_before(&mut self, op: Op) {

@@ -58,6 +58,30 @@
 //! 25. A selected control states that it selects. [17-WIDGETS §8.1]
 
 use super::host::Host;
+
+#[test]
+fn passive_correlated_region_keeps_hover_without_press_or_focus() {
+    use windows_scene::{ControlId, HitFlags, NodeId};
+    let mut rig = Rig::new();
+    let live = crate::present::Live::new().unwrap();
+    let group = crate::correlation::Correlation::new(&live);
+    let mut id = ControlId::NONE;
+    let mut frame = rig.mount(|ui| {
+        let mut region = ui.region(windows_present::Queue::Solo, &live,
+            |_, _| panic!("the authoring fixture does not create a renderer"))
+            .correlate(&group, None).name("Passive graph").width(Len::dip(200.0)).height(Len::dip(100.0));
+        id = region.control_id();
+    });
+    let hit = frame.hits().iter().find(|entry| entry.id == id).unwrap();
+    assert!(hit.flags.contains(HitFlags::HOVER));
+    assert!(!hit.flags.contains(HitFlags::INTERACTIVE));
+    let row = frame.uia("Passive graph").unwrap();
+    assert!(!row.flags.has(ColFlags::FOCUSABLE));
+    Host::with(|host| {
+        let row = host.control(id).unwrap();
+        assert_eq!(row.correlation.as_ref().unwrap().reveal, NodeId::NONE);
+    });
+}
 use super::rig::{Kind, Rig};
 use super::ui::Ui;
 use crate::layout::{Align, Len, Preset, scroll};
@@ -1291,6 +1315,39 @@ fn a_disabled_control_keeps_its_entry_and_states_that_it_is_disabled() {
 }
 
 #[test]
+fn disabled_controls_publish_no_input_flags_and_restore_them_when_enabled() {
+    use windows_scene::HitFlags;
+
+    for initially_disabled in [false, true] {
+        let mut rig = Rig::new();
+        let disabled = Cell::new(initially_disabled);
+        let mut id = ControlId::NONE;
+        let mut frame = rig.mount(|ui| {
+            id = button(ui, "Command")
+                .disabled(disabled)
+                .on_click(|| {})
+                .control_id();
+        });
+        let flags = |frame: &super::rig::Frame<'_>| {
+            frame.hits().iter().find(|entry| entry.id == id).unwrap().flags
+        };
+        assert_eq!(flags(&frame).contains(HitFlags::INTERACTIVE), !initially_disabled);
+        assert_eq!(flags(&frame).contains(HitFlags::GESTURE), !initially_disabled);
+        for off in [!initially_disabled, initially_disabled, !initially_disabled] {
+            frame = rig.set(disabled, off);
+            assert!(frame.patch().ops().iter().any(|op| matches!(op, Op::Hits { .. })));
+            assert_eq!(flags(&frame).contains(HitFlags::INTERACTIVE), !off);
+            assert_eq!(flags(&frame).contains(HitFlags::GESTURE), !off);
+            let row = frame.uia("Command").unwrap();
+            assert_eq!(row.state.has(State::ENABLED), !off);
+            assert_eq!(row.flags.has(ColFlags::FOCUSABLE), !off);
+        }
+        let unchanged = rig.flush();
+        assert!(!unchanged.patch().ops().iter().any(|op| matches!(op, Op::Hits { .. })));
+    }
+}
+
+#[test]
 fn selection_and_disabled_bindings_preserve_each_other() {
     for disabled_first in [false, true] {
         let mut rig = Rig::new();
@@ -1415,6 +1472,36 @@ fn choice_navigation_crosses_layout_wrappers_and_skips_disabled_items() {
         assert_eq!(h.choice_neighbor(ids[0], 0x25), Some(ids[2]));
         assert_eq!(h.choice_neighbor(ids[2], 0x24), Some(ids[0]));
     });
+}
+
+#[test]
+fn scrollbar_rail_keeps_pointer_input_without_an_invisible_tab_stop() {
+    use crate::input::FocusRing;
+    use windows_scene::{HitFlags, HitTable};
+    let mut rig = Rig::new();
+    let mut apply = ControlId::NONE;
+    let frame = rig.mount(|ui| {
+        scroll(ui, |ui| { boxed(ui, 200.0, 400.0); })
+            .height(Len::dip(100.0)).name("Details");
+        apply = button(ui, "Apply").control_id();
+    });
+    let mut hits = HitTable::default();
+    hits.replace(frame.hits(), &[]);
+    let mut ring = FocusRing::default();
+    let (viewport, rail) = Host::with(|host| {
+        ring.apply(&host.focus_ops, &hits);
+        let front = host.scrolls.get(0).unwrap().front;
+        (front.hover, front.grab)
+    });
+    assert!(hits.entries().iter().any(|hit| hit.id == rail && hit.flags.contains(HitFlags::INTERACTIVE)));
+    ring.focus(Some(viewport));
+    ring.step(&hits, true);
+    assert_eq!(ring.current(), Some(apply));
+    ring.step(&hits, false);
+    assert_eq!(ring.current(), Some(viewport));
+    ring.focus(Some(rail));
+    ring.step(&hits, true);
+    assert_eq!(ring.current(), Some(apply));
 }
 
 #[test]
@@ -1557,6 +1644,57 @@ fn presented_atlas_defers_hidden_mount_and_keeps_buffers_fixed_across_layout_cha
         host.region_ops.clear();
     });
     assert!(rig.flush().patch().ops().is_empty());
+    rig.unmount();
+    Host::with(|host| assert_eq!(host.region_ops.len(), 1));
+}
+
+#[test]
+fn canvas_atlas_tracks_layout_extent_and_suspends_hidden_sources() {
+    use crate::present::Live;
+    use crate::seam::RegionOp;
+    use windows_present::Queue;
+    let mut rig = Rig::new();
+    let hidden = Cell::new(true);
+    let width = Cell::new(200.0);
+    let frame = rig.mount(|ui| {
+        ui.region(Queue::Shared("canvas atlas"), &Live::new().unwrap(), |_, _| unreachable!())
+            .layout_from(move |layout| layout.width = Len::dip(width.get()))
+            .height(Len::dip(100.0)).hide_if(hidden)
+            .canvas_atlas(Vector2::new(320.0, 32.0), |ui, region| {
+                ui.region_view(region, windows_scene::RegionView {
+                    rect: [0.0, 0.0, 100.0, 20.0], sampling: windows_scene::RegionSampling::Pixels,
+                }, Len::ZERO);
+            });
+    });
+    assert!(frame.patch().ops().iter().any(|op| matches!(op,
+        windows_scene::Op::Paint { paint: windows_scene::Paint::Presented { origin, .. }, .. }
+            if *origin == Vector2::new(0.0, 32.0))));
+    Host::with(|host| assert!(host.region_ops.is_empty()));
+    rig.set(hidden, false);
+    Host::with(|host| {
+        assert!(matches!(host.region_ops.as_slice(), [RegionOp::Mount { extent, size_node: None, .. }]
+            if extent.w == 320.0 && extent.h == 132.0));
+        host.region_ops.clear();
+    });
+    rig.set(width, 600.0);
+    Host::with(|host| {
+        assert!(matches!(host.region_ops.as_slice(), [RegionOp::Resize { extent, .. }]
+            if extent.w == 600.0 && extent.h == 132.0));
+        host.region_ops.clear();
+        host.env = windows_scene::Env::new(144.0, host.env.output());
+    });
+    rig.flush();
+    Host::with(|host| {
+        assert!(matches!(host.region_ops.as_slice(), [RegionOp::Resize { extent, .. }]
+            if extent.w == 600.0 && extent.h == 132.0 && extent.dpi == 144.0));
+        host.region_ops.clear();
+    });
+    assert!(rig.flush().patch().ops().is_empty());
+    rig.set(hidden, true);
+    Host::with(|host| {
+        assert!(matches!(host.region_ops.as_slice(), [RegionOp::Active { active: false, .. }]));
+        host.region_ops.clear();
+    });
     rig.unmount();
     Host::with(|host| assert_eq!(host.region_ops.len(), 1));
 }

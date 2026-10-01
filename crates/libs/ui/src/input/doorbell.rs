@@ -441,12 +441,11 @@ impl Doorbell {
     /// message can still be produced, and nothing here can write a legacy arm because neither
     /// binding filter generates a constant to write one with.
     ///
-    /// `WM_POINTERLEAVE` is the exception. The custom caption reads the same message to clear
+    /// `WM_POINTERLEAVE` and `WM_NCPOINTERUPDATE` are forwarded. The custom caption reads them to clear
     /// a window command's hover, and the window procedure runs the application's handler
     /// before the caption's, so consuming it here would leave a close button lit after the
-    /// pointer had gone. It carries no position and starts no contact, so what
-    /// `DefWindowProc` may make of it is a `WM_MOUSELEAVE`, which is in the set nothing here
-    /// can handle anyway. The key messages and the two window-state messages are forwarded for
+    /// pointer had gone. Caption motion also ends client hover before the pointer leaves
+    /// the window. The key messages and the two window-state messages are forwarded for
     /// the same reason: `WM_KEYDOWN` has to reach `TranslateMessage` for `WM_CHAR` to exist at
     /// all, and the application's own focus handling runs behind this one.
     pub fn wndproc(&self, message: u32, wparam: usize, lparam: isize) -> Option<isize> {
@@ -459,7 +458,7 @@ impl Doorbell {
             WM_POINTERHWHEEL => self.discrete(id, flags, EventKind::Wheel, notches(wparam), true),
             WM_POINTERCAPTURECHANGED => self.discrete(id, flags, EventKind::Cancel, 0, false),
             WM_POINTERUPDATE | WM_POINTERENTER => self.motion(id, flags),
-            WM_POINTERLEAVE => self.leave(id),
+            WM_POINTERLEAVE | WM_NCPOINTERUPDATE => self.leave(id),
             // A window-level capture change names no pointer: its `wParam` is a window handle.
             // The tick resolves it against whatever holds the explicit capture, and a change
             // that takes nothing away is not a cancel.
@@ -561,9 +560,8 @@ impl Doorbell {
     ///
     /// It also establishes hover presence. On 26200 a mouse moving into this window's client
     /// area produces `WM_POINTERUPDATE` and no `WM_POINTERENTER` at all, so a hover state
-    /// derived from the enter message alone never begins. Only the entering half is inferred —
-    /// a pointer that updates over the client area is over it — while leave stays the real
-    /// message, which the custom caption depends on.
+    /// derived from the enter message alone never begins. Client hover ends on a leave
+    /// message or motion over the non-client caption.
     fn motion(&self, id: u32, flags: PointerFlags) -> Option<isize> {
         let mut state = self.state.borrow_mut();
         // Only the primary contact drives hover: a second finger arriving does not move the
@@ -602,10 +600,12 @@ impl Doorbell {
     /// Clears hover presence, and the slot with it unless a captured drag still owns it.
     fn leave(&self, id: u32) -> Option<isize> {
         let mut state = self.state.borrow_mut();
+        let mut changed = false;
         if state.hovering == Some(id) {
             state.hovering = None;
+            changed = true;
         }
-        if let Some(i) = state.slot(id) {
+        if let Some(i) = state.slots.iter().position(|slot| slot.id == id && id != 0) {
             // The contact is gone from this window, but a captured drag still owns it until
             // its up arrives — so the slot is released only when nothing is down on it.
             if state.slots[i].down {
@@ -613,10 +613,11 @@ impl Doorbell {
             } else {
                 state.slots[i] = Contact::default();
             }
+            changed = true;
         }
         // The hover the tick has to clear is not a moved contact, so the frame is asked for
         // here rather than derived from a dirty bit.
-        state.frame();
+        if changed { state.frame(); }
         // Not consumed, so the custom caption behind this handler still sees it.
         None
     }
@@ -905,6 +906,23 @@ mod tests {
         let mut moved = Vec::new();
         bell.moved_into(&mut moved);
         assert_eq!(moved, [3]);
+    }
+
+    #[test]
+    fn caption_motion_clears_client_hover_without_consuming_caption_input() {
+        let bell = Doorbell::new();
+        let pointer = wparam(3, POINTER_FLAG_PRIMARY);
+        bell.wndproc(WM_POINTERUPDATE as u32, pointer, 0);
+        assert_eq!(bell.hovering(), Some(3));
+        assert_eq!(bell.wndproc(WM_NCPOINTERUPDATE as u32, pointer, 0), None);
+        assert_eq!(bell.hovering(), None);
+        assert!(bell.state.borrow().idle());
+        for _ in 0..32 {
+            assert_eq!(bell.wndproc(WM_NCPOINTERUPDATE as u32, pointer, 0), None);
+            assert!(bell.state.borrow().slots.iter().all(|slot| slot.id == 0));
+        }
+        bell.wndproc(WM_POINTERUPDATE as u32, pointer, 0);
+        assert_eq!(bell.hovering(), Some(3));
     }
 
     #[test]

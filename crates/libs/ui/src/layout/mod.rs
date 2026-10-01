@@ -26,7 +26,7 @@ pub use scroll::{
 };
 pub use solve::{shift, snap, solve_root};
 
-pub(crate) use scroll::{ScrollRow, ScrollTable, front as scroll_front};
+pub(crate) use scroll::{SMALL_STEP, ScrollRow, ScrollTable, front as scroll_front};
 
 use crate::build::{Element, Ui};
 

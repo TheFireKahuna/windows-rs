@@ -77,6 +77,7 @@ pub struct Uia {
     trackers: Vec<(NodeId, Arc<AtomicU64>)>,
     positions: Vec<(NodeId, Vector2)>,
     translations: Vec<(ControlId, Vector2)>,
+    lifted: ControlId,
 }
 
 impl Default for Uia {
@@ -98,6 +99,7 @@ impl Uia {
             trackers: Vec::new(),
             positions: Vec::new(),
             translations: Vec::new(),
+            lifted: ControlId::NONE,
         }
     }
 
@@ -184,6 +186,7 @@ impl Uia {
         self.scroll_changed();
         self.moved_properties(snapshot);
         let next = Arc::new(Tree::adopt(snapshot, &self.trackers));
+        next.lift(self.lifted);
         next.carry(&self.current);
         self.property_events(&next);
         self.structure_events(&next);
@@ -506,6 +509,25 @@ impl Uia {
             }
         }
         self.current.translation_positions(&mut self.translations);
+    }
+
+    pub(crate) fn lift(&mut self, owner: ControlId) {
+        if self.lifted == owner { return; }
+        self.lifted = owner;
+        let previous = self.current.lift_range();
+        self.current.lift(owner);
+        for (at, entry) in self.current.entries().iter().enumerate() {
+            let before = self.current.bounds_resolved(at as u16, &[], &[], previous.clone());
+            let after = self.current.bounds(at as u16);
+            if before == after { continue; }
+            self.pending.push(Raise::Property(entry.id,
+                Property::Native(UIA_BoundingRectanglePropertyId), Val::Rect(before)));
+            let was_off = before[2] == 0.0 || before[3] == 0.0;
+            if was_off != (after[2] == 0.0 || after[3] == 0.0) {
+                self.pending.push(Raise::Property(entry.id,
+                    Property::Native(UIA_IsOffscreenPropertyId), Val::Bool(was_off)));
+            }
+        }
     }
 
     /// Announces tracker movement after an existing compositor notification.

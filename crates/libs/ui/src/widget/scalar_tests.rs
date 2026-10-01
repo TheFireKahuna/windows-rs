@@ -127,6 +127,11 @@ impl Rig {
         controls.tick(reports, &mut front, out)
     }
 
+    pub fn correlate(&mut self, routes: &mut crate::correlation::Routes) -> Result<()> {
+        let mut front = Front { scene: &mut self.scene, back: &self.back, env: self.env };
+        routes.reveal(&mut front)
+    }
+
     /// Adopts rows the way a patch does, through the one call the driver makes.
     pub fn adopt(
         &mut self,
@@ -221,6 +226,70 @@ fn moved(target: ControlId, at: Point) -> Report {
         contact: 1,
         sample,
     }
+}
+
+#[test]
+fn native_correlation_retargets_retained_members_without_idle_work() -> Result<()> {
+    use crate::correlation::{Correlation, Member, Route, Router, Routes};
+    use crate::present::Live;
+    use windows_present::SubId;
+
+    let mut rig = Rig::new("correlation reveal")?;
+    let live = Live::new()?;
+    let group = Correlation::new(&live);
+    let (a, b, region) = (rig.ids.mint(), rig.ids.mint(), rig.ids.mint());
+    let (ra, rb) = (rig.node()?, rig.node()?);
+    rig.publish_hits(&[entry(a, 0.0, 0.0, 100.0, 32.0),
+        entry(b, 100.0, 0.0, 200.0, 32.0), entry(region, 0.0, 32.0, 200.0, 132.0)])?;
+    let rows = [
+        Route { source: a, member: Member { group: group.clone(), key: Some(SubId(1)), reveal: ra } },
+        Route { source: b, member: Member { group: group.clone(), key: Some(SubId(2)), reveal: rb } },
+        Route { source: region, member: Member { group: group.clone(), key: None, reveal: NodeId::NONE } },
+    ];
+    let mut routes = Routes::default();
+    routes.adopt(&rows, &[]);
+    let mut router = Router::default();
+    router.sync(&rows, rig.scene.hits());
+    let before = rig.animations();
+    router.route(&[moved(a, Point::default())], rig.scene.hits());
+    rig.correlate(&mut routes)?;
+    assert_eq!(rig.animations() - before, 1);
+    live.input.set_hover(Some(SubId(2)));
+    router.route(&[moved(region, Point::default())], rig.scene.hits());
+    rig.correlate(&mut routes)?;
+    assert_eq!(rig.animations() - before, 3, "the previous member hides and the next reveals");
+    let settled = rig.animations();
+    let minted = rig.visuals_minted();
+    let allocations = crate::counting::allocations();
+    for _ in 0..32 {
+        assert!(!router.route(&[moved(region, Point::default())], rig.scene.hits()));
+        rig.correlate(&mut routes)?;
+    }
+    assert_eq!(rig.animations(), settled);
+    assert_eq!(rig.visuals_minted(), minted);
+    assert_eq!(crate::counting::allocations(), allocations);
+    for _ in 0..2 {
+        router.route(&[moved(a, Point::default())], rig.scene.hits());
+        rig.correlate(&mut routes)?;
+        router.route(&[moved(b, Point::default())], rig.scene.hits());
+        rig.correlate(&mut routes)?;
+    }
+    let allocations = crate::counting::allocations();
+    for _ in 0..32 {
+        router.route(&[moved(a, Point::default())], rig.scene.hits());
+        rig.correlate(&mut routes)?;
+        router.route(&[moved(b, Point::default())], rig.scene.hits());
+        rig.correlate(&mut routes)?;
+    }
+    assert_eq!(crate::counting::allocations(), allocations);
+    assert_eq!(rig.visuals_minted(), minted);
+    routes.adopt(&[], &[b]);
+    router.sync(&[rows[0].clone(), rows[2].clone()], rig.scene.hits());
+    let retired = rig.animations();
+    rig.correlate(&mut routes)?;
+    assert_eq!(rig.animations(), retired, "retirement does not address the released target");
+    assert_eq!(group.selected(), None);
+    Ok(())
 }
 
 fn dragged(target: ControlId, phase: Phase, decided: bool) -> Report {
@@ -574,6 +643,55 @@ fn native_a_turn_reads_the_rotation_about_its_own_centre_and_a_cancel_restores_i
 }
 
 #[test]
+fn native_landing_retires_on_completion_and_is_canceled_by_a_new_preview() -> Result<()> {
+    let mut rig = Rig::new("reorder landing")?;
+    let parent = rig.node()?;
+    let tile = rig.node_in(windows_scene::Attach::Node(parent))?;
+    rig.patch.push(Op::Bind { id: tile, prop: Prop::Size,
+        bind: Bind::Set(Value::Vec2(Vector2::new(80.0, 40.0))) });
+    rig.apply()?;
+    let count = rig.scene.census().visuals_live;
+    rig.scene.land_drag_preview(tile, Vector2::new(120.0, 50.0), &rig.back)?;
+    let epoch = rig.scene.drag_preview_epoch().unwrap();
+    assert_eq!(rig.scene.census().visuals_live, count + 1);
+    assert_eq!(rig.scene.hits().lifted_owner(), ControlId::NONE);
+    rig.back.request_commit()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let mut events = Vec::new();
+    while rig.scene.drag_preview_epoch().is_some() {
+        assert!(std::time::Instant::now() < deadline, "landing completion did not restore the tile");
+        windows_window::pump();
+        rig.scene.drain_events(&mut events);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(rig.scene.census().visuals_live, count);
+    let settled = *rig.scene.census();
+    for _ in 0..100 { rig.scene.drain_events(&mut events); }
+    assert_eq!(*rig.scene.census(), settled);
+    rig.scene.land_drag_preview(tile, Vector2::new(-80.0, 0.0), &rig.back)?;
+    assert!(rig.scene.drag_preview_epoch().unwrap() > epoch);
+    assert!(rig.scene.begin_drag_preview(tile, ControlId::NONE, &rig.back));
+    let dragging = rig.scene.drag_preview_epoch();
+    rig.scene.finish_drag_preview(epoch);
+    assert_eq!(rig.scene.drag_preview_epoch(), dragging);
+    rig.scene.end_drag_preview();
+    assert_eq!(rig.scene.census().visuals_live, count);
+    rig.scene.set_springs_enabled(false);
+    rig.scene.land_drag_preview(tile, Vector2::new(100.0, 30.0), &rig.back)?;
+    assert_eq!(rig.scene.drag_preview_epoch(), None);
+    rig.scene.set_springs_enabled(true);
+    rig.scene.land_drag_preview(tile, Vector2::zero(), &rig.back)?;
+    assert_eq!(rig.scene.drag_preview_epoch(), None);
+    rig.scene.land_drag_preview(tile, Vector2::new(100.0, 0.0), &rig.back)?;
+    rig.patch.push(Op::Drop { id: tile, exit: windows_scene::Exit::None,
+        origin: Vector2::zero(), bounds: None });
+    rig.apply()?;
+    assert_eq!(rig.scene.drag_preview_epoch(), None);
+    assert_eq!(rig.scene.census().visuals_live, count - 1);
+    Ok(())
+}
+
+#[test]
 fn native_drag_preview_lifts_once_restores_on_cancel_and_ignores_late_reports() -> Result<()> {
     let mut rig = Rig::new("drag preview")?;
     let parent = rig.node()?;
@@ -745,6 +863,9 @@ fn native_grid_reorder_displaces_neighbors_on_index_edges_and_cancels_stale_geom
     assert!(matches!(out.last().map(|i| i.what), Some(What::ReorderEnded(Some(ReorderUpdate { to: 2, .. })))));
     assert_eq!(rows[2].state.get(), Vector2::new(100.0, -60.0));
     let epoch = rig.controls.take_preview_release().unwrap();
+    assert!(rig.controls.reorder_landing(epoch, ControlId::NONE, &rig.scene, &rig.patch).is_none());
+    assert!(rig.controls.reorder_landing(epoch + 1, id, &rig.scene, &rig.patch).is_none());
+    assert!(rig.controls.reorder_landing(epoch, id, &rig.scene, &rig.patch).is_some());
     rig.controls.finish_reorder(epoch, &mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env })?;
     rig.scene.finish_drag_preview(epoch);
     assert_eq!(rig.scene.census().visuals_live, resting_visuals);
@@ -794,6 +915,140 @@ fn native_grid_reorder_displaces_neighbors_on_index_edges_and_cancels_stale_geom
     assert_eq!(rig.scene.census().visuals_live, resting_visuals);
     rig.tick(&[sample(70.0, 80.0, false)], &mut out)?;
     assert!(rows.iter().all(|r| r.state.get() == Vector2::zero()));
+    Ok(())
+}
+
+#[test]
+fn native_grid_reorder_autoscroll_keeps_source_and_drop_geometry_coherent() -> Result<()> {
+    use crate::layout::{ScrollTable, Reveal, thumb_geom};
+    use crate::seam::{ScrollFront, ScrollOp};
+    use windows_scene::{Affine, Axes, GroupId, TrackerAxis, TrackerId, TrackerOp, TRACKER};
+    let mut rig = Rig::new("reorder autoscroll")?;
+    let viewport = rig.node()?;
+    let group = rig.node_in(windows_scene::Attach::Node(viewport))?;
+    let tracker = TrackerId::new(Ids::<TRACKER>::default().mint());
+    rig.patch.push(Op::Bind { id: viewport, prop: Prop::Size,
+        bind: Bind::Set(Value::Vec2(Vector2::new(100.0, 120.0))) });
+    rig.patch.push(Op::Tracker { id: tracker.erased(), op: TrackerOp::Create {
+        viewport: GroupId(viewport), axes: Axes::VERTICAL, owned: true } });
+    rig.patch.push(Op::Tracker { id: tracker.erased(), op: TrackerOp::Bounds {
+        min: Vector2::zero(), max: Vector2::new(0.0, 1000.0) } });
+    rig.patch.push(Op::Bind { id: group, prop: Prop::OffsetY, bind: Bind::Track {
+        tracker: tracker.erased(), axis: TrackerAxis::PositionY, affine: Affine::CONTENT } });
+    rig.apply()?;
+    let hover = rig.ids.mint();
+    let mut hits = vec![entry(hover, 0.0, 0.0, 100.0, 120.0)];
+    let mut rows = Vec::new();
+    for index in 0..8 {
+        let node = rig.node_in(windows_scene::Attach::Node(group))?;
+        rig.patch.push(Op::Bind { id: node, prop: Prop::Size,
+            bind: Bind::Set(Value::Vec2(Vector2::new(80.0, 40.0))) });
+        let id = rig.ids.mint();
+        let y = index as f32 * 60.0;
+        let mut hit = entry(id, 0.0, y, 80.0, y + 40.0);
+        hit.scroll_src = viewport;
+        hit.clip_parent = 0;
+        hits.push(hit);
+        rows.push(ReorderRow { id, node, group, index,
+            state: windows_scene::Translation::new(Vector2::zero()) });
+    }
+    rig.apply()?;
+    rig.publish_hits(&hits)?;
+    rig.adopt(&rows.iter().map(|row| (row.id, ChromeRow {
+        flags: flag::DRAGS | flag::DRAG_PREVIEW, ..ChromeRow::default()
+    })).collect::<Vec<_>>(), &[], &[])?;
+    rig.controls.adopt_previews(&rows.iter().map(|r| (r.id, r.node)).collect::<Vec<_>>());
+    rig.controls.adopt_reorders(&rows, &[]);
+    rig.adopt_translations(&rows.iter().map(|r| (r.id, r.node, r.state.clone())).collect::<Vec<_>>(), &[])?;
+    let mut scrolls = ScrollTable::default();
+    scrolls.apply_ops(&mut vec![
+        ScrollOp::Add { front: ScrollFront { viewport, tracker, hover, grab: ControlId::NONE },
+            thumb: None, reveal: Reveal::Never, observe: false },
+        ScrollOp::Thumb { viewport, geom: thumb_geom(120.0, 1120.0) },
+    ]);
+    let id = rows[0].id;
+    let point = Point { x: 70.0, y: 110.0 };
+    let moved = |at, decided| Report::Dragged { target: id, contact: 1,
+        update: DragUpdate { phase: Phase::Free, from: Point::default(), at, delta: at, decided } };
+    let mut out = Vec::with_capacity(16);
+    rig.tick(&[press(id), moved(point, true)], &mut out)?;
+    assert_eq!(rig.scene.hits().visible_rect(id), Some([70.0, 110.0, 150.0, 150.0]));
+    assert_eq!(rig.scene.hit(Point { x: 140.0, y: 140.0 }, windows_scene::ContactKind::Mouse).unwrap().id, id);
+    let mut front = Front { scene: &mut rig.scene, back: &rig.back, env: rig.env };
+    scrolls.reorder_scroll(rig.controls.reorder_pointer(), &mut front)?;
+    let animations = front.scene.census().animations;
+    let allocations = crate::counting::allocations();
+    for _ in 0..100 { scrolls.reorder_scroll(rig.controls.reorder_pointer(), &mut front)?; }
+    assert_eq!(crate::counting::allocations(), allocations);
+    assert_eq!(front.scene.census().animations, animations);
+    rig.back.request_commit()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let mut events = Vec::new();
+    while rig.scene.hits().offset(viewport).y < 363.5 {
+        assert!(std::time::Instant::now() < deadline, "tracker did not reach the last row");
+        windows_window::pump();
+        events.clear();
+        rig.scene.drain_events(&mut events);
+        let mut front = Front { scene: &mut rig.scene, back: &rig.back, env: rig.env };
+        rig.controls.refresh_reorder(&mut front, &mut out)?;
+        scrolls.reorder_scroll(rig.controls.reorder_pointer(), &mut front)?;
+        assert!(front.scene.hits().shifted(1).into_iter().zip([70.0, 110.0, 150.0, 150.0])
+            .all(|(actual, expected)| (actual - expected).abs() < 0.0001));
+        assert_eq!(front.scene.hit(Point { x: 140.0, y: 140.0 }, windows_scene::ContactKind::Mouse).unwrap().id, id);
+        rig.back.request_commit()?;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(rig.scene.hits().offset(viewport).y <= 364.001);
+    assert!(matches!(out.last().map(|i| i.what), Some(What::Reordered(ReorderUpdate { to: 7, .. }))));
+    rig.tick(&[Report::Released { target: id, contact: 1, at: point }], &mut out)?;
+    scrolls.reorder_scroll(rig.controls.reorder_pointer(),
+        &mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env })?;
+    assert!(matches!(out.last().map(|i| i.what), Some(What::ReorderEnded(Some(ReorderUpdate { to: 7, .. })))));
+    let epoch = rig.controls.take_preview_release().unwrap();
+    rig.controls.finish_reorder(epoch, &mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env })?;
+    rig.scene.finish_drag_preview(epoch);
+    assert!(rows.iter().all(|r| r.state.get() == Vector2::zero()));
+
+    let target = rows[7].id;
+    rig.tick(&[press(target), Report::Dragged { target, contact: 2, update: DragUpdate {
+        phase: Phase::Free, from: Point { x: 70.0, y: 90.0 }, at: Point { x: 70.0, y: 10.0 },
+        delta: Point { x: 0.0, y: -80.0 }, decided: true,
+    } }], &mut out)?;
+    scrolls.reorder_scroll(rig.controls.reorder_pointer(),
+        &mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env })?;
+    rig.back.request_commit()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while rig.scene.hits().offset(viewport).y > 300.0 {
+        assert!(std::time::Instant::now() < deadline, "top edge did not reverse scrolling");
+        windows_window::pump();
+        events.clear();
+        rig.scene.drain_events(&mut events);
+        rig.controls.refresh_reorder(&mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env }, &mut out)?;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    rig.tick(&[Report::Canceled { target, contact: 2 }], &mut out)?;
+    let stopped = rig.scene.hits().offset(viewport).y;
+    scrolls.reorder_scroll(rig.controls.reorder_pointer(),
+        &mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env })?;
+    rig.back.request_commit()?;
+    let settle = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    while std::time::Instant::now() < settle {
+        windows_window::pump();
+        events.clear();
+        rig.scene.drain_events(&mut events);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!((rig.scene.hits().offset(viewport).y - stopped).abs() < 0.001);
+    assert_eq!(out.last().map(|i| i.what), Some(What::ReorderEnded(None)));
+    assert!(rows.iter().all(|r| r.state.get() == Vector2::zero()));
+    let census = *rig.scene.census();
+    for _ in 0..100 {
+        scrolls.reorder_scroll(None, &mut Front { scene: &mut rig.scene, back: &rig.back, env: rig.env })?;
+    }
+    assert_eq!(*rig.scene.census(), census);
+    assert!(rig.scene.begin_drag_preview(rows[0].node, rows[0].id, &rig.back));
+    rig.scene.show_drag_placeholder(0.25, &rig.back);
+    drop(rig);
     Ok(())
 }
 

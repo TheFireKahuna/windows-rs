@@ -517,8 +517,8 @@ row! {
         theme: Option<(Scope, windows_scene::BackdropSpec)>,
         /// The window-owned outline, installed once before interaction.
         focus_outline: Option<NodeId>,
-        /// Preview to restore after this batch's patch has applied.
-        preview_done: Option<u64>,
+        /// Preview identity and the control whose reorder the application accepted.
+        preview_done: Option<(u64, ControlId)>,
     }
 }
 
@@ -564,6 +564,7 @@ row! {
     /// **An appending producer**, as [`Up`] is: a deferred contact is a lost contact.
     ToScene,
     empty: |b| b.reports.is_empty()
+        && !b.correlation_changed
         && b.springs_enabled.is_none()
         && b.intents.is_empty()
         && b.caption.is_none()
@@ -590,6 +591,8 @@ row! {
         /// Read by `Controls::nonclient`: what the pointer is doing to a window command whose
         /// input the system took.
         caption: Option<CaptionState>,
+        /// A correlation selection moved; retained reveal targets need a scene pass.
+        correlation_changed: bool,
         /// Controls whether subsequent compositor springs animate or snap to their targets.
         springs_enabled: Option<bool>,
         /// The client size in DIPs, where it changed.

@@ -106,7 +106,7 @@ pub use animation::{
     ImplicitAnimationCollection, ScalarKeyFrameAnimation, Vector3KeyFrameAnimation,
 };
 pub use batch::{BatchKind, CompositionScopedBatch};
-pub use brush::{Brush, CompositionBrush, CompositionColorBrush, CompositionNineGridBrush};
+pub use brush::{Brush, CompositionBackdropBrush, CompositionBrush, CompositionColorBrush, CompositionNineGridBrush};
 pub use color::Color;
 pub use compositor::Compositor;
 pub use geometry::Geometry;
@@ -133,7 +133,7 @@ pub use animatable::{Animatable, CompositionObject};
 pub use clip::{Clip, CompositionClip, CompositionGeometricClip, InsetClip, RectangleClip};
 #[cfg(feature = "system")]
 pub use effects::{
-    CompositionEffectBrush, CompositionEffectFactory, CompositeMode, EffectGraph,
+    CompositionEffectBrush, CompositionEffectFactory, CompositeMode, EffectBorderMode, EffectGraph,
     PropertyMapping,
 };
 #[cfg(feature = "system")]

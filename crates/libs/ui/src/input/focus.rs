@@ -92,11 +92,23 @@ impl FocusRing {
     }
 
     pub(crate) fn validate(&mut self, hits: &HitTable) {
-        if self.current.is_some_and(|id| {
-            hits.entry(id)
-                .is_none_or(|entry| !entry.flags.contains(HitFlags::INTERACTIVE))
+        let outside = self.scopes.last().is_some_and(|scope| {
+            let entries = hits.entries();
+            entries.iter().position(|entry| entry.id == scope.from).is_none_or(|start| {
+                !entries[start..].iter().any(|entry| Some(entry.id) == self.current)
+            })
+        });
+        if outside || self.current.is_some_and(|id| {
+            hits.entry(id).is_none_or(|entry| {
+                !entry.flags.contains(HitFlags::INTERACTIVE)
+                    || entry.flags.contains(HitFlags::BLOCKER)
+            })
         }) {
             self.current = None;
+        }
+        // An entering overlay can publish its controls after its focus scope.
+        if self.current.is_none() && self.scopes.last().is_some() {
+            self.enter(hits, false);
         }
     }
 
@@ -157,18 +169,21 @@ impl FocusRing {
                     trap,
                     from,
                     restore_to,
-                } => self.scopes.push(Scope {
-                    id,
-                    trap,
-                    // An overlay anchored to a control names that control. One anchored to a
-                    // point or to the window names none, and what it interrupted is known
-                    // only here.
-                    restore_to: restore_to.or(self.current),
-                    // A scope naming no entry collects nothing, which is the same fail-closed
-                    // answer as one whose entry has left the array: `ControlId::NONE` is never
-                    // an entry's id.
-                    from: from.unwrap_or(ControlId::NONE),
-                }),
+                } => {
+                    self.scopes.push(Scope {
+                        id,
+                        trap,
+                        // An overlay anchored to a control names that control. One anchored to a
+                        // point or to the window names none, and what it interrupted is known
+                        // only here.
+                        restore_to: restore_to.or(self.current),
+                        // A scope naming no entry collects nothing, which is the same fail-closed
+                        // answer as one whose entry has left the array: `ControlId::NONE` is never
+                        // an entry's id.
+                        from: from.unwrap_or(ControlId::NONE),
+                    });
+                    self.current = None;
+                }
                 FocusOp::Pop(scope) => self.pop(scope),
                 FocusOp::Focus(next) => {
                     self.focus(next);
@@ -373,6 +388,40 @@ mod tests {
         assert_eq!(ring.current(), Some(cid(1)));
         ring.window_focus(true, &hits);
         assert_eq!(ring.keyboard(), Some(cid(1)));
+    }
+
+    #[test]
+    fn scope_entry_waits_for_hits_and_rejects_background_focus() {
+        let background = table(&[1, 2]);
+        let visible = table_of(&[
+            entry(1, HitFlags::INTERACTIVE),
+            entry(9, HitFlags::INTERACTIVE | HitFlags::BLOCKER),
+            entry(10, HitFlags::INTERACTIVE),
+            entry(11, HitFlags::INTERACTIVE),
+        ]);
+        let mut ring = FocusRing::default();
+        ring.focus(Some(cid(1)));
+        ring.apply(&[FocusOp::Push {
+            id: ScopeId(1), trap: true, from: Some(cid(9)), restore_to: None,
+        }], &background);
+        ring.validate(&background);
+        assert_eq!(ring.current(), None);
+        ring.validate(&visible);
+        assert_eq!(ring.current(), Some(cid(10)));
+        ring.focus(Some(cid(1)));
+        ring.validate(&visible);
+        assert_eq!(ring.current(), Some(cid(10)));
+        ring.focus(Some(cid(11)));
+        ring.validate(&visible);
+        assert_eq!(ring.current(), Some(cid(11)));
+        ring.validate(&background);
+        assert_eq!(ring.current(), None);
+        ring.apply(&[FocusOp::Pop(ScopeId(1))], &background);
+        ring.validate(&background);
+        assert_eq!(ring.current(), Some(cid(1)));
+        ring.focus(None);
+        ring.validate(&background);
+        assert_eq!(ring.current(), None);
     }
 
     #[test]

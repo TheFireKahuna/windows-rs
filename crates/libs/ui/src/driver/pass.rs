@@ -103,7 +103,7 @@ struct App {
     /// Held for the life of the mount: retiring it unmounts the tree.
     root: Option<Mount>,
     focus_outline: Option<windows_scene::NodeId>,
-    preview_done: Option<u64>,
+    preview_done: Option<(u64, ControlId)>,
     overlays: Overlays,
     /// Focus edits the overlay stack emitted since the last batch went out.
     focus: Vec<FocusOp>,
@@ -354,8 +354,8 @@ impl App {
         );
         // After the front table has consumed them, which it did on the scene thread before
         // they were forwarded: the press that opens an overlay here has already lit its button.
-        Host::dispatch(&up.intents);
-        if up.preview_done.is_some() { self.preview_done = up.preview_done.take(); }
+        let accepted = Host::dispatch(&up.intents).unwrap_or(ControlId::NONE);
+        if let Some(epoch) = up.preview_done.take() { self.preview_done = Some((epoch, accepted)); }
         // A client is owed the number a drag settled on and the fact that an action completed,
         // and neither restales the tree. Collected only while one is listening, so a drag with
         // nothing attached copies nothing.
@@ -488,6 +488,11 @@ pub(super) fn key_intents(
     intents: &mut Vec<Intent>,
 ) {
     for report in reports {
+        if let Report::Key { target, .. } = *report
+            && !overlays.accepts_key(target)
+        {
+            continue;
+        }
         if let Report::Key { target, event } = *report
             && let Some(command) = Host::with(|h| h.shortcut_target(target, event))
         {
@@ -553,6 +558,7 @@ fn discrete(report: &Report) -> bool {
     !matches!(
         report,
         Report::Moved { .. }
+            | Report::HoverMoved { .. }
             | Report::Dragged { .. }
             | Report::Buttons { .. }
             | Report::Wheel { .. }
@@ -561,9 +567,11 @@ fn discrete(report: &Report) -> bool {
 }
 
 pub(super) fn apply_control_patch(controls: &mut Controls, down: &mut Down, front: &mut Front<'_>) -> Result<()> {
-    if let Some(epoch) = down.preview_done { controls.finish_reorder(epoch, front)?; }
+    let landing = down.preview_done.and_then(|(epoch, accepted)|
+        controls.reorder_landing(epoch, accepted, front.scene, &down.patch));
+    if let Some((epoch, _)) = down.preview_done { controls.finish_reorder(epoch, front)?; }
     front.scene.apply(&mut down.patch, front.back, front.env)?;
-    if let Some(epoch) = down.preview_done.take() { front.scene.finish_drag_preview(epoch); }
+    if let Some((epoch, _)) = down.preview_done.take() { front.scene.finish_drag_preview(epoch); }
     if let Some(outline) = down.focus_outline.take() {
         controls.set_ring(outline);
     }
@@ -579,6 +587,7 @@ pub(super) fn apply_control_patch(controls: &mut Controls, down: &mut Down, fron
     )?;
     controls.adopt_previews(&down.previews);
     controls.validate_reorder(front)?;
+    if let Some(landing) = landing { controls.land_reorder(landing, front)?; }
     Ok(())
 }
 
@@ -755,6 +764,11 @@ impl Worker for SceneThread {
                 self.links.window.post(WM_FRAME, 0, 0);
             }
         }
+        let mut front = Front { scene: &mut self.scene, back: &self.back, env: self.env };
+        if self.events.iter().any(|event| matches!(event, SceneEvent::TrackerValues { .. })) {
+            self.controls.refresh_reorder(&mut front, &mut self.up.intents)?;
+        }
+        self.scrolls.reorder_scroll(self.controls.reorder_pointer(), &mut front)?;
         self.regions.visibility(&mut self.scene, self.hidden)?;
         self.regions.retire_exits(&mut Front {
             scene: &mut self.scene, back: &self.back, env: self.env,
@@ -943,6 +957,7 @@ impl SceneThread {
         // intent causes a visual: by the time one exists, the visual has happened.
         self.controls
             .tick(&to.reports, &mut front, &mut self.up.intents)?;
+        self.correlations.reveal(&mut front)?;
         if let Some(epoch) = self.controls.take_preview_release() {
             self.up.preview_done = Some(epoch);
         }
@@ -1101,13 +1116,13 @@ mod tests {
             assert!(links.up.put(up).is_ok());
             app.pass().unwrap();
             assert_eq!(calls.get(), epoch);
-            assert_eq!(app.preview_done, Some(epoch));
+            assert_eq!(app.preview_done, Some((epoch, ControlId::NONE)));
             assert!(app.owed);
             assert!(links.down.take().is_none());
             assert!(links.down.give(spare));
             app.pass().unwrap();
             let down = links.down.take().expect("no-op drops must also return an acknowledgement");
-            assert_eq!(down.preview_done, Some(epoch));
+            assert_eq!(down.preview_done, Some((epoch, ControlId::NONE)));
             assert_eq!(down.patch.ops().iter().any(|op| matches!(op, Op::Drop { .. })), edits);
             assert_eq!(app.preview_done, None);
             links.down.give(down);
@@ -1251,6 +1266,50 @@ mod tests {
             &mut intents,
         );
         assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn active_overlay_rejects_queued_background_key_activations() {
+        use crate::widget::button;
+        let _patch = crate::build::tests::fixture();
+        let (_owner, _mount) = signal::Owner::scope(|| Ui::mount_root(|ui| {
+            button(ui, "Background").key("background");
+        }));
+        let named = |name| Host::with(|h| h.controls.iter()
+            .find(|(_, row)| row.key.as_deref() == Some(name)).unwrap().0);
+        let background = named("background");
+        let mut overlays = Overlays::new();
+        let mut focus = Vec::new();
+        let mut intents = Vec::new();
+        overlays.open(&mut focus, crate::overlay::Spec::popup(), |ui| {
+            button(ui, "Inside").key("inside");
+        });
+        let inside = named("inside");
+        focus.clear();
+        for value in [SPACE, RETURN, 0x27, 0x28] {
+            key_intents(&mut overlays,
+                &[key(background, value, KeyKind::Down, false, Mods::default())],
+                &mut focus, &mut intents);
+            assert!(intents.is_empty());
+            assert!(focus.is_empty());
+        }
+        for value in [0x25, 0x27, 0x28, 0x24, 0x23, 0x49] {
+            key_intents(&mut overlays,
+                &[key(inside, value, KeyKind::Down, false, Mods::default())],
+                &mut focus, &mut intents);
+            assert!(intents.is_empty());
+            assert!(focus.is_empty());
+        }
+        key_intents(&mut overlays,
+            &[key(inside, SPACE, KeyKind::Down, false, Mods::default())],
+            &mut focus, &mut intents);
+        assert_eq!(intents, [Intent { target: inside, what: What::Tapped }]);
+        intents.clear();
+        overlays.close_top(&mut focus);
+        key_intents(&mut overlays,
+            &[key(background, SPACE, KeyKind::Down, false, Mods::default())],
+            &mut focus, &mut intents);
+        assert_eq!(intents, [Intent { target: background, what: What::Tapped }]);
     }
 
     #[test]

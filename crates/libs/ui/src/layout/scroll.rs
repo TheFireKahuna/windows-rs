@@ -12,7 +12,8 @@ use crate::GestureSettings;
 use crate::build::control::ControlRow;
 use crate::build::{Element, Host, Node, Ui};
 use crate::gesture::{DragDecl, DragUpdate, GestureDecl, Phase};
-use crate::input::Report;
+use crate::bindings::{VK_DOWN, VK_END, VK_HOME, VK_NEXT, VK_PRIOR, VK_UP};
+use crate::input::{KeyEvent, KeyKind, Report};
 use crate::layout::{Edge, Layout, Len, Position, Preset, Rect, Table, anchors, probe};
 use crate::role::{Metric, metric};
 use crate::seam::{ScrollFront, ScrollOp};
@@ -25,7 +26,7 @@ use std::sync::Arc;
 use windows_core::Result;
 use windows_numerics::Vector2;
 use windows_scene::{
-    Affine, Anim, Axes, Bind, ControlId, GroupId, HitDecl, HitFlags, Id, NodeId, Observed,
+    Affine, Anim, Axes, Bind, ControlId, GroupId, HitDecl, HitFlags, HitTable, Id, NodeId, Observed,
     Phase as TrackerPhase, Prop, SceneEvent, SpriteId, TRACKER, TrackerAxis, TrackerId,
     TrackerRequest, Tuning, Value, unpack_offset,
 };
@@ -59,6 +60,8 @@ const GRAB_INFLATE: f32 = 8.0;
 ///
 /// Sub-pixel overflow is a rounding residue of the solve rather than something to scroll.
 const OVERFLOW_FLOOR: f32 = 0.5;
+/// Fraction of a viewport used by arrow keys and accessibility small scroll steps.
+pub(crate) const SMALL_STEP: f32 = 0.1;
 /// How long a thumb stays lit after the last reason to show it ends, in milliseconds.
 ///
 /// The fade carries it as its own delay, so the compositor measures the wait and a reason
@@ -1040,7 +1043,11 @@ impl Ui<'_> {
         if let Some(row) = host.control_mut(hover) {
             row.uia = crate::widget::UiaRole::Group;
         }
-        let grab = host.mint_control(ControlRow::blank(rail, scope));
+        // The viewport owns keyboard scrolling; the rail only accepts pointer input.
+        let mut rail_control = ControlRow::blank(rail, scope);
+        rail_control.tab_stop = Some(false);
+        let grab = host.mint_control(rail_control);
+        host.focus_ops.push(crate::seam::FocusOp::TabIndex(grab, -1));
         // The surface itself is a target so a hover can reveal its bar and a wheel notch the
         // tracker did not take reaches it. Its own box is the whole of it, so it is not
         // inflated: a control sitting near its edge would otherwise share the point.
@@ -1240,6 +1247,7 @@ impl Live {
 #[derive(Default)]
 pub(crate) struct ScrollTable {
     rows: Vec<Live>,
+    reorder: Option<(NodeId, i8)>,
     /// The word each live tracker publishes its reported position into, listed from the scene.
     shadows: Vec<(NodeId, Arc<AtomicU64>)>,
     /// Whether a container has arrived or left since the shadows were listed.
@@ -1302,6 +1310,42 @@ fn reveal_step(
 }
 
 impl ScrollTable {
+    pub(crate) fn reorder_scroll(
+        &mut self, pointer: Option<(ControlId, windows_scene::Point, [f32; 2])>, front: &mut Front<'_>,
+    ) -> Result<()> {
+        let wanted = pointer.and_then(|(id, point, _)| {
+            let entry = front.scene.hits().entry(id)?;
+            if entry.flags.contains(HitFlags::UNSCROLLED) { return None; }
+            let row = self.rows.iter().find(|row| row.of.viewport == entry.scroll_src)?;
+            let view = front.scene.hits().visible_rect(row.of.hover)?;
+            let direction = reorder_edge(view, point);
+            (direction != 0 && row.geom().max_scroll.is_finite() && row.geom().max_scroll > 0.0)
+                .then_some((entry.scroll_src, direction))
+        });
+        if self.reorder == wanted { return Ok(()); }
+        if let Some((viewport, _)) = self.reorder.take()
+            && let Some(row) = self.rows.iter().find(|row| row.of.viewport == viewport)
+        {
+            front.scene.request(row.of.tracker, TrackerRequest::To(front.scene.hits().offset(viewport)))?;
+        }
+        if let Some((viewport, direction)) = wanted {
+            let row = self.rows.iter().find(|row| row.of.viewport == viewport).unwrap();
+            let from = front.scene.hits().offset(viewport);
+            let view = front.scene.hits().visible_rect(row.of.hover).unwrap();
+            let span = pointer.unwrap().2;
+            let edge = if direction < 0 { span[0] - view[1] - REORDER_EDGE }
+                else { span[1] - view[3] + REORDER_EDGE };
+            let to = Vector2::new(from.x, edge.clamp(0.0, row.geom().max_scroll));
+            let seconds = (to.y - from.y) * f32::from(direction) / REORDER_SPEED;
+            if seconds > 0.0 {
+                front.scene.animate_tracker(row.of.tracker, to,
+                    std::time::Duration::from_secs_f32(seconds.max(0.001)), front.back)?;
+            }
+            self.reorder = wanted;
+        }
+        Ok(())
+    }
+
     /// Applies one batch of container edits, in the order the app half emitted them.
     ///
     /// A thumb declared [`Reveal::Always`] is opaque from its mount, so its row starts shown and
@@ -1398,6 +1442,38 @@ impl ScrollTable {
         };
         let tracker = row.of.tracker;
         request(front, tracker, to.y)
+    }
+
+    fn key_request(
+        &self,
+        target: ControlId,
+        event: KeyEvent,
+        hits: &HitTable,
+    ) -> Option<(TrackerId<Observed>, TrackerRequest)> {
+        if event.kind != KeyKind::Down || event.mods.ctrl || event.mods.alt {
+            return None;
+        }
+        let row = self.rows.iter().find(|row| row.of.hover == target)?;
+        let hit = hits.entry(target)?;
+        if !hit.flags.contains(HitFlags::INTERACTIVE.union(HitFlags::SCROLL)) {
+            return None;
+        }
+        let page = (hit.y1 - hit.y0).max(0.0);
+        let max = row.geom().max_scroll;
+        if page <= 0.0 || !max.is_finite() || max <= OVERFLOW_FLOOR {
+            return None;
+        }
+        let y = match event.key as i32 {
+            VK_UP => -page * SMALL_STEP,
+            VK_DOWN => page * SMALL_STEP,
+            VK_PRIOR => -page,
+            VK_NEXT => page,
+            VK_HOME => return Some((row.of.tracker, TrackerRequest::To(Vector2 { x: 0.0, y: 0.0 }))),
+            VK_END => return Some((row.of.tracker, TrackerRequest::To(Vector2 { x: 0.0, y: max }))),
+            _ => return None,
+        };
+        // Relative requests accumulate in the tracker before its next position publication.
+        Some((row.of.tracker, TrackerRequest::By(Vector2 { x: 0.0, y })))
     }
 
     pub(crate) fn reveal_field(
@@ -1583,6 +1659,19 @@ impl ScrollTable {
     }
 }
 
+const REORDER_EDGE: f32 = 24.0;
+const REORDER_SPEED: f32 = 240.0;
+
+fn reorder_edge(view: [f32; 4], point: windows_scene::Point) -> i8 {
+    if !point.x.is_finite() || !point.y.is_finite()
+        || point.x < view[0] || point.x > view[2] || point.y < view[1] || point.y > view[3]
+    { return 0; }
+    let band = REORDER_EDGE.min((view[3] - view[1]) * 0.5);
+    if point.y < view[1] + band { -1 }
+    else if point.y > view[3] - band { 1 }
+    else { 0 }
+}
+
 /// Records what the trackers reported into each container's [`ListState`].
 ///
 /// **Writes signals only**, and runs before the flush, so the realization window a reported
@@ -1626,8 +1715,8 @@ pub fn observe(events: &[SceneEvent]) {
     });
 }
 
-/// Applies a tick's events and reports to the compositor: a thumb's reveal, a redirected
-/// contact, and a thumb being dragged.
+/// Applies thumb reveals, redirected contacts, thumb drags and focused keyboard scrolling
+/// to the compositor.
 ///
 /// Must run **after the apply**, so a retarget never names a node the patch was about to
 /// rebuild, and after the router's tick, so a grab resolves against the hit array this frame
@@ -1695,6 +1784,11 @@ pub(crate) fn front(
             }
             Report::Dragged { target, update, .. } => {
                 keep(&mut failed, drag(table, target, update, front));
+            }
+            Report::Key { target: Some(target), event } => {
+                if let Some((tracker, request)) = table.key_request(target, event, front.scene.hits()) {
+                    keep(&mut failed, front.scene.request(tracker, request).map(|_| ()));
+                }
             }
             // A released or cancelled grab forgets where it started, so the next one measures
             // from where the content actually is.
@@ -2453,6 +2547,58 @@ mod tests {
             created: true,
             state: observed.then(list_state),
         }
+    }
+
+    #[test]
+    fn keyboard_scroll_uses_the_focused_viewport_and_keeps_repeats_relative() {
+        let mut table = ScrollTable::default();
+        let mut ops = Vec::new();
+        row(1, false).publish(geom(200.0, 1200.0), &mut ops);
+        row(2, false).publish(geom(400.0, 2400.0), &mut ops);
+        table.apply_ops(&mut ops);
+        let target = table.rows[1].of.hover;
+        let tracker = table.rows[1].of.tracker;
+        let entry = windows_scene::HitEntry {
+            x0: 0.0, y0: 70.0, x1: 300.0, y1: 470.0,
+            touch_inflate: 0.0,
+            clip_parent: windows_scene::NO_ENTRY,
+            parent: windows_scene::NO_ENTRY,
+            flags: HitFlags::INTERACTIVE.union(HitFlags::SCROLL),
+            scroll_src: NodeId::NONE,
+            id: target,
+        };
+        let mut hits = HitTable::default();
+        hits.replace(&[entry], &[(target, 0)]);
+        let event = KeyEvent { kind: KeyKind::Down, key: VK_DOWN as u16, repeat: false, mods: Default::default() };
+        for (key, y) in [(VK_UP, -40.0), (VK_DOWN, 40.0), (VK_PRIOR, -400.0), (VK_NEXT, 400.0)] {
+            for repeat in [false, true] {
+                assert_eq!(table.key_request(target, KeyEvent { key: key as u16, repeat, ..event }, &hits),
+                    Some((tracker, TrackerRequest::By(Vector2 { x: 0.0, y }))));
+            }
+        }
+        for (key, y) in [(VK_HOME, 0.0), (VK_END, 2000.0)] {
+            assert_eq!(table.key_request(target, KeyEvent { key: key as u16, ..event }, &hits),
+                Some((tracker, TrackerRequest::To(Vector2 { x: 0.0, y }))));
+        }
+        table.rows[1].extended = 50.0;
+        assert_eq!(table.key_request(target, KeyEvent { key: VK_END as u16, ..event }, &hits),
+            Some((tracker, TrackerRequest::To(Vector2 { x: 0.0, y: 2050.0 }))));
+        for kind in [KeyKind::Up, KeyKind::Char] {
+            assert_eq!(table.key_request(target, KeyEvent { kind, ..event }, &hits), None);
+        }
+        for mods in [crate::input::Mods { ctrl: true, ..Default::default() }, crate::input::Mods { alt: true, ..Default::default() }] {
+            assert_eq!(table.key_request(target, KeyEvent { mods, ..event }, &hits), None);
+        }
+        assert_eq!(table.key_request(table.rows[0].of.hover, event, &hits), None);
+        assert_eq!(table.key_request(table.rows[1].of.grab, event, &hits), None);
+        hits.replace(&[windows_scene::HitEntry { flags: HitFlags::SCROLL, ..entry }], &[(target, 0)]);
+        assert_eq!(table.key_request(target, event, &hits), None);
+        hits.replace(&[entry], &[(target, 0)]);
+        table.rows[1].last = geom(400.0, 300.0);
+        table.rows[1].extended = 0.0;
+        assert_eq!(table.key_request(target, event, &hits), None);
+        table.rows.clear();
+        assert_eq!(table.key_request(target, event, &hits), None);
     }
 
     /// A container reaches the table that moves its thumb once, and leaves it when it unmounts.

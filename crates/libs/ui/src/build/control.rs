@@ -59,7 +59,7 @@ pub(crate) struct Handlers {
 pub(crate) struct ReorderHandler {
     pub group: NodeId,
     pub index: u32,
-    pub call: Rc<dyn Fn(Gesturing<crate::widget::ReorderUpdate>)>,
+    pub call: Rc<dyn Fn(Gesturing<crate::widget::ReorderUpdate>) -> bool>,
 }
 
 /// One interactive control. Its index is its slot for the life of its mount.
@@ -533,8 +533,35 @@ impl<K> Element<'_, K> {
     pub fn correlate(self, group: &crate::correlation::Correlation, member: Option<windows_present::SubId>) -> Self {
         assert!(member.is_none_or(|key| key.0 != u32::MAX));
         self.interaction_scope().declare(HitFlags::INTERACTIVE, |row| {
-            row.correlation = Some(crate::correlation::Member { group: group.clone(), key: member });
+            row.correlation = Some(crate::correlation::Member {
+                group: group.clone(), key: member, reveal: NodeId::NONE,
+            });
         })
+    }
+
+    /// Reveals this element when its enclosing correlation member is selected.
+    ///
+    /// The target must be below a scope declared with `correlate` and a member id.
+    /// The scene owns opacity and uses the shared interaction spring.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the scope has no member id, already reveals another target, or this
+    /// element's opacity already has a writer.
+    pub fn reveal_on_correlation(mut self) -> Self {
+        let enclosing = self.ui.control;
+        let scope = self.host().control(enclosing)
+            .map_or(ControlId::NONE, |row| row.front.scope);
+        let node = self.node_id();
+        assert_eq!(self.host().tree.c.channels[node.index()] & (1 << Prop::Opacity as u32), 0,
+            "a correlation reveal requires unclaimed opacity");
+        let member = self.host().control_mut(scope).and_then(|row| row.correlation.as_mut())
+            .expect("a correlation reveal requires an enclosing correlation scope");
+        assert!(member.key.is_some(), "a correlation reveal requires a member id");
+        assert!(member.reveal.is_none(), "one correlation reveal target per scope");
+        member.reveal = node;
+        self.host().write_channel(node, Prop::Opacity, Value::Scalar(0.0));
+        self
     }
 
     /// Groups hover, press and keyboard focus for one retained reveal target.
@@ -662,9 +689,11 @@ impl<K> Element<'_, K> {
     /// Declare this before children. Both translation channels must be unclaimed;
     /// put other translations on a separate ancestor or child. Indices must be unique
     /// and start at zero.
+    /// The callback must return true only when it accepts a committed insertion.
+    /// The acknowledged replacement tile then lands through a compositor spring.
     pub fn on_reorder(
         self, group: super::Node, index: u32,
-        callback: impl Fn(Gesturing<crate::widget::ReorderUpdate>) + 'static,
+        callback: impl Fn(Gesturing<crate::widget::ReorderUpdate>) -> bool + 'static,
     ) -> Self {
         let mut this = self.translate_on_interaction(windows_numerics::Vector2::zero())
             .drag_preview().handler(HitFlags::GESTURE, |row| {

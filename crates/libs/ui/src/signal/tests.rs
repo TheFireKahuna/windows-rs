@@ -307,6 +307,41 @@ fn an_effect_may_write_and_the_flush_settles() {
 }
 
 #[test]
+fn deferred_descendants_run_in_creation_order_without_consuming_feedback_passes() {
+    fn descend(left: u32, seen: Ref<RefCell<Vec<u32>>>) {
+        Effect::deferred(move || {
+            seen.borrow_mut().push(left);
+            if left > 0 { descend(left - 1, Ref::clone(&seen)); }
+        });
+    }
+    let (_owner, ()) = Owner::scope(|| {
+        let seen = Ref::new(RefCell::new(Vec::new()));
+        descend(24, Ref::clone(&seen));
+        let sibling = Ref::clone(&seen);
+        Effect::deferred(move || sibling.borrow_mut().push(100));
+        assert!(flush());
+        let mut expected = vec![24, 100];
+        expected.extend((0..24).rev());
+        assert_eq!(*seen.borrow(), expected);
+        assert!(!flush());
+    });
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "signal flush did not settle in 8 passes")]
+fn fresh_descendants_do_not_hide_a_feedback_cycle() {
+    let (_owner, ()) = Owner::scope(|| {
+        let value = Cell::new(0);
+        Effect::deferred(move || {
+            value.set(value.get() + 1);
+            Effect::deferred(|| {});
+        });
+        flush();
+    });
+}
+
+#[test]
 fn a_version_moves_only_when_the_value_does() {
     let (_owner, ()) = Owner::scope(|| {
         let a = Cell::new(1_i32);

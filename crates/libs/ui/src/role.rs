@@ -572,6 +572,10 @@ impl<T> core::fmt::Debug for ScopedToken<T> {
 /// [`Scope::for_paint`] pins the axis on the way in, so a palette reading `scope.width` in a
 /// colour method still cannot produce a width-dependent colour.
 pub trait Palette: core::any::Any + Send + Sync + 'static {
+    /// Returns the typography and dimensions of a transient text description.
+    fn tooltip(&self, _scope: Scope) -> TooltipStyle {
+        TooltipStyle::default()
+    }
     /// Returns the light a foreground role resolves to in `scope`.
     fn text(&self, role: Text, scope: Scope) -> Radiance;
 
@@ -609,6 +613,28 @@ pub trait Palette: core::any::Any + Send + Sync + 'static {
     /// above it clips. Taken in the primaries of the display the transform is for, because a
     /// channel's height depends on the primaries it is expressed in.
     fn content_peak_nits(&self, gamut: &Gamut, scope: Scope) -> f32;
+}
+
+/// Styles a non-interactive tooltip. Dimensions are in DIPs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TooltipStyle {
+    pub typography: TypeRole,
+    pub max_width: f32,
+    pub padding_x: f32,
+    pub padding_y: f32,
+    pub radius: Metric,
+}
+
+impl Default for TooltipStyle {
+    fn default() -> Self {
+        Self { typography: TypeRole::Caption, max_width: 320.0, padding_x: 10.0,
+            padding_y: 7.0, radius: Metric::Radius }
+    }
+}
+
+/// Resolves tooltip typography and dimensions from the owning palette.
+pub fn tooltip(scope: Scope) -> TooltipStyle {
+    scope.palette.0.tooltip(scope)
 }
 
 /// Returns the root scope a window resolves against.

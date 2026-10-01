@@ -339,6 +339,8 @@ pub struct Tree {
     /// own, which reads zero.
     scrolls: Box<[(ScrollView, Arc<AtomicU64>)]>,
     translations: Box<[windows_scene::TranslationRange]>,
+    /// Packed start/end indices. Relaxed access publishes this independent range as one word.
+    lifted: AtomicU32,
     /// The focused control as a packed generational id. Focus is singular, so it is one word,
     /// and an id rather than an index because an index is only meaningful until the next
     /// republish.
@@ -378,6 +380,7 @@ impl Tree {
             state: Box::default(),
             scrolls: Box::default(),
             translations: Box::default(),
+            lifted: AtomicU32::new(0),
             focus: AtomicU64::new(u64::MAX),
             origin: AtomicU64::new(0),
             scale: AtomicU32::new(1.0f32.to_bits()),
@@ -431,6 +434,7 @@ impl Tree {
                 .map(|at| AtomicU32::new(snapshot.state.get(at).copied().unwrap_or_default().0))
                 .collect(),
             translations: snapshot.translations.clone().into_boxed_slice(),
+            lifted: AtomicU32::new(0),
             entries: entries.into_boxed_slice(),
             pool: snapshot.blob.clone().into_boxed_slice(),
             by_id,
@@ -674,10 +678,28 @@ impl Tree {
     /// is naming a pixel, not placing a finger.
     #[must_use]
     pub fn hit(&self, p: Point) -> Option<u16> {
-        (0..self.entries.len() as u16).rev().find(|&at| {
+        let lifted = self.lift_range();
+        lifted.clone().rev().chain((0..self.entries.len() as u16).rev()
+            .filter(|at| !lifted.contains(at))).find(|&at| {
             let entry = &self.entries[at as usize];
-            inside(entry.box_, self.resolve(p, at)) && !self.clipped_out(p, entry.clip)
+            inside(entry.box_, self.resolve(p, at))
+                && !self.clipped_out(p, entry.clip, lifted.contains(&at).then_some(lifted.start))
         })
+    }
+
+    pub(crate) fn lift_range(&self) -> core::ops::Range<u16> {
+        let range = self.lifted.load(Relaxed);
+        range as u16..(range >> 16) as u16
+    }
+
+    pub(crate) fn lift(&self, owner: ControlId) {
+        let range = self.index_of(owner).map_or(0..0, |start| {
+            let end = (start + 1..self.entries.len() as u16)
+                .find(|&at| self.entries[at as usize].parent == NONE || self.entries[at as usize].parent < start)
+                .unwrap_or(self.entries.len() as u16);
+            start..end
+        });
+        self.lifted.store(u32::from(range.start) | (u32::from(range.end) << 16), Relaxed);
     }
 
     /// Returns `p` in the layout space of the entry at `at`.
@@ -695,8 +717,9 @@ impl Tree {
     /// Returns whether any clipping ancestor from `clip` upward excludes `p`.
     ///
     /// Terminates because a clipping ancestor sits earlier in the table than what it clips.
-    fn clipped_out(&self, p: Point, mut clip: u16) -> bool {
+    fn clipped_out(&self, p: Point, mut clip: u16, lifted: Option<u16>) -> bool {
         while let Some(entry) = self.at(clip) {
+            if lifted.is_some_and(|start| clip < start) { break; }
             if !inside(entry.box_, self.resolve(p, clip)) {
                 return true;
             }
@@ -728,8 +751,10 @@ impl Tree {
     #[must_use]
     pub fn clipped(&self, at: u16) -> bool {
         let me = self.shifted(at);
+        let lifted = self.lift_range();
         let mut clip = self.at(at).map_or(NONE, |entry| entry.clip);
         while let Some(entry) = self.at(clip) {
+            if lifted.contains(&at) && clip < lifted.start { break; }
             let bound = self.shifted(clip);
             if me[0] >= bound[2] || me[1] >= bound[3] || me[2] <= bound[0] || me[3] <= bound[1] {
                 return true;
@@ -751,6 +776,11 @@ impl Tree {
 
     pub fn bounds_with(&self, at: u16, positions: &[(NodeId, Vector2)],
         translations: &[(ControlId, Vector2)]) -> [f64; 4] {
+        self.bounds_resolved(at, positions, translations, self.lift_range())
+    }
+
+    pub(crate) fn bounds_resolved(&self, at: u16, positions: &[(NodeId, Vector2)],
+        translations: &[(ControlId, Vector2)], lifted: core::ops::Range<u16>) -> [f64; 4] {
         let shifted = |at| {
             let Some(entry) = self.at(at) else {
                 return [0.0; 4];
@@ -776,6 +806,7 @@ impl Tree {
         let mut b = original;
         let mut clip = self.at(at).map_or(NONE, |e| e.clip);
         while let Some(e) = self.at(clip) {
+            if lifted.contains(&at) && clip < lifted.start { break; }
             let c = shifted(clip);
             b = [
                 b[0].max(c[0]),

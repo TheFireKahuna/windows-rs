@@ -88,9 +88,8 @@ const DECL_HIGH: u32 = 0b0011_0000_0000;
 
 /// Compresses a declaration's flags into the eight bits [`DECL`] holds.
 ///
-/// `HitFlags` defines ten bits and two of them — `SCROLL` and `CLIP` — are the node's own
-/// [`SCROLL`] and [`CLIP`], so the eight that are authored are not contiguous and a bare
-/// shift would drop `BLOCKER` and `UNSCROLLED` off the top.
+/// `SCROLL`, `CLIP` and `HOVER` are derived by the hit builder. The eight authored
+/// flags are not contiguous; a bare shift would drop `BLOCKER` and `UNSCROLLED`.
 pub(crate) const fn pack_decl(flags: u32) -> Bits {
     (flags & DECL_LOW) | ((flags & DECL_MID) >> 1) | ((flags & DECL_HIGH) >> 2)
 }

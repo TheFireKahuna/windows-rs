@@ -101,6 +101,8 @@ pub enum Report {
         /// none. A dwell is measured against this rather than against a tick count.
         qpc: u64,
     },
+    /// The hovering pointer moved within one target, in client DIPs.
+    HoverMoved { target: ControlId, at: Point },
     FocusChanged {
         from: Option<ControlId>,
         to: Option<ControlId>,
@@ -967,9 +969,10 @@ impl Router {
     fn cross(&mut self, hits: &HitTable, sample: &Sample, out: &mut Vec<Report>) {
         self.census.hover_hits += 1;
         let to = hits
-            .hit(sample.raw, sample.kind())
+            .hover(sample.raw, sample.kind())
             .map(|hit| hit.id);
         if to == self.hover {
+            if let Some(target) = to { out.push(Report::HoverMoved { target, at: sample.raw }); }
             return;
         }
         let from = self.hover;
@@ -1087,5 +1090,38 @@ impl core::fmt::Debug for Router {
             .field("capture", &self.capture)
             .field("inertia", &self.inertia)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod hover_tests {
+    use super::*;
+    use windows_scene::{HitEntry, NodeId, NO_ENTRY};
+
+    #[test]
+    fn passive_hover_reports_movement_inside_one_graph_without_contact() {
+        let window = windows_window::Window::new("hover movement").create().unwrap();
+        let pacer = window.pacer().unwrap();
+        let bell = Rc::new(Doorbell::new());
+        let mut router = Router::new(&bell, &window, pacer.wake()).unwrap();
+        let id = ControlId::FIRST;
+        let entry = HitEntry { id, parent: NO_ENTRY, clip_parent: NO_ENTRY,
+            x0: 0.0, y0: 0.0, x1: 100.0, y1: 100.0, touch_inflate: 0.0,
+            scroll_src: NodeId::NONE, flags: HitFlags::HOVER };
+        let mut hits = HitTable::default();
+        hits.replace(&[entry], &[(id, 0)]);
+        let mut sample = Sample { id: 1, ptype: PointerType::Mouse, flags: PointerFlags(0),
+            at: Point::new(10.0, 20.0), raw: Point::new(10.0, 20.0),
+            contact: (0.0, 0.0), pen: None, time: 0, qpc: 0 };
+        let mut reports = Vec::with_capacity(2);
+        router.cross(&hits, &sample, &mut reports);
+        assert!(matches!(reports.as_slice(), [Report::HoverChanged { from: None, to: Some(to), .. }] if *to == id));
+        reports.clear();
+        sample.raw.x = 30.0;
+        let allocations = crate::counting::allocations();
+        router.cross(&hits, &sample, &mut reports);
+        assert_eq!(crate::counting::allocations(), allocations);
+        assert!(matches!(reports.as_slice(), [Report::HoverMoved { target, at }] if *target == id && at.x == 30.0));
+        assert!(router.contacts.live() == 0);
     }
 }

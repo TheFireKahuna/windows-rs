@@ -22,7 +22,7 @@ use windows_composition::{
     Animatable, BorderMode, Brush, Color, CompositionBrush, CompositionDrawingSurface,
     CompositionEffectFactory, CompositionGraphicsDevice,
     CompositionPath, CompositionPathGeometry, CompositionSurfaceBrush, CompositeMode,
-    Compositor, EffectGraph, SpriteVisual, Stretch, StrokeCap, StrokeJoin, Surface, Visual,
+    Compositor, EffectBorderMode, EffectGraph, SpriteVisual, Stretch, StrokeCap, StrokeJoin, Surface, Visual,
 };
 use windows_core::{Interface, Result};
 use windows_d2d::{
@@ -55,6 +55,7 @@ pub struct Backends {
     /// The glow graph's factory, minted once per compositor. The graph is fixed; only its
     /// brushes' sources and sigma move, so every lit node shares the one factory.
     glow: core::cell::OnceCell<CompositionEffectFactory>,
+    backdrop: core::cell::OnceCell<CompositionEffectFactory>,
 }
 
 /// Opaque white, the only colour a coverage cell draws in.
@@ -97,6 +98,7 @@ impl Backends {
             masks_a8: core::cell::Cell::new(true),
             white: core::cell::OnceCell::new(),
             glow: core::cell::OnceCell::new(),
+            backdrop: core::cell::OnceCell::new(),
         })
     }
 
@@ -173,6 +175,18 @@ impl Backends {
             .compositor
             .create_effect_factory(&glow_graph(), &["blur.BlurAmount"])?;
         Ok(self.glow.get_or_init(|| factory))
+    }
+
+    fn backdrop_factory(&self) -> Result<&CompositionEffectFactory> {
+        if let Some(factory) = self.backdrop.get() {
+            return Ok(factory);
+        }
+        let graph = EffectGraph::GaussianBlur {
+            name: "blur", sigma: 0.0, border: EffectBorderMode::Hard,
+            input: Box::new(EffectGraph::Parameter("backdrop")),
+        };
+        let factory = self.compositor.create_effect_factory(&graph, &["blur.BlurAmount"])?;
+        Ok(self.backdrop.get_or_init(|| factory))
     }
 
     /// Rasterizes one cell, surfacing the callback's error alongside the bridge's.
@@ -1435,7 +1449,8 @@ pub fn realize(
         return Ok(());
     };
     sprite.set_pixel_snapping(matches!(mask, Mask::Run(_)) || matches!(paint,
-        Paint::PresentedView { view: RegionView { sampling: RegionSampling::Pixels, .. }, .. }));
+        Paint::PresentedView { view: RegionView { sampling: RegionSampling::Pixels, .. }, .. })
+        || matches!(paint, Paint::Presented { origin, .. } if origin != Vector2::zero()));
     let held = held_capture_channel(arena, id);
     let has_clip = arena.aux(id).is_some_and(|aux| aux.clip.is_some());
     let has_halo = halo.is_some() || matches!(paint, Paint::Captured { .. });
@@ -1470,13 +1485,16 @@ pub fn realize(
         )),
         _ => None,
     };
-    let source = if let Paint::PresentedView { region, view } = paint {
-        presented_view(arena, id, region, view, ctx)
-    } else {
+    let source = match paint {
+        Paint::PresentedView { region, view } => presented_view(arena, id, region, PresentedSource::View(view), ctx),
+        Paint::Presented { region, origin } if origin != Vector2::zero() =>
+            presented_view(arena, id, region, PresentedSource::Pixels(origin), ctx),
+        _ => {
         if arena.has_aux(id) {
             arena.aux_mut(id).region_view = None;
         }
         paint_brush(&paint, captured.as_ref(), ctx)?
+        }
     };
 
     // A mask and a paint arrive as separate ops in either order, so a half-declared sprite
@@ -1748,7 +1766,13 @@ fn paint_brush(
                 .map(Brush::as_brush)
         }
         Paint::Ramp(id) => ctx.res.brush(id.erased()).map(Brush::as_brush),
-        Paint::Presented(id) => ctx.res.brush(id.erased()).map(Brush::as_brush),
+        Paint::Backdrop { sigma } => {
+            let brush = ctx.back.backdrop_factory()?.create_brush();
+            brush.set_source_parameter("backdrop", &ctx.back.compositor.create_backdrop_brush()?);
+            brush.properties().insert_scalar("blur.BlurAmount", sigma);
+            Some(brush.as_brush())
+        }
+        Paint::Presented { region, .. } => ctx.res.brush(region.erased()).map(Brush::as_brush),
         Paint::PresentedView { .. } => unreachable!("view brushes are owned by their sprite"),
         Paint::Captured { .. } => captured.map(|held| held.brush.as_brush()),
         Paint::None => None,
@@ -1757,8 +1781,14 @@ fn paint_brush(
 
 pub struct PresentedView {
     pub(crate) brush: CompositionSurfaceBrush,
-    view: RegionView,
+    source: PresentedSource,
     scale: f32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PresentedSource {
+    View(RegionView),
+    Pixels(Vector2),
 }
 
 impl Drop for PresentedView {
@@ -1772,7 +1802,7 @@ fn presented_view(
     arena: &mut Arena,
     id: NodeId,
     region: RegionId,
-    view: RegionView,
+    source: PresentedSource,
     ctx: &mut Ctx<'_>,
 ) -> Option<CompositionBrush> {
     let Some(surface) = ctx.res.brush(region.erased()).and_then(CompositionSurfaceBrush::surface) else {
@@ -1784,23 +1814,27 @@ fn presented_view(
     let visual = arena.visual(id)?.clone();
     let scale = ctx.env.scale();
     let held = &mut arena.aux_mut(id).region_view;
-    if let Some(held) = held.as_ref().filter(|held| held.view == view && held.scale == scale) {
+    if let Some(held) = held.as_ref().filter(|held| held.source == source && held.scale == scale) {
         held.brush.set_surface(&surface);
         return Some(held.brush.as_brush());
     }
     *held = None;
     let brush = ctx.back.brush(&surface, Stretch::None);
     brush.set_alignment_ratio(0.0, 0.0);
-    let [left, top, right, bottom] = view.rect.map(|dip| (dip * scale).round());
-    let origin = Vector2::new(left, top);
-    let span = Vector2::new((right - left).max(1.0), (bottom - top).max(1.0));
-    match view.sampling {
-        RegionSampling::Pixels => {
+    let origin = match source {
+        PresentedSource::View(view) => Vector2::new(view.rect[0], view.rect[1]),
+        PresentedSource::Pixels(origin) => origin,
+    };
+    let origin = Vector2::new((origin.x * scale).round(), (origin.y * scale).round());
+    match source {
+        PresentedSource::Pixels(_) | PresentedSource::View(RegionView { sampling: RegionSampling::Pixels, .. }) => {
             brush.set_nearest_sampling();
-            brush.set_source_transform(Vector2::new(-left / scale, -top / scale),
+            brush.set_source_transform(Vector2::new(-origin.x / scale, -origin.y / scale),
                 Vector2::new(1.0 / scale, 1.0 / scale));
         }
-        RegionSampling::Fit => {
+        PresentedSource::View(view) => {
+            let span = Vector2::new(((view.rect[2] * scale).round() - origin.x).max(1.0),
+                ((view.rect[3] * scale).round() - origin.y).max(1.0));
             brush.set_linear_sampling();
             for (property, expression) in [
                 ("Scale", "v.Size / span"),
@@ -1814,9 +1848,9 @@ fn presented_view(
             }
         }
     }
-    let source = brush.as_brush();
-    *held = Some(Box::new(PresentedView { brush, view, scale }));
-    Some(source)
+    let result = brush.as_brush();
+    *held = Some(Box::new(PresentedView { brush, source, scale }));
+    Some(result)
 }
 
 /// Casts, or removes, the light this node spends past its own silhouette.
@@ -2031,6 +2065,7 @@ fn glow_graph() -> EffectGraph {
         destination: Box::new(EffectGraph::GaussianBlur {
             name: "blur",
             sigma: 4.0,
+            border: EffectBorderMode::Soft,
             input: Box::new(EffectGraph::Parameter("silhouette")),
         }),
     }

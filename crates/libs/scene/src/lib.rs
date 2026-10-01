@@ -31,7 +31,7 @@ pub use patch::{Attach, Op, PatchPool, SinkPatch, Span};
 pub use realize::{Backends, BoxKey, CACHE_CAP, Cache, CellKey, fit, nine_slice};
 pub use scene::{
     Audit, BackdropSpec, CHROME_DAMPING, CHROME_PERIOD, Census, Glow, SCROLL_DAMPING,
-    SCROLL_PERIOD, Scene, SceneEvent, invalid_arg,
+    SCROLL_PERIOD, Scene, SceneEvent, TranslationCarry, invalid_arg,
 };
 pub use sink::*;
 

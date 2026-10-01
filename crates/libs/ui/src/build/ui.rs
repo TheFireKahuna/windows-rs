@@ -978,9 +978,23 @@ impl Element<'_, super::Region> {
         assert!(size.x.is_finite() && size.x > 0.0 && size.y.is_finite() && size.y > 0.0);
         let node = self.node;
         let region = self.ui.host.region_sink(node);
-        self.ui.host.region_source_size(node, size);
+        self.ui.host.region_source_size(node, size, false);
         self.ui.host.declare_part(node, super::theme::Part::Ink,
             super::theme::PaintSource::None, super::theme::PaintMask::Region, 1.0);
+        self.children(|ui| create(ui, region))
+    }
+
+    /// Reserves a fixed strip above a canvas that follows this region's layout size.
+    ///
+    /// `strip` must be finite and positive. The producer extent is the greater of the
+    /// layout and strip widths, and their summed heights. The root samples pixels below
+    /// the strip; view children sample fixed rectangles inside it. Layout parts remain
+    /// relative to the canvas. Packing must remain fixed while mounted.
+    pub fn canvas_atlas(self, strip: Vector2, create: impl FnOnce(&mut Ui<'_>, windows_scene::RegionId)) -> Self {
+        assert!(strip.x.is_finite() && strip.x > 0.0 && strip.y.is_finite() && strip.y > 0.0);
+        let node = self.node;
+        let region = self.ui.host.region_sink(node);
+        self.ui.host.region_source_size(node, strip, true);
         self.children(|ui| create(ui, region))
     }
 

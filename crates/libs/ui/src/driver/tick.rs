@@ -121,6 +121,7 @@ impl Tick {
         from_pump: Handoffs,
     ) -> Result<Self> {
         let router = Router::new(bell, window, from_pump.wake.clone())?;
+        let picks = Picks::new(from_pump.wake.clone());
         Ok(Self {
             window: Rc::clone(window),
             links: Arc::clone(links),
@@ -128,7 +129,7 @@ impl Tick {
             from_pump,
             view: Rc::clone(view),
             trackers: Vec::new(),
-            picks: Picks::default(),
+            picks,
             correlations: crate::correlation::Router::default(),
             focus: Vec::new(),
             retiring: Vec::new(),
@@ -246,13 +247,19 @@ impl Tick {
             ..
         } = self;
         view.with(|hits| crate::present::pick(reports, hits, picks, &mut to_scene.intents));
-        self.view.with(|hits| self.correlations.route(&self.reports, hits));
+        if self.picks.refresh() {
+            self.to_scene.correlation_changed |=
+                self.view.with(|hits| self.correlations.refresh(hits));
+        }
+        self.to_scene.correlation_changed |=
+            self.view.with(|hits| self.correlations.route(&self.reports, hits));
         // ④ what the scene thread turns into pixels, and the window facts that arrived with it.
         // Appended to the batch this thread holds; handed over only when the spare is back,
         // otherwise carried to the next tick in the order it happened.
         // Copied rather than moved: the observer below is handed what the whole tick settled
         // on, and the next tick clears this buffer before it routes anything.
-        self.to_scene.reports.extend_from_slice(&self.reports);
+        self.to_scene.reports.extend(self.reports.iter()
+            .filter(|report| !matches!(report, Report::HoverMoved { .. })).cloned());
         if let Some(state) = self.from_pump.nonclient.take() {
             self.to_scene.caption = Some(state);
         }
@@ -318,6 +325,7 @@ impl Tick {
         }
         if down.hits_changed {
             self.view.replace(&down.hits, &self.trackers);
+            self.from_pump.uia.borrow_mut().lift(down.hits.lifted_owner());
         }
         if down.trackers_changed {
             self.trackers.clear();
@@ -331,7 +339,8 @@ impl Tick {
             self.picks.sync(&down.regions);
         }
         if down.correlations_changed {
-            self.view.with(|hits| self.correlations.sync(&down.correlations, hits));
+            self.to_scene.correlation_changed |=
+                self.view.with(|hits| self.correlations.sync(&down.correlations, hits));
         }
         for source in &down.fields.sources {
             self.from_pump.text.source(source);

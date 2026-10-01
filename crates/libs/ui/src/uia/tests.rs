@@ -286,6 +286,59 @@ fn a_published_tree_carries_its_names_and_its_shape() {
     assert_eq!(tree.at(1).unwrap().next, 2);
 }
 
+#[test]
+fn a_lift_updates_published_automation_geometry_and_survives_republication() {
+    let mut uia = listening();
+    let mut screen = Screen::new();
+    let viewport = screen.add(NONE, (0.0, 0.0, 100.0, 100.0), UiaRole::Group, "viewport");
+    let source = screen.add(viewport, (10.0, 10.0, 50.0, 50.0), UiaRole::Group, "tile");
+    let child = screen.add(source, (20.0, 20.0, 60.0, 60.0), UiaRole::Button, "field");
+    let neighbor = screen.add(NONE, (100.0, 0.0, 200.0, 100.0), UiaRole::Button, "neighbor");
+    screen.snapshot.entries[source as usize].clip = viewport;
+    screen.snapshot.entries[child as usize].clip = source;
+    let shift = windows_scene::Translation::new(Vector2::new(100.0, 0.0));
+    shift.set_active(true);
+    screen.snapshot.translations.push(windows_scene::TranslationRange {
+        owner: screen.control(source), start: source as usize, end: child as usize + 1, state: shift,
+    });
+    screen.publish(&mut uia);
+    let published = uia.tree_arc_for_test();
+    assert!(published.clipped(child));
+    assert_eq!(published.hit(Point { x: 130.0, y: 30.0 }), Some(neighbor));
+    let old_bounds = published.bounds(child);
+    let mut events = Vec::new();
+    uia.take_pending_for_test(&mut events);
+    events.clear();
+    uia.lift(screen.control(source));
+    uia.take_pending_for_test(&mut events);
+    assert!(events.contains(&Raise::Property(screen.control(child),
+        Property::Native(UIA_BoundingRectanglePropertyId), Val::Rect(old_bounds))));
+    assert!(events.contains(&Raise::Property(screen.control(child),
+        Property::Native(UIA_IsOffscreenPropertyId), Val::Bool(true))));
+    events.clear();
+    assert!(!published.clipped(child));
+    assert_eq!(published.bounds(child), [120.0, 20.0, 30.0, 30.0]);
+    assert_eq!(published.hit(Point { x: 130.0, y: 30.0 }), Some(child));
+    assert_eq!(published.hit(Point { x: 155.0, y: 30.0 }), Some(neighbor));
+    let before = allocations();
+    for _ in 0..100 {
+        uia.lift(screen.control(source));
+        assert_eq!(published.hit(Point { x: 130.0, y: 30.0 }), Some(child));
+        assert_eq!(published.bounds(child), [120.0, 20.0, 30.0, 30.0]);
+    }
+    assert_eq!(allocations(), before);
+    uia.take_pending_for_test(&mut events);
+    assert!(events.is_empty());
+    screen.publish(&mut uia);
+    let republished = uia.tree_arc_for_test();
+    assert_eq!(republished.hit(Point { x: 130.0, y: 30.0 }), Some(child));
+    uia.lift(ControlId::NONE);
+    assert!(republished.clipped(child));
+    assert_eq!(republished.hit(Point { x: 130.0, y: 30.0 }), Some(neighbor));
+    uia.lift(ControlId::raw(0, 99));
+    assert!(republished.clipped(child));
+}
+
 /// Element-from-point and the pointer's hit test resolve over two tables the same walk fills,
 /// so the two answer identically at every point.
 #[test]

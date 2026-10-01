@@ -57,9 +57,11 @@ impl HitFlags {
     /// Chrome pinned to a scroll container's viewport: its rect does not resolve through
     /// that container's offset, so a rail does not slide off its own track.
     pub const UNSCROLLED: Self = Self(1 << 9);
+    /// Receives hover without accepting presses or keyboard focus. Set by the builder.
+    pub const HOVER: Self = Self(1 << 10);
 
     /// Every flag this vocabulary defines. The bound [`from_bits`](Self::from_bits) admits.
-    const ALL: u32 = (1 << 10) - 1;
+    const ALL: u32 = (1 << 11) - 1;
 
     /// Whether every flag in `other` is set.
     #[must_use]
@@ -237,6 +239,7 @@ mod tests {
             HitFlags::CLIP,
             HitFlags::BLOCKER,
             HitFlags::UNSCROLLED,
+            HitFlags::HOVER,
         ];
         let all = every.into_iter().fold(HitFlags::NONE, HitFlags::union);
         assert_eq!(HitFlags::from_bits(all.bits()), all);

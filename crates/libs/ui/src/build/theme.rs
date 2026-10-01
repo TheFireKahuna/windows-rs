@@ -69,6 +69,8 @@ const fn wash_role(wash: Wash) -> Option<Role> {
 /// solved box at publication; nothing here holds a resolved number.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum PaintMask {
+    /// Paints the sprite's extent without a mask brush.
+    None,
     /// A filled box. `radius` is authored, and the resolved value is capped at half the
     /// shorter side of the solved box: `CompositionRoundedRectangleGeometry` saturates there
     /// anyway, so a pill authored at half a row height renders as a stadium of the wrong axis
@@ -93,7 +95,7 @@ pub(crate) enum PaintMask {
         stroke: Option<Len>,
         space: PathSpace,
     },
-    /// A square box a presented region paints its own buffer over.
+    /// A square box whose paint needs no content-relative mask geometry.
     Region,
 }
 
@@ -115,6 +117,7 @@ pub(crate) enum PaintSource {
     Gradient(RampId),
     Region(RegionId),
     RegionView(RegionId, u32),
+    Backdrop(f32),
     None,
 }
 
@@ -429,8 +432,8 @@ impl Host {
         self.pending.push(windows_scene::Op::New {
             id,
             kind: windows_scene::NodeKind::Sprite,
-            parent: windows_scene::Attach::Overlay,
-            after: None,
+            parent: windows_scene::Attach::Window,
+            after: Some(self.root()),
         });
         self.declare_part(
             id,
@@ -443,6 +446,7 @@ impl Host {
             1.0,
         );
         self.write_channel(id, Prop::Opacity, Value::Scalar(0.0));
+        self.focus_outline = Some((id, None));
         id
     }
 
@@ -759,7 +763,8 @@ impl Host {
                     .roles(row.state)
                     .and_then(|roles| paint.part.role(roles, surface.wash))
             }
-            PaintSource::Gradient(_) | PaintSource::Region(_) | PaintSource::RegionView(..) | PaintSource::None => None,
+            PaintSource::Gradient(_) | PaintSource::Region(_) | PaintSource::RegionView(..)
+                | PaintSource::Backdrop(_) | PaintSource::None => None,
         }
     }
 
@@ -777,12 +782,16 @@ impl Host {
         });
         let fill = match paint.source {
             PaintSource::Gradient(id) => Paint::Ramp(id),
-            PaintSource::Region(id) => Paint::Presented(id),
+            PaintSource::Region(region) => Paint::Presented { region, origin: self.regions.iter()
+                .find(|(_, row)| row.sink == region)
+                .and_then(|(_, row)| row.atlas.as_ref().filter(|atlas| atlas.canvas))
+                .map_or(Vector2::zero(), |atlas| Vector2::new(0.0, atlas.size.y)) },
             PaintSource::RegionView(region, at) => self.regions.iter()
                 .find(|(_, row)| row.sink == region)
                 .and_then(|(_, row)| row.atlas.as_ref()?.views.get(at as usize))
                 .map_or(Paint::None, |view| Paint::PresentedView { region, view: *view }),
             PaintSource::None => Paint::None,
+            PaintSource::Backdrop(sigma) => Paint::Backdrop { sigma },
             _ => Paint::Solid(light),
         };
         // One write: a declared halo is what the sprite casts, and a role-painting sprite with
@@ -803,6 +812,14 @@ impl Host {
         self.paint(paint.id, fill, halo);
         if mask {
             self.emit_mask(paint.id, paint.mask, paint.scope, paint.surface);
+        }
+    }
+
+    pub(crate) fn republish_paints(&mut self, node: NodeId) {
+        let mut link = self.tree.c.paints[node.index()];
+        while let Some(paint) = self.appearances.get(link).copied() {
+            self.publish_paint(paint, false);
+            link = paint.next;
         }
     }
 
@@ -994,6 +1011,7 @@ impl Host {
         let cap = self.cap_of(id);
         let scale = self.env.scale();
         let mask = match mask {
+            PaintMask::None => Mask::None,
             PaintMask::Box { radius } => Mask::Box {
                 radius: corners(radius.dips_at(scope, scale).min(cap), attached),
             },
@@ -1163,6 +1181,12 @@ impl<K> Element<'_, K> {
             radius: radius.into(),
         };
         self.part(Part::Fill, PaintSource::Role(role), mask, strength)
+    }
+
+    /// Paints a Gaussian-blurred backdrop; sigma must be in 0..=250 DIPs.
+    pub fn backdrop_blur(self, sigma: f32) -> Self {
+        assert!(sigma.is_finite() && (0.0..=250.0).contains(&sigma), "invalid backdrop sigma");
+        self.part(Part::Fill, PaintSource::Backdrop(sigma), PaintMask::None, 1.0)
     }
 
     pub fn outline(self, radius: Metric, role: Role, width: impl Into<Len>) -> Self {

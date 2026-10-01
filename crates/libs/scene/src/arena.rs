@@ -1619,6 +1619,7 @@ mod tests {
         let graph = windows_composition::EffectGraph::GaussianBlur {
             name: "blur",
             sigma: 4.0,
+            border: windows_composition::EffectBorderMode::Soft,
             input: Box::new(windows_composition::EffectGraph::Parameter("s")),
         };
         let factory = comp

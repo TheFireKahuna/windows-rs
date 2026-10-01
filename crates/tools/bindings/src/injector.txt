@@ -73,8 +73,8 @@
     SM_CYVIRTUALSCREEN
     GetCursorPos
     WHEEL_DELTA
-// The keys a focus or dismiss assertion needs, and no others: a harness carrying the whole
-// virtual-key table invites a test to drive something it is not testing.
+// Virtual keys for focus navigation, activation and dismissal.
+    VK_SHIFT
     VK_TAB
     VK_ESCAPE
     VK_RETURN
@@ -83,6 +83,10 @@
     VK_RIGHT
     VK_UP
     VK_DOWN
+    VK_PRIOR
+    VK_NEXT
+    VK_HOME
+    VK_END
 
 // ── Touch ─────────────────────────────────────────────────────────────────────
 // The desktop touch-injection path, and the reason it is here rather than the injection

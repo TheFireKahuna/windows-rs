@@ -588,12 +588,16 @@ pub enum Mask {
 pub enum Paint {
     Solid(Radiance),
     Ramp(RampId),
+    /// Blurs already transformed content behind the sprite; sigma must be in 0..=250 DIPs.
+    /// The sprite must use `Mask::None` and no halo to preserve HDR effect output through composition.
+    Backdrop { sigma: f32 },
     Captured {
         group: GroupId,
         sigma: f32,
         tint: Radiance,
     },
-    Presented(RegionId),
+    /// Samples unscaled pixels from a finite, nonnegative source origin in DIPs.
+    Presented { region: RegionId, origin: Vector2 },
     PresentedView { region: RegionId, view: RegionView },
     None,
 }
@@ -819,7 +823,7 @@ impl Paint {
     pub const fn holds(self) -> Option<Holding> {
         match self {
             Self::Ramp(id) => Some(Holding::Ramp(id)),
-            Self::Presented(id) | Self::PresentedView { region: id, .. } => Some(Holding::Region(id)),
+            Self::Presented { region: id, .. } | Self::PresentedView { region: id, .. } => Some(Holding::Region(id)),
             _ => None,
         }
     }
@@ -831,7 +835,7 @@ impl Paint {
         match self {
             Self::Solid(_) => GenMask::LIGHT,
             Self::Captured { .. } => GenMask::LIGHT.union(GenMask::GEOMETRY),
-            Self::PresentedView { .. } => GenMask::GEOMETRY,
+            Self::Presented { .. } | Self::PresentedView { .. } => GenMask::GEOMETRY,
             _ => GenMask::NONE,
         }
     }
@@ -1493,7 +1497,7 @@ mod tests {
         );
         assert_eq!(Mask::None.holds(), None);
         assert_eq!(
-            Paint::Presented(RegionId::FIRST).holds(),
+            Paint::Presented { region: RegionId::FIRST, origin: Vector2::zero() }.holds(),
             Some(Holding::Region(RegionId::FIRST))
         );
         assert_eq!(Paint::Solid(Radiance::TRANSPARENT).holds(), None);

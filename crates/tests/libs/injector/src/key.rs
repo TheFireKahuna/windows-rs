@@ -15,6 +15,8 @@ use crate::{Error, Result};
 /// A key this harness can press.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Key {
+    /// Modifies another key while held, including reverse Tab navigation.
+    Shift,
     /// Moves focus to the next control, or out of an overlay's scope at its end.
     Tab,
     /// Dismisses the innermost focus scope.
@@ -31,11 +33,20 @@ pub enum Key {
     Up,
     /// See [`Key::Left`].
     Down,
+    /// Scrolls one viewport toward the beginning.
+    PageUp,
+    /// Scrolls one viewport toward the end.
+    PageDown,
+    /// Moves to the beginning of the focused control.
+    Home,
+    /// Moves to the end of the focused control.
+    End,
 }
 
 impl Key {
     const fn vk(self) -> u16 {
         (match self {
+            Self::Shift => VK_SHIFT,
             Self::Tab => VK_TAB,
             Self::Escape => VK_ESCAPE,
             Self::Enter => VK_RETURN,
@@ -44,6 +55,10 @@ impl Key {
             Self::Right => VK_RIGHT,
             Self::Up => VK_UP,
             Self::Down => VK_DOWN,
+            Self::PageUp => VK_PRIOR,
+            Self::PageDown => VK_NEXT,
+            Self::Home => VK_HOME,
+            Self::End => VK_END,
         }) as u16
     }
 }

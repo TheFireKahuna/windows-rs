@@ -47,6 +47,7 @@ impl Offset {
 /// pointer had left a clipped region.
 #[derive(Copy, Clone)]
 struct Memo {
+    eligible: HitFlags,
     index: u32,
     epoch: u64,
     rect: [f32; 4],
@@ -57,6 +58,7 @@ struct Memo {
 pub struct HitTable {
     entries: Vec<HitEntry>,
     translations: Vec<crate::TranslationRange>,
+    lifted: Option<(ControlId, core::ops::Range<usize>)>,
     /// Control id to entry index, ordered by id: the app ships it built, so a rebuild copies
     /// and never sorts.
     index: Vec<(ControlId, u32)>,
@@ -104,6 +106,13 @@ impl HitTable {
         );
         self.entries.clear();
         self.entries.extend_from_slice(entries);
+        if let Some((owner, range)) = &mut self.lifted {
+            if let Some(start) = entries.iter().position(|entry| entry.id == *owner) {
+                *range = start..subtree_end(entries, start);
+            } else {
+                self.lifted = None;
+            }
+        }
         self.translations.retain_mut(|row| {
             let Some(start) = entries.iter().position(|e| e.id == row.owner) else { return false };
             row.start = start;
@@ -124,6 +133,7 @@ impl HitTable {
         self.entries.clear();
         self.entries.extend_from_slice(&other.entries);
         self.translations.clone_from(&other.translations);
+        self.lifted.clone_from(&other.lifted);
         self.index.clear();
         self.index.extend_from_slice(&other.index);
         self.epoch.set(other.epoch.get());
@@ -142,20 +152,29 @@ impl HitTable {
     /// Reports whether any interior survives the entry's scroll and clip ancestry.
     #[must_use]
     pub fn visible(&self, id: ControlId) -> bool {
-        let Some(entry) = self.entry(id) else { return false; };
-        let Ok(index) = self.index.binary_search_by_key(&id, |&(key, _)| key) else { return false; };
+        self.visible_rect(id).is_some()
+    }
+
+    /// Returns the client rectangle surviving a control's scroll and clip ancestry.
+    #[must_use]
+    pub fn visible_rect(&self, id: ControlId) -> Option<[f32; 4]> {
+        let entry = self.entry(id)?;
+        let index = self.index.binary_search_by_key(&id, |&(key, _)| key).ok()?;
         let mut rect = self.shifted(self.index[index].1 as usize);
         let mut at = entry.clip_parent;
         let mut remaining = self.entries.len();
         while at != NO_ENTRY {
-            if remaining == 0 { return false; }
-            let Some(parent) = self.entries.get(at as usize) else { return false; };
+            if self.lifted.as_ref().is_some_and(|(_, range)|
+                range.contains(&(self.index[index].1 as usize)) && !range.contains(&(at as usize)))
+            { break; }
+            if remaining == 0 { return None; }
+            let parent = self.entries.get(at as usize)?;
             let clip = self.shifted(at as usize);
             rect = [rect[0].max(clip[0]), rect[1].max(clip[1]), rect[2].min(clip[2]), rect[3].min(clip[3])];
             at = parent.clip_parent;
             remaining -= 1;
         }
-        rect[2] > rect[0] && rect[3] > rect[1]
+        (rect[2] > rect[0] && rect[3] > rect[1]).then_some(rect)
     }
 
     /// Returns an entry's client-space rectangle, including unnamed clipping entries.
@@ -256,6 +275,19 @@ impl HitTable {
         displacement(&self.translations, at)
     }
 
+    pub(crate) fn lift(&mut self, owner: ControlId) {
+        let next = self.entries.iter().position(|entry| entry.id == owner && !owner.is_none())
+            .map(|start| (owner, start..subtree_end(&self.entries, start)));
+        if self.lifted == next { return; }
+        self.lifted = next;
+        self.bump();
+    }
+
+    /// Returns the control whose subtree is drawn in the drag overlay.
+    pub fn lifted_owner(&self) -> ControlId {
+        self.lifted.as_ref().map_or(ControlId::NONE, |(owner, _)| *owner)
+    }
+
     /// What is under `p`, recorded as the next memo.
     ///
     /// The memo bounds the scan and does not short-circuit it: a pointer still inside the
@@ -264,12 +296,23 @@ impl HitTable {
     /// win, since the scan is back-to-front and takes the first hit, so it supplies a floor
     /// and the skipped tail holds most of the entries.
     pub fn hit(&self, p: Point, contact: ContactKind) -> Option<Hit> {
-        if !self.translations.is_empty() {
-            return scan_translated(&self.entries, p, contact, 0, &|viewport| self.offset(viewport), &self.translations);
+        self.query(p, contact, HitFlags::INTERACTIVE | HitFlags::SCROLL)
+    }
+
+    /// Resolves hover, including passive graphs that accept no press or focus.
+    pub fn hover(&self, p: Point, contact: ContactKind) -> Option<Hit> {
+        self.query(p, contact, HitFlags::INTERACTIVE | HitFlags::SCROLL | HitFlags::HOVER)
+    }
+
+    fn query(&self, p: Point, contact: ContactKind, eligible: HitFlags) -> Option<Hit> {
+        if !self.translations.is_empty() || self.lifted.is_some() {
+            return scan_translated(&self.entries, p, contact, 0, &|viewport| self.offset(viewport), &self.translations, eligible,
+                self.lifted.as_ref().map(|(_, range)| range.clone()));
         }
         let floor = match self.memo.get() {
             Some(memo)
                 if memo.epoch == self.epoch.get()
+                    && memo.eligible == eligible
                     && p.x >= memo.rect[0]
                     && p.y >= memo.rect[1]
                     && p.x <= memo.rect[2]
@@ -279,10 +322,11 @@ impl HitTable {
             }
             _ => 0,
         };
-        let found = scan(&self.entries, p, contact, floor, &|viewport| {
+        let found = scan_translated(&self.entries, p, contact, floor, &|viewport| {
             self.offset(viewport)
-        })?;
+        }, &[], eligible, None)?;
         self.memo.set(Some(Memo {
+            eligible,
             index: found.index,
             epoch: self.epoch.get(),
             rect: self.clipped_box(found.index),
@@ -331,7 +375,7 @@ pub fn scan(
     floor: u32,
     offset: &dyn Fn(NodeId) -> Vector2,
 ) -> Option<Hit> {
-    scan_translated(entries, p, contact, floor, offset, &[])
+    scan_translated(entries, p, contact, floor, offset, &[], HitFlags::INTERACTIVE | HitFlags::SCROLL, None)
 }
 
 fn subtree_end(entries: &[HitEntry], start: usize) -> usize {
@@ -346,6 +390,7 @@ fn displacement(rows: &[crate::TranslationRange], at: usize) -> Vector2 {
 fn scan_translated(
     entries: &[HitEntry], p: Point, contact: ContactKind, floor: u32,
     offset: &dyn Fn(NodeId) -> Vector2, translations: &[crate::TranslationRange],
+    eligible: HitFlags, lifted: Option<core::ops::Range<usize>>,
 ) -> Option<Hit> {
     // Layout places content unscrolled and the compositor applies the offset, so a query
     // moves the point rather than the rects.
@@ -363,11 +408,15 @@ fn scan_translated(
     };
     // Walks the clip ancestry, rejecting a point any clipping ancestor excludes. The scan
     // has no descent to prune, so overhang survives and only a clip removes an entry.
-    let clipped_out = |mut at: u32| -> bool {
+    let clipped_out = |mut at: u32, is_lifted: bool| -> bool {
         // A cycle in the clip-parent indices would otherwise spin here and hang the pump.
         // The bound is the array's own length, which no acyclic chain can exceed.
         let mut guard = entries.len();
         while at != NO_ENTRY {
+            // The native carrier retains clips inside the subtree, not its former ancestors.
+            if is_lifted && lifted.as_ref().is_some_and(|range| !range.contains(&(at as usize))) {
+                return false;
+            }
             let Some(clip) = entries.get(at as usize) else {
                 return false;
             };
@@ -385,16 +434,21 @@ fn scan_translated(
     };
 
     let mut best: Option<(f32, Hit)> = None;
-    for index in (floor as usize..entries.len()).rev() {
+    let is_lifted = |index: usize| lifted.as_ref().is_some_and(|range| range.contains(&index));
+    let order = lifted.clone().unwrap_or(0..0).rev()
+        .chain((floor as usize..entries.len()).rev().filter(|&index| !is_lifted(index)));
+    for index in order {
         let entry = &entries[index];
         if !entry
             .flags
-            .intersects(HitFlags::INTERACTIVE.union(HitFlags::SCROLL))
+            .intersects(eligible)
         {
             continue;
         }
         let q = resolve(entry, index);
-        let own = translations.iter().find(|r| r.owner == entry.id).map_or(Vector2::zero(), |r| r.state.get());
+        let own = if is_lifted(index) { Vector2::zero() } else {
+            translations.iter().find(|r| r.owner == entry.id).map_or(Vector2::zero(), |r| r.state.get())
+        };
         let contains = |inflate: f32| {
             q.x >= entry.x0 - own.x.max(0.0) - inflate && q.x <= entry.x1 - own.x.min(0.0) + inflate
                 && q.y >= entry.y0 - own.y.max(0.0) - inflate && q.y <= entry.y1 - own.y.min(0.0) + inflate
@@ -404,7 +458,7 @@ fn scan_translated(
         } else {
             0.0
         };
-        if !contains(inflate) || clipped_out(entry.clip_parent) {
+        if !contains(inflate) || clipped_out(entry.clip_parent, is_lifted(index)) {
             continue;
         }
         let hit = Hit {
@@ -455,6 +509,20 @@ mod tests {
         Vector2 { x, y }
     }
 
+    #[test]
+    fn passive_hover_does_not_steal_presses_or_poison_the_hit_memo() {
+        let entries = [entry(1, (0.0, 0.0, 100.0, 100.0), HitFlags::INTERACTIVE),
+            entry(2, (0.0, 0.0, 100.0, 100.0), HitFlags::HOVER)];
+        let hits = table(&entries);
+        for _ in 0..4 {
+            assert_eq!(hits.hover(at(40.0, 40.0), ContactKind::Mouse).unwrap().id, entries[1].id);
+            assert_eq!(hits.hit(at(40.0, 40.0), ContactKind::Mouse).unwrap().id, entries[0].id);
+        }
+        let hits = table(&entries[1..]);
+        assert!(hits.hover(at(40.0, 40.0), ContactKind::Mouse).is_some());
+        assert!(hits.hit(at(40.0, 40.0), ContactKind::Mouse).is_none());
+    }
+
     /// The id index the app ships alongside the entries, ordered by id.
     fn index(entries: &[HitEntry]) -> Vec<(ControlId, u32)> {
         let mut rows: Vec<_> = entries
@@ -470,6 +538,45 @@ mod tests {
         let mut table = HitTable::default();
         table.replace(entries, &index(entries));
         table
+    }
+
+    #[test]
+    fn lifted_hits_leave_ancestor_clips_keep_internal_clips_and_restore_order() {
+        let viewport = entry(1, (0.0, 0.0, 100.0, 100.0), HitFlags::CLIP);
+        let mut source = entry(2, (10.0, 10.0, 50.0, 50.0), HitFlags::INTERACTIVE | HitFlags::CLIP);
+        source.parent = 0;
+        source.clip_parent = 0;
+        let mut child = entry(3, (20.0, 20.0, 60.0, 60.0), HitFlags::INTERACTIVE);
+        child.parent = 1;
+        child.clip_parent = 1;
+        let neighbor = entry(4, (100.0, 0.0, 200.0, 100.0), HitFlags::INTERACTIVE);
+        let entries = [viewport, source, child, neighbor];
+        let mut hits = table(&entries);
+        let shift = crate::Translation::new(at(100.0, 0.0));
+        shift.set_active(true);
+        hits.install_translation(source.id, &shift);
+        assert!(!hits.visible(child.id));
+        hits.lift(source.id);
+        let epoch = hits.epoch();
+        hits.lift(source.id);
+        assert_eq!(hits.epoch(), epoch);
+        let mut copy = HitTable::default();
+        copy.copy_from(&hits);
+        for table in [&hits, &copy] {
+            assert_eq!(table.visible_rect(child.id), Some([120.0, 20.0, 150.0, 50.0]));
+            assert_eq!(table.hit(at(130.0, 30.0), ContactKind::Mouse).unwrap().id, child.id);
+            assert_eq!(table.hover(at(130.0, 30.0), ContactKind::Mouse).unwrap().id, child.id);
+            assert_eq!(table.hit(at(155.0, 30.0), ContactKind::Mouse).unwrap().id, neighbor.id);
+            assert_eq!(table.hit(at(30.0, 15.0), ContactKind::Mouse), None);
+        }
+        hits.replace(&entries, &index(&entries));
+        assert_eq!(hits.hit(at(130.0, 30.0), ContactKind::Mouse).unwrap().id, child.id);
+        hits.lift(ControlId::NONE);
+        assert_eq!(hits.hit(at(130.0, 30.0), ContactKind::Mouse).unwrap().id, neighbor.id);
+        assert!(!hits.visible(child.id));
+        hits.lift(source.id);
+        hits.replace(&[neighbor], &index(&[neighbor]));
+        assert!(hits.lifted.is_none());
     }
 
     #[test]
