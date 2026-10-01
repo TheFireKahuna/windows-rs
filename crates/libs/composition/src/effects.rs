@@ -542,6 +542,24 @@ impl Compositor {
 mod tests {
     use super::*;
 
+    /// Pumps and commits until `factory`'s load leaves `Pending`.
+    ///
+    /// The load completes on a later commit than the one that first carries the brush, so
+    /// a status read as soon as that commit completes can still be `Pending`.
+    fn settle(
+        compositor: &Compositor,
+        factory: &CompositionEffectFactory,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        while factory.load_status() == bindings::CompositionEffectFactoryLoadStatus::Pending {
+            assert!(std::time::Instant::now() < deadline, "the effect graph's load never settled");
+            drop(compositor.request_commit()?);
+            windows_window::pump();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        Ok(())
+    }
+
     /// The glow graph loads, its sources bind, its sigma animates, and a commit with a
     /// live effect brush completes. Rendering the brush is the scene's verification; this
     /// is the API-level gate the construction depends on.
@@ -603,6 +621,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        settle(&compositor, &factory, deadline)?;
         assert_eq!(
             factory.load_status(),
             bindings::CompositionEffectFactoryLoadStatus::Success,

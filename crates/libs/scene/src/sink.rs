@@ -560,6 +560,10 @@ pub struct StrokeStyle {
     pub cap: Cap,
     pub join: Join,
     pub dash: DashId,
+    /// Filters the edge wider than exact coverage, for a curve whose edge runs at every
+    /// angle. A pixel-aligned rule or an icon must stay `false`: the filter softens an edge
+    /// that sits on the pixel grid.
+    pub smooth: bool,
 }
 
 /// Supplies the sprite's shape. Carries alpha only, never colour.

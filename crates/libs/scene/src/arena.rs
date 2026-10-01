@@ -16,7 +16,7 @@ use core::num::NonZeroU32;
 use windows_d2d::note;
 use windows_composition::{
     Animatable, Captured, CompositionAnimation, CompositionBrush, CompositionEffectBrush,
-    CompositionGeometricClip, CompositionMaskBrush, CompositionPathGeometry,
+    CompositionGeometricClip, CompositionPathGeometry,
     CompositionPropertySet, CompositionSpriteShape, ContainerVisual, ExpressionAnimation,
     Geometry, InsetClip, RectangleClip, ShapeVisual, SpriteVisual, Visual,
 };
@@ -426,8 +426,9 @@ pub struct Painted {
     pub paint: Paint,
     pub halo: Option<Halo>,
     /// `None` where the mask is [`Mask::None`] or a shape took the clip route: a mask brush
-    /// in the chain disqualifies a presented buffer from a display plane.
-    pub chain: Option<CompositionMaskBrush>,
+    /// in the chain disqualifies a presented buffer from a display plane. A mask brush,
+    /// or the smooth-stroke effect brush that stands in for one.
+    pub chain: Option<CompositionBrush>,
     /// The alpha source, as the base brush type: a coverage tile and a shape capture are
     /// surface brushes, and a box cell reaches the slot through a nine-grid, which is not.
     pub alpha: Option<CompositionBrush>,

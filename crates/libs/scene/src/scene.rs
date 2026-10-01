@@ -9,7 +9,7 @@ use crate::hit_entry::{ContactKind, Hit, pack_offset};
 use crate::patch::{Attach, Op, SinkPatch};
 use crate::realize::{
     Backends, Beneath, BoxKey, Cache, Ctx, GRAIN_ALPHA, GRAIN_CODES, GRAIN_STRIPS, GRAIN_TILE,
-    ResObj, Resources, fit, realize,
+    RampSource, ResObj, Resources, fit, gain_of, realize,
 };
 use crate::sink::*;
 use core::cell::{Cell, RefCell};
@@ -750,7 +750,7 @@ impl Backdrop {
             .iter()
             .map(|glow| (&glow.stops[..], Spread::Radial, glow.at, glow.size));
         for (stops, spread, at, size) in base.into_iter().chain(glows) {
-            let Some(surface) = back.raster_ramp(stops, spread, env, beneath)? else {
+            let Some(surface) = back.raster_ramp(stops, spread, env, beneath, 1.0)? else {
                 continue;
             };
             let sprite = back.compositor.create_sprite_visual();
@@ -2318,11 +2318,21 @@ impl Scene {
                 ResObj::Geom(back.compositor.create_path_geometry(&path), path)
             }
             ResOp::Ramp { stops, spread } => {
-                let Some(surface) = back.raster_ramp(patch.stops(stops), spread, env, None)? else {
+                let stops = patch.stops(stops);
+                let Some(surface) = back.raster_ramp(stops, spread, env, None, 1.0)? else {
                     return Ok(());
                 };
+                // Every brighter strip a smooth stroke holds is drawn again from the new
+                // stops, so it re-surfaces with the base rather than keeping the old light.
+                let mut brighter = Vec::new();
+                for gain in self.res.ramp_gains(id) {
+                    if let Some(next) = back.raster_ramp(stops, spread, env, None, gain_of(gain))? {
+                        brighter.push((gain, back.brush(&next, Stretch::Fill), next));
+                    }
+                }
                 let brush = back.brush(&surface, Stretch::Fill);
-                ResObj::Brush(brush, Some(surface))
+                let source = RampSource { stops: stops.to_vec(), spread, brighter };
+                ResObj::Ramp(brush, surface, Box::new(source))
             }
             ResOp::Run { segs, ink } => {
                 let Some(surface) = back.raster_run(
@@ -3191,7 +3201,7 @@ mod tests {
         let mut patch = SinkPatch::default();
         let id = rig.sprite(&mut patch, 120.0);
         let mask = Mask::Shape { geom, space: PathSpace::Unit, stroke: Some(StrokeStyle {
-            width: 2.0, cap: Cap::Round, join: Join::Round, dash: DashId::NONE,
+            width: 2.0, cap: Cap::Round, join: Join::Round, dash: DashId::NONE, smooth: false,
         }) };
         patch.push(Op::Mask { id: SpriteId(id), mask });
         patch.push(Op::Paint { id: SpriteId(id), paint: Paint::Solid(Radiance::new(30.0, 140.0, 170.0, 1.0)), halo: None });
@@ -3668,7 +3678,7 @@ mod tests {
             (65535, Radiance::new(0.2, 0.6, 0.9, 1.0)),
         ];
         let ramp_surface = back
-            .raster_ramp(&ramp_stops, Spread::Vertical, env, None)
+            .raster_ramp(&ramp_stops, Spread::Vertical, env, None, 1.0)
             .expect("the ramp rasterized")
             .expect("a ramp surface");
         scene.res.declare(
