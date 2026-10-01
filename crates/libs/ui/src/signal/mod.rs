@@ -79,6 +79,7 @@ pub(crate) fn read_only<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Returns a node's payload as the type its handle names.
+#[track_caller]
 fn payload<T: 'static>(id: SignalId, track: bool) -> Rc<RefCell<T>> {
     let any = if track { graph::read(id) } else { graph::peek(id) };
     let any = any.expect("signal disposed");
@@ -149,6 +150,7 @@ impl<T: 'static> Cell<T> {
     /// Panics if the cell has been disposed, or if `f` writes this same cell: the read borrow
     /// taken here is still held for the duration of `f`. Reading any cell from inside `f`,
     /// including this one, is allowed.
+    #[track_caller]
     pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R {
         let value = payload::<T>(self.id, true);
         let slot = RefCell::borrow(&value);
@@ -164,6 +166,7 @@ impl<T: 'static> Cell<T> {
     ///
     /// Panics if the cell has been disposed, or if `f` reads or writes this same cell: the
     /// write borrow taken here is held for the duration of `f`.
+    #[track_caller]
     pub fn update(self, f: impl FnOnce(&mut T)) {
         assert_writable();
         f(&mut RefCell::borrow_mut(&payload::<T>(self.id, false)));
@@ -173,6 +176,7 @@ impl<T: 'static> Cell<T> {
 
 impl<T: Clone + 'static> Cell<T> {
     /// Returns a clone of the current value, registering a dependency.
+    #[track_caller]
     pub fn get(self) -> T {
         self.with(T::clone)
     }
@@ -181,6 +185,7 @@ impl<T: Clone + 'static> Cell<T> {
     ///
     /// The read a write takes of its own target, and the read a diagnostic takes of state it
     /// must not subscribe to.
+    #[track_caller]
     pub fn peek(self) -> T {
         let value = payload::<T>(self.id, false);
         let slot = RefCell::borrow(&value);
@@ -193,6 +198,7 @@ impl<T: PartialEq + 'static> Cell<T> {
     ///
     /// The comparison gates everything downstream, so a derivation over a clamped input is not
     /// woken by a write the clamp absorbs.
+    #[track_caller]
     pub fn set(self, v: T) {
         assert_writable();
         let value = payload::<T>(self.id, false);
@@ -221,6 +227,7 @@ impl<T: PartialEq + Send + 'static> Cell<T> {
     ///
     /// Panics on the thread that owns the graph if the cell has been disposed. A write staged
     /// from any other thread is dropped at the drain instead.
+    #[track_caller]
     pub fn post(self, v: T) {
         if graph::owns(self.id) {
             self.set(v);
@@ -361,6 +368,7 @@ impl<T: PartialEq + 'static> Memo<T> {
     /// # Panics
     ///
     /// Panics if the memo has been disposed.
+    #[track_caller]
     pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R {
         graph::resolve(self.id);
         let cache = payload::<Option<T>>(self.id, true);
@@ -372,6 +380,7 @@ impl<T: PartialEq + 'static> Memo<T> {
 impl<T: Clone + PartialEq + 'static> Memo<T> {
     /// Returns a clone of the current value, resolving the memo first and registering a
     /// dependency.
+    #[track_caller]
     pub fn get(self) -> T {
         self.with(T::clone)
     }

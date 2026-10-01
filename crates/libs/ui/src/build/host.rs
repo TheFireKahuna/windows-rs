@@ -2005,7 +2005,9 @@ impl Host {
     ///
     /// A set moves only where its origin's box, class or scope moved, where an attached
     /// node's box moved, or where an attachment came or went; each of those names a node
-    /// in the change set or owes the pass. A flush with none of them walks no set.
+    /// in the change set or owes the pass. A flush with none of them walks no set. A set
+    /// whose owner has been disposed is skipped, because `Cell::update` panics on a disposed
+    /// handle.
     fn publish_anchors(&mut self) {
         let owed = core::mem::take(&mut self.anchors_owed) || self.changes.sweeping();
         let due = owed
@@ -2031,7 +2033,7 @@ impl Host {
                 continue;
             }
             let side = &self.sides[at];
-            let Some(set) = side.origin else { continue };
+            let Some(set) = side.origin.filter(|set| set.cell().alive()) else { continue };
             let origin = self.tree.c.geom[side.node.index()];
             let scope = self
                 .scope_of(side.node)
@@ -2059,7 +2061,9 @@ impl Host {
     /// An update wakes every reader, so a set that did not move is never written.
     fn anchor_set_held(&self, at: u32) -> bool {
         let side = &self.sides[at];
-        let Some(set) = side.origin else { return true };
+        // A set whose owner has been disposed has no reader left and nothing to hold: the
+        // origin node retires after the scope that minted the set, as a probe's does.
+        let Some(set) = side.origin.filter(|set| set.cell().alive()) else { return true };
         let origin = self.tree.c.geom[side.node.index()];
         // At the class the origin was solved in, so a reader converting a box to metric
         // units divides by the number the solve multiplied by.
