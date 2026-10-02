@@ -405,6 +405,22 @@ impl<K> Element<'_, K> {
         named.uia_restale()
     }
 
+    /// Names this control from a tracked source, re-reading it when what it read changes.
+    ///
+    /// A changed name restales the automation rows, so the next snapshot carries it and a
+    /// listening client is told the name changed.
+    pub fn name_from(mut self, name: impl Fn() -> Cow<'static, str> + 'static) -> Self {
+        let id = self.control_id();
+        self.declare(HitFlags::UIA, |_| {}).bind(name, move |host, name| {
+            let Some(row) = host.control_mut(id) else { return };
+            if row.name.as_deref() == Some(&*name) {
+                return;
+            }
+            row.name = Some(name);
+            host.uia_stale.set(true);
+        })
+    }
+
     fn uia_restale(mut self) -> Self {
         self.host().uia_stale.set(true);
         self

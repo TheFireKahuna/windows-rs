@@ -949,6 +949,30 @@ impl<'a, K> Element<'a, K> {
         self.channel(Prop::RotationAngle, value)
     }
 
+    /// Turns this element about its pivot without end, one revolution every `period_ms`.
+    ///
+    /// One key-frame loop the compositor plays: nothing on this side wakes for it, and it
+    /// ends when the node is retired. It still has the compositor draw every frame while it
+    /// runs, so it belongs on a node mounted only while there is something to wait for.
+    /// With client-area animations off the element holds still. The rotation channel must
+    /// remain exclusive to this, and `period_ms` must be nonzero.
+    pub fn spin(self, period_ms: u32) -> Self {
+        use windows_scene::{Anim, Bind, Easing, Iterations};
+        assert!(period_ms > 0, "a spin needs a period");
+        let node = self.node;
+        let host = &mut *self.ui.host;
+        let frames = host.frames(&[
+            (0.0, Value::Scalar(0.0), Easing::Linear),
+            (1.0, Value::Scalar(core::f32::consts::TAU), Easing::Linear),
+        ]);
+        host.bind(node, Prop::RotationAngle, Bind::Animate(Anim::Frames {
+            frames,
+            duration_ms: period_ms,
+            iterations: Iterations::Forever,
+        }));
+        self
+    }
+
     pub fn trim<M>(self, value: impl Signal<f32, M> + 'static) -> Self {
         self.channel(Prop::TrimEnd, value)
     }

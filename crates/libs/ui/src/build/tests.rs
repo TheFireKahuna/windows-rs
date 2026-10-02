@@ -738,6 +738,23 @@ fn a_geometry_channel_snaps_and_a_chrome_channel_springs() {
     assert!(snapped, "a geometry channel did not snap");
 }
 
+#[test]
+fn a_spin_is_one_compositor_loop_and_asks_nothing_after_it() {
+    let mut rig = Rig::new();
+    let mut node = None;
+    let frame = rig.mount(|ui| {
+        node = Some(ui.node(Preset::Layer).width(Len::dip(12.0)).height(Len::dip(12.0)).spin(900).id().into());
+    });
+    let node: NodeId = node.unwrap();
+    let loops = frame.patch().ops().iter().filter(|op| {
+        matches!(op, Op::Bind { id, prop: Prop::RotationAngle, bind: Bind::Animate(Anim::Frames {
+            duration_ms: 900, iterations: windows_scene::Iterations::Forever, .. }) } if *id == node)
+    }).count();
+    assert_eq!(loops, 1, "the spin was not one forever loop");
+    // The compositor plays it; a settled tree hands over nothing more.
+    assert!(rig.flush().patch().ops().is_empty(), "a spin kept the tree publishing");
+}
+
 // ── mount and retirement ────────────────────────────────────────────────────────────
 
 #[test]
@@ -1276,6 +1293,21 @@ fn a_control_is_named_by_the_text_its_subtree_laid_out() {
         row.flags.has(ColFlags::FOCUSABLE),
         "a button is not focusable"
     );
+}
+
+#[test]
+fn a_tracked_name_follows_its_source() {
+    let mut rig = Rig::new();
+    let off = Cell::new(false);
+    let mut frame = rig.mount(|ui| {
+        button(ui, "Apply").name_from(move || {
+            if off.get() { "Apply, off".into() } else { "Apply".into() }
+        });
+    });
+    assert!(frame.uia("Apply").is_some(), "the first name was not published");
+    let mut frame = rig.set(off, true);
+    assert!(frame.uia("Apply, off").is_some(), "the changed name was not published");
+    assert!(frame.uia("Apply").is_none(), "the old name survived the change");
 }
 
 #[test]
