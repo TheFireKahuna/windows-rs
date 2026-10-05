@@ -41,7 +41,7 @@ impl HitFlags {
     pub const SCROLL: Self = Self(1 << 1);
     /// Has a gesture declaration.
     pub const GESTURE: Self = Self(1 << 2);
-    /// Accepts wheel input that a tracker did not already take.
+    /// Takes the wheel through an interaction source of its own.
     pub const WHEEL: Self = Self(1 << 3);
     /// Has an automation peer.
     pub const UIA: Self = Self(1 << 4);

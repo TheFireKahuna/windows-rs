@@ -1116,6 +1116,11 @@ impl Axes {
         y: true,
         scale: false,
     };
+    pub const HORIZONTAL: Self = Self {
+        x: true,
+        y: false,
+        scale: false,
+    };
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -1157,9 +1162,10 @@ pub enum Source {
     /// A scroll container's viewport: pans on `axes` from the touchpad, the wheel and a
     /// redirected touch contact, handing off at its bounds.
     Scroll(Axes),
-    /// A valued control: the vertical wheel alone. The touchpad is left to whatever source is
-    /// beneath it, and nothing is handed off at a bound.
-    Wheel,
+    /// A valued control: the wheel on `axes` — `y` the rotated wheel, `x` the tilted one — and
+    /// nothing else. An axis it leaves off, and the touchpad, go to whatever source is beneath
+    /// it, and nothing is handed off at a bound.
+    Wheel(Axes),
 }
 
 /// The phase a tracker's last reported transition put it in.

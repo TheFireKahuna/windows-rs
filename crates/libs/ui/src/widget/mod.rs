@@ -23,7 +23,7 @@ pub use roles::{
 };
 // `ChromeRow` and `ValueRow` are the two halves of a control the front thread reads; `Controls` is
 // its table of live controls.
-pub use state::{ChromeRow, Controls, Front, Intent, ValueRow, What, flag};
+pub use state::{ChromeRow, Controls, Front, Intent, ValueRow, WheelAxis, What, flag};
 pub use state::ReorderUpdate;
 pub(crate) use state::ReorderRow;
 pub use text::{Flow, Shaped, TextAnnotation, TextSource, Written, reactive, shown};

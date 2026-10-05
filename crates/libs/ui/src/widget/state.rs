@@ -228,12 +228,23 @@ impl Intent {
     }
 }
 
+/// The wheel axis a detent came from.
+///
+/// A detent is positive for a wheel rotated away from the user or tilted to the right.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WheelAxis {
+    /// The wheel rotated forward or back.
+    Rotate,
+    /// The wheel tilted left or right, or a horizontal wheel turned.
+    Tilt,
+}
+
 /// What an [`Intent`] asks of the application.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum What {
     /// A platform-recognized double tap in target-local DIPs.
     DoubleTapped(Point),
-    /// Signed wheel detents the control's own wheel source took.
+    /// Signed detents of the rotated wheel the control's own wheel source took.
     Wheel { notches: f32 },
     Closed,
     /// Entry or exit of an explicitly observed hover scope.
@@ -847,7 +858,20 @@ impl Controls {
                     }
                 }
             }
-            Report::Wheel { target, notches }
+            // A horizontal slider takes the tilted wheel as a step count, as a dial takes its
+            // detents; the rotated wheel stays with the scroll container it sits in.
+            Report::Wheel { target, axis: WheelAxis::Tilt, notches }
+                if notches.is_finite() && notches != 0.0 && self.dragged.is_none()
+                    && self.flags(target) & (flag::SLIDE | flag::VERTICAL | flag::DISABLED) == flag::SLIDE
+                    && self.value(target).span > 0.0
+                    && front.scene.hits().entry(target).is_some_and(|hit| {
+                        hit.flags.contains(HitFlags::WHEEL)
+                    }) =>
+            {
+                let row = self.value(target);
+                self.settle(target, row.fraction + notches * row.quantum(), front, out)?;
+            }
+            Report::Wheel { target, axis: WheelAxis::Rotate, notches }
                 if notches.is_finite() && notches != 0.0 && self.dragged.is_none()
                     && self.chrome.get(target).is_some_and(|row| row.flags & flag::DISABLED == 0)
                     && front.scene.hits().entry(target).is_some_and(|hit| {

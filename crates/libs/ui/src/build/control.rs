@@ -367,14 +367,14 @@ impl<K> Element<'_, K> {
         })
     }
 
-    /// Receives signed, fractional vertical wheel detents.
+    /// Receives signed, fractional detents of the rotated wheel, positive away from the user.
     ///
     /// The control gets a wheel source of its own, which takes the wheel wherever this
     /// control's visual paints — inside a scroll container too, whose own source then does not
     /// see it — and leaves the touchpad to whatever is beneath. Pointer gestures are unchanged.
     pub fn on_wheel(mut self, callback: impl Fn(f32) + 'static) -> Self {
         let (node, control) = (self.node_id(), self.control_id());
-        self.host().mount_wheel(node, control);
+        self.host().mount_wheel(node, control, windows_scene::Axes::VERTICAL);
         self.handler(HitFlags::INTERACTIVE | HitFlags::WHEEL, |row| {
             row.wheel.replace(Rc::new(callback)).map(Retired::new)
         })
@@ -863,7 +863,15 @@ impl<K> Element<'_, K> {
             row.front.flags |= bits_of(drive);
         }
         self.host().gestures.push((id, decl));
-        self.hit(HitFlags::INTERACTIVE | HitFlags::GESTURE, role)
+        // A horizontal slider steps on the tilted wheel, which runs along it. The rotated wheel
+        // is left to the page it scrolls, so passing over a slider never takes a scroll.
+        let tilts = matches!(drive, Interaction::Slide(range) if !range.vertical);
+        if tilts {
+            let node = self.node_id();
+            self.host().mount_wheel(node, id, windows_scene::Axes::HORIZONTAL);
+        }
+        let wheel = if tilts { HitFlags::WHEEL } else { HitFlags::NONE };
+        self.hit(HitFlags::INTERACTIVE | HitFlags::GESTURE | wheel, role)
             .bind_scalar(range_of(drive), value)
     }
 

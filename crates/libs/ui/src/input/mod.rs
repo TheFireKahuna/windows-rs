@@ -152,6 +152,7 @@ pub enum Report {
     /// carries it.
     Wheel {
         target: ControlId,
+        axis: crate::widget::WheelAxis,
         /// Notches, signed and fractional. One detent is `1.0`.
         notches: f32,
     },

@@ -127,6 +127,12 @@ impl Rig {
         controls.tick(reports, &mut front, out)
     }
 
+    /// Runs `f` against this rig's own scene front.
+    pub fn front<R>(&mut self, f: impl FnOnce(&mut Front<'_>) -> R) -> R {
+        let mut front = Front { scene: &mut self.scene, back: &self.back, env: self.env };
+        f(&mut front)
+    }
+
     pub fn correlate(&mut self, routes: &mut crate::correlation::Routes) -> Result<()> {
         let mut front = Front { scene: &mut self.scene, back: &self.back, env: self.env };
         routes.reveal(&mut front)
@@ -307,7 +313,7 @@ fn dragged(target: ControlId, phase: Phase, decided: bool) -> Report {
 }
 
 /// A slider row over a 100-DIP rail inset 13 DIPs into a 126-DIP hit box, snapping to a tenth.
-fn slider_row(thumb: NodeId) -> ValueRow {
+pub(super) fn slider_row(thumb: NodeId) -> ValueRow {
     ValueRow {
         parts: [
             (thumb, ScalarPart::Thumb { vertical: false }),

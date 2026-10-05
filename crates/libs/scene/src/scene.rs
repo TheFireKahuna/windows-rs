@@ -627,22 +627,32 @@ fn configure_source(viewport: &Visual, axes: Axes) -> Result<VisualInteractionSo
     Ok(source)
 }
 
-/// Configures a valued control's source: the vertical wheel, and nothing else.
+/// Configures a valued control's source: the wheel on `axes`, and nothing else.
 ///
 /// The Y axis is enabled because the compositor gives a wheel only to a source whose axis
 /// admits it; redirection is the wheel's alone, so a touchpad pan over the control reaches the
 /// scroll container beneath it; and chaining is off, so a wheel is never handed on to that
 /// container at a bound.
-fn configure_wheel_source(visual: &Visual) -> Result<VisualInteractionSource> {
+fn configure_wheel_source(visual: &Visual, axes: Axes) -> Result<VisualInteractionSource> {
     debug_assert!(
         visual.size().x > 0.0 && visual.size().y > 0.0,
         "a wheel source's visual must be sized before the source is created"
     );
     let source = VisualInteractionSource::for_visual(visual)?;
-    source.set_axis_modes(SourceMode::Disabled, SourceMode::EnabledWithInertia, SourceMode::Disabled);
+    let mode_of = |on: bool| {
+        if on {
+            (SourceMode::EnabledWithInertia, WheelMode::Enabled)
+        } else {
+            (SourceMode::Disabled, WheelMode::Disabled)
+        }
+    };
+    let ((x, wheel_x), (y, wheel_y)) = (mode_of(axes.x), mode_of(axes.y));
+    source.set_axis_modes(x, y, SourceMode::Disabled);
     source.set_redirection_mode(RedirectionMode::WheelOnly);
     source.set_chaining(ChainingMode::Never, ChainingMode::Never, ChainingMode::Never);
-    source.set_wheel_modes(WheelMode::Disabled, WheelMode::Enabled, WheelMode::Disabled)?;
+    // An axis left off passes its wheel to the next source beneath that takes it, or to the
+    // window when none does.
+    source.set_wheel_modes(wheel_x, wheel_y, WheelMode::Disabled)?;
     Ok(source)
 }
 
@@ -2495,7 +2505,7 @@ impl Scene {
                 };
                 let (source, scrolls) = match source {
                     Source::Scroll(axes) => (configure_source(&visual, axes)?, Some(node.0)),
-                    Source::Wheel => (configure_wheel_source(&visual)?, None),
+                    Source::Wheel(axes) => (configure_wheel_source(&visual, axes)?, None),
                 };
                 inner.add_source(&source)?;
                 self.trackers.place(
