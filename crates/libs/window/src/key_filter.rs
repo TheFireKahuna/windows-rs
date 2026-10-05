@@ -56,7 +56,9 @@ impl Window {
         if hook.is_null() {
             return Err(Error::from_thread());
         }
-        FILTER.with(|slot| *slot.borrow_mut() = Some((self.handle(), Rc::new(filter))));
+        // Keys are delivered to the window input goes to, which is the content window where
+        // there is one.
+        FILTER.with(|slot| *slot.borrow_mut() = Some((self.input_window(), Rc::new(filter))));
         Ok(KeyFilter {
             hook,
             _window: PhantomData,

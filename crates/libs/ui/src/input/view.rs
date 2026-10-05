@@ -1,6 +1,6 @@
 //! The hit array the input thread resolves against, reachable from the window procedure.
 //!
-//! One array answers the pointer, the wheel, focus order, overlay dismiss, the window's own
+//! One array answers the pointer, focus order, overlay dismiss, the window's own
 //! caption hit test and automation's element-from-point. The procedure has to answer the
 //! caption's question while an input pass is on the stack, so the array is shared rather than
 //! owned by the pass — and every borrow of it here is short enough that no call-out can span

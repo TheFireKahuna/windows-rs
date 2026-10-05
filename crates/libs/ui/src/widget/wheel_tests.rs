@@ -9,26 +9,23 @@ fn native_wheel_preserves_fractional_detents_and_requires_a_live_opted_in_target
     let row = ChromeRow::default();
     rig.adopt(&[(id, row)], &[], &[])?;
     rig.publish_hits(&[hit])?;
-    let report = |target, notches, horizontal| Report::Wheel {
-        target, notches, horizontal, at: Point::default(),
-    };
+    let report = |target, notches| Report::Wheel { target, notches };
     let mut out = Vec::new();
-    rig.tick(&[report(Some(id), 1.0, false)], &mut out)?;
+    rig.tick(&[report(id, 1.0)], &mut out)?;
     assert!(out.is_empty());
     hit.flags = hit.flags | HitFlags::WHEEL;
     rig.publish_hits(&[hit])?;
-    for (notches, horizontal) in [(0.25, false), (-2.0, false), (1.0, true)] {
+    for notches in [0.25, -2.0, 1.0] {
         out.clear();
-        rig.tick(&[report(Some(id), notches, horizontal)], &mut out)?;
+        rig.tick(&[report(id, notches)], &mut out)?;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].target, id);
-        assert_eq!(out[0].what, What::Wheel { notches, horizontal });
+        assert_eq!(out[0].what, What::Wheel { notches });
     }
     out.clear();
     for notches in [0.0, f32::NAN, f32::INFINITY] {
-        rig.tick(&[report(Some(id), notches, false)], &mut out)?;
+        rig.tick(&[report(id, notches)], &mut out)?;
     }
-    rig.tick(&[report(None, 1.0, false)], &mut out)?;
     assert!(out.is_empty());
     rig.adopt(&[(id, ChromeRow { flags: flag::DRAGS, ..row })], &[], &[])?;
     rig.tick(&[scalar_tests::press(id), Report::Dragged {
@@ -40,18 +37,18 @@ fn native_wheel_preserves_fractional_detents_and_requires_a_live_opted_in_target
         },
     }], &mut out)?;
     out.clear();
-    rig.tick(&[report(Some(id), 1.0, false)], &mut out)?;
+    rig.tick(&[report(id, 1.0)], &mut out)?;
     assert!(out.is_empty());
     rig.tick(&[Report::Canceled { target: id, contact: 1 }], &mut out)?;
     out.clear();
-    rig.tick(&[report(Some(id), 1.0, false)], &mut out)?;
-    assert_eq!(out.last().map(|i| i.what), Some(What::Wheel { notches: 1.0, horizontal: false }));
+    rig.tick(&[report(id, 1.0)], &mut out)?;
+    assert_eq!(out.last().map(|i| i.what), Some(What::Wheel { notches: 1.0 }));
     out.clear();
     rig.adopt(&[(id, ChromeRow { flags: flag::DISABLED, ..row })], &[], &[])?;
-    rig.tick(&[report(Some(id), 1.0, false)], &mut out)?;
+    rig.tick(&[report(id, 1.0)], &mut out)?;
     assert!(out.is_empty());
     rig.adopt(&[], &[], &[id])?;
-    rig.tick(&[report(Some(id), 1.0, false)], &mut out)?;
+    rig.tick(&[report(id, 1.0)], &mut out)?;
     assert!(out.is_empty());
     Ok(())
 }

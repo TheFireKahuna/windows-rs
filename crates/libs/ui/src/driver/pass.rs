@@ -601,6 +601,9 @@ struct SceneThread {
     regions: present::Regions,
     correlations: crate::correlation::Routes,
     scrolls: ScrollTable,
+    wheels: crate::wheel::WheelTable,
+    /// This pass's wheel detents, kept so the buffer is reused.
+    wheel_reports: Vec<Report>,
     scope: Scope,
     /// The control a caret belongs to, so only a field's own geometry change reaches TSF.
     text_focused: Option<ControlId>,
@@ -613,7 +616,7 @@ struct SceneThread {
     /// The batch being filled for the input thread.
     down: Box<InputDown>,
     /// The array epoch and tracker count last sent to the input thread.
-    sent: (u64, u32),
+    sent: (u64, u64),
     env: Env,
     tally: SceneTally,
     /// Whether a patch was applied since the input thread last heard the tallies, so an
@@ -663,7 +666,7 @@ where
                 if let Ok(mut held) = links.ladder.lock() {
                     *held = Some(back.ladder().clone());
                 }
-                let scene = Scene::new_at(links.window, &back, env, backdrop)?;
+                let scene = Scene::new_at(links.content, &back, env, backdrop)?;
                 // The present thread rings this thread for every binding it posts, and the
                 // registry it installs is this thread's local.
                 present::install(env.output(), present_watch, Arc::clone(&links.scene_bell))?;
@@ -675,13 +678,15 @@ where
                     regions: present::Regions::default(),
                     correlations: crate::correlation::Routes::default(),
                     scrolls: ScrollTable::default(),
+                    wheels: crate::wheel::WheelTable::default(),
+                    wheel_reports: Vec::new(),
                     scope,
                     text_focused: None,
                     caption: [None; 3],
                     events: Vec::new(),
                     up: Box::default(),
                     down: Box::default(),
-                    sent: (u64::MAX, u32::MAX),
+                    sent: (u64::MAX, u64::MAX),
                     env,
                     tally: SceneTally::default(),
                     applied: false,
@@ -765,6 +770,15 @@ impl Worker for SceneThread {
             }
         }
         let mut front = Front { scene: &mut self.scene, back: &self.back, env: self.env };
+        // A wheel control's detents arrive as its tracker's reports, with no input behind them,
+        // so they are routed here rather than with the input thread's batch.
+        self.wheels
+            .reports(&self.events, self.env.scale(), &mut self.wheel_reports, &mut front)?;
+        if !self.wheel_reports.is_empty() {
+            self.controls
+                .tick(&self.wheel_reports, &mut front, &mut self.up.intents)?;
+            self.wheel_reports.clear();
+        }
         if self.events.iter().any(|event| matches!(event, SceneEvent::TrackerValues { .. })) {
             self.controls.refresh_reorder(&mut front, &mut self.up.intents)?;
         }
@@ -861,6 +875,7 @@ impl SceneThread {
         present::apply(&mut self.regions, &mut down.regions, &mut front, Some(&down.patch))?;
         apply_control_patch(&mut self.controls, down, &mut front)?;
         self.scrolls.apply_ops(&mut down.scrolls);
+        self.wheels.apply(&mut down.wheels);
         // A restated geometry replaces the map the thumb is bound through, so a container
         // holding an occlusion's extent is bound again from the extended one. Here, because the
         // patch that restated it has just been applied.
@@ -988,7 +1003,7 @@ impl SceneThread {
     /// the window for a tick to take it.
     ///
     /// The array is copied only when its epoch moved, so a patch that changed only values
-    /// ships no entries; the shadows only when the tracker count did.
+    /// ships no entries; the shadows only when the tracker set did.
     fn to_input(&mut self) {
         let shifted = self.controls.take_translation_changed();
         self.down.translation_changed |= shifted;
@@ -999,7 +1014,7 @@ impl SceneThread {
             self.down.hits_changed = true;
             self.sent.0 = epoch;
         }
-        let trackers = self.scene.census().trackers_live;
+        let trackers = self.scene.census().tracker_edits;
         if trackers != self.sent.1 {
             self.scene.tracker_shadows(&mut self.down.trackers);
             self.down.trackers_changed = true;
@@ -1026,7 +1041,11 @@ mod tests {
     #[test]
     fn app_pass_consumes_worker_posts_without_input_or_resize() {
         let _patch = crate::build::tests::fixture();
-        let window = windows_window::Window::new("posted completion").hidden().create().unwrap();
+        let window = windows_window::Window::new("posted completion")
+            .content_window(|_, _, _, _| None)
+            .hidden()
+            .create()
+            .unwrap();
         let links = Arc::new(Links::new(&window).unwrap());
         let posts = signal::arm_posts(Arc::clone(&links.app_bell));
         let observed = Rc::new(Cell::new(0));
@@ -1070,7 +1089,11 @@ mod tests {
         use windows_scene::{Op, Point};
 
         let _patch = crate::build::tests::fixture();
-        let window = windows_window::Window::new("drag handoff").hidden().create().unwrap();
+        let window = windows_window::Window::new("drag handoff")
+            .content_window(|_, _, _, _| None)
+            .hidden()
+            .create()
+            .unwrap();
         let links = Arc::new(Links::new(&window).unwrap());
         let posts = signal::arm_posts(Arc::clone(&links.app_bell));
         let calls = Rc::new(Cell::new(0));
@@ -1167,7 +1190,10 @@ mod tests {
             }
         }
         let window = windows_window::Window::new("worker completion")
-            .hidden().create().unwrap();
+            .content_window(|_, _, _, _| None)
+            .hidden()
+            .create()
+            .unwrap();
         let links = Links::new(&window).unwrap();
         links.scene_bell.ring();
         run(&links, &links.scene_bell, Completion {

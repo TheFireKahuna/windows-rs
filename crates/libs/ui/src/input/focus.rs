@@ -1,7 +1,7 @@
 //! Keyboard focus and the scopes that bound it.
 //!
 //! Focus order is the hit array's order, filtered to `INTERACTIVE`, with `tab_index` as an
-//! explicit override. The pointer, the wheel, keyboard focus order, the window's caption hit
+//! explicit override. The pointer, keyboard focus order, the window's caption hit
 //! test and automation's element-from-point all resolve through that one z-ordered flat array,
 //! so no second ordering is maintained beside it.
 //!

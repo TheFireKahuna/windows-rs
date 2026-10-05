@@ -27,7 +27,8 @@ use windows_core::Result;
 use windows_numerics::Vector2;
 use windows_scene::{
     Affine, Anim, Axes, Bind, ControlId, GroupId, HitDecl, HitFlags, HitTable, Id, NodeId, Observed,
-    Phase as TrackerPhase, Prop, SceneEvent, SpriteId, TRACKER, TrackerAxis, TrackerId,
+    Paint, Phase as TrackerPhase, Prop, SceneEvent, Source, SpriteId, TRACKER, TrackerAxis,
+    TrackerId,
     TrackerRequest, Tuning, Value, unpack_offset,
 };
 
@@ -1020,13 +1021,19 @@ impl Ui<'_> {
     ///
     /// The children go into a content group of their own, because the viewport must not move: it
     /// is what clips, and an offset on it would take the clip with it.
+    ///
+    /// The viewport is a sprite carrying [`Paint::Clear`]. Its tracker's source receives wheel
+    /// and touchpad input only where the compositor's hit test finds painted content, so a
+    /// viewport that paints nothing would scroll over its rows and not over the gaps between
+    /// them. A sprite's own brush draws under its children, so the paint costs no visual.
     pub fn scroll(&mut self, decl: ScrollDecl, children: impl FnOnce(&mut Ui<'_>)) -> Element<'_> {
         let mut content = NodeId::NONE;
         let mut viewport = self
-            .node(Preset::Scroll)
+            .sprite(Preset::Scroll)
             .children(|ui| content = ui.group(Preset::Stack, children).node_id());
         let node = viewport.node_id();
         let host = viewport.host();
+        host.paint(SpriteId(node), Paint::Clear, None);
         let scope = host.scope_of(node);
         // Minted after the content, because child order is paint order: a bar declared before
         // the rows would be drawn under whatever the list paints over them.
@@ -1048,13 +1055,13 @@ impl Ui<'_> {
         rail_control.tab_stop = Some(false);
         let grab = host.mint_control(rail_control);
         host.focus_ops.push(crate::seam::FocusOp::TabIndex(grab, -1));
-        // The surface itself is a target so a hover can reveal its bar and a wheel notch the
-        // tracker did not take reaches it. Its own box is the whole of it, so it is not
-        // inflated: a control sitting near its edge would otherwise share the point.
+        // The surface itself is a target so a hover can reveal its bar. Its own box is the whole
+        // of it, so it is not inflated: a control sitting near its edge would otherwise share
+        // the point.
         host.hit(
             node,
             Some(HitDecl {
-                flags: HitFlags::INTERACTIVE.union(HitFlags::WHEEL),
+                flags: HitFlags::INTERACTIVE,
                 id: hover,
                 touch_inflate: Some(0.0),
             }),
@@ -1117,7 +1124,7 @@ impl Host {
         let (reveal, state, created) = (row.reveal, row.state, row.created);
         let moved = row.last != geom || row.last_w != view.x;
         if !created {
-            self.create_tracker(front.tracker, GroupId(front.viewport), Axes::VERTICAL);
+            self.create_tracker(front.tracker, GroupId(front.viewport), Source::Scroll(Axes::VERTICAL));
             self.bind(
                 content,
                 Prop::OffsetY,

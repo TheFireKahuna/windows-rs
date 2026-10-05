@@ -930,7 +930,7 @@ fn native_grid_reorder_autoscroll_keeps_source_and_drop_geometry_coherent() -> R
     rig.patch.push(Op::Bind { id: viewport, prop: Prop::Size,
         bind: Bind::Set(Value::Vec2(Vector2::new(100.0, 120.0))) });
     rig.patch.push(Op::Tracker { id: tracker.erased(), op: TrackerOp::Create {
-        viewport: GroupId(viewport), axes: Axes::VERTICAL, owned: true } });
+        visual: GroupId(viewport), source: windows_scene::Source::Scroll(Axes::VERTICAL), owned: true } });
     rig.patch.push(Op::Tracker { id: tracker.erased(), op: TrackerOp::Bounds {
         min: Vector2::zero(), max: Vector2::new(0.0, 1000.0) } });
     rig.patch.push(Op::Bind { id: group, prop: Prop::OffsetY, bind: Bind::Track {

@@ -3,7 +3,7 @@
 //! UI Automation lets one COM object implement every pattern interface and decide in
 //! `GetPatternProvider` which of them an element admits to, so there are two object shapes
 //! here and not one per pattern: [`Element`] over `(Weak<Shared>, id, part)`, and [`Root`]
-//! for the window, which is the only element that answers element-from-point and focus.
+//! for the content window, which is the only element that answers element-from-point and focus.
 //!
 //! Nothing is cached. Every call reads the currently published snapshot, from whatever thread
 //! automation chose to call on, so there is nothing to invalidate and no call hops onto the
@@ -38,9 +38,12 @@ use windows_scene::{ControlId, Point};
 /// every query through the window's own pump, which is the path along which a slow provider
 /// blocks a screen reader. Every provider here is thread-safe already.
 ///
-/// `RefuseNonClientSupport`, because the window draws its own caption and publishes those
-/// buttons as ordinary elements. Without it the system contributes a second set.
-const OPTIONS: ProviderOptions =
+const OPTIONS: ProviderOptions = ProviderOptions_ServerSideProvider;
+
+/// What the frame's provider claims: `RefuseNonClientSupport`, because the frame draws its own
+/// caption and the root publishes those buttons as ordinary elements. Without it the system
+/// contributes a title bar of its own beside them.
+const FRAME_OPTIONS: ProviderOptions =
     ProviderOptions_ServerSideProvider | ProviderOptions_RefuseNonClientSupport;
 
 /// `UiaRootObjectId`. A `WM_GETOBJECT` naming any other object id is not ours to answer.
@@ -82,6 +85,11 @@ pub struct Shared {
     /// event nobody advised is not raised.
     pub(crate) advised: super::events::Advised,
     hwnd: AtomicIsize,
+    /// The frame: its queue runs the tick a wake is posted to, and its provider refuses the
+    /// system's non-client elements.
+    frame: AtomicIsize,
+    /// The frame's provider, minted on the frame's first `WM_GETOBJECT`.
+    frame_object: Mutex<Option<Agile>>,
     /// One object per element identity, sorted by it, so an element always answers as the same
     /// object. Automation matches a raised event to a listener by object identity.
     objects: Mutex<Vec<((ControlId, u32), Agile)>>,
@@ -95,9 +103,23 @@ struct Agile(IRawElementProviderSimple);
 unsafe impl Send for Agile {}
 
 impl Shared {
-    /// Records the window every provider answers for.
-    pub fn attach(&self, hwnd: HWND) {
+    /// Records the window every provider answers for, and its frame.
+    pub fn attach(&self, hwnd: HWND, frame: HWND) {
         self.hwnd.store(hwnd as isize, Relaxed);
+        self.frame.store(frame as isize, Relaxed);
+    }
+
+    /// Returns the frame, or null before [`attach`](Self::attach) has run.
+    pub fn frame(&self) -> HWND {
+        self.frame.load(Relaxed) as HWND
+    }
+
+    /// Returns the frame's provider, minting it on the first ask.
+    fn frame_object(self: &Arc<Self>) -> IRawElementProviderSimple {
+        let mut held = self.frame_object.lock().unwrap_or_else(PoisonError::into_inner);
+        held.get_or_insert_with(|| Agile(Frame(Arc::downgrade(self)).into()))
+            .0
+            .clone()
     }
 
     /// Returns the attached window, or null before [`attach`](Self::attach) has run.
@@ -125,7 +147,7 @@ impl Shared {
 
     /// Asks the front thread for a tick.
     pub fn wake(&self) {
-        let hwnd = self.window();
+        let hwnd = self.frame();
         if hwnd.is_null() {
             return;
         }
@@ -192,7 +214,8 @@ pub fn tree_of(shared: &Arc<Shared>) -> Arc<Tree> {
 /// One element: a weak reference to [`Shared`], and the two ids that name it.
 pub struct Element {
     shared: Weak<Shared>,
-    /// [`ControlId::NONE`] is the fragment root, which is the window and is not in the table.
+    /// [`ControlId::NONE`] is the fragment root, which is the content window and is not in the
+    /// table.
     /// No minted control can be it: ids start at generation one.
     pub id: ControlId,
     /// Which part of a presentation region, or [`NO_PART`].
@@ -227,6 +250,14 @@ implement_decl! {
         IScrollProvider,
         ITextProvider2
     ]
+}
+
+/// The frame's provider. It holds no element of its own: every property is the system's host
+/// provider's, and what it adds is the refusal of the system's non-client elements.
+pub struct Frame(Weak<Shared>);
+
+implement_decl! {
+    impl Frame as pub Frame_Impl: [IRawElementProviderSimple]
 }
 
 implement_decl! {
@@ -676,11 +707,13 @@ fn property(element: &Element, id: PROPERTYID) -> Result<VARIANT> {
         .map_or_else(variant::empty, |&(_, answer)| answer(&at)))
 }
 
-/// Answers the properties the window itself carries. The root is not in the table, so it
-/// shares no entry with the elements below it.
+/// Answers the properties the content window itself carries. The root is not in the table, so
+/// it shares no entry with the elements below it.
+///
+/// A pane: the frame above it is the window, and the system's own provider reports it as one.
 fn root_property(id: PROPERTYID) -> VARIANT {
     match id {
-        UIA_ControlTypePropertyId => variant::i4(roles::DIALOG_CONTROL_TYPE),
+        UIA_ControlTypePropertyId => variant::i4(UIA_PaneControlTypeId),
         UIA_IsControlElementPropertyId
         | UIA_IsContentElementPropertyId
         | UIA_IsEnabledPropertyId => variant::bool(true),
@@ -885,16 +918,20 @@ impl Root {
 
     /// Returns the window's host provider, which is what carries the window's own properties.
     fn host(&self) -> Result<IRawElementProviderSimple> {
-        let hwnd = self.shared()?.window();
-        let mut provider = core::ptr::null_mut();
-        // SAFETY: the handle names a window this process owns and the out-pointer is a local.
-        // The call transfers one reference, which `from_raw` takes ownership of.
-        unsafe {
-            UiaHostProviderFromHwnd(hwnd, &raw mut provider).ok()?;
-            IRawElementProviderSimple::from_raw(provider)
-                .cast()
-                .or(Err(none()))
-        }
+        host_of(self.shared()?.window())
+    }
+}
+
+/// Returns the system's host provider for `hwnd`, which carries that window's own properties.
+fn host_of(hwnd: HWND) -> Result<IRawElementProviderSimple> {
+    let mut provider = core::ptr::null_mut();
+    // SAFETY: the handle names a window this process owns and the out-pointer is a local. The
+    // call transfers one reference, which `from_raw` takes ownership of.
+    unsafe {
+        UiaHostProviderFromHwnd(hwnd, &raw mut provider).ok()?;
+        IRawElementProviderSimple::from_raw(provider)
+            .cast()
+            .or(Err(none()))
     }
 }
 
@@ -919,8 +956,8 @@ vtable! {
         fn ProviderOptions(&self) -> Result<ProviderOptions> { Ok(OPTIONS) }
         fn GetPatternProvider(&self, id: PATTERNID) -> Result<IUnknown> { pattern(&self.this, id) }
         fn GetPropertyValue(&self, id: PROPERTYID) -> Result<VARIANT> { property(&self.this, id) }
-        // Only the fragment root has a host: it is the window, and a child claiming one would
-        // be announced as a second window.
+        // Only the fragment root has a host: it is the content window, and a child claiming one
+        // would be announced as a second window.
         fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> { Err(none()) }
     }
     IRawElementProviderFragment_Impl for Element_Impl {
@@ -937,9 +974,17 @@ vtable! {
         }
         fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> { root_of(&self.this) }
     }
+    IRawElementProviderSimple_Impl for Frame_Impl {
+        fn ProviderOptions(&self) -> Result<ProviderOptions> { Ok(FRAME_OPTIONS) }
+        fn GetPatternProvider(&self, _: PATTERNID) -> Result<IUnknown> { Err(none()) }
+        fn GetPropertyValue(&self, _: PROPERTYID) -> Result<VARIANT> { Ok(variant::empty()) }
+        fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
+            host_of(self.0.upgrade().ok_or_else(gone)?.frame())
+        }
+    }
     IRawElementProviderSimple_Impl for Root_Impl {
         fn ProviderOptions(&self) -> Result<ProviderOptions> { Ok(OPTIONS) }
-        // The root is the window: it holds no value, no text and nothing to invoke.
+        // The root is the content window: it holds no value, no text and nothing to invoke.
         fn GetPatternProvider(&self, _: PATTERNID) -> Result<IUnknown> { Err(none()) }
         fn GetPropertyValue(&self, id: PROPERTYID) -> Result<VARIANT> { Ok(root_property(id)) }
         fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> { self.this.host() }
@@ -950,7 +995,7 @@ vtable! {
         fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> { Ok(core::ptr::null_mut()) }
         fn get_BoundingRectangle(&self) -> Result<UiaRect> { self.this.bounds() }
         fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> { Ok(core::ptr::null_mut()) }
-        // The window takes focus through the system, not through a queued command.
+        // The content window takes keyboard focus from its frame, not through a queued command.
         fn SetFocus(&self) -> Result<()> { Ok(()) }
         fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> { root_of(&self.this) }
     }
@@ -1396,12 +1441,17 @@ pub fn provider_for(shared: &Arc<Shared>, id: ControlId) -> Option<IRawElementPr
 /// Must be called while the window handle is still valid, which puts it on `WM_DESTROY` rather
 /// than on a drop.
 pub fn disconnect(shared: &Arc<Shared>) {
-    let hwnd = shared.window();
+    let (hwnd, frame) = (shared.window(), shared.frame());
     if !hwnd.is_null() && shared.asked.swap(false, Relaxed) {
-        // SAFETY: the handle names a window this process owns and has not yet destroyed, and a
-        // null provider is the documented argument for releasing its cache.
-        unsafe { _ = UiaReturnRawElementProvider(hwnd, 0, 0, core::ptr::null_mut()) }
+        // SAFETY: both handles name windows this process owns and has not yet destroyed — this
+        // runs from the content window's `WM_DESTROY`, and a parent outlives its children's —
+        // and a null provider is the documented argument for releasing a window's cache.
+        unsafe {
+            _ = UiaReturnRawElementProvider(hwnd, 0, 0, core::ptr::null_mut());
+            _ = UiaReturnRawElementProvider(frame, 0, 0, core::ptr::null_mut());
+        }
     }
+    *shared.frame_object.lock().unwrap_or_else(PoisonError::into_inner) = None;
     shared.forget();
 }
 
@@ -1422,6 +1472,18 @@ pub fn get_object(shared: &Arc<Shared>, w: WPARAM, l: LPARAM) -> Option<LRESULT>
     // SAFETY: the handle names a window this process owns, and `object` holds a reference for
     // the whole call — `UiaReturnRawElementProvider` takes its own.
     Some(unsafe { UiaReturnRawElementProvider(shared.window(), w, l, object.as_raw()) })
+}
+
+/// Answers the frame's `WM_GETOBJECT` with the frame's provider, or `None` when `l` names
+/// another object.
+pub fn get_frame_object(shared: &Arc<Shared>, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
+    if l as i32 != ROOT_OBJECT_ID {
+        return None;
+    }
+    let object = shared.frame_object();
+    // SAFETY: the handle names a window this process owns, and `object` holds a reference for
+    // the whole call — `UiaReturnRawElementProvider` takes its own.
+    Some(unsafe { UiaReturnRawElementProvider(shared.frame(), w, l, object.as_raw()) })
 }
 
 /// Resolves a mounted popup before answering its fixed window capabilities.

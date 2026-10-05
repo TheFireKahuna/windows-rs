@@ -192,37 +192,27 @@ impl UiRuntime {
         let failed: Rc<RefCell<Option<Error>>> = Rc::default();
 
         let window = window
-            // The tick, and the doorbell for every other message. `WM_FRAME` is answered inside
-            // the window procedure rather than after the pump returns, so a drag-resize keeps
-            // routing: the system's sizing loop pumps this message and does not return until
-            // the contact lifts.
+            // The tick. `WM_FRAME` is answered inside the window procedure rather than after the
+            // pump returns, so a drag-resize keeps routing: the system's sizing loop pumps this
+            // message and does not return until the contact lifts.
             //
             // Chained, so a caller's own handler survives being handed to this method and
             // answers first. Replacing it would discard it without a diagnostic.
             .chain_message({
                 let (frame, failed) = (Rc::downgrade(&frame), Rc::clone(&failed));
-                let (uia, rescaled) = (Rc::clone(&uia), Rc::clone(&rescaled));
-                let (bell, settings) = (Rc::clone(&bell), Rc::clone(&settings));
+                let (rescaled, settings) = (Rc::clone(&rescaled), Rc::clone(&settings));
+                let uia = Rc::clone(&uia);
                 move |_, msg, w, l| {
-                    // The system's own questions, answered before the tick: a settings change
-                    // and a move both re-read the display, `WM_GETOBJECT` is a synchronous
-                    // cross-process call, and `WM_DESTROY` releases the provider while its
-                    // handle is still valid.
+                    // A settings change and a move both re-read the display, and `WM_GETOBJECT`
+                    // is a synchronous cross-process call.
                     match msg {
                         WM_SETTINGCHANGE => {
                             settings.set(true);
                             rescaled.post(());
                         }
                         WM_MOVE => rescaled.post(()),
-                        WM_GETOBJECT => return uia.borrow_mut().get_object(w, l),
-                        WM_DESTROY => uia.borrow_mut().detach(),
+                        WM_GETOBJECT => return uia.borrow_mut().get_frame_object(w, l),
                         _ => {}
-                    }
-                    // The doorbell answers without the tick, so a pointer or key message the
-                    // system's nested pump dispatches while a pass is on the stack is recorded
-                    // in the order it arrived rather than dropped for want of a borrow.
-                    if let Some(answer) = bell.wndproc(msg, w, l) {
-                        return Some(answer);
                     }
                     if msg != WM_FRAME {
                         return None;
@@ -232,6 +222,26 @@ impl UiRuntime {
                         windows_window::quit();
                     }
                     Some(0)
+                }
+            })
+            // The content window takes every pointer and key message and is what automation
+            // asks for its provider; the scene's target is bound to it, because a target on the
+            // top-level window gets no input sink and its trackers never see a wheel or a
+            // touchpad gesture.
+            .content_window({
+                let (uia, bell) = (Rc::clone(&uia), Rc::clone(&bell));
+                move |_, msg, w, l| {
+                    // `WM_GETOBJECT` is a synchronous cross-process call, and `WM_DESTROY`
+                    // releases the provider while its handle is still valid.
+                    match msg {
+                        WM_GETOBJECT => return uia.borrow_mut().get_object(w, l),
+                        WM_DESTROY => uia.borrow_mut().detach(),
+                        _ => {}
+                    }
+                    // The doorbell answers without the tick, so a pointer or key message the
+                    // system's nested pump dispatches while a pass is on the stack is recorded
+                    // in the order it arrived rather than dropped for want of a borrow.
+                    bell.wndproc(msg, w, l)
                 }
             })
             .on_resize({
@@ -246,8 +256,9 @@ impl UiRuntime {
             .create()?;
         // Shared with the tick, which outlives every stack frame here.
         let window = Rc::new(window);
+        let content = window.content().ok_or_else(closed)?;
 
-        uia.borrow_mut().attach(window.hwnd());
+        uia.borrow_mut().attach(content.raw(), window.hwnd());
         let text = crate::text_input::TextInput::new(&window)?;
         // The one seam a harness drives a docked occlusion through, published where the window's
         // own text input is built so what it reaches is the production mailbox.

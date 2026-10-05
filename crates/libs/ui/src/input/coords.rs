@@ -2,7 +2,7 @@
 //!
 //! `POINTER_INFO.ptPixelLocation` and `ptPixelLocationRaw` are **screen physical**. The hit
 //! array is built in **client DIPs**. This module crosses that gap in one place, so the
-//! pointer, the wheel, the caption band, focus order and automation all resolve through one
+//! pointer, the caption band, focus order and automation all resolve through one
 //! conversion rather than through two that can disagree. Reading a pointer is part of the same
 //! job, because every read ends in that conversion.
 //!

@@ -82,6 +82,7 @@ pub mod rotary;
 // atomic, so a client reads it from its own thread without involving the window's thread.
 #[expect(non_upper_case_globals, reason = "the property and pattern ids are matched by their bound names")]
 pub mod uia;
+pub(crate) mod wheel;
 
 mod front;
 

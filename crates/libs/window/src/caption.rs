@@ -227,6 +227,11 @@ pub(crate) struct Caption {
     state: Cell<CaptionState>,
     on_state: RefCell<Option<StateSink>>,
     border: Cell<BorderColor>,
+    /// The answer the content window resolved for the point it passed through, taken by the
+    /// frame's hit test of that same point. The system asks the frame synchronously after the
+    /// content window answers `HTTRANSPARENT`, so this lives for one hit test and is a handoff
+    /// between the two windows' halves of it, not a cache of answers.
+    handoff: Cell<Option<(LPARAM, i32)>>,
 }
 
 impl Caption {
@@ -237,7 +242,21 @@ impl Caption {
             state: Cell::new(CaptionState::default()),
             on_state: RefCell::new(None),
             border: Cell::new(BorderColor::System),
+            handoff: Cell::new(None),
         }
+    }
+
+    /// Resolves the content window's hit test of a point: `true` where the caption claims it,
+    /// which the content window answers `HTTRANSPARENT` so the system asks `frame` next.
+    pub(crate) fn pass_through(&self, frame: HWND, lparam: LPARAM) -> bool {
+        let (x, y) = screen_point(lparam);
+        let code = self.hit_code(frame, x, y);
+        if code == HTCLIENT {
+            self.handoff.set(None);
+            return false;
+        }
+        self.handoff.set(Some((lparam, code)));
+        true
     }
 
     pub(crate) fn spec(&self) -> CaptionSpec {
@@ -351,6 +370,11 @@ impl Caption {
             }
 
             WM_NCHITTEST => {
+                if let Some((point, code)) = self.handoff.take()
+                    && point == lparam
+                {
+                    return Some(code as isize);
+                }
                 let (x, y) = screen_point(lparam);
                 Some(self.hit_code(hwnd, x, y) as isize)
             }

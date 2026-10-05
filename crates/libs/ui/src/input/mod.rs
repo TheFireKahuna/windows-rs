@@ -5,8 +5,8 @@
 //!  front thread — WndProc                     front thread — service tick
 //!  ───────────────────────────────            ────────────────────────────────────────
 //!  WM_POINTERDOWN / UP / cancel   ─ring──▶    1. drain ring in order → flat hit test
-//!  WM_POINTERWHEEL / HWHEEL       ─ring──▶    2. active contact?
-//!  WM_KEY* / WM_CHAR              ─ring──▶         batch → ProcessMoveEvents
+//!  WM_KEY* / WM_CHAR              ─ring──▶    2. active contact?
+//!                                                  batch → ProcessMoveEvents
 //!        └─ and post WM_FRAME now                  (recogniser events → gesture sinks)
 //!                                             3. at most once per tick: every RAW
 //!  WM_POINTERUPDATE               ─flag──▶       sample in the batch → crossings
@@ -60,7 +60,7 @@ pub use platform::{Capability, Inertia, Late, Service};
 
 use crate::bindings::*;
 use crate::gesture::{
-    Contacts, DragUpdate, Events, Feed, Flags, Recognised, SLOTS, pivot_of, scroll_ancestor,
+    Contacts, DragUpdate, Events, Feed, Flags, Recognised, SLOTS, pivot_of,
     scroll_offer,
 };
 use crate::rotary::{Rotary, Rotation};
@@ -147,15 +147,13 @@ pub enum Report {
         contact: u32,
         update: DragUpdate,
     },
-    /// A wheel notch over a target that is not a scroll surface. A scroll container's wheel
-    /// does not reach here: `PointerWheelConfig` routes it to that container's tracker on the
-    /// compositor side, with no front-thread work.
+    /// Wheel detents a control's own source took. Raised on the scene thread from that
+    /// source's tracker: the compositor gives the wheel to the source, and no window message
+    /// carries it.
     Wheel {
-        target: Option<ControlId>,
-        at: Point,
-        /// Notches, signed. One detent is `1.0`.
+        target: ControlId,
+        /// Notches, signed and fractional. One detent is `1.0`.
         notches: f32,
-        horizontal: bool,
     },
     Key {
         target: Option<ControlId>,
@@ -455,7 +453,6 @@ impl Router {
         match p.kind {
             EventKind::Down => return self.press(p, hits, env, out),
             EventKind::Up => return self.up(p, hits, env, out),
-            EventKind::Wheel => return self.wheel(p, hits, env, out),
             EventKind::Cancel => {
                 // A window-level capture change names no pointer, so it ends whatever held the
                 // explicit capture and nothing where none did.
@@ -696,47 +693,6 @@ impl Router {
         // Returned last, so a refused sample reaches the caller only after the contact has
         // been fully ended rather than leaving this stack still holding it.
         fed
-    }
-
-    fn wheel(
-        &mut self,
-        p: &PointerEvent,
-        hits: &HitTable,
-        env: Env,
-        out: &mut Vec<Report>,
-    ) -> Result<()> {
-        let at = self.bell.coords().client(env, p.id, p.x_px, p.y_px);
-        self.census.discrete_hits += 1;
-        let hit = hits.hit(at, p.ptype.contact());
-        // A scroll surface's wheel belongs to its tracker: the source's `PointerWheelConfig`
-        // takes it, and handling it front-side here would be a second scroll path.
-        if hit.is_some_and(|hit| {
-            (hit.flags.contains(HitFlags::SCROLL) || !hit.flags.contains(HitFlags::WHEEL))
-                && scroll_ancestor(hits, hit).is_some()
-        }) {
-            return Ok(());
-        }
-        if let Some(hit) = hit
-            && self
-                .contacts
-                .bound(p.id)
-                .is_some_and(|(target, _)| target == hit.id)
-            && let Some(point) = p.point()
-        {
-            // A pointer wheel message packs the pointer id where the legacy one packs the
-            // modifier keys, so neither shift nor control is readable from the record.
-            self.contacts
-                .feed(p.id, Feed::Wheel(point?, false, false))?;
-            self.collect(p.id, hits, out);
-            return Ok(());
-        }
-        out.push(Report::Wheel {
-            target: hit.map(|hit| hit.id),
-            at,
-            notches: p.wheel as f32 / WHEEL_DELTA as f32,
-            horizontal: p.horizontal,
-        });
-        Ok(())
     }
 
     fn key(&mut self, event: KeyEvent, hits: &HitTable, out: &mut Vec<Report>) {

@@ -28,6 +28,16 @@
 // A window with no redirection surface: its content is whatever the compositor is given, and
 // nothing is drawn into a bitmap the window owns.
     WS_EX_NOREDIRECTIONBITMAP
+// The content window: a child filling the client area that takes input, focus, text and
+// automation. The system compositor gives a target's root an input sink only on a child window.
+// Its hit test passes the caption's points through to the frame.
+    WS_CHILD
+    WS_VISIBLE
+    WS_CLIPSIBLINGS
+    GetParent
+    SetFocus
+    WM_SETFOCUS
+    HTTRANSPARENT
     GetClientRect
     GetWindowRect
     ScreenToClient

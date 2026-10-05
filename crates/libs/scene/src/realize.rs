@@ -1032,6 +1032,9 @@ struct Entry {
 /// instead, and runs only while the cache is at capacity.
 pub struct Cache {
     map: FxHashMap<CellKey, Entry>,
+    /// The one brush every [`Paint::Clear`] sprite carries. A colour brush holds no surface,
+    /// so device loss leaves it valid.
+    clear: Option<windows_composition::CompositionColorBrush>,
     cap: usize,
     /// Monotonic, incremented per lookup. At one lookup per nanosecond this takes five
     /// centuries to wrap.
@@ -1052,6 +1055,7 @@ impl Default for Cache {
     fn default() -> Self {
         Self {
             map: FxHashMap::default(),
+            clear: None,
             cap: CACHE_CAP,
             clock: 0,
             hits: 0,
@@ -1066,6 +1070,13 @@ impl Cache {
     /// re-rasterized in place on its next use rather than swept.
     pub fn clear(&mut self) {
         self.map.clear();
+    }
+
+    /// The transparent brush a [`Paint::Clear`] sprite carries, created on first use.
+    fn clear_brush(&mut self, back: &Backends) -> CompositionBrush {
+        self.clear
+            .get_or_insert_with(|| back.compositor.create_color_brush(Color::rgba(0, 0, 0, 0)))
+            .as_brush()
     }
 
     #[must_use]
@@ -1899,6 +1910,7 @@ fn paint_brush(
         Paint::Presented { region, .. } => ctx.res.brush(region.erased()).map(Brush::as_brush),
         Paint::PresentedView { .. } => unreachable!("view brushes are owned by their sprite"),
         Paint::Captured { .. } => captured.map(|held| held.brush.as_brush()),
+        Paint::Clear => Some(ctx.cache.clear_brush(ctx.back)),
         Paint::None => None,
     })
 }

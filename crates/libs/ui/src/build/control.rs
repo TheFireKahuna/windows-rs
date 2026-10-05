@@ -38,7 +38,7 @@ pub struct Shortcut {
 #[derive(Default)]
 pub(crate) struct Handlers {
     pub click: Option<Rc<dyn Fn()>>,
-    pub wheel: Option<Rc<dyn Fn(f32, bool)>>,
+    pub wheel: Option<Rc<dyn Fn(f32)>>,
     pub double_tap: Option<Rc<dyn Fn(windows_scene::Point)>>,
     pub choice: Option<(u32, String)>,
     pub expand: Option<Rc<dyn Fn(bool)>>,
@@ -367,9 +367,14 @@ impl<K> Element<'_, K> {
         })
     }
 
-    /// Receives signed wheel detents and whether the wheel is horizontal.
-    /// The positional hit target owns the event; pointer gestures remain unchanged.
-    pub fn on_wheel(self, callback: impl Fn(f32, bool) + 'static) -> Self {
+    /// Receives signed, fractional vertical wheel detents.
+    ///
+    /// The control gets a wheel source of its own, which takes the wheel wherever this
+    /// control's visual paints — inside a scroll container too, whose own source then does not
+    /// see it — and leaves the touchpad to whatever is beneath. Pointer gestures are unchanged.
+    pub fn on_wheel(mut self, callback: impl Fn(f32) + 'static) -> Self {
+        let (node, control) = (self.node_id(), self.control_id());
+        self.host().mount_wheel(node, control);
         self.handler(HitFlags::INTERACTIVE | HitFlags::WHEEL, |row| {
             row.wheel.replace(Rc::new(callback)).map(Retired::new)
         })

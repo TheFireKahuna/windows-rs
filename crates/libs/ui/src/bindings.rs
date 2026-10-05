@@ -1589,25 +1589,6 @@ impl IGestureRecognizer {
             .ok()
         }
     }
-    pub fn ProcessMouseWheelEvent<P0>(
-        &self,
-        value: P0,
-        isshiftkeydown: bool,
-        iscontrolkeydown: bool,
-    ) -> windows_core::Result<()>
-    where
-        P0: windows_core::Param<PointerPoint>,
-    {
-        unsafe {
-            (windows_core::Interface::vtable(self).ProcessMouseWheelEvent)(
-                windows_core::Interface::as_raw(self),
-                value.param().abi(),
-                isshiftkeydown,
-                iscontrolkeydown,
-            )
-            .ok()
-        }
-    }
     pub fn ProcessInertia(&self) -> windows_core::Result<()> {
         unsafe {
             (windows_core::Interface::vtable(self).ProcessInertia)(windows_core::Interface::as_raw(
@@ -1944,12 +1925,7 @@ pub struct IGestureRecognizer_Vtbl {
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
-    pub ProcessMouseWheelEvent: unsafe extern "system" fn(
-        *mut core::ffi::c_void,
-        *mut core::ffi::c_void,
-        bool,
-        bool,
-    ) -> windows_core::HRESULT,
+    ProcessMouseWheelEvent: usize,
     pub ProcessInertia: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
     pub CompleteGesture: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
     pub Tapped: unsafe extern "system" fn(
@@ -3201,26 +3177,6 @@ impl IPointerPointProperties {
             .map(|| result__)
         }
     }
-    pub fn MouseWheelDelta(&self) -> windows_core::Result<i32> {
-        unsafe {
-            let mut result__ = core::mem::zeroed();
-            (windows_core::Interface::vtable(self).MouseWheelDelta)(
-                windows_core::Interface::as_raw(self),
-                &mut result__,
-            )
-            .map(|| result__)
-        }
-    }
-    pub fn IsHorizontalMouseWheel(&self) -> windows_core::Result<bool> {
-        unsafe {
-            let mut result__ = core::mem::zeroed();
-            (windows_core::Interface::vtable(self).IsHorizontalMouseWheel)(
-                windows_core::Interface::as_raw(self),
-                &mut result__,
-            )
-            .map(|| result__)
-        }
-    }
     pub fn IsPrimary(&self) -> windows_core::Result<bool> {
         unsafe {
             let mut result__ = core::mem::zeroed();
@@ -3295,10 +3251,8 @@ pub struct IPointerPointProperties_Vtbl {
     IsLeftButtonPressed: usize,
     IsRightButtonPressed: usize,
     IsMiddleButtonPressed: usize,
-    pub MouseWheelDelta:
-        unsafe extern "system" fn(*mut core::ffi::c_void, *mut i32) -> windows_core::HRESULT,
-    pub IsHorizontalMouseWheel:
-        unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+    MouseWheelDelta: usize,
+    IsHorizontalMouseWheel: usize,
     pub IsPrimary:
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
     pub IsInRange:
@@ -12132,7 +12086,6 @@ pub const VK_SHIFT: i32 = 16;
 pub const VK_SPACE: i32 = 32;
 pub const VK_TAB: i32 = 9;
 pub const VK_UP: i32 = 38;
-pub const WHEEL_DELTA: i32 = 120;
 pub const WM_CAPTURECHANGED: i32 = 533;
 pub const WM_CHAR: i32 = 258;
 pub const WM_GETOBJECT: i32 = 61;
@@ -12143,7 +12096,6 @@ pub const WM_POINTERCAPTURECHANGED: i32 = 588;
 pub const WM_POINTERDOWN: i32 = 582;
 pub const WM_POINTERENTER: i32 = 585;
 pub const WM_POINTERHWHEEL: i32 = 591;
-pub const WM_NCPOINTERUPDATE: i32 = 577;
 pub const WM_POINTERLEAVE: i32 = 586;
 pub const WM_POINTERUP: i32 = 583;
 pub const WM_POINTERUPDATE: i32 = 581;

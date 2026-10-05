@@ -14,6 +14,7 @@ windows_core::link!("kernel32.dll" "system" fn GetCurrentThread() -> HANDLE);
 windows_core::link!("user32.dll" "system" fn GetDpiForWindow(hwnd : HWND) -> u32);
 windows_core::link!("user32.dll" "system" fn GetMessageW(lpmsg : *mut MSG, hwnd : HWND, wmsgfiltermin : u32, wmsgfiltermax : u32) -> windows_core::BOOL);
 windows_core::link!("kernel32.dll" "system" fn GetModuleHandleW(lpmodulename : windows_core::PCWSTR) -> HMODULE);
+windows_core::link!("user32.dll" "system" fn GetParent(hwnd : HWND) -> HWND);
 windows_core::link!("user32.dll" "system" fn GetPointerInfo(pointerid : u32, pointerinfo : *mut POINTER_INFO) -> windows_core::BOOL);
 windows_core::link!("kernel32.dll" "system" fn GetProcAddress(hmodule : HMODULE, lpprocname : windows_core::PCSTR) -> FARPROC);
 windows_core::link!("user32.dll" "system" fn GetSystemMetricsForDpi(nindex : i32, dpi : u32) -> i32);
@@ -40,6 +41,7 @@ windows_core::link!("user32.dll" "system" fn RegisterClassW(lpwndclass : *const 
 windows_core::link!("user32.dll" "system" fn ScreenToClient(hwnd : HWND, lppoint : *mut POINT) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn SendMessageW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> LRESULT);
 windows_core::link!("kernel32.dll" "system" fn SetEvent(hevent : HANDLE) -> windows_core::BOOL);
+windows_core::link!("user32.dll" "system" fn SetFocus(hwnd : HWND) -> HWND);
 windows_core::link!("user32.dll" "system" fn SetProcessDpiAwarenessContext(value : DPI_AWARENESS_CONTEXT) -> windows_core::BOOL);
 windows_core::link!("kernel32.dll" "system" fn SetThreadInformation(hthread : HANDLE, threadinformationclass : THREAD_INFORMATION_CLASS, threadinformation : *const core::ffi::c_void, threadinformationsize : u32) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn SetWindowFeedbackSetting(hwnd : HWND, feedback : FEEDBACK_TYPE, dwflags : u32, size : u32, configuration : *const core::ffi::c_void) -> windows_core::BOOL);
@@ -271,6 +273,7 @@ pub const HTRIGHT: i32 = 11;
 pub const HTTOP: i32 = 12;
 pub const HTTOPLEFT: i32 = 13;
 pub const HTTOPRIGHT: i32 = 14;
+pub const HTTRANSPARENT: i32 = -1;
 pub type HWND = *mut core::ffi::c_void;
 windows_core::imp::define_interface!(
     IAdvancedColorInfo,
@@ -1009,6 +1012,7 @@ pub const WM_NCPOINTERUP: i32 = 579;
 pub const WM_NCPOINTERUPDATE: i32 = 577;
 pub const WM_POINTERLEAVE: i32 = 586;
 pub const WM_QUIT: i32 = 18;
+pub const WM_SETFOCUS: i32 = 7;
 pub const WM_SIZE: i32 = 5;
 pub const WM_SYSCOMMAND: i32 = 274;
 pub const WM_THEMECHANGED: i32 = 794;
@@ -1032,7 +1036,10 @@ pub type WNDPROC = Option<
     unsafe extern "system" fn(param0: HWND, param1: u32, param2: WPARAM, param3: LPARAM) -> LRESULT,
 >;
 pub type WPARAM = usize;
+pub const WS_CHILD: i32 = 1073741824;
+pub const WS_CLIPSIBLINGS: i32 = 67108864;
 pub const WS_EX_NOREDIRECTIONBITMAP: i32 = 2097152;
 pub const WS_MAXIMIZEBOX: i32 = 65536;
 pub const WS_OVERLAPPEDWINDOW: i32 = 13565952;
 pub const WS_THICKFRAME: i32 = 262144;
+pub const WS_VISIBLE: i32 = 268435456;

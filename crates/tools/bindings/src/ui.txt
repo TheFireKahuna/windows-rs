@@ -77,7 +77,6 @@
     WM_POINTERUPDATE
     WM_POINTERENTER
     WM_POINTERLEAVE
-    WM_NCPOINTERUPDATE
     WM_POINTERCAPTURECHANGED
     WM_POINTERWHEEL
     WM_POINTERHWHEEL
@@ -132,7 +131,6 @@
     GetCapture
     GetKeyState
     GetAsyncKeyState
-    WHEEL_DELTA
     WM_CAPTURECHANGED
     WM_KEYDOWN
     WM_KEYUP
@@ -169,15 +167,15 @@
 // shell with nothing callable on it — the same trap `windows-window` hit on
 // `IDisplayInformation5`. What is *not* named is as deliberate: no `CanBeDoubleTap` (the
 // recogniser answers double-tap itself through `GestureSettings::DoubleTap`), no
-// `MouseWheelParameters` (wheel over a scroll surface is the tracker's, and wheel over
-// anything else is a gesture whose step this stack states), and no cross-slide thresholds
+// wheel member (every wheel is taken by a scroll container's or a wheel control's own
+// interaction source, compositor-side, and none reaches a recogniser), and no cross-slide thresholds
 // (there is no cross-slide consumer yet, and a threshold set from nowhere is worse than the
 // default).
     Windows.UI.Input.GestureRecognizer
 // Standalone activation: a recogniser is minted per contact from a pool, and there is no
 // view to obtain one from.
     Windows.UI.Input.GestureRecognizer::CreateInstance
-    Windows.UI.Input.IGestureRecognizer::{get_GestureSettings, put_GestureSettings, get_IsActive, get_IsInertial, put_ShowGestureFeedback, put_ManipulationExact, put_AutoProcessInertia, put_PivotCenter, put_PivotRadius, put_InertiaTranslationDeceleration, put_InertiaRotationDeceleration, put_InertiaExpansionDeceleration, ProcessDownEvent, ProcessMoveEvents, ProcessUpEvent, ProcessMouseWheelEvent, ProcessInertia, CompleteGesture, add_Tapped, remove_Tapped, add_RightTapped, remove_RightTapped, add_Holding, remove_Holding, add_Dragging, remove_Dragging, add_ManipulationStarted, remove_ManipulationStarted, add_ManipulationUpdated, remove_ManipulationUpdated, add_ManipulationInertiaStarting, remove_ManipulationInertiaStarting, add_ManipulationCompleted, remove_ManipulationCompleted}
+    Windows.UI.Input.IGestureRecognizer::{get_GestureSettings, put_GestureSettings, get_IsActive, get_IsInertial, put_ShowGestureFeedback, put_ManipulationExact, put_AutoProcessInertia, put_PivotCenter, put_PivotRadius, put_InertiaTranslationDeceleration, put_InertiaRotationDeceleration, put_InertiaExpansionDeceleration, ProcessDownEvent, ProcessMoveEvents, ProcessUpEvent, ProcessInertia, CompleteGesture, add_Tapped, remove_Tapped, add_RightTapped, remove_RightTapped, add_Holding, remove_Holding, add_Dragging, remove_Dragging, add_ManipulationStarted, remove_ManipulationStarted, add_ManipulationUpdated, remove_ManipulationUpdated, add_ManipulationInertiaStarting, remove_ManipulationInertiaStarting, add_ManipulationCompleted, remove_ManipulationCompleted}
 // Hold tuning and the contact-count bounds arrived in 2004, on their own interface. A
 // knob that must not be claimed by a two-finger contact needs the maxima, not just the
 // delay.
@@ -191,7 +189,7 @@
 // whether the decision is continuous or discrete. Both are read.
     Windows.UI.Input.IPointerPoint::{get_PointerId, get_Position, get_RawPosition, get_Timestamp, get_IsInContact, get_Properties}
     Windows.UI.Input.PointerPointProperties
-    Windows.UI.Input.IPointerPointProperties::{get_Pressure, get_XTilt, get_YTilt, get_Twist, get_Orientation, get_ContactRect, get_ContactRectRaw, get_TouchConfidence, get_IsPrimary, get_IsInRange, get_IsCanceled, get_IsBarrelButtonPressed, get_IsEraser, get_IsInverted, get_MouseWheelDelta, get_IsHorizontalMouseWheel, get_PointerUpdateKind}
+    Windows.UI.Input.IPointerPointProperties::{get_Pressure, get_XTilt, get_YTilt, get_Twist, get_Orientation, get_ContactRect, get_ContactRectRaw, get_TouchConfidence, get_IsPrimary, get_IsInRange, get_IsCanceled, get_IsBarrelButtonPressed, get_IsEraser, get_IsInverted, get_PointerUpdateKind}
     Windows.UI.Input.IPointerPointStatics
 // Implemented, not called: the recogniser asks *us* to transform, which is how it comes to
 // report in the same space the hit array is built in.

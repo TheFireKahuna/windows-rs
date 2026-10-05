@@ -14,7 +14,8 @@ use std::sync::Arc;
 use windows_numerics::Vector2;
 use windows_present::{Extent, Queue};
 use windows_scene::{
-    Census, ControlId, Env, HitTable, NodeId, RegionId, SceneEvent, SinkPatch, SpriteId, TrackerId,
+    Census, ControlId, Env, HitTable, NodeId, Observed, RegionId, SceneEvent, SinkPatch, SpriteId,
+    TrackerId,
 };
 use windows_window::{CaptionState, Event};
 
@@ -505,6 +506,8 @@ row! {
         regions: Vec<RegionOp>,
         /// Read by `ScrollTable::apply_ops`, and relayed as front rows to the router.
         scrolls: Vec<ScrollOp>,
+        /// Read by `WheelTable::apply`.
+        wheels: Vec<WheelOp>,
         /// Read by `TextInput`: a field's source, its solved line boxes, and the text a commit
         /// carries back to its handler.
         fields: Fields,
@@ -764,6 +767,18 @@ pub(crate) enum ScrollOp {
     },
     Drop {
         viewport: NodeId,
+    },
+}
+
+/// A wheel control's source, as the scene thread reads its tracker.
+pub(crate) enum WheelOp {
+    /// The control's tracker exists.
+    Add {
+        tracker: TrackerId<Observed>,
+        control: ControlId,
+    },
+    Drop {
+        tracker: TrackerId<Observed>,
     },
 }
 

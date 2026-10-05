@@ -1,29 +1,28 @@
 //! Probe: a `Windows.UI.Composition` scene owned by a thread that is not the window's.
 //!
 //! The window and its pump live on the main thread. A second thread creates the dispatcher
-//! queue, the compositor and the `DesktopWindowTarget` for that window's `HWND`, and then waits
-//! on an event plus its own message queue — no window message and no clock. The probe drives
-//! itself from a third thread and reads the answers back off the screen:
+//! queue, the compositor and the `DesktopWindowTarget` for the window's content window, and
+//! then waits on an event plus its own message queue — no window message and no clock. The
+//! probe drives itself from a third thread and reads the answers back off the screen:
 //!
 //! 1. the target renders — a red square is on screen;
 //! 2. a property write made from an event-driven wake publishes — the square turns green;
 //! 3. a compositor animation started the same way plays — the square springs right;
 //! 4. an `InteractionTracker` owner callback lands on the scene thread — a wheel notch over
-//!    the window reports `ValuesChanged` there;
+//!    the window moves the tracker, which reports `ValuesChanged` there;
 //! 5. a resize while the target is foreign-owned does not fault;
 //! 6. teardown in the reverse order is clean.
+//!
+//! The target is on the content window because the system compositor attaches the input sink
+//! that routes a wheel to a `VisualInteractionSource` only to a target whose window has
+//! `WS_CHILD`, and the source's visual is painted because that routing follows the compositor's
+//! hit test, which finds content rather than bounds.
 //!
 //! Exit code 0 when every check passes, 1 otherwise, with each verdict printed.
 //!
 //! `--same-thread` builds the identical scene on the window's own thread, as a control.
-//! `--manual` waits for a real wheel notch instead of injecting one: injected wheel input is
-//! not redirected to a tracker on any thread, so only a device answers the routing question.
+//! `--manual` waits for a real wheel notch instead of injecting one.
 //!
-//! Outcome on Windows 11 26200: every check passes off-thread, including a real wheel notch
-//! redirected to the foreign-thread tracker. Wheel-driven motion raised no owner callback in
-//! either mode while a direct request did; the two long-scroll checks after a manual wheel
-//! sample points the scrolled layer has left, and pass in the injected run.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -89,6 +88,7 @@ unsafe extern "system" {
     fn GetDC(hwnd: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
     fn ReleaseDC(hwnd: *mut core::ffi::c_void, hdc: *mut core::ffi::c_void) -> i32;
     fn GetWindowRect(hwnd: *mut core::ffi::c_void, rect: *mut Rect) -> i32;
+    fn GetClientRect(hwnd: *mut core::ffi::c_void, rect: *mut Rect) -> i32;
     fn ClientToScreen(hwnd: *mut core::ffi::c_void, point: *mut [i32; 2]) -> i32;
     fn SetCursorPos(x: i32, y: i32) -> i32;
     fn SendInput(count: u32, inputs: *const Input, size: i32) -> u32;
@@ -116,6 +116,8 @@ unsafe extern "system" {
 /// What the scene thread and the driver share. Plain atomics: this is a probe, not the seam.
 struct Shared {
     hwnd: AtomicUsize,
+    /// The content window, which the target is bound to and input is delivered to.
+    content: AtomicUsize,
     command: AtomicU32,
     wake: Event,
     scene_thread: AtomicU32,
@@ -133,6 +135,7 @@ use std::sync::atomic::AtomicUsize;
 fn main() -> Result<()> {
     let shared = Arc::new(Shared {
         hwnd: AtomicUsize::new(0),
+        content: AtomicUsize::new(0),
         command: AtomicU32::new(CMD_NONE),
         wake: Event::auto_reset()?,
         scene_thread: AtomicU32::new(0),
@@ -148,7 +151,7 @@ fn main() -> Result<()> {
         .size_dips(640.0, 400.0)
         .pointer_input()
         .quit_on_close(true)
-        .chain_message({
+        .content_window({
             let shared = Arc::clone(&shared);
             move |_, message, _, _| {
                 // `WM_MOUSEWHEEL` and `WM_POINTERWHEEL`: whether the injected notches reached
@@ -162,6 +165,8 @@ fn main() -> Result<()> {
         .create()?;
     let hwnd = window.hwnd();
     shared.hwnd.store(hwnd as usize, Ordering::Release);
+    let content = window.content().expect("the window was built with a content window");
+    shared.content.store(content.raw() as usize, Ordering::Release);
     // SAFETY: takes no pointer.
     let window_thread = unsafe { GetCurrentThreadId() };
     println!("window thread {window_thread}");
@@ -238,10 +243,10 @@ fn scene_body(shared: &Shared) -> Result<()> {
 
     let _queue = DispatcherQueueController::create_on_current_thread()?;
     let compositor = Compositor::new()?;
-    let hwnd = shared.hwnd.load(Ordering::Acquire) as *mut core::ffi::c_void;
+    let content = shared.content.load(Ordering::Acquire) as *mut core::ffi::c_void;
     // SAFETY: the handle is live for the probe's whole run; the main thread joins this one
     // before the window drops. Whether a foreign thread may do this is what the probe asks.
-    let target = match unsafe { compositor.create_desktop_window_target_for_hwnd(hwnd, false) } {
+    let target = match unsafe { compositor.create_desktop_window_target_for_hwnd(content, false) } {
         Ok(target) => target,
         Err(e) => {
             println!("CHECK target-on-foreign-thread: FAIL ({e})");
@@ -250,10 +255,7 @@ fn scene_body(shared: &Shared) -> Result<()> {
     };
     println!("CHECK target-on-foreign-thread: created on {me}");
 
-    let root = compositor.create_container_visual();
-    // An explicit extent: an interaction source refuses a visual with no size of its own, and
-    // a relative adjustment is not one. The window opens at this size.
-    root.set_size(640.0, 400.0);
+    let root = painted_root(&compositor, shared);
     target.set_root(&root);
 
     // The scrolled layer: the tracker's position drives its offset through an expression,
@@ -342,10 +344,12 @@ fn scene_body(shared: &Shared) -> Result<()> {
             }
             CMD_NUDGE => {
                 // A request from this thread: its `ValuesChanged` must come back here
-                // whatever the wheel does, which separates callback delivery from routing.
-                _ = tracker.try_update_position_by(
+                // whatever the wheel did, which separates callback delivery from routing.
+                // Absolute, so the layer rests 120 up however far the wheel scrolled it.
+                _ = tracker.try_update_position(
                     Vector3 { x: 0.0, y: 120.0, z: 0.0 },
                     windows_composition::Clamping::Auto,
+                    windows_composition::ScaleAnimationPolicy::Keep,
                 );
             }
             CMD_STOP => break,
@@ -467,6 +471,22 @@ fn drive(shared: &Shared, window_thread: u32) -> bool {
     ok
 }
 
+/// Returns the source's visual: a sprite covering the client area with a transparent brush.
+///
+/// An explicit extent, because an interaction source refuses a visual with no size of its own
+/// and a relative adjustment is not one. Painted, because the compositor routes a wheel to a
+/// source only over content its hit test finds, and a container paints nothing.
+fn painted_root(compositor: &Compositor, shared: &Shared) -> windows_composition::SpriteVisual {
+    let mut client = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+    let content = shared.content.load(Ordering::Acquire) as *mut core::ffi::c_void;
+    // SAFETY: the content window is live for the probe's run; the destination is a local.
+    unsafe { GetClientRect(content, &mut client) };
+    let root = compositor.create_sprite_visual();
+    root.set_brush(&compositor.create_color_brush(Color::rgba(0, 0, 0, 0)));
+    root.set_size(client.right as f32, client.bottom as f32);
+    root
+}
+
 /// Posts `WM_CLOSE`, the same way a worker that must end the process would.
 unsafe fn post_close(hwnd: *mut core::ffi::c_void) {
     #[link(name = "user32")]
@@ -525,9 +545,10 @@ fn is(sampled: (u8, u8, u8), want: (u8, u8, u8)) -> bool {
 fn control(shared: Arc<Shared>, window: Window, window_thread: u32) -> Result<()> {
     // The window's creation already gave this thread its dispatcher queue.
     let compositor = Compositor::new()?;
-    let target = compositor.create_desktop_window_target(&window, false)?;
-    let root = compositor.create_container_visual();
-    root.set_size(640.0, 400.0);
+    let content = shared.content.load(Ordering::Acquire) as *mut core::ffi::c_void;
+    // SAFETY: the content window is live and owned by this thread.
+    let target = unsafe { compositor.create_desktop_window_target_for_hwnd(content, false)? };
+    let root = painted_root(&compositor, &shared);
     target.set_root(&root);
     // The scrolled layer: the tracker's position drives its offset through an expression,
     // so a wheel notch that reached the tracker is visible as the square moving up.

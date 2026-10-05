@@ -462,7 +462,7 @@ impl Tick {
         }
         let mut uia = self.from_pump.uia.borrow_mut();
         uia.set_focus(self.router.focus_mut().keyboard());
-        if let Some(origin) = client_origin(self.window.hwnd()) {
+        if let Some(origin) = client_origin(self.window.input_window().raw()) {
             uia.set_window(origin, env.scale());
         }
         // The renderers' own geometry, joined against what this side says it means. One

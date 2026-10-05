@@ -50,7 +50,10 @@ struct Locks {
 
 pub(crate) struct Inner {
     pub doc: Rc<RefCell<Doc>>,
+    /// The window input is delivered to, which a text service asks the store for.
     pub hwnd: Hwnd,
+    /// The window whose tick delivers notifications.
+    wake: Hwnd,
     locks: Cell<Locks>,
     /// What the sink was last told, so a notification is sent only on a real difference.
     seen: Cell<(u64, i32, Selection)>,
@@ -65,10 +68,11 @@ pub(crate) struct Inner {
 }
 
 impl Inner {
-    pub fn new(doc: Rc<RefCell<Doc>>, hwnd: Hwnd) -> Rc<Self> {
+    pub fn new(doc: Rc<RefCell<Doc>>, hwnd: Hwnd, wake: Hwnd) -> Rc<Self> {
         Rc::new(Self {
             doc,
             hwnd,
+            wake,
             locks: Cell::default(),
             seen: Cell::default(),
             mask: Cell::default(),
@@ -83,7 +87,7 @@ impl Inner {
     /// Rings the window once. Notifications are delivered from that tick, never from inside
     /// a lock grant.
     pub fn wake(&self) {
-        if !self.posted.replace(true) && !self.hwnd.post(WM_FRAME, 0, 0) {
+        if !self.posted.replace(true) && !self.wake.post(WM_FRAME, 0, 0) {
             self.posted.set(false);
         }
     }
@@ -900,7 +904,7 @@ mod tests {
             text: Vec::new().into(),
         });
         doc.focus(Some(id));
-        let inner = Inner::new(Rc::new(RefCell::new(doc)), hwnd);
+        let inner = Inner::new(Rc::new(RefCell::new(doc)), hwnd, hwnd);
         inner.mask.set(7);
         inner
     }

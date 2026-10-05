@@ -560,9 +560,6 @@ pub enum Feed<'a> {
     /// point.
     Moves(&'a IVector<PointerPoint>),
     Up(&'a PointerPoint),
-    /// A wheel notch, with shift and control, over a target that declared gesture interest. A
-    /// scroll surface never reaches here: its wheel drives the tracker compositor-side.
-    Wheel(&'a PointerPoint, bool, bool),
     /// Pumped from the pacer tick, so inertia, springs and a system stop request all resolve
     /// on one clock.
     Inertia,
@@ -627,8 +624,8 @@ impl Recognizer {
 
     /// Feeds one thing.
     ///
-    /// The physical recogniser has neither a wheel nor inertia of its own, because the system
-    /// continues a touchpad manipulation itself and reports it through the inertia messages.
+    /// The physical recogniser has no inertia of its own, because the system continues a
+    /// touchpad manipulation itself and reports it through the inertia messages.
     ///
     /// # Errors
     ///
@@ -643,11 +640,8 @@ impl Recognizer {
             (Kind::Physical(r), Feed::Up(p)) => r.ProcessUpEvent(p),
             (Kind::Gesture(r), Feed::Complete) => r.CompleteGesture(),
             (Kind::Physical(r), Feed::Complete) => r.CompleteGesture(),
-            (Kind::Gesture(r), Feed::Wheel(p, shift, ctrl)) => {
-                r.ProcessMouseWheelEvent(p, shift, ctrl)
-            }
             (Kind::Gesture(r), Feed::Inertia) => r.ProcessInertia(),
-            (Kind::Physical(_), Feed::Wheel(..) | Feed::Inertia) => Ok(()),
+            (Kind::Physical(_), Feed::Inertia) => Ok(()),
         }
     }
 

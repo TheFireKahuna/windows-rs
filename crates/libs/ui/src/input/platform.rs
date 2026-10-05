@@ -178,7 +178,7 @@ impl Inertia {
     #[must_use]
     pub fn new(window: &windows_window::Window, late: Late) -> Self {
         Self {
-            hwnd: window.hwnd(),
+            hwnd: window.input_window().raw(),
             late,
             told: false,
         }
@@ -211,7 +211,7 @@ impl Inertia {
 /// Gates one window's requests for an immediate tick, shared by every producer with something
 /// latency-critical to hand over.
 ///
-/// A press, a release, a wheel notch, a keystroke and a dial detent do not batch and are not
+/// A press, a release, a keystroke and a dial detent do not batch and are not
 /// per-frame quantities, so making any of them wait for the display buys a frame of latency.
 /// Motion does not come here, and neither does anything the frame clock is *for*.
 ///

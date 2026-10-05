@@ -44,7 +44,6 @@ pub enum EventKind {
     CaptureLost,
     /// The window gained keyboard focus.
     FocusGained,
-    Wheel,
 }
 
 /// Names the device a contact came from.
@@ -160,9 +159,6 @@ pub struct PointerEvent {
     /// press target chosen from an extrapolated point is a mis-click.
     pub x_px: i32,
     pub y_px: i32,
-    /// Notches × `WHEEL_DELTA`, signed. Zero on every kind but [`EventKind::Wheel`].
-    pub wheel: i32,
-    pub horizontal: bool,
     pub time: u32,
     /// The recogniser's point, retained before the pump retrieves another message and the
     /// system may retire this pointer. Aborts and button changes need no recogniser point.
@@ -346,7 +342,7 @@ impl State {
 /// Installed into the window at creation and shared with the [`Router`](super::Router) that
 /// drains it on the frame clock.
 pub struct Doorbell {
-    /// The window this doorbell serves, null until [`Doorbell::pace`] names it.
+    /// The window input is delivered to, null until [`Doorbell::pace`] names it.
     hwnd: Cell<HWND>,
     /// The `user32` exports this build carries, resolved once and shared with every conversion
     /// this doorbell hands out.
@@ -391,10 +387,12 @@ impl Doorbell {
     /// Separate from construction: the doorbell is installed into the window builder, so it
     /// exists before the window, and a pacer cannot exist before the window it posts to.
     /// Anything that arrives in between is recorded and consumed by the first tick.
+    ///
+    /// Pointer coordinates and capture resolve against the window input is delivered to; the
+    /// service's frame request is posted to `window` itself, which runs the tick.
     pub fn pace(&self, window: &Window, wake: Wake) {
-        let hwnd = window.hwnd();
-        self.hwnd.set(hwnd);
-        self.service.attach(hwnd);
+        self.hwnd.set(window.input_window().raw());
+        self.service.attach(window.hwnd());
         let mut state = self.state.borrow_mut();
         state.wake = Some(wake);
         if !state.idle() {
@@ -441,24 +439,24 @@ impl Doorbell {
     /// message can still be produced, and nothing here can write a legacy arm because neither
     /// binding filter generates a constant to write one with.
     ///
-    /// `WM_POINTERLEAVE` and `WM_NCPOINTERUPDATE` are forwarded. The custom caption reads them to clear
-    /// a window command's hover, and the window procedure runs the application's handler
-    /// before the caption's, so consuming it here would leave a close button lit after the
-    /// pointer had gone. Caption motion also ends client hover before the pointer leaves
-    /// the window. The key messages and the two window-state messages are forwarded for
-    /// the same reason: `WM_KEYDOWN` has to reach `TranslateMessage` for `WM_CHAR` to exist at
-    /// all, and the application's own focus handling runs behind this one.
+    /// This answers the content window, which passes the caption's points through to the frame,
+    /// so a pointer moving into the caption band leaves this window and its `WM_POINTERLEAVE`
+    /// ends client hover. The key messages and the two window-state messages are forwarded:
+    /// `WM_KEYDOWN` has to reach `TranslateMessage` for `WM_CHAR` to exist at all, and the
+    /// application's own focus handling runs behind this one.
     pub fn wndproc(&self, message: u32, wparam: usize, lparam: isize) -> Option<isize> {
         let id = (wparam & 0xffff) as u32;
         let flags = PointerFlags::from_wparam(wparam);
         match message as i32 {
-            WM_POINTERDOWN => self.discrete(id, flags, EventKind::Down, 0, false),
-            WM_POINTERUP => self.discrete(id, flags, EventKind::Up, 0, false),
-            WM_POINTERWHEEL => self.discrete(id, flags, EventKind::Wheel, notches(wparam), false),
-            WM_POINTERHWHEEL => self.discrete(id, flags, EventKind::Wheel, notches(wparam), true),
-            WM_POINTERCAPTURECHANGED => self.discrete(id, flags, EventKind::Cancel, 0, false),
+            WM_POINTERDOWN => self.discrete(id, flags, EventKind::Down),
+            WM_POINTERUP => self.discrete(id, flags, EventKind::Up),
+            // A wheel is the compositor's: every scroll container's source and every wheel
+            // control's takes it before it reaches this window, so one arriving here is over
+            // nothing that asked for it. Consumed, so no legacy wheel is promoted from it.
+            WM_POINTERWHEEL | WM_POINTERHWHEEL => Some(0),
+            WM_POINTERCAPTURECHANGED => self.discrete(id, flags, EventKind::Cancel),
             WM_POINTERUPDATE | WM_POINTERENTER => self.motion(id, flags),
-            WM_POINTERLEAVE | WM_NCPOINTERUPDATE => self.leave(id),
+            WM_POINTERLEAVE => self.leave(id),
             // A window-level capture change names no pointer: its `wParam` is a window handle.
             // The tick resolves it against whatever holds the explicit capture, and a change
             // that takes nothing away is not a cancel.
@@ -477,16 +475,9 @@ impl Doorbell {
     /// Records a discrete transition, resolving the point it happened at.
     ///
     /// Asks for service on the next pump iteration rather than at the next composition frame:
-    /// a press, a release, a cancel and a wheel notch are latency-critical, and waiting for
+    /// a press, a release and a cancel are latency-critical, and waiting for
     /// the frame clock would add a frame to each.
-    fn discrete(
-        &self,
-        id: u32,
-        flags: PointerFlags,
-        kind: EventKind,
-        wheel: i32,
-        horizontal: bool,
-    ) -> Option<isize> {
+    fn discrete(&self, id: u32, flags: PointerFlags, kind: EventKind) -> Option<isize> {
         let mut info = POINTER_INFO::default();
         // A record is written whether or not the system still answers about this pointer: the
         // transition happened, and a dropped record is a swallowed press.
@@ -508,20 +499,14 @@ impl Doorbell {
             flags,
             x_px: info.ptPixelLocationRaw.x,
             y_px: info.ptPixelLocationRaw.y,
-            wheel,
-            horizontal,
             time: info.dwTime,
-            point: matches!(kind, EventKind::Down | EventKind::Up | EventKind::Wheel)
+            point: matches!(kind, EventKind::Down | EventKind::Up)
                 .then(|| self.capture(id, &info)),
             manipulation: (kind == EventKind::Down && ptype == PointerType::Touch)
                 .then(|| windows_scene::ManipulationPointer::capture(id)),
         };
         let mut state = self.state.borrow_mut();
-        // A wheel notch is not a contact: it takes no slot, so a burst of them over a window
-        // cannot fill the table with pointers that will never lift.
-        if kind != EventKind::Wheel
-            && let Some(i) = state.slot(id)
-        {
+        if let Some(i) = state.slot(id) {
             state.slots[i].down = flags.in_contact();
             state.slots[i].buttons = event.buttons;
             // Kept dirty until the tick has consumed the transition, so the frame that ends a
@@ -546,8 +531,6 @@ impl Doorbell {
                 flags: PointerFlags::default(),
                 x_px: 0,
                 y_px: 0,
-                wheel: 0,
-                horizontal: false,
                 time: 0,
                 point: None,
                 manipulation: None,
@@ -592,7 +575,7 @@ impl Doorbell {
         // A second button pressed during a drag arrives as an update with a changed button
         // set, never as a second down, so the change is a bit compare against the slot.
         if changed {
-            return self.discrete(id, flags, EventKind::Button, 0, false);
+            return self.discrete(id, flags, EventKind::Button);
         }
         Some(0)
     }
@@ -759,10 +742,6 @@ impl Doorbell {
 
 /// Returns the wheel delta a pointer wheel message carries in the high half of its `wParam`,
 /// which is the flag word's place on every other pointer message.
-const fn notches(wparam: usize) -> i32 {
-    ((wparam >> 16) as u16) as i16 as i32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,23 +885,6 @@ mod tests {
         let mut moved = Vec::new();
         bell.moved_into(&mut moved);
         assert_eq!(moved, [3]);
-    }
-
-    #[test]
-    fn caption_motion_clears_client_hover_without_consuming_caption_input() {
-        let bell = Doorbell::new();
-        let pointer = wparam(3, POINTER_FLAG_PRIMARY);
-        bell.wndproc(WM_POINTERUPDATE as u32, pointer, 0);
-        assert_eq!(bell.hovering(), Some(3));
-        assert_eq!(bell.wndproc(WM_NCPOINTERUPDATE as u32, pointer, 0), None);
-        assert_eq!(bell.hovering(), None);
-        assert!(bell.state.borrow().idle());
-        for _ in 0..32 {
-            assert_eq!(bell.wndproc(WM_NCPOINTERUPDATE as u32, pointer, 0), None);
-            assert!(bell.state.borrow().slots.iter().all(|slot| slot.id == 0));
-        }
-        bell.wndproc(WM_POINTERUPDATE as u32, pointer, 0);
-        assert_eq!(bell.hovering(), Some(3));
     }
 
     #[test]

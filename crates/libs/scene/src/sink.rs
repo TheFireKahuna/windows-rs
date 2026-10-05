@@ -603,6 +603,13 @@ pub enum Paint {
     /// Samples unscaled pixels from a finite, nonnegative source origin in DIPs.
     Presented { region: RegionId, origin: Vector2 },
     PresentedView { region: RegionId, view: RegionView },
+    /// Paints nothing, and makes the sprite a target of the compositor's own hit test.
+    ///
+    /// The compositor hit-tests rendered content rather than a visual's bounds, so a
+    /// `VisualInteractionSource` receives wheel and touchpad input only over a pixel something
+    /// paints; a sprite with no brush, or at zero opacity, paints none. One transparent colour
+    /// brush serves every sprite carrying this paint.
+    Clear,
     None,
 }
 
@@ -1124,8 +1131,9 @@ pub enum TrackerOp {
     /// hit region from the visual's size at the moment it is created, and a zero-size one
     /// hit-tests nothing while returning success.
     Create {
-        viewport: GroupId,
-        axes: Axes,
+        /// The node whose visual the source is created on.
+        visual: GroupId,
+        source: Source,
         owned: bool,
     },
     /// The range it rests inside. The position may travel outside during a manipulation or
@@ -1137,6 +1145,21 @@ pub enum TrackerOp {
     /// How fast inertia decays per axis, in `0..=1`, or the system default.
     Decay(Option<Vector2>),
     Drop,
+}
+
+/// What a tracker's interaction source takes.
+///
+/// The compositor gives a wheel to the nearest source under the pointer that admits it, and
+/// that source's tracker absorbs it, so a source inside a scroll container decides for itself
+/// what the container behind it no longer sees.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Source {
+    /// A scroll container's viewport: pans on `axes` from the touchpad, the wheel and a
+    /// redirected touch contact, handing off at its bounds.
+    Scroll(Axes),
+    /// A valued control: the vertical wheel alone. The touchpad is left to whatever source is
+    /// beneath it, and nothing is handed off at a bound.
+    Wheel,
 }
 
 /// The phase a tracker's last reported transition put it in.

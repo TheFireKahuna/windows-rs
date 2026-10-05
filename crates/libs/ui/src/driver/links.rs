@@ -19,8 +19,10 @@ use std::sync::Arc;
 
 /// The links between the threads, shared by `Arc`.
 pub(crate) struct Links {
-    /// The window, as a token: the scene thread's target and the worker threads' close.
+    /// The frame, as a token: the worker threads' close and the frame wake.
     pub(crate) window: Hwnd,
+    /// The content window, which the scene thread's composition target is bound to.
+    pub(crate) content: Hwnd,
     /// App → scene: the patch and the rows beside it.
     pub(crate) down: Link<Down>,
     /// Input → scene: the tick's reports and the window facts they came with.
@@ -68,10 +70,14 @@ impl Links {
     ///
     /// # Errors
     ///
-    /// A doorbell's or a start-up event's kernel object could not be created.
+    /// The window has no content window, or a doorbell's or a start-up event's kernel object
+    /// could not be created.
     pub(crate) fn new(window: &Window) -> Result<Self> {
         Ok(Self {
             window: window.handle(),
+            content: window
+                .content()
+                .ok_or_else(|| Error::new(E_HANDLE, "the window has no content window"))?,
             down: Link::new(),
             to_scene: Link::new(),
             up: Link::new(),

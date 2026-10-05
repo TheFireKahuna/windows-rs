@@ -171,7 +171,7 @@ impl Scene {
     /// A preview accepts one viewport; an absent tracker leaves it unchanged.
     pub fn follow_drag_scroll(&mut self, viewport: NodeId, back: &Backends) {
         let Some(lift) = self.lift.as_mut().filter(|lift| lift.scroll.is_none()) else { return; };
-        let Some((_, tracker)) = self.trackers.iter().find(|(_, state)| state.viewport == viewport) else { return; };
+        let Some((_, tracker)) = self.trackers.iter().find(|(_, state)| state.scrolls == Some(viewport)) else { return; };
         let properties = lift.carrier.properties();
         properties.insert_vector3("PointerOffset", v3(lift.offset));
         let animation = back.compositor.create_expression_animation(

@@ -61,6 +61,9 @@ pub struct Census {
     /// the bindings onto it apply, the ops addressed to it are dropped, and the surface
     /// never scrolls.
     pub trackers_live: u32,
+    /// Trackers created plus trackers dropped. It moves on every change to the tracker set,
+    /// which the live count does not: a drop and a create in one patch leave that where it was.
+    pub tracker_edits: u64,
     /// Ops applied, across every patch.
     pub ops_applied: u64,
     /// Animations started, which is the event-rate cost of motion.
@@ -489,8 +492,9 @@ struct TrackerState {
     /// Held because a captured contact is redirected into it, and because dropping it while
     /// the tracker is live leaves the source unreachable.
     source: Option<VisualInteractionSource>,
-    /// The group this tracker scrolls, so a reported position has somewhere to land.
-    viewport: NodeId,
+    /// The group this tracker scrolls, so a reported position has somewhere to land. `None`
+    /// for a wheel source, whose position moves nothing on screen.
+    scrolls: Option<NodeId>,
     /// The last values a callback reported, and the only sound read: the tracker runs in
     /// another process, every call and callback is asynchronous, and its own getter answers
     /// with whatever was last set.
@@ -620,6 +624,25 @@ fn configure_source(viewport: &Visual, axes: Axes) -> Result<VisualInteractionSo
         },
         WheelMode::Disabled,
     )?;
+    Ok(source)
+}
+
+/// Configures a valued control's source: the vertical wheel, and nothing else.
+///
+/// The Y axis is enabled because the compositor gives a wheel only to a source whose axis
+/// admits it; redirection is the wheel's alone, so a touchpad pan over the control reaches the
+/// scroll container beneath it; and chaining is off, so a wheel is never handed on to that
+/// container at a bound.
+fn configure_wheel_source(visual: &Visual) -> Result<VisualInteractionSource> {
+    debug_assert!(
+        visual.size().x > 0.0 && visual.size().y > 0.0,
+        "a wheel source's visual must be sized before the source is created"
+    );
+    let source = VisualInteractionSource::for_visual(visual)?;
+    source.set_axis_modes(SourceMode::Disabled, SourceMode::EnabledWithInertia, SourceMode::Disabled);
+    source.set_redirection_mode(RedirectionMode::WheelOnly);
+    source.set_chaining(ChainingMode::Never, ChainingMode::Never, ChainingMode::Never);
+    source.set_wheel_modes(WheelMode::Disabled, WheelMode::Enabled, WheelMode::Disabled)?;
     Ok(source)
 }
 
@@ -2449,11 +2472,11 @@ impl Scene {
     fn tracker(&mut self, id: TrackerId<()>, op: TrackerOp, back: &Backends) -> Result<()> {
         match op {
             TrackerOp::Create {
-                viewport,
-                axes,
+                visual: node,
+                source,
                 owned,
             } => {
-                let Some(visual) = self.nodes.visual(viewport.0).cloned() else {
+                let Some(visual) = self.nodes.visual(node.0).cloned() else {
                     return Ok(());
                 };
                 // The owner is supplied at construction with no per-callback subscription,
@@ -2470,14 +2493,17 @@ impl Scene {
                 } else {
                     back.compositor.create_interaction_tracker()?
                 };
-                let source = configure_source(&visual, axes)?;
+                let (source, scrolls) = match source {
+                    Source::Scroll(axes) => (configure_source(&visual, axes)?, Some(node.0)),
+                    Source::Wheel => (configure_wheel_source(&visual)?, None),
+                };
                 inner.add_source(&source)?;
                 self.trackers.place(
                     id.id(),
                     TrackerState {
                         inner,
                         source: Some(source),
-                        viewport: viewport.0,
+                        scrolls,
                         position: Vector2::zero(),
                         scale: 1.0,
                         phase: Phase::Idle,
@@ -2488,6 +2514,7 @@ impl Scene {
                     },
                 );
                 self.census.trackers_live += 1;
+                self.census.tracker_edits += 1;
             }
             TrackerOp::Bounds { min, max } => {
                 if let Some(state) = self.trackers.get_mut(id.id()) {
@@ -2507,8 +2534,11 @@ impl Scene {
                     let _ = state.inner.clear_sources();
                     // So the hit query stops resolving that node's descendants through an
                     // offset nothing updates any more.
-                    self.hits.clear_scroll(state.viewport);
+                    if let Some(viewport) = state.scrolls {
+                        self.hits.clear_scroll(viewport);
+                    }
                     self.census.trackers_live = self.census.trackers_live.saturating_sub(1);
+                    self.census.tracker_edits += 1;
                 }
             }
         }
@@ -2611,7 +2641,7 @@ impl Scene {
         out.extend(
             self.trackers
                 .iter()
-                .map(|(_, state)| (state.viewport, Arc::clone(&state.shadow))),
+                .filter_map(|(_, state)| Some((state.scrolls?, Arc::clone(&state.shadow)))),
         );
     }
 
@@ -2632,9 +2662,9 @@ impl Scene {
                     position,
                     scale,
                 } => {
-                    let viewport = self.trackers.get_mut(tracker.id()).map(|state| {
+                    let viewport = self.trackers.get_mut(tracker.id()).and_then(|state| {
                         state.values_changed(position, scale);
-                        state.viewport
+                        state.scrolls
                     });
                     if let Some(viewport) = viewport {
                         self.hits.set_scroll(viewport, position);

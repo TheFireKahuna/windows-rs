@@ -9,6 +9,7 @@ use crate::caption::{BorderColor, Caption, CaptionHit, CaptionSpec, CaptionState
 use crate::display::{DisplayColor, Subscription};
 use crate::dpi::Metrics;
 use crate::feedback::FeedbackPolicy;
+use crate::hwnd::Hwnd;
 use crate::pace::Clock;
 use crate::qos::{self, Speed};
 use crate::visibility::{OcclusionStatus, Visibility, Watch};
@@ -20,9 +21,7 @@ use std::sync::{Arc, OnceLock};
 use windows_color::DisplayCapability;
 use windows_core::*;
 
-/// Receives the raw window handle, message code, and `wparam`/`lparam`. Return
-/// `Some(result)` to handle the message, or `None` to fall through to default processing.
-type MessageHandler = Box<dyn FnMut(*mut core::ffi::c_void, u32, usize, isize) -> Option<isize>>;
+use crate::content::MessageHandler;
 
 /// Receives the new client-area width and height in pixels.
 type ResizeHandler = Box<dyn FnMut(i32, i32)>;
@@ -58,6 +57,9 @@ struct State {
     quit_on_close: bool,
     /// The live pacer's clock, if there is one.
     frame_gate: RefCell<Option<Arc<Clock>>>,
+    /// The content window, or null for a window that did not ask for one. Destroyed with this
+    /// window, so it is never released here.
+    content: HWND,
 }
 
 /// Carries the system's occlusion-status notification. Numbered in the `WM_USER` range
@@ -69,6 +71,7 @@ const WM_USER_OCCLUSION: u32 = WM_USER as u32 + 0x45;
 /// out from the handler runs the application's callback from the ordinary pump, in message
 /// order, and not inside a projection frame it may not re-enter.
 const WM_USER_COLOR: u32 = WM_USER as u32 + 0x46;
+
 
 /// Supplies the identity stamped into a window's own extra bytes at creation. Monotonic for
 /// the process, so no value is issued twice.
@@ -148,6 +151,7 @@ impl Window {
             hidden: false,
             quit_on_close: true,
             min_size_dips: None,
+            content: None,
         }
     }
 
@@ -340,6 +344,24 @@ impl Window {
         self.state().is_some() && enter_move_size_loop(self.hwnd, at, operation)
     }
 
+    /// Returns the content window's handle, for a window built with
+    /// [`WindowBuilder::content_window`].
+    ///
+    /// `None` once the window is closed, and on a window that did not ask for one.
+    #[must_use]
+    pub fn content(&self) -> Option<Hwnd> {
+        let content = self.state()?.content;
+        (!content.is_null()).then(|| Hwnd::new(content))
+    }
+
+    /// Returns the window pointer and key input is delivered to: the content window where there
+    /// is one, and this window otherwise. Pointer coordinates, capture, keyboard focus, text
+    /// services and automation all address it.
+    #[must_use]
+    pub fn input_window(&self) -> Hwnd {
+        self.content().unwrap_or_else(|| self.handle())
+    }
+
     /// Returns this window's caption, for an open window that asked for one.
     fn caption(&self) -> Option<&Caption> {
         self.state()?.caption.as_deref()
@@ -444,6 +466,7 @@ pub struct WindowBuilder {
     hidden: bool,
     quit_on_close: bool,
     min_size_dips: Option<(f32, f32)>,
+    content: Option<MessageHandler>,
 }
 
 impl WindowBuilder {
@@ -536,6 +559,35 @@ impl WindowBuilder {
     #[must_use]
     pub fn min_size_dips(mut self, width: f32, height: f32) -> Self {
         self.min_size_dips = Some((width, height));
+        self
+    }
+
+    /// Gives the window a content window, with `handler` called for every message it receives.
+    ///
+    /// The content window is a child that always covers the client area. It is the window
+    /// pointer and key input is delivered to, keyboard focus is forwarded to and text services
+    /// and automation address, and the one a system compositor's `DesktopWindowTarget` is created
+    /// on: the compositor attaches the input sink that routes wheel and precision-touchpad input
+    /// to a `VisualInteractionSource` only to a target whose window has `WS_CHILD`. This window
+    /// keeps the caption, whose points the content window passes through, and the frame's own
+    /// messages. The content window is resized in this window's `WM_SIZE` handling, which no
+    /// handler can suppress. [`Window::content`] returns its handle.
+    ///
+    /// `handler` follows [`on_message`](Self::on_message)'s contract for the content window.
+    /// Called again, it adds `handler` behind the one already installed, as
+    /// [`chain_message`](Self::chain_message) does for this window.
+    #[must_use]
+    pub fn content_window<F>(mut self, mut handler: F) -> Self
+    where
+        F: FnMut(*mut core::ffi::c_void, u32, usize, isize) -> Option<isize> + 'static,
+    {
+        self.content = Some(match self.content.take() {
+            Some(mut installed) => Box::new(move |hwnd, message, wparam, lparam| {
+                installed(hwnd, message, wparam, lparam)
+                    .or_else(|| handler(hwnd, message, wparam, lparam))
+            }),
+            None => Box::new(handler),
+        });
         self
     }
 
@@ -703,6 +755,22 @@ impl WindowBuilder {
                 return Err(error);
             }
         };
+        let caption = self.caption.map(|spec| Rc::new(Caption::new(spec)));
+        let content = match self.content {
+            Some(handler) => match crate::content::create(hwnd, Some(handler), caption.clone()) {
+                Ok(content) => content,
+                Err(error) => {
+                    // SAFETY: `hwnd` is live and owned here; destroying it destroys its children.
+                    unsafe {
+                        _ = DestroyWindow(hwnd);
+                    }
+                    return Err(error);
+                }
+            },
+            None => core::ptr::null_mut(),
+        };
+        // Input is registered and its feedback set on the window input is delivered to.
+        let input = if content.is_null() { hwnd } else { content };
 
         let state = Box::new(State {
             message: RefCell::new(self.message),
@@ -713,12 +781,13 @@ impl WindowBuilder {
             // missed.
             _occlusion: OcclusionStatus::register(hwnd, WM_USER_OCCLUSION),
             display: RefCell::new(Some(display)),
-            caption: self.caption.map(|spec| Rc::new(Caption::new(spec))),
-            touchpad: self.touchpad && register_touchpad_capable(hwnd),
+            caption,
+            touchpad: self.touchpad && register_touchpad_capable(input),
             speed: Cell::new(Speed::Managed),
             min_size_dips: self.min_size_dips,
             quit_on_close: self.quit_on_close,
             frame_gate: RefCell::new(None),
+            content,
         });
         let (caption, visibility) = (state.caption.clone(), Arc::clone(&state.visibility));
         let installed = Box::into_raw(state);
@@ -732,7 +801,7 @@ impl WindowBuilder {
             SetWindowLongPtrW(hwnd, GWLP_WINDOW_ID, id as isize);
         }
 
-        self.feedback.apply(hwnd);
+        self.feedback.apply(input);
 
         if let Size::Dips(width, height) = self.size {
             resize_to_dips(hwnd, width, height);
@@ -1138,6 +1207,9 @@ unsafe extern "system" fn wndproc(
     let edges = |state: &State| {
         match message {
             m if m == WM_SIZE as u32 || m == WM_WINDOWPOSCHANGED as u32 => {
+                if m == WM_SIZE as u32 && !state.content.is_null() {
+                    crate::content::fit(state.content, lparam);
+                }
                 state.visibility.evaluate(hwnd);
                 // The window's thread carries the pump, the input and the retained tree, so
                 // it runs at full speed while any of that is observable. The re-tag is gated
@@ -1169,6 +1241,12 @@ unsafe extern "system" fn wndproc(
                         };
                     }
                 }
+            }
+            // Keyboard focus belongs to the content window: activation gives it to this one,
+            // and it is passed on before anything else sees it.
+            m if m == WM_SETFOCUS as u32 && !state.content.is_null() => {
+                // SAFETY: the content window is this window's child, on this thread.
+                unsafe { _ = SetFocus(state.content) };
             }
             WM_USER_OCCLUSION => state.visibility.poke(),
             // Ahead of the application's frame work, so a frame completing during it is

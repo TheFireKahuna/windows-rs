@@ -20,6 +20,8 @@ pub(crate) struct TextInput {
     pub touch: Touch,
     /// A lone high surrogate from a translated character message, held for its pair.
     high: Option<u16>,
+    /// The window input is delivered to: what a text service and the clipboard address, and
+    /// the space a field's box is reported in.
     hwnd: Hwnd,
 }
 
@@ -27,10 +29,10 @@ impl TextInput {
     pub fn new(window: &Window) -> Result<Self> {
         system::refresh();
         let doc = Rc::new(RefCell::new(Doc::default()));
-        let hwnd = window.handle();
+        let (hwnd, wake) = (window.input_window(), window.handle());
         Ok(Self {
-            tsf: Rc::new(Session::new(Rc::clone(&doc), hwnd)?),
-            touch: Touch::new(hwnd),
+            tsf: Rc::new(Session::new(Rc::clone(&doc), hwnd, wake)?),
+            touch: Touch::new(wake),
             doc,
             high: None,
             hwnd,

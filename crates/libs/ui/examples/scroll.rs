@@ -1,14 +1,12 @@
 //! Drives scroll and virtualization against a real compositor and prints a census of the run.
 //!
-//! The run measures three properties that only a live compositor supplies:
+//! The run measures two properties that only a live compositor supplies:
 //!
 //! 1. A fling holds the frame clock open. A tracker reports from another process with no
 //!    input behind it, and the queue its callbacks push into keeps the clock running until it
 //!    drains. Without that the realization window is read at whatever unrelated wake comes
 //!    next, and the fling lands on rows nothing realized.
-//! 2. A wheel notch costs the front thread nothing. `PointerWheelConfig` routes the notch to
-//!    the tracker, so the position moves with no [`Report::Wheel`] on the front thread.
-//! 3. The realized set stays bounded across ten thousand rows. The realized-row count is
+//! 2. The realized set stays bounded across ten thousand rows. The realized-row count is
 //!    reported at rest and at its peak.
 //!
 //! The run is the shipping one: [`UiRuntime::run`] owns the window, the tick and their order, and
@@ -39,19 +37,12 @@ use windows_window::Window;
 /// Rows in the list, enough that realizing all of them would be plain in the census.
 const ROWS: usize = 10_000;
 
-/// `WM_KEYDOWN`, `WM_MOUSEWHEEL` and `WM_POINTERWHEEL`: the three raw messages this example
-/// reads before the doorbell classifies them.
+/// `WM_KEYDOWN`, the raw message this example reads before the doorbell classifies it.
 const WM_KEYDOWN: u32 = 0x0100;
-const WM_MOUSEWHEEL: u32 = 0x020A;
-const WM_POINTERWHEEL: u32 = 0x024E;
 
 fn main() -> Result<()> {
     let ui = UiRuntime::new(&REFERENCE, AccentId(0), Density::Comfortable);
     let seen = Rc::new(Seen::default());
-    // Raw wheel messages, counted before the doorbell. A notch the compositor took and a
-    // notch that never arrived both read as zero front-thread reports; this count separates
-    // them.
-    let wheel_messages = Rc::new(Cell::new(0u32));
 
     observe({
         let seen = Rc::clone(&seen);
@@ -63,15 +54,11 @@ fn main() -> Result<()> {
         .pointer_input()
         .touchpad_capable()
         .quit_on_close(true)
-        // Chained ahead of the driver's own, which answers `WM_FRAME` and hands everything
-        // else to the doorbell. Returning `None` is what lets both run.
+        // Chained ahead of the driver's own, which answers `WM_FRAME`. Returning `None` is what
+        // lets both run.
         .on_message({
-            let wheel_messages = Rc::clone(&wheel_messages);
             let mut pending_drive = std::env::args().any(|arg| arg == "--drive");
-            move |hwnd, message, wparam, _| {
-                if message == WM_MOUSEWHEEL || message == WM_POINTERWHEEL {
-                    wheel_messages.set(wheel_messages.get() + 1);
-                }
+            move |hwnd, _, _, _| {
                 // The first message is where this example learns the handle: the driver owns
                 // the window and hands it to nothing here.
                 if pending_drive {
@@ -79,12 +66,16 @@ fn main() -> Result<()> {
                     let hwnd = hwnd as usize;
                     std::thread::spawn(move || drive(hwnd));
                 }
-                if message == WM_KEYDOWN && wparam == b'Q' as usize {
-                    windows_window::quit();
-                    return Some(0);
-                }
                 None
             }
+        })
+        // Keys are delivered to the content window, ahead of the driver's doorbell there.
+        .content_window(|_, message, wparam, _| {
+            if message == WM_KEYDOWN && wparam == b'Q' as usize {
+                windows_window::quit();
+                return Some(0);
+            }
+            None
         });
 
     println!(
@@ -135,7 +126,6 @@ and a second line")
     )?;
 
     seen.report();
-    println!("  raw wheel messages           {}", wheel_messages.get());
     Ok(())
 }
 
@@ -149,7 +139,6 @@ struct Seen {
     scene_wakes: Cell<u64>,
     scene_applies: Cell<u64>,
     app_flushes: Cell<u64>,
-    wheel_reports: Cell<u32>,
     drags: Cell<u32>,
     /// Highest realized-row count seen during the run.
     realized_max: Cell<usize>,
@@ -169,7 +158,6 @@ impl Seen {
         self.app_flushes.set(seen.app.flushes);
         for report in seen.reports {
             match report {
-                Report::Wheel { .. } => self.wheel_reports.set(self.wheel_reports.get() + 1),
                 Report::Dragged { .. } => self.drags.set(self.drags.get() + 1),
                 _ => {}
             }
@@ -192,11 +180,6 @@ impl Seen {
         );
         println!("  app-thread flushes           {}", self.app_flushes.get());
         println!("  thumb drag samples           {}", self.drags.get());
-        println!(
-            "  Report::Wheel on the front   {}   (a scroll container's wheel is the \
-             compositor's; anything here is a leak)",
-            self.wheel_reports.get()
-        );
         println!(
             "  realized rows   at rest {}   peak {}   of {ROWS}",
             self.realized_rest.get(),

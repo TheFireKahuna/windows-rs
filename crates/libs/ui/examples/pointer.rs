@@ -162,9 +162,6 @@ fn main() -> Result<()> {
                             }
                             other => println!("gesture {} {other:?}", label(Some(*target))),
                         },
-                        Report::Wheel {
-                            target, notches, ..
-                        } => println!("wheel {} {notches:+.1}", label(*target)),
                         Report::FocusChanged { to, .. } => println!("focus → {}", label(*to)),
                         other => println!("{other:?}"),
                     }

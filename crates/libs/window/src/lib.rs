@@ -12,6 +12,7 @@
 )]
 mod bindings;
 mod caption;
+mod content;
 mod display;
 mod dpi;
 mod event;

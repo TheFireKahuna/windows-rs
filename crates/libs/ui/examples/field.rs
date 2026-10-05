@@ -264,12 +264,19 @@ fn working_set() -> u64 {
     if ok == 0 { 0 } else { counters.working_set as u64 }
 }
 
-/// Posts one message to the window under test.
+/// Posts one message to the window under test: a key to its content window, which keyboard
+/// input is delivered to, and anything else to the window itself.
 fn post(hwnd: usize, message: u32, wparam: usize) {
+    const GW_CHILD: u32 = 5;
     // SAFETY: the handle names the window this process created and has not destroyed, and
     // every message posted here carries no pointer in either parameter.
     unsafe {
-        PostMessageW(hwnd as _, message, wparam, 0);
+        let target = if (0x100..=0x109).contains(&message) {
+            GetWindow(hwnd as _, GW_CHILD)
+        } else {
+            hwnd as _
+        };
+        PostMessageW(target, message, wparam, 0);
     }
 }
 
@@ -924,6 +931,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 windows_core::link!("user32.dll" "system" fn PostMessageW(hwnd: *mut core::ffi::c_void, message: u32, w: usize, l: isize) -> i32);
+windows_core::link!("user32.dll" "system" fn GetWindow(hwnd: *mut core::ffi::c_void, command: u32) -> *mut core::ffi::c_void);
 windows_core::link!("user32.dll" "system" fn PeekMessageW(message: *mut Msg, hwnd: *mut core::ffi::c_void, first: u32, last: u32, remove: u32) -> i32);
 windows_core::link!("user32.dll" "system" fn TranslateMessage(message: *const Msg) -> i32);
 windows_core::link!("user32.dll" "system" fn DispatchMessageW(message: *const Msg) -> isize);

@@ -34,8 +34,8 @@ impl Session {
     ///
     /// Required initialization fails explicitly and by name: a host that cannot give this
     /// thread an `ITfKeystrokeMgr` has no text input at all.
-    pub fn new(doc: Rc<RefCell<Doc>>, hwnd: Hwnd) -> Result<Self> {
-        let inner = Inner::new(doc, hwnd);
+    pub fn new(doc: Rc<RefCell<Doc>>, hwnd: Hwnd, wake: Hwnd) -> Result<Self> {
+        let inner = Inner::new(doc, hwnd, wake);
         let mut raw = core::ptr::null_mut();
         // SAFETY: the class and interface identifiers are constants and `raw` is a local.
         unsafe {

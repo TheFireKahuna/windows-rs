@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use windows_numerics::Vector2;
 use windows_scene::{
-    Anim, Attach, Axes, Bind, CONTROL, Cap, ControlId, DELAY, DashId, DelayId, Easing, Env, Exit,
+    Anim, Attach, Bind, CONTROL, Cap, ControlId, DELAY, DashId, DelayId, Easing, Env, Exit,
     GEOM, GeomId, GroupId, Halo, HitDecl, Id, Ids, Ink, Iterations, Join, Mask, NodeId, NodeKind,
     Op, Paint, PathVerb, Prop, RAMP, RampId, RegionId, ResOp, RunId, SinkPatch, Slots, Span,
     Spread, SpriteId, StrokeStyle, TRACKER, TrackerId, TrackerOp, Value,
@@ -101,6 +101,7 @@ struct Side {
     visual: Visual,
     geometry: u32,
     scroll: u32,
+    wheel: u32,
     region: u32,
     surface: u32,
     rounded: u32,
@@ -126,6 +127,7 @@ impl Default for Side {
             visual: Visual::Unplaced,
             geometry: tree::NONE,
             scroll: tree::NONE,
+            wheel: tree::NONE,
             region: tree::NONE,
             surface: tree::NONE,
             rounded: tree::NONE,
@@ -252,6 +254,8 @@ pub struct Host {
     pub(crate) peers: Vec<crate::uia::RegionPeer>,
     pub(crate) region_ops: Vec<crate::seam::RegionOp>,
     pub(crate) scroll_ops: Vec<crate::seam::ScrollOp>,
+    pub(crate) wheels: Pool<crate::wheel::WheelRow>,
+    pub(crate) wheel_ops: Vec<crate::seam::WheelOp>,
     pub(crate) popups: Vec<crate::overlay::Request>,
     pub(crate) uia_stale: core::cell::Cell<bool>,
     /// The id paths the last publish used, held for their allocations.
@@ -341,6 +345,8 @@ impl Host {
                 uia_seen: Vec::new(),
                 region_ops: Vec::new(),
                 scroll_ops: Vec::new(),
+                wheels: Pool::default(),
+                wheel_ops: Vec::new(),
                 popups: Vec::new(),
                 uia_stale: core::cell::Cell::new(false),
                 census: crate::seam::AppCensus::default(),
@@ -922,12 +928,12 @@ impl Host {
         TrackerId::new(self.tracker_ids.mint())
     }
 
-    pub(crate) fn create_tracker<O>(&mut self, id: TrackerId<O>, viewport: GroupId, axes: Axes) {
+    pub(crate) fn create_tracker<O>(&mut self, id: TrackerId<O>, visual: GroupId, source: windows_scene::Source) {
         self.pending.push(Op::Tracker {
             id: id.erased(),
             op: TrackerOp::Create {
-                viewport,
-                axes,
+                visual,
+                source,
                 owned: true,
             },
         });
@@ -1050,6 +1056,15 @@ impl Host {
 
     pub(crate) fn set_scroll_row(&mut self, node: NodeId, at: u32) {
         self.side_mut(node).scroll = at;
+    }
+
+    pub(crate) fn set_wheel_row(&mut self, node: NodeId, at: u32) {
+        self.side_mut(node).wheel = at;
+    }
+
+    /// The wheel row this node's control holds, or `NONE`.
+    pub(crate) fn wheel_row(&self, node: NodeId) -> u32 {
+        self.side(node).map_or(tree::NONE, |side| side.wheel)
     }
 
     pub(crate) fn set_region_row(&mut self, node: NodeId, at: u32) {
@@ -1491,10 +1506,10 @@ impl Host {
                 let call = handlers?.expand.clone()?;
                 Some(Box::new(move || call(expanded)))
             }
-            What::Wheel { notches, horizontal } => {
+            What::Wheel { notches } => {
                 if row.disabled { return None; }
                 let call = handlers?.wheel.clone()?;
-                Some(Box::new(move || call(notches, horizontal)))
+                Some(Box::new(move || call(notches)))
             }
             What::DoubleTapped(at) => {
                 if row.disabled { return None; }
@@ -1680,6 +1695,9 @@ impl Host {
                 self.release_control(row.front.grab);
             }
         }
+        if side.wheel != tree::NONE {
+            self.retire_wheel(side.wheel);
+        }
         if side.surface != tree::NONE {
             self.appearances
                 .release_surface(side.surface, &mut self.pending);
@@ -1711,6 +1729,7 @@ impl Host {
             h.publish_rounded_clips();
             h.publish_text();
             h.publish_scrolls();
+            h.publish_wheels();
             h.place_overlays();
             h.place_focus_outline();
             h.publish_anchors();
@@ -2443,6 +2462,7 @@ impl Host {
         down.values.append(&mut self.values);
         down.regions.append(&mut self.region_ops);
         down.scrolls.append(&mut self.scroll_ops);
+        down.wheels.append(&mut self.wheel_ops);
         down.declared.gestures.append(&mut self.gestures);
         down.declared.focus.append(&mut self.focus_ops);
         down.fields.sources.append(&mut self.field_sources);

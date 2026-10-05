@@ -103,9 +103,18 @@ impl Uia {
         }
     }
 
-    /// Records the window every provider answers for.
-    pub fn attach(&mut self, hwnd: HWND) {
-        self.shared.attach(hwnd);
+    /// Records the window every provider answers for — the content window, whose
+    /// `WM_GETOBJECT` reaches [`get_object`](Self::get_object) — and its frame, whose queue runs
+    /// the tick a client's request wakes and whose `WM_GETOBJECT` reaches
+    /// [`get_frame_object`](Self::get_frame_object).
+    pub fn attach(&mut self, hwnd: HWND, frame: HWND) {
+        self.shared.attach(hwnd, frame);
+    }
+
+    /// Answers the frame's `WM_GETOBJECT`, or `None` for an object id that names something
+    /// else.
+    pub fn get_frame_object(&mut self, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
+        provider::get_frame_object(&self.shared, w, l)
     }
 
     /// Answers `WM_GETOBJECT` with the fragment root, or `None` for an object id that names
