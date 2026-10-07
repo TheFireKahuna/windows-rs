@@ -2724,6 +2724,19 @@ impl ID2D1RenderTarget {
             (windows_core::Interface::vtable(self).PopLayer)(windows_core::Interface::as_raw(self));
         }
     }
+    pub unsafe fn Flush(
+        &self,
+        tag1: Option<*mut D2D1_TAG>,
+        tag2: Option<*mut D2D1_TAG>,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).Flush)(
+                windows_core::Interface::as_raw(self),
+                tag1.unwrap_or(core::mem::zeroed()) as _,
+                tag2.unwrap_or(core::mem::zeroed()) as _,
+            )
+        }
+    }
     pub unsafe fn PushAxisAlignedClip(
         &self,
         cliprect: *const D2D_RECT_F,
@@ -2912,7 +2925,11 @@ pub struct ID2D1RenderTarget_Vtbl {
     GetTags: usize,
     PushLayer: usize,
     pub PopLayer: unsafe extern "system" fn(*mut core::ffi::c_void),
-    Flush: usize,
+    pub Flush: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut D2D1_TAG,
+        *mut D2D1_TAG,
+    ) -> windows_core::HRESULT,
     SaveDrawingState: usize,
     RestoreDrawingState: usize,
     pub PushAxisAlignedClip:

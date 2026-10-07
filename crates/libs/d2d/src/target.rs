@@ -11,6 +11,7 @@
 //! solves in, what DirectWrite measures in, and what Direct2D scales by default.
 
 use super::*;
+use core::cell::Cell;
 use core::mem::ManuallyDrop;
 
 /// A Direct2D render target: FP16, at a known pixel size and a known DPI.
@@ -19,6 +20,10 @@ pub struct Target {
     px: (u32, u32),
     dpi: f32,
     pub(crate) opacity: Opacity,
+    /// Set once a [`Blur`] reads this target. Its binding then flushes when it drops,
+    /// because Direct2D can run an effect's draw ahead of commands still batched for the
+    /// effect's input within one bracket.
+    pub(crate) feeds_effect: Cell<bool>,
 }
 
 /// Asserts, in debug builds, that `dpi` is inside the range Direct2D's pipeline is designed
@@ -104,6 +109,7 @@ impl Gpu {
             px,
             dpi: 96.0,
             opacity: Opacity::Translucent,
+            feeds_effect: Cell::new(false),
         })
     }
 
@@ -129,6 +135,7 @@ impl Gpu {
             px,
             dpi,
             opacity,
+            feeds_effect: Cell::new(false),
         })
     }
 
@@ -157,6 +164,7 @@ impl Gpu {
             px: (size.width, size.height),
             dpi,
             opacity,
+            feeds_effect: Cell::new(false),
         })
     }
 }

@@ -48,7 +48,9 @@ impl Gpu {
     /// Builds a Gaussian blur of `source` at `sigma` standard deviations, in DIPs.
     ///
     /// `source` must be a target this device minted, and it must outlive nothing: the blur
-    /// holds it. Draw the result with [`Draw::blurred`].
+    /// holds it. Draw the result with [`Draw::blurred`]. From here on, every binding of
+    /// `source` flushes the context when it drops, so a blur drawn later in the same pass
+    /// reads what that binding drew.
     ///
     /// The blur spreads about **three sigma**, so a source whose content reaches its own
     /// edge is cut off there — the border mode lets the blur spread past the edge rather
@@ -61,6 +63,7 @@ impl Gpu {
     pub fn blur(&self, source: &Target, sigma: f32) -> Result<Blur> {
         debug_assert!(sigma > 0.0, "a blur at {sigma} sigma spreads nothing");
         let effect = unsafe { self.ctx().CreateEffect(&CLSID_D2D1GaussianBlur)? };
+        source.feeds_effect.set(true);
         unsafe {
             effect.SetInput(0, &source.bitmap, true);
             // Quality rather than speed or balanced: the two cheaper paths downsample before
@@ -195,5 +198,66 @@ mod tests {
             "the blur clamped an above-white source to {lit}, so an intermediate was \
              limited-range"
         );
+    }
+
+    /// Each of several blurs drawn in one pass reads what its own source drew in that pass,
+    /// whether the source drew a line or only cleared.
+    ///
+    /// Each source is drawn and then blurred before the next source is drawn. That puts every
+    /// blur after the first one behind commands Direct2D has not run yet.
+    #[test]
+    fn each_blur_in_a_pass_reads_its_sources_drawing_from_that_pass() {
+        let Ok(gpu) = Gpu::for_presentation() else {
+            eprintln!("no Direct2D device: the blur's contract is untested on this machine");
+            return;
+        };
+        let ink = gpu
+            .solid(Scrgb { r: 1.0, g: 1.0, b: 1.0, a: 0.5 })
+            .expect("solid brush");
+        let line = gpu
+            .path(|s| {
+                s.figure(Vector2 { x: 8.0, y: 32.0 }, Figure::Hollow)
+                    .lines(&[Vector2 { x: 56.0, y: 32.0 }])
+                    .close(End::Open);
+                Ok(())
+            })
+            .expect("path");
+        let glows: Vec<_> = (0..3)
+            .map(|_| {
+                let source = gpu
+                    .offscreen((64, 64), 96.0, Opacity::Translucent)
+                    .expect("offscreen");
+                let blur = gpu.blur(&source, 4.0).expect("blur");
+                let out = gpu
+                    .offscreen((64, 64), 96.0, Opacity::Translucent)
+                    .expect("offscreen");
+                (source, blur, out)
+            })
+            .collect();
+        for lit in [true, false] {
+            let mut pass = gpu.pass().expect("pass");
+            for (source, blur, out) in &glows {
+                {
+                    let draw = pass.draw(source);
+                    draw.clear(Scrgb::TRANSPARENT);
+                    if lit {
+                        draw.stroke(&line, &ink, Stroke::width(4.0));
+                    }
+                }
+                let draw = pass.draw(out);
+                draw.clear(Scrgb::TRANSPARENT);
+                draw.blurred(blur, Vector2 { x: 0.0, y: 0.0 });
+            }
+            pass.end().expect("end");
+            for (i, (_, _, out)) in glows.iter().enumerate() {
+                // Six DIPs off the line, inside the spread and outside the stroke.
+                let glow = gpu.read(out).expect("readback").pixel(32, 26)[3];
+                if lit {
+                    assert!(glow > 0.01, "blur {i} shows {glow} where its source drew a line");
+                } else {
+                    assert!(glow == 0.0, "blur {i} shows {glow} where its source only cleared");
+                }
+            }
+        }
     }
 }

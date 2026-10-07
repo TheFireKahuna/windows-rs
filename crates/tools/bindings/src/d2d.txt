@@ -76,7 +76,11 @@
 // systematically thin or fat and reads as a font choice rather than as a setting.
 // The params object itself is DirectWrite's and is built by `windows-text`; this
 // crate names only the interface, so that a caller can hand one over.
-    ID2D1RenderTarget::{BeginDraw, EndDraw, SetTags, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize, PushAxisAlignedClip, PopAxisAlignedClip, PopLayer, SetTextAntialiasMode, SetTextRenderingParams, GetTextRenderingParams, SetAntialiasMode, GetAntialiasMode}
+//
+// `Flush` executes the commands batched so far. Within one bracket Direct2D can run an
+// effect's draw ahead of commands still batched for the bitmap the effect reads, so a
+// target that feeds an effect flushes when its binding drops.
+    ID2D1RenderTarget::{BeginDraw, EndDraw, SetTags, Flush, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize, PushAxisAlignedClip, PopAxisAlignedClip, PopLayer, SetTextAntialiasMode, SetTextRenderingParams, GetTextRenderingParams, SetAntialiasMode, GetAntialiasMode}
     IDWriteRenderingParams::{}
 // Ideal glyph metrics, independent of the display resolution, positioned with
 // subpixel precision. Design metrics stay DIP-constant, so the GDI modes — which

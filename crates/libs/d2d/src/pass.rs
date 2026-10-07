@@ -70,6 +70,7 @@ impl<'g> Pass<'g> {
             dpi,
             layers: Cell::new(0),
             unbind: true,
+            flush: target.feeds_effect.get(),
         }
     }
 
@@ -159,6 +160,7 @@ pub struct Draw<'p> {
     dpi: f32,
     layers: Cell<u32>,
     unbind: bool,
+    flush: bool,
 }
 
 impl<'p> Draw<'p> {
@@ -172,6 +174,7 @@ impl<'p> Draw<'p> {
             dpi,
             layers: Cell::new(0),
             unbind: false,
+            flush: false,
         }
     }
 
@@ -501,6 +504,11 @@ impl Drop for Draw<'_> {
             0,
             "an unpopped layer poisons the target through to EndDraw"
         );
+        if self.flush {
+            // An effect reading this target sees what was drawn here only once it has run.
+            // A failure here is latched too, and `EndDraw` reports it with its tag.
+            let _ = unsafe { self.ctx.Flush(None, None) };
+        }
         if self.unbind {
             // Release the target's hold before the buffer is presented or freed. Drawing
             // calls after this would error, and nothing draws after this.
