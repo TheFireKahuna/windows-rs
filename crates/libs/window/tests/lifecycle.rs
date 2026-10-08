@@ -118,6 +118,10 @@ fn handlers_dispatch_through_the_window_procedure() {
     // the call runs its window procedure inline.
     unsafe { SendMessageW(window.hwnd(), WM_SIZE, 0, 640 | (480 << 16)) };
     assert_eq!(sizes.get(), (640, 480));
+
+    // SAFETY: as above. `wparam` 1 is `SIZE_MINIMIZED`, which reports a zero client area.
+    unsafe { SendMessageW(window.hwnd(), WM_SIZE, 1, 0) };
+    assert_eq!(sizes.get(), (640, 480), "a minimize reached the resize handler");
 }
 
 /// Reports a window built hidden as hidden until [`Window::show`] runs.

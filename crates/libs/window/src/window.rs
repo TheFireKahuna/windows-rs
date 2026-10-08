@@ -660,6 +660,9 @@ impl WindowBuilder {
 
     /// Sets a handler called when the client area is resized, with the new width and height
     /// in pixels. It replaces default processing of `WM_SIZE`.
+    ///
+    /// A minimize is not a resize: the handler is not called for the zero client area a
+    /// minimize reports, so content keeps its size until the restore reports the real one.
     #[must_use]
     pub fn on_resize<F>(mut self, handler: F) -> Self
     where
@@ -1278,9 +1281,10 @@ unsafe extern "system" fn wndproc(
     let mut handled =
         unsafe { detached(hwnd, |s| &s.message, |h| h(hwnd, message, wparam, lparam)) }.flatten();
 
-    if handled.is_none() && message == WM_SIZE as u32 {
-        let width = (lparam & 0xffff) as i32;
-        let height = ((lparam >> 16) & 0xffff) as i32;
+    let width = (lparam & 0xffff) as i32;
+    let height = ((lparam >> 16) & 0xffff) as i32;
+    // A zero dimension is a minimize, which the resize handler does not see.
+    if handled.is_none() && message == WM_SIZE as u32 && width != 0 && height != 0 {
         // SAFETY: as above.
         handled = unsafe {
             detached(
