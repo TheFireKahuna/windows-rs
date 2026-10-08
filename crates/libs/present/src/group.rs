@@ -173,6 +173,7 @@ pub struct PresentationGroup(Rc<Inner>);
 
 impl PresentationGroup {
     pub(crate) fn new(factory: &IPresentationFactory, statistics: bool) -> Result<Self> {
+        windows_census::count!("present.manager");
         // SAFETY: `factory` is live for the call; every out-parameter is a stack local.
         let (manager, lost_event, statistics_event) = unsafe {
             let manager = factory.CreatePresentationManager()?;
@@ -239,6 +240,7 @@ impl PresentationGroup {
         if inner.pending.replace(0) == 0 {
             return Ok(false);
         }
+        windows_census::count!("present.present");
         if self.is_lost() {
             return Ok(false);
         }

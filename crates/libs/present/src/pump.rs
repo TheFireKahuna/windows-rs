@@ -22,14 +22,10 @@ use std::sync::{Arc, Mutex};
 pub struct Tuning {
     /// Frames drawn per wake, each presented into its own scheduled slot.
     ///
-    /// At one frame per wake, present and the Direct2D bracket were 87% of a 494 µs
-    /// compositor frame before anything was drawn, and nearly all of that is fixed per pass
-    /// rather than per frame, so it divides: 7.12% of a core at 1, 6.55% at 2, 5.00% at 3,
-    /// 4.76% at 4, 4.69% at 5.
-    ///
-    /// The cost is freshness. Inside a batch the first frame is as current as a per-refresh
-    /// pass and the last is `depth - 1` refreshes stale — 13.9 ms at 144 Hz for three, half
-    /// that on average — which is what bounds the value rather than the CPU curve.
+    /// Every frame of a batch is drawn from the inputs observed at the wake, so a slot after
+    /// the first is up to `depth - 1` refreshes stale. A batch shows each of its frames only
+    /// when the compositor composes every refresh; where it composes less often, the slots
+    /// due between two compositions are superseded and never shown.
     pub depth: u32,
     /// Buffers beyond `depth`: one for what the display is showing, one of slack so the
     /// rotation never catches its own tail on a frame the queue was late to retire.
@@ -60,7 +56,7 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Self {
         Self {
-            depth: 3,
+            depth: 1,
             slack: 2,
             quiet_ticks: 30,
             statistics: false,
@@ -309,6 +305,10 @@ struct Mounted {
     geometry: Arc<RegionGeometry>,
     geometry_moving: bool,
     geometry_revision: u64,
+    /// Whether this pass draws the region at every slot of its batch. A region that is not
+    /// animating would show the same pixels at each, so it draws, binds and presents the
+    /// first slot only.
+    animated: bool,
     render_extent: Extent,
     follows_animated_extent: bool,
     input: Arc<RegionInput>,
@@ -537,6 +537,7 @@ impl Pump {
     /// Runs one pass: gate every region, draw the whole batch inside one bracket, then bind
     /// and show. Returns `true` when anything was drawn.
     fn pass(&mut self, now: u64, tick: u64, wake: &Event) -> bool {
+        let _pass = windows_census::span!("present.pass");
         self.tick_count += 1;
         for m in &mut self.mounted {
             if !m.active { continue; }
@@ -597,6 +598,7 @@ impl Pump {
         let interval = std::time::Duration::from_nanos(tick * 100);
         due.clear();
         poisoned.clear();
+        let gate = windows_census::span!("present.gate");
         for (i, m) in mounted.iter_mut().enumerate() {
             if !m.active { continue; }
             let observed = m.region.extent();
@@ -618,12 +620,23 @@ impl Pump {
                 out: *out,
                 input: &m.input,
             };
-            match guarded(|| m.frame.should_draw(ctx)) {
-                Some(true) => due.push(i),
-                Some(false) => { if m.resize_pending { due.push(i); } }
+            let drawn = match guarded(|| m.frame.should_draw(ctx)) {
+                Some(drawn) => drawn || m.resize_pending,
+                None => {
+                    poisoned.push(m.spec.key);
+                    continue;
+                }
+            };
+            if !drawn { continue; }
+            match guarded(|| m.frame.animating()) {
+                Some(animated) => {
+                    m.animated = animated;
+                    due.push(i);
+                }
                 None => poisoned.push(m.spec.key),
             }
         }
+        drop(gate);
         if due.is_empty() {
             for m in mounted.iter_mut() {
                 m.resize_pending = false;
@@ -637,8 +650,10 @@ impl Pump {
         slots.clear();
         let depth = if self.replace_queued || mounted.iter().any(|m| m.active && (m.resize_pending || m.input.active().is_some() || m.geometry_moving)) {
             1
-        } else {
+        } else if due.iter().any(|&i| mounted[i].animated) {
             self.tuning.depth
+        } else {
+            1
         };
         for m in mounted.iter_mut() {
             m.resize_pending = false;
@@ -651,7 +666,10 @@ impl Pump {
         // Every slot of every due region, before anything binds. The bracket opens here
         // and spans the whole batch; its cost is fixed per pair and independent of what
         // was drawn, so a batch of `depth` frames pays it once instead of `depth` times.
-        let Ok(mut pass) = device.pass() else {
+        let Ok(mut pass) = ({
+            let _begin = windows_census::span!("present.begin_draw");
+            device.pass()
+        }) else {
             for &i in &*due { let _ = guarded(|| mounted[i].frame.finish_batch(false)); }
             return false;
         };
@@ -659,7 +677,11 @@ impl Pump {
         'drawing: for k in 0..slots.len() {
             for &i in &*due {
                 let m = &mut mounted[i];
-                let Ok(Acquisition::Ready(target)) = m.region.acquire_with(&interruptions[..interruption_count]) else {
+                if k > 0 && !m.animated { continue; }
+                let Ok(Acquisition::Ready(target)) = ({
+                    let _acquire = windows_census::span!("present.acquire");
+                    m.region.acquire_with(&interruptions[..interruption_count])
+                }) else {
                     interrupted = true;
                     break 'drawing;
                 };
@@ -680,10 +702,14 @@ impl Pump {
                 // Once per retarget rather than once per call: a latched error discards the
                 // rest of the batch, and the tag names the region that latched it.
                 pass.tag(m.spec.key.0);
-                if !matches!(guarded(|| m.frame.prepare(gate, &mut pass)), Some(Ok(()))) {
+                let prepare = windows_census::span!("present.prepare");
+                let prepared = guarded(|| m.frame.prepare(gate, &mut pass));
+                drop(prepare);
+                if !matches!(prepared, Some(Ok(()))) {
                     poisoned.push(m.spec.key);
                     break 'drawing;
                 }
+                let _record = windows_census::span!("present.record");
                 let draw = pass.draw(target);
                 if guarded(|| m.frame.draw(gate.draw_ctx(), &draw)).is_none() {
                     poisoned.push(m.spec.key);
@@ -701,7 +727,10 @@ impl Pump {
             wake.signal();
             return false;
         }
-        let flushed = match Flushed::end(pass) {
+        let end = windows_census::span!("present.end_draw");
+        let flushed = Flushed::end(pass);
+        drop(end);
+        let flushed = match flushed {
             Ok(flushed) => flushed,
             Err(error) => {
                 for &i in &*due {
@@ -771,6 +800,7 @@ impl Pump {
                 let (key, group) = &self.groups[*index];
                 let mut bound = false;
                 for &i in &due[range.clone()] {
+                    let _bind = windows_census::span!("present.bind");
                     match mounted[i].region.submit(&flushed) {
                         Ok(submitted) => bound |= submitted,
                         Err(_) => { failed_group = Some(*key); break 'submission; }
@@ -787,7 +817,10 @@ impl Pump {
                 } else {
                     Interrupt::Defer
                 };
-                if group.present_at(*at, interrupt).is_err() {
+                let present = windows_census::span!("present.present_at");
+                let presented = group.present_at(*at, interrupt);
+                drop(present);
+                if presented.is_err() {
                     failed_group = Some(*key);
                     break 'submission;
                 }
@@ -933,6 +966,7 @@ impl Pump {
             observed_urgent: epoch.urgent(),
             geometry,
             geometry_moving: false,
+            animated: false,
             geometry_revision: u64::MAX,
             render_extent: spec.extent,
             follows_animated_extent,
@@ -1172,8 +1206,9 @@ mod tests {
 
     #[derive(Debug, PartialEq)]
     enum Seen { Observe(u64), Prepare(u64, Instant), Draw(u64, Instant), Finish(u64, bool) }
-    struct Probe { id: u64, seen: Arc<Mutex<Vec<Seen>>>, dirty: bool, fail: bool, panic: bool, invalidate: Option<Arc<Epoch>> }
+    struct Probe { id: u64, seen: Arc<Mutex<Vec<Seen>>>, dirty: bool, fail: bool, panic: bool, invalidate: Option<Arc<Epoch>>, moving: bool }
     impl Frame for Probe {
+        fn animating(&self) -> bool { self.moving }
         fn should_draw(&mut self, _: GateCtx<'_>) -> bool {
             self.seen.lock().unwrap().push(Seen::Observe(self.id));
             core::mem::replace(&mut self.dirty, false)
@@ -1196,8 +1231,10 @@ mod tests {
             if !success { self.dirty = true; }
         }
     }
+    /// A pump that batches three frames per wake, so the tests reach the scheduling a
+    /// batch exercises.
     fn pump() -> Pump {
-        Pump::new(Tuning::default(), OutputTransform::for_display(DisplayCapability::Sdr,1000.0),
+        Pump::new(Tuning { depth: 3, ..Tuning::default() }, OutputTransform::for_display(DisplayCapability::Sdr,1000.0),
             Box::new(|_,_|{}),Arc::default(),None).unwrap()
     }
     #[test]
@@ -1205,10 +1242,10 @@ mod tests {
         let mut pump = pump();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let epoch = Arc::new(Epoch::new().unwrap());
-        let frame = Probe { id: 1, seen: seen.clone(), dirty: true, fail: false, panic: false, invalidate: Some(epoch.clone()) };
+        let frame = Probe { id: 1, seen: seen.clone(), dirty: true, fail: false, panic: false, invalidate: Some(epoch.clone()), moving: true };
         pump.mount(RegionSpec { key: RegionKey(1), queue: Queue::Shared("test"), extent: Extent::new(16.0,16.0,96.0) }, epoch, Arc::default(), Arc::default(), Box::new(move |_| Ok(Box::new(frame)))).unwrap();
         mount(&mut pump, 2, &seen, false, false);
-        let frame = Probe { id: 3, seen: seen.clone(), dirty: true, fail: false, panic: false, invalidate: None };
+        let frame = Probe { id: 3, seen: seen.clone(), dirty: true, fail: false, panic: false, invalidate: None, moving: true };
         pump.mount(RegionSpec { key: RegionKey(3), queue: Queue::Solo, extent: Extent::new(16.0,16.0,96.0) }, Arc::new(Epoch::new().unwrap()), Arc::default(), Arc::default(), Box::new(move |_| Ok(Box::new(frame)))).unwrap();
         let wake = Event::auto_reset().unwrap();
         assert!(pump.pass(interrupt_time_now(), 100_000, &wake));
@@ -1232,7 +1269,7 @@ mod tests {
         let epoch = Arc::new(Epoch::new().unwrap());
         let input = Arc::new(RegionInput::new());
         for (id, width) in [(1, 100.0), (2, 320.0)] {
-            let frame = Probe { id, seen: seen.clone(), dirty: true, fail: false, panic: false, invalidate: None };
+            let frame = Probe { id, seen: seen.clone(), dirty: true, fail: false, panic: false, invalidate: None, moving: true };
             pump.mount(RegionSpec { key: RegionKey(id), queue: Queue::Shared("test"),
                 extent: Extent::new(width, 44.0, 96.0) }, epoch.clone(), input.clone(),
                 Arc::default(), Box::new(move |_| Ok(Box::new(frame)))).unwrap();
@@ -1348,7 +1385,10 @@ mod tests {
         assert!(seen.lock().unwrap().iter().any(|event| matches!(event,Seen::Draw(1,_))));
     }
     fn mount(pump: &mut Pump, id:u64, seen: &Arc<Mutex<Vec<Seen>>>, fail: bool, panic: bool) {
-        let frame = Probe { id, seen:seen.clone(),dirty:true,fail,panic,invalidate:None };
+        mount_probe(pump, Probe { id, seen:seen.clone(),dirty:true,fail,panic,invalidate:None,moving:true });
+    }
+    fn mount_probe(pump: &mut Pump, frame: Probe) {
+        let id = frame.id;
         pump.mount(RegionSpec {key:RegionKey(id),queue:Queue::Shared("test"),extent:Extent::new(16.0,16.0,96.0)},
             Arc::new(Epoch::new().unwrap()),Arc::default(),Arc::default(),Box::new(move |_| Ok(Box::new(frame)))).unwrap();
     }
@@ -1371,6 +1411,27 @@ mod tests {
         seen.lock().unwrap().clear();
         assert!(!pump.pass(interrupt_time_now(),100_000,&wake));
         assert_eq!(&*seen.lock().unwrap(), &[Seen::Observe(1),Seen::Observe(2)]);
+    }
+    #[test]
+    fn a_region_that_is_not_animating_draws_only_the_first_slot() {
+        let mut pump = pump();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        mount(&mut pump,1,&seen,false,false);
+        mount_probe(&mut pump, Probe { id:2, seen:seen.clone(), dirty:true, fail:false, panic:false, invalidate:None, moving:false });
+        let wake = Event::auto_reset().unwrap();
+        assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+        assert_eq!(pump.slots.len(),3);
+        let drawn = |id| seen.lock().unwrap().iter().filter(|e| matches!(e, Seen::Draw(at,_) if *at==id)).count();
+        assert_eq!((drawn(1),drawn(2)),(3,1));
+    }
+    #[test]
+    fn a_batch_with_nothing_animating_is_one_slot() {
+        let mut pump = pump();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        mount_probe(&mut pump, Probe { id:1, seen:seen.clone(), dirty:true, fail:false, panic:false, invalidate:None, moving:false });
+        let wake = Event::auto_reset().unwrap();
+        assert!(pump.pass(interrupt_time_now(),100_000,&wake));
+        assert_eq!(pump.slots.len(),1);
     }
     #[test]
     fn failed_or_panicking_preparation_retries_unaffected_regions() {

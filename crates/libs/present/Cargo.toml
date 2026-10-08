@@ -10,6 +10,7 @@ categories = ["os::windows-apis"]
 readme = "readme.md"
 
 [dependencies]
+windows-census = { workspace = true }
 # A frame's colours cross the draw choke here exactly as they do on the retained path,
 # so the transform is carried in the frame context and this crate names the type. It is the
 # dependency with no dependencies of its own.

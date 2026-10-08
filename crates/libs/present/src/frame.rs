@@ -458,9 +458,11 @@ pub trait Frame {
     /// The target is bound in DIPs with the region's origin at `(0, 0)`, and its contents
     /// are undefined on entry, so an implementation must clear or cover the whole box.
     ///
-    /// Called `depth` times per pass, once per frame the batch will show, in the order they
-    /// will be shown. A batch draws exactly the frames that will appear, so an ease stepped
-    /// once per call produces the same motion as a pass per refresh.
+    /// Called once per frame the batch will show, in the order they will be shown: `depth`
+    /// times while [`animating`](Self::animating) reports `true`, and once otherwise, since
+    /// a frame that does not move would show the same pixels at every slot. A batch draws
+    /// exactly the frames that will appear, so an ease stepped once per call produces the
+    /// same motion as a pass per refresh.
     ///
     /// Must not block. A later region's buffer acquisition can block with this pass's
     /// bracket already open, so time spent waiting here delays every region in the pass.
@@ -486,6 +488,10 @@ pub trait Frame {
 
     /// Returns `true` while something this renderer draws is still moving, which keeps the
     /// present thread paced off the display clock rather than parked.
+    ///
+    /// Read after [`should_draw`](Self::should_draw) reports a change, and it decides how
+    /// many slots of the batch [`draw`](Self::draw) fills: a renderer whose pixels depend on
+    /// the slot's time must report `true` for as long as they do.
     fn animating(&self) -> bool {
         false
     }

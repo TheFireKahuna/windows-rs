@@ -145,6 +145,7 @@ impl PresentationRegion {
         key: RegionKey,
         pool: u32,
     ) -> Result<Self> {
+        windows_census::count!("present.region");
         // SAFETY: no security attributes; the out-parameter is a stack local, and
         // ownership of the handle transfers on success.
         let handle = unsafe {
@@ -351,6 +352,7 @@ impl PresentationRegion {
         if self.submitted.get() == self.acquired.get() || self.is_lost() {
             return Ok(false);
         }
+        windows_census::count!("present.submit");
         let index = (self.submitted.get() % u64::from(self.pool)) as usize;
         self.state_content_layout()?;
         // SAFETY: `surface` and the buffer are live and owned by this region.

@@ -33,10 +33,12 @@ its wake source, so a new consumer adds nothing to this crate.
 
 ### What the thread does with a wake
 
-It draws `depth` frames per wake rather than one, inside one Direct2D bracket, and presents each into
-its own scheduled slot. At one frame per wake the present and the bracket were 87% of a compositor
-frame before anything was drawn, and nearly all of that is fixed per pass, so it divides: 7.12% of a
-core at depth 1, 5.00% at 3. Three mechanisms pay for it — amortizing the bracket (79.82 µs a call to
+It draws `depth` frames per wake, one by default, inside one Direct2D bracket, and presents each into
+its own scheduled slot. A deeper batch divides the fixed cost of a pass — at one frame per wake the
+present and the bracket were 87% of a compositor frame before anything was drawn, 7.12% of a core at
+depth 1 and 5.00% at 3 — but every frame of it shows the inputs of the wake, and a compositor that
+composes less often than every refresh supersedes the slots due between two of its frames, so they
+are never shown. Three mechanisms pay for a batch — amortizing the bracket (79.82 µs a call to
 10.97), scheduling each present into its slot rather than asking for "as early as possible" (~10% of
 a present), and declining the VSync interrupt on every present but the one the next pass waits behind
 (~26 µs of CPU each).
