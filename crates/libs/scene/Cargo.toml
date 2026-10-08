@@ -10,6 +10,7 @@ categories = ["os::windows-apis"]
 readme = "readme.md"
 
 [dependencies]
+windows-census = { workspace = true }
 # One hash map implementation, in the one place a key is content-addressed rather than
 # minted. Every per-node table is a `Vec` indexed by a dense id.
 rustc-hash = { workspace = true }

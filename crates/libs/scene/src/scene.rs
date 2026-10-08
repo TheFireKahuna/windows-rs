@@ -416,8 +416,9 @@ fn period_for(tuning: Tuning, travel: f32) -> f32 {
 /// What one in-flight batch is holding alive.
 enum PendingKind {
     /// The flattened capture, on screen for as long as the exit plays. Held because nothing
-    /// else does: a ghost is unparented from the model's tree by construction.
-    Ghost(Visual),
+    /// else does: a ghost is unparented from the model's tree by construction. The count is
+    /// the visuals it holds: the sprite, and the clip host above it when there is one.
+    Ghost(Visual, u32),
     Collapse { id: NodeId, parent: NodeId, carrier: ContainerVisual, resources: Vec<Aux> },
     /// An animation whose target has been collected is dropped by the compositor and the
     /// batch then never reports, so the scratch target is held.
@@ -1262,7 +1263,23 @@ impl Scene {
         }
         self.settle_stopped(back)?;
         patch.clear();
+        self.publish_census();
         Ok(self.census.changed_since(&before))
+    }
+
+    /// Publishes the tallies to `windows-census`, where a profiling build reads them. A
+    /// level is this scene's alone, so a process with several scenes reports the last
+    /// one applied.
+    fn publish_census(&self) {
+        let c = &self.census;
+        windows_census::count!("scene.apply");
+        windows_census::level!("scene.visuals", c.visuals_live);
+        windows_census::level!("scene.trackers", c.trackers_live);
+        windows_census::total!("scene.visuals_minted", c.visuals_minted);
+        windows_census::total!("scene.props_written", c.props_written);
+        windows_census::total!("scene.props_skipped", c.props_skipped);
+        windows_census::total!("scene.ops", c.ops_applied);
+        windows_census::total!("scene.animations", c.animations);
     }
 
     fn settle_stopped(&mut self, back: &Backends) -> Result<()> {
@@ -1416,6 +1433,7 @@ impl Scene {
     }
 
     fn realize(&mut self, id: NodeId, back: &Backends, env: Env) -> Result<()> {
+        windows_census::count!("scene.realize");
         let glow = match self.nodes.painted(id).map(|painted| painted.paint) {
             Some(Paint::Captured { group, .. }) => self.nodes.visual(group.0).cloned(),
             _ => None,
@@ -1675,10 +1693,7 @@ impl Scene {
                 PendingKind::Frames(node, _) | PendingKind::TranslationCarry { node, .. } if node == id),
         );
         let (aux, painted) = self.nodes.free(id);
-        // A split group's content carrier goes with its visual.
-        if aux.as_ref().is_some_and(|aux| aux.content.is_some()) {
-            self.census.visuals_live = self.census.visuals_live.saturating_sub(1);
-        }
+        let held = aux.as_ref().map_or(0, Aux::visuals);
         if let (Some(aux), Some(resources)) = (aux, resources) { resources.push(aux); }
         self.prune_settlements();
         if let Some(painted) = painted {
@@ -1686,7 +1701,7 @@ impl Scene {
             self.res.release(painted.mask.holds_dash());
             self.res.release(painted.paint.holds());
         }
-        self.census.visuals_live = self.census.visuals_live.saturating_sub(1);
+        self.census.visuals_live = self.census.visuals_live.saturating_sub(1 + held);
     }
 
     /// Detaches the subtree and keeps it on screen for the length of the exit.
@@ -1761,6 +1776,7 @@ impl Scene {
         };
         self.overlay.children().insert_at_top(&mounted);
         let minted = 1 + u32::from(bounds.is_some());
+        windows_census::count!("scene.exit.ghost");
         self.census.visuals_minted += u64::from(minted);
         self.census.visuals_live += minted;
 
@@ -1793,7 +1809,7 @@ impl Scene {
             scalar,
         );
         self.census.animations += 1;
-        self.motion.watch(back, PendingKind::Ghost(mounted), |_| {
+        self.motion.watch(back, PendingKind::Ghost(mounted, minted), |_| {
             sprite.start_animation(path, &animation);
         })
     }
@@ -1819,6 +1835,7 @@ impl Scene {
         let animation = self.motion.templates.spring(
             1, Tuning::Layout, Value::Scalar(offset.y), size.y, Duration::ZERO,
         );
+        windows_census::count!("scene.exit.collapse");
         self.census.visuals_minted += 1;
         self.census.visuals_live += 1;
         self.census.animations += 1;
@@ -2339,6 +2356,7 @@ impl Scene {
         back: &Backends,
         env: Env,
     ) -> Result<()> {
+        windows_census::count!("scene.resource");
         let obj = match op {
             // Drops only the model's own claim: a sprite still painting with the resource
             // keeps it alive until that sprite is destroyed or re-declares.
@@ -2734,7 +2752,7 @@ impl Scene {
     /// Ends transient exit snapshots, which a window resize invalidates.
     pub fn cancel_exits(&mut self) {
         self.pending_retain(|pending| !matches!(pending.holds,
-            PendingKind::Ghost(_) | PendingKind::Collapse { .. }));
+            PendingKind::Ghost(..) | PendingKind::Collapse { .. }));
     }
 
     /// Returns the collapsing ancestor that keeps a presented region visible in this patch.
@@ -2771,9 +2789,9 @@ impl Scene {
             }
             // Explicitly removed from its parent collection, since that collection owns a
             // strong reference.
-            if let PendingKind::Ghost(visual) = &pending.holds {
+            if let PendingKind::Ghost(visual, held) = &pending.holds {
                 let _ = overlay.try_remove(visual);
-                census.visuals_live = census.visuals_live.saturating_sub(1);
+                census.visuals_live = census.visuals_live.saturating_sub(*held);
             }
             if let PendingKind::Collapse { carrier, .. } = &pending.holds {
                 if let Some(parent) = carrier.parent() {
@@ -2803,10 +2821,10 @@ impl Scene {
                 return true;
             }
             match &pending.holds {
-                PendingKind::Ghost(visual) => {
+                PendingKind::Ghost(visual, held) => {
                     // Collection access schedules dispatcher work; only completed ghosts need it.
                     let _ = overlay.children().try_remove(visual);
-                    census.visuals_live = census.visuals_live.saturating_sub(1);
+                    census.visuals_live = census.visuals_live.saturating_sub(*held);
                 }
                 PendingKind::Collapse { carrier, .. } => {
                     if let Some(parent) = carrier.parent() {
@@ -4399,7 +4417,7 @@ mod tests {
         assert!(!rig.scene.nodes.live(root));
         assert!(!rig.scene.nodes.live(child));
         assert_eq!(source.children().count(), 1, "the live capture source was dismantled");
-        assert!(rig.scene.motion.pending.iter().any(|p| matches!(p.holds, PendingKind::Ghost(_))));
+        assert!(rig.scene.motion.pending.iter().any(|p| matches!(p.holds, PendingKind::Ghost(..))));
         assert!(rig.scene.audit().agrees());
     }
 

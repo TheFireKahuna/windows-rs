@@ -223,6 +223,7 @@ impl Backends {
         dpi: f32,
         draw: impl FnOnce(&Draw<'_>) -> Result<()>,
     ) -> Result<Option<CompositionDrawingSurface>> {
+        windows_census::count!("scene.rasterize");
         let surface = self.surface(px, coverage, o)?;
         let mut raised = Ok(());
         let live = surface.draw(dpi, o, |d| raised = draw(d))?;
@@ -1111,12 +1112,14 @@ impl Cache {
         {
             entry.used = stamp;
             self.hits += 1;
+            windows_census::count!("scene.cell.hit");
             // Re-borrowed rather than returned from the branch above: the mutable borrow
             // that stamped it cannot also be handed out as a shared one.
             return Ok(self.map.get(&key).map(|entry| &entry.brush));
         }
 
         self.misses += 1;
+        windows_census::count!("scene.cell.miss");
         let scale = env.scale();
         let Some(surface) =
             back.rasterize(key.px(), key.coverage(), key.opacity(), env.dpi(), |d| {
@@ -1152,6 +1155,7 @@ impl Cache {
         };
         self.map.remove(&oldest);
         self.evictions += 1;
+        windows_census::count!("scene.cell.evict");
     }
 }
 
@@ -2154,7 +2158,7 @@ fn cast_glow(
     paint_sprite.set_relative_size_adjustment(whole);
     // The host, the caster, the halo and the paint. The capture, the property set and the
     // two brushes are not visuals and cost the tree walk nothing.
-    ctx.minted += 4;
+    ctx.minted += GlowState::VISUALS as i32;
 
     // The node stops painting itself and becomes the host of the two.
     sprite.clear_brush();
@@ -2350,7 +2354,7 @@ fn unlight(arena: &mut Arena, id: NodeId, sprite: &SpriteVisual, ctx: &mut Ctx<'
         if let Some(clip) = arena.aux(id).and_then(|aux| aux.clip.as_ref()) {
             clip.apply(sprite);
         }
-        ctx.freed += 4;
+        ctx.freed += GlowState::VISUALS as i32;
     }
 }
 

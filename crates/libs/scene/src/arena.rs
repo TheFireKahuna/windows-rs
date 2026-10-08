@@ -310,6 +310,9 @@ pub struct GlowState {
 }
 
 impl GlowState {
+    /// Visuals one glow holds: the host, the caster, the halo and the paint.
+    pub const VISUALS: u32 = 4;
+
     /// Writes sigma through the frontier the effect's expression reads, and takes the
     /// effect property back: the restart is a no-op while the expression already owns
     /// it, and a spring that owned it was stopped before this write landed.
@@ -401,6 +404,14 @@ pub struct Aux {
     /// a relative size adjustment, so an animated resize, a layout spring or a transform
     /// on the group moves chrome and content as one, and the clip still bounds the box.
     pub content: Option<ContainerVisual>,
+}
+
+impl Aux {
+    /// Returns the visuals this row holds beyond the node's own, which go when the row does.
+    #[must_use]
+    pub fn visuals(&self) -> u32 {
+        u32::from(self.content.is_some()) + self.glow.as_ref().map_or(0, |_| GlowState::VISUALS)
+    }
 }
 
 /// Which of the two constructions realizes a shape mask. Derived, never authored.
