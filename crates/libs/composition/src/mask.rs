@@ -91,6 +91,7 @@ impl CompositionLinearGradientBrush {
     /// steps and bands. Normalize such a ramp to full range and scale the *source* brush
     /// instead.
     pub fn set_alpha_stops(&self, stops: &[(f32, f32)]) {
+        windows_census::count!("comp.gradient_stop", stops.len());
         let compositor = self.compositor();
         let brush: bindings::ICompositionGradientBrush = self.0.cast().unwrap();
         let collection: windows_collections::IVector<bindings::CompositionColorGradientStop> =
@@ -144,6 +145,7 @@ impl CompositionNineGridBrush {
 impl Compositor {
     /// Creates a mask brush, with neither half assigned yet.
     pub fn create_mask_brush(&self) -> CompositionMaskBrush {
+        windows_census::count!("comp.brush.mask");
         let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
         CompositionMaskBrush(compositor.CreateMaskBrush().unwrap())
     }
@@ -151,6 +153,7 @@ impl Compositor {
     /// Creates a linear gradient brush with no stops — see
     /// [`set_alpha_stops`](CompositionLinearGradientBrush::set_alpha_stops).
     pub fn create_linear_gradient_brush(&self) -> CompositionLinearGradientBrush {
+        windows_census::count!("comp.brush.linear_gradient");
         let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
         CompositionLinearGradientBrush(compositor.CreateLinearGradientBrush().unwrap())
     }

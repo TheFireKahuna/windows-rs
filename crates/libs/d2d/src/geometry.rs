@@ -399,6 +399,7 @@ impl Gpu {
     /// The sink is closed on the way out, and a failure inside `f` aborts the path rather
     /// than returning a half-built one.
     pub fn path(&self, f: impl FnOnce(&mut Sink) -> Result<()>) -> Result<Path> {
+        windows_census::count!("d2d.path");
         let geometry = unsafe { self.factory().CreatePathGeometry()? };
         let mut sink = Sink(unsafe { geometry.Open()? });
         f(&mut sink)?;
@@ -424,6 +425,7 @@ impl Gpu {
         scale: f32,
         stroke: Option<Stroke<'_>>,
     ) -> Result<Realization> {
+        windows_census::count!("d2d.realization");
         // The tolerance is in target space, so a realization built for a larger scale needs
         // a proportionally tighter one to hold the same on-screen error.
         let flatten = FLATTEN / scale;

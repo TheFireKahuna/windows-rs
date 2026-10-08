@@ -265,6 +265,7 @@ impl Compositor {
     /// surfaces later as a failed realization or as content that never appears, not as an
     /// error from this call. Using one Direct2D factory per compositor holds the invariant.
     pub fn create_path(&self, geometry: &impl Interface) -> Result<CompositionPath> {
+        windows_census::count!("comp.path");
         let geometry: bindings::ID2D1Geometry = geometry.cast()?;
         let source: bindings::IGeometrySource2D =
             windows_core::ComObject::new(GeometrySource(geometry)).into_interface();
@@ -273,6 +274,7 @@ impl Compositor {
 
     /// Creates a geometry that draws `path`.
     pub fn create_path_geometry(&self, path: &CompositionPath) -> CompositionPathGeometry {
+        windows_census::count!("comp.geometry.path");
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         CompositionPathGeometry(compositor.CreatePathGeometryWithPath(&path.0).unwrap())
     }
@@ -280,6 +282,7 @@ impl Compositor {
     /// Creates a rounded-rectangle geometry, zero-sized until
     /// [`set_size`](CompositionRoundedRectangleGeometry::set_size) is called.
     pub fn create_rounded_rectangle_geometry(&self) -> CompositionRoundedRectangleGeometry {
+        windows_census::count!("comp.geometry.rounded_rectangle");
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         CompositionRoundedRectangleGeometry(compositor.CreateRoundedRectangleGeometry().unwrap())
     }

@@ -165,6 +165,7 @@ impl TextEngine {
     }
 
     fn lay_out(&self, text: &str, spec: &FontSpec, flow: Flow) -> Result<(IDWriteTextLayout, u32)> {
+        windows_census::count!("dwrite.layout");
         let format = self.format(spec, flow)?;
         let mut scratch = self.scratch.borrow_mut();
         scratch.clear();

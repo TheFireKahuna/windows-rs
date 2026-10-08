@@ -1,0 +1,20 @@
+[package]
+name = "windows-census"
+version = "0.100.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Named counters at the graphics wrappers, compiled out unless a profiling build asks for them"
+repository = "https://github.com/microsoft/windows-rs"
+categories = ["development-tools::profiling"]
+readme = "readme.md"
+
+# No dependencies, so every graphics crate can carry its counters unconditionally.
+
+[features]
+default = []
+# Counts. Without it every macro expands to nothing that survives optimisation.
+enabled = []
+
+[lints]
+workspace = true

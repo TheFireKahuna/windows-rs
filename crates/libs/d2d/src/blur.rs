@@ -61,6 +61,7 @@ impl Gpu {
     ///
     /// The device refused the effect, or one of its properties.
     pub fn blur(&self, source: &Target, sigma: f32) -> Result<Blur> {
+        windows_census::count!("d2d.effect.blur");
         debug_assert!(sigma > 0.0, "a blur at {sigma} sigma spreads nothing");
         let effect = unsafe { self.ctx().CreateEffect(&CLSID_D2D1GaussianBlur)? };
         source.feeds_effect.set(true);
@@ -112,6 +113,7 @@ impl Draw<'_> {
     /// The blur spreads past the source's own box, so `at` places the source's top-left and
     /// the result reaches outside it on every side.
     pub fn blurred(&self, blur: &Blur, at: Vector2) {
+        windows_census::count!("d2d.draw.image");
         unsafe {
             self.ctx.DrawImage(
                 blur.image(),

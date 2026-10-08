@@ -489,6 +489,7 @@ impl TextEngine {
     }
 
     pub(crate) fn resolve(&self, key: &FaceKey) -> Result<FontFace> {
+        windows_census::count!("dwrite.font_face");
         let name = wide(&key.family);
 
         // SAFETY: every out-parameter is a stack local outliving its call, and `name` is

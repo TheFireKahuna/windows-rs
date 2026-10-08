@@ -315,6 +315,7 @@ impl Compositor {
     /// Creates an expression animation from `expression`, whose text is validated when
     /// the animation is started rather than here.
     pub fn create_expression_animation(&self, expression: &str) -> ExpressionAnimation {
+        windows_census::count!("comp.animation.expression");
         ExpressionAnimation(
             self.0
                 .CreateExpressionAnimationWithExpression(expression)
@@ -324,11 +325,13 @@ impl Compositor {
 
     /// Creates a `Vector2` key-frame animation.
     pub fn create_vector2_key_frame_animation(&self) -> Vector2KeyFrameAnimation {
+        windows_census::count!("comp.animation.key_frame");
         Vector2KeyFrameAnimation(self.0.CreateVector2KeyFrameAnimation().unwrap())
     }
 
     /// Creates a spring over a scalar property.
     pub fn create_spring_scalar_animation(&self) -> SpringScalarNaturalMotionAnimation {
+        windows_census::count!("comp.animation.spring");
         let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
         SpringScalarNaturalMotionAnimation(
             compositor.CreateSpringScalarAnimation().unwrap(),
@@ -338,6 +341,7 @@ impl Compositor {
 
     /// Creates a spring over a [`Vector2`] property.
     pub fn create_spring_vector2_animation(&self) -> SpringVector2NaturalMotionAnimation {
+        windows_census::count!("comp.animation.spring");
         let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
         SpringVector2NaturalMotionAnimation(
             compositor.CreateSpringVector2Animation().unwrap(),
@@ -347,6 +351,7 @@ impl Compositor {
 
     /// Creates a spring over a [`Vector3`] property.
     pub fn create_spring_vector3_animation(&self) -> SpringVector3NaturalMotionAnimation {
+        windows_census::count!("comp.animation.spring");
         let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
         SpringVector3NaturalMotionAnimation(
             compositor.CreateSpringVector3Animation().unwrap(),
@@ -368,6 +373,7 @@ impl Compositor {
     ///
     /// `steps` must be positive.
     pub fn create_step_easing_function(&self, steps: i32) -> CompositionEasingFunction {
+        windows_census::count!("comp.easing");
         debug_assert!(steps > 0, "a step easing function needs at least one step");
         let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
         CompositionEasingFunction(

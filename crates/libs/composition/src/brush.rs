@@ -30,6 +30,7 @@ impl Brush for CompositionBackdropBrush {
 impl Compositor {
     /// Creates a brush sampling the content behind its consuming visual.
     pub fn create_backdrop_brush(&self) -> Result<CompositionBackdropBrush> {
+        windows_census::count!("comp.brush.backdrop");
         let compositor: bindings::ICompositor2 = self.0.cast()?;
         Ok(CompositionBackdropBrush(compositor.CreateBackdropBrush()?))
     }

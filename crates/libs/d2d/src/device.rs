@@ -60,6 +60,7 @@ impl Gpu {
     }
 
     fn new(extra: D3D11_CREATE_DEVICE_FLAG) -> Result<Self> {
+        windows_census::count!("d2d.device");
         let flags =
             (D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED | extra) as u32;
         // One fallback and then a hard error: a machine with no hardware Direct3D still
@@ -105,6 +106,7 @@ impl Gpu {
     ///
     /// `E_INVALIDARG` when a bracket is already open on this device.
     pub fn pass(&self) -> Result<Pass<'_>> {
+        windows_census::count!("d2d.pass");
         if self.0.drawing.replace(true) {
             return Err(windows_core::Error::from_hresult(E_INVALIDARG));
         }

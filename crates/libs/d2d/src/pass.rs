@@ -246,6 +246,7 @@ impl<'p> Draw<'p> {
     /// premultiplies on the way in; a target that ignores alpha replaces this one with
     /// fully opaque.
     pub fn clear(&self, color: Scrgb) {
+        windows_census::count!("d2d.draw.clear");
         unsafe { self.ctx.Clear(Some(d2d_color(&color))) };
     }
 
@@ -254,10 +255,22 @@ impl<'p> Draw<'p> {
         let brush = brush.brush().raw();
         unsafe {
             match shape.into() {
-                Shape::Rect(r) => self.ctx.FillRectangle(r.d2d(), brush),
-                Shape::Round(r) => self.ctx.FillRoundedRectangle(r.d2d(), brush),
-                Shape::Ellipse(e) => self.ctx.FillEllipse(e.d2d(), brush),
-                Shape::Path(p) => self.ctx.FillGeometry(p.raw(), brush, None),
+                Shape::Rect(r) => {
+                    windows_census::count!("d2d.fill.rect");
+                    self.ctx.FillRectangle(r.d2d(), brush);
+                }
+                Shape::Round(r) => {
+                    windows_census::count!("d2d.fill.round");
+                    self.ctx.FillRoundedRectangle(r.d2d(), brush);
+                }
+                Shape::Ellipse(e) => {
+                    windows_census::count!("d2d.fill.ellipse");
+                    self.ctx.FillEllipse(e.d2d(), brush);
+                }
+                Shape::Path(p) => {
+                    windows_census::count!("d2d.fill.path");
+                    self.ctx.FillGeometry(p.raw(), brush, None);
+                }
             }
         }
     }
@@ -268,10 +281,22 @@ impl<'p> Draw<'p> {
         let (w, style) = k.parts();
         unsafe {
             match shape.into() {
-                Shape::Rect(r) => self.ctx.DrawRectangle(r.d2d(), brush, w, style),
-                Shape::Round(r) => self.ctx.DrawRoundedRectangle(r.d2d(), brush, w, style),
-                Shape::Ellipse(e) => self.ctx.DrawEllipse(e.d2d(), brush, w, style),
-                Shape::Path(p) => self.ctx.DrawGeometry(p.raw(), brush, w, style),
+                Shape::Rect(r) => {
+                    windows_census::count!("d2d.stroke.rect");
+                    self.ctx.DrawRectangle(r.d2d(), brush, w, style);
+                }
+                Shape::Round(r) => {
+                    windows_census::count!("d2d.stroke.round");
+                    self.ctx.DrawRoundedRectangle(r.d2d(), brush, w, style);
+                }
+                Shape::Ellipse(e) => {
+                    windows_census::count!("d2d.stroke.ellipse");
+                    self.ctx.DrawEllipse(e.d2d(), brush, w, style);
+                }
+                Shape::Path(p) => {
+                    windows_census::count!("d2d.stroke.path");
+                    self.ctx.DrawGeometry(p.raw(), brush, w, style);
+                }
             }
         }
     }
@@ -281,6 +306,7 @@ impl<'p> Draw<'p> {
     /// A line cannot be filled, so it is its own call rather than a [`Shape`] arm that
     /// would be meaningless in [`fill`](Self::fill).
     pub fn line(&self, from: Vector2, to: Vector2, brush: &impl Brush, k: Stroke<'_>) {
+        windows_census::count!("d2d.draw.line");
         let (w, style) = k.parts();
         unsafe {
             self.ctx.DrawLine(from, to, brush.brush().raw(), w, style);
@@ -298,6 +324,7 @@ impl<'p> Draw<'p> {
     /// runs Direct2D's image command graph to discover what it was handed, at several times
     /// the cost per call. There is no general image draw here.
     pub fn blit(&self, src: &Target, dest: Rect, src_rect: Option<Rect>, interp: Interp) {
+        windows_census::count!("d2d.draw.bitmap");
         let dest = self.snap_rect(dest);
         unsafe {
             self.ctx.DrawBitmap(
@@ -330,6 +357,8 @@ impl<'p> Draw<'p> {
             "a batch over {} sprites needs a Flush to split, which is illegal inside a layer",
             SpriteBatch::CEILING
         );
+        windows_census::count!("d2d.draw.sprite_batch");
+        windows_census::count!("d2d.draw.sprite", count);
         let _aliased = self.aliased();
         unsafe {
             self.ctx.DrawSpriteBatch(
@@ -386,6 +415,8 @@ impl<'p> Draw<'p> {
             isSideways: false.into(),
             bidiLevel: run.bidi,
         };
+        windows_census::count!("d2d.draw.glyph_run");
+        windows_census::count!("d2d.draw.glyph", count);
         unsafe {
             self.ctx.DrawGlyphRun(
                 origin,
@@ -400,6 +431,7 @@ impl<'p> Draw<'p> {
 
     /// Draws a realization: tessellated once, rasterized per frame.
     pub fn realization(&self, r: &Realization, brush: &impl Brush) {
+        windows_census::count!("d2d.draw.realization");
         debug_assert!(
             (r.scale() - self.scale()).abs() < f32::EPSILON,
             "a realization drawn at a scale it was not built for shows its flattening as facets"
@@ -418,6 +450,7 @@ impl<'p> Draw<'p> {
     /// message when a layer is pushed with a null opacity mask, 1.0 opacity and an
     /// axis-aligned rectangular mask, because a clip reaches the same result for less.
     pub fn clip(&self, r: Rect) -> Clipped<'_> {
+        windows_census::count!("d2d.clip");
         unsafe {
             self.ctx
                 .PushAxisAlignedClip(r.d2d(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -430,6 +463,7 @@ impl<'p> Draw<'p> {
     ///
     /// [`Layer`] names which of the three, and the cheaper alternatives where they apply.
     pub fn layer(&self, l: Layer<'_>) -> Layered<'_> {
+        windows_census::count!("d2d.layer");
         let mut params = l.params(self.opacity);
         unsafe {
             if l.replacing {

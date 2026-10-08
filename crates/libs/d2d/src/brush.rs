@@ -268,6 +268,7 @@ impl<'a> Stroke<'a> {
 impl Gpu {
     /// Creates a flat-colour brush. [`Solid::set`] retints it without building another.
     pub fn solid(&self, c: Scrgb) -> Result<Solid> {
+        windows_census::count!("d2d.brush.solid");
         Ok(Solid(unsafe {
             self.ctx().CreateSolidColorBrush(d2d_color(&c), None)?
         }))
@@ -279,6 +280,7 @@ impl Gpu {
     /// The stops are interpolated in scRGB at 16 bits of float per channel, which holds the
     /// values above white that an sRGB-gamma interpolation stage would quantize away.
     pub fn ramp(&self, stops: &[Stop], from: Vector2, to: Vector2, extend: Extend) -> Result<Ramp> {
+        windows_census::count!("d2d.brush.linear");
         let collection = self.stops(stops, extend)?;
         let properties = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
             startPoint: from,
@@ -297,6 +299,7 @@ impl Gpu {
     /// of float per channel, which holds a narrow alpha falloff that eight bits would
     /// quantize to almost nothing.
     pub fn radial(&self, stops: &[Stop], center: Vector2, radius: Vector2, extend: Extend) -> Result<Radial> {
+        windows_census::count!("d2d.brush.radial");
         let collection = self.stops(stops, extend)?;
         let properties = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
             center,
@@ -312,6 +315,7 @@ impl Gpu {
 
     /// Builds the stop collection both ramp forms take.
     fn stops(&self, stops: &[Stop], extend: Extend) -> Result<ID2D1GradientStopCollection1> {
+        windows_census::count!("d2d.gradient_stops");
         const {
             assert!(size_of::<Stop>() == size_of::<D2D1_GRADIENT_STOP>());
             assert!(
@@ -345,6 +349,7 @@ impl Gpu {
     ///
     /// A sprite batch covers the rectangular case for less; this fills shapes.
     pub fn tile(&self, src: &Target, extend: Extend, interp: Interp) -> Result<Tile> {
+        windows_census::count!("d2d.brush.bitmap");
         let properties = D2D1_BITMAP_BRUSH_PROPERTIES1 {
             extendModeX: extend.d2d(),
             extendModeY: extend.d2d(),
@@ -359,6 +364,7 @@ impl Gpu {
 
     /// Creates a reusable stroke style from `spec`.
     pub fn stroke_style(&self, spec: &StrokeSpec<'_>) -> Result<StrokeStyle> {
+        windows_census::count!("d2d.stroke_style");
         let properties = D2D1_STROKE_STYLE_PROPERTIES1 {
             startCap: spec.cap.d2d(),
             endCap: spec.cap.d2d(),

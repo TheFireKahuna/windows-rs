@@ -101,6 +101,7 @@ impl Compositor {
         window: windows_window::Hwnd,
         is_topmost: bool,
     ) -> Result<DesktopWindowTarget> {
+        windows_census::count!("comp.target");
         // SAFETY: the token names a window whose owner outlives this call by the token's
         // contract, and the call reads nothing through the handle.
         unsafe { self.create_desktop_window_target_for_hwnd(window.raw(), is_topmost) }
@@ -124,45 +125,53 @@ impl Compositor {
 
     /// Creates an empty container visual that hosts a child visual tree.
     pub fn create_container_visual(&self) -> ContainerVisual {
+        windows_census::count!("comp.visual.container");
         ContainerVisual::new(self.0.CreateContainerVisual().unwrap())
     }
 
     /// Creates a sprite visual that paints itself with a brush.
     pub fn create_sprite_visual(&self) -> SpriteVisual {
+        windows_census::count!("comp.visual.sprite");
         SpriteVisual::new(self.0.CreateSpriteVisual().unwrap())
     }
 
     /// Creates a solid-color brush.
     pub fn create_color_brush(&self, color: Color) -> CompositionColorBrush {
+        windows_census::count!("comp.brush.color");
         CompositionColorBrush(self.0.CreateColorBrushWithColor(color.0).unwrap())
     }
 
     /// Creates a nine-grid brush.
     pub fn create_nine_grid_brush(&self) -> CompositionNineGridBrush {
+        windows_census::count!("comp.brush.nine_grid");
         let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
         CompositionNineGridBrush(compositor.CreateNineGridBrush().unwrap())
     }
 
     /// Creates a shape visual that renders composition shapes.
     pub fn create_shape_visual(&self) -> ShapeVisual {
+        windows_census::count!("comp.visual.shape");
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         ShapeVisual::new(compositor.CreateShapeVisual().unwrap())
     }
 
     /// Creates an empty container shape that groups child shapes.
     pub fn create_container_shape(&self) -> CompositionContainerShape {
+        windows_census::count!("comp.shape.container");
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         CompositionContainerShape(compositor.CreateContainerShape().unwrap())
     }
 
     /// Creates an ellipse geometry.
     pub fn create_ellipse_geometry(&self) -> CompositionEllipseGeometry {
+        windows_census::count!("comp.geometry.ellipse");
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         CompositionEllipseGeometry(compositor.CreateEllipseGeometry().unwrap())
     }
 
     /// Creates a sprite shape that fills the given geometry with a brush.
     pub fn create_sprite_shape(&self, geometry: &impl Geometry) -> CompositionSpriteShape {
+        windows_census::count!("comp.shape.sprite");
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         CompositionSpriteShape(
             compositor
@@ -174,27 +183,32 @@ impl Compositor {
     /// Creates a scoped batch that tracks the completion of the given kind of
     /// work.
     pub fn create_scoped_batch(&self, kind: BatchKind) -> CompositionScopedBatch {
+        windows_census::count!("comp.batch");
         CompositionScopedBatch(self.0.CreateScopedBatch(kind.into()).unwrap())
     }
 
     /// Creates a `Vector3` key-frame animation.
     pub fn create_vector3_key_frame_animation(&self) -> Vector3KeyFrameAnimation {
+        windows_census::count!("comp.animation.key_frame");
         Vector3KeyFrameAnimation(self.0.CreateVector3KeyFrameAnimation().unwrap())
     }
 
     /// Creates an empty group whose animations start together.
     pub fn create_animation_group(&self) -> CompositionAnimationGroup {
+        windows_census::count!("comp.animation.group");
         let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
         CompositionAnimationGroup(compositor.CreateAnimationGroup().unwrap())
     }
 
     /// Creates a scalar (`f32`) key-frame animation.
     pub fn create_scalar_key_frame_animation(&self) -> ScalarKeyFrameAnimation {
+        windows_census::count!("comp.animation.key_frame");
         ScalarKeyFrameAnimation(self.0.CreateScalarKeyFrameAnimation().unwrap())
     }
 
     /// Creates a linear easing function.
     pub fn create_linear_easing_function(&self) -> CompositionEasingFunction {
+        windows_census::count!("comp.easing");
         CompositionEasingFunction(self.0.CreateLinearEasingFunction().unwrap().cast().unwrap())
     }
 
@@ -205,6 +219,7 @@ impl Compositor {
         control1: Vector2,
         control2: Vector2,
     ) -> CompositionEasingFunction {
+        windows_census::count!("comp.easing");
         CompositionEasingFunction(
             self.0
                 .CreateCubicBezierEasingFunction(control1, control2)
@@ -217,6 +232,7 @@ impl Compositor {
     /// Creates an empty implicit-animation collection to attach to a visual
     /// with [`Visual::set_implicit_animations`](crate::Visual::set_implicit_animations).
     pub fn create_implicit_animation_collection(&self) -> ImplicitAnimationCollection {
+        windows_census::count!("comp.animation.implicit");
         let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
         ImplicitAnimationCollection(compositor.CreateImplicitAnimationCollection().unwrap())
     }
@@ -227,6 +243,7 @@ impl Compositor {
         &self,
         rendering_device: &impl Interface,
     ) -> Result<CompositionGraphicsDevice> {
+        windows_census::count!("comp.graphics_device");
         let interop: bindings::ICompositorInterop = self.0.cast()?;
         let device: windows_core::IUnknown = rendering_device.cast()?;
         let graphics = unsafe { interop.CreateGraphicsDevice(&device)? };
@@ -237,6 +254,7 @@ impl Compositor {
     /// pixels, a captured subtree, or a buffer the app presents itself.
     #[cfg(feature = "system")]
     pub fn create_surface_brush(&self, surface: &impl Surface) -> CompositionSurfaceBrush {
+        windows_census::count!("comp.brush.surface");
         CompositionSurfaceBrush(
             self.0
                 .CreateSurfaceBrushWithSurface(&surface.as_surface().0)

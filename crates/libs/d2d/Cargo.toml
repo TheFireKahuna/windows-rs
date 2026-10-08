@@ -19,6 +19,7 @@ default = []
 composition = ["dep:windows-composition", "windows-composition/system"]
 
 [dependencies]
+windows-census = { workspace = true }
 # Every brush and every stop takes an `Scrgb`. There is no colour type in this crate,
 # which is what makes the output transform unskippable rather than merely documented.
 windows-color = { workspace = true }

@@ -101,6 +101,7 @@ impl Sealed for CompositionDrawingSurface {}
 
 impl SurfaceDraw for CompositionDrawingSurface {
     fn draw(&self, dpi: f32, opacity: Opacity, f: impl FnOnce(&Draw<'_>)) -> Result<bool> {
+        windows_census::count!("d2d.surface_draw");
         match self.begin_draw::<ID2D1DeviceContext>() {
             Ok((ctx, offset)) => paint(&ctx, offset, dpi, opacity, f, || self.end_draw()),
             Err(e) if classify(e.code()) != Loss::None => {
@@ -116,6 +117,7 @@ impl Sealed for CompositionDrawHandle {}
 
 impl SurfaceDraw for CompositionDrawHandle {
     fn draw(&self, dpi: f32, opacity: Opacity, f: impl FnOnce(&Draw<'_>)) -> Result<bool> {
+        windows_census::count!("d2d.surface_draw");
         match self.begin_draw::<ID2D1DeviceContext>() {
             Ok((ctx, offset)) => paint(&ctx, offset, dpi, opacity, f, || self.end_draw()),
             Err(e) if classify(e.code()) != Loss::None => {

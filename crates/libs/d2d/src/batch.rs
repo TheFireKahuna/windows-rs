@@ -96,6 +96,7 @@ impl SpriteBatch {
     }
 
     fn replace(&self, rects: &[Rect], sources: Option<&[[u32; 4]]>) -> Result<()> {
+        windows_census::count!("d2d.sprite.set", rects.len());
         // Switching between whole-source and atlas sampling resets the property arrays.
         // A null SetSprites source leaves existing coordinates unchanged; it cannot reset
         // atlas entries to the whole-source default. Steady-mode updates keep storage.
@@ -198,6 +199,7 @@ impl SpriteBatch {
 impl Gpu {
     /// Creates an empty sprite batch.
     pub fn batch(&self) -> Result<SpriteBatch> {
+        windows_census::count!("d2d.sprite_batch");
         Ok(SpriteBatch(
             unsafe { self.ctx().CreateSpriteBatch()? },
             core::cell::Cell::new(false),

@@ -18,6 +18,7 @@ default = []
 d2d = ["dep:windows-d2d", "dep:windows-color"]
 
 [dependencies]
+windows-census = { workspace = true }
 rustc-hash = { workspace = true }
 # `proc-macros` for `implement`: a shaped layout is walked through a DirectWrite renderer
 # callback, so the crate has to be able to be one.

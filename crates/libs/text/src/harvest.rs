@@ -91,6 +91,7 @@ impl Collector {
     /// Runs one walk against `layout`, with `into` lent to the collector for its duration
     /// and swapped back before returning.
     pub(crate) fn walk(this: &ComObject<Self>, layout: &IDWriteTextLayout, into: &mut Harvest) {
+        windows_census::count!("dwrite.harvest");
         into.clear();
         core::mem::swap(&mut *this.get().out.borrow_mut(), into);
         let renderer: IDWriteTextRenderer = this.to_interface();

@@ -479,6 +479,7 @@ impl CompositionEffectFactory {
     /// is a [`set_source_parameter`](CompositionEffectBrush::set_source_parameter) call
     /// on the brush, so re-pointing a source re-keys no factory and mints no brush.
     pub fn create_brush(&self) -> CompositionEffectBrush {
+        windows_census::count!("comp.brush.effect");
         CompositionEffectBrush(self.0.CreateBrush().unwrap())
     }
 
@@ -526,6 +527,7 @@ impl Compositor {
         graph: &EffectGraph,
         animatable: &[&str],
     ) -> Result<CompositionEffectFactory> {
+        windows_census::count!("comp.effect_factory");
         let effect = materialize(graph)?.cast::<IGraphicsEffect>()?;
         let animatable: Vec<windows_core::HSTRING> =
             animatable.iter().map(|name| (*name).into()).collect();

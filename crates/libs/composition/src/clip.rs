@@ -143,18 +143,21 @@ impl Clip for CompositionGeometricClip {
 impl Compositor {
     /// Creates an inset clip, with every inset at zero (clipping nothing).
     pub fn create_inset_clip(&self) -> InsetClip {
+        windows_census::count!("comp.clip.inset");
         InsetClip(self.0.CreateInsetClip().unwrap())
     }
 
     /// Creates a rectangle clip with every side at zero, which clips the subtree away
     /// entirely until the sides are set.
     pub fn create_rectangle_clip(&self) -> RectangleClip {
+        windows_census::count!("comp.clip.rectangle");
         let compositor: bindings::ICompositor7 = self.0.cast().unwrap();
         RectangleClip(compositor.CreateRectangleClip().unwrap())
     }
 
     /// Creates a clip in the shape of `geometry`.
     pub fn create_geometric_clip(&self, geometry: &impl Geometry) -> CompositionGeometricClip {
+        windows_census::count!("comp.clip.geometric");
         let compositor: bindings::ICompositor6 = self.0.cast().unwrap();
         CompositionGeometricClip(
             compositor

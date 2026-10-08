@@ -103,6 +103,7 @@ impl SpriteVisual {
 impl Compositor {
     /// Creates a drop shadow, black and unblurred until configured.
     pub fn create_drop_shadow(&self) -> DropShadow {
+        windows_census::count!("comp.shadow");
         let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
         DropShadow(compositor.CreateDropShadow().unwrap())
     }

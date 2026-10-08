@@ -88,6 +88,7 @@ impl Gpu {
     /// Uploads already-transformed scRGB pixels into an FP16 target at 96 DPI.
     /// Input colour is straight alpha; the stored bitmap is premultiplied.
     pub fn pixels(&self, px: (u32, u32), pixels: &[Scrgb]) -> Result<Target> {
+        windows_census::count!("d2d.bitmap.pixels");
         assert_eq!(pixels.len(), px.0 as usize * px.1 as usize);
         let mut packed = Vec::with_capacity(pixels.len() * 4);
         for p in pixels {
@@ -123,6 +124,7 @@ impl Gpu {
     /// The pixel extent is the allocation and the cache key; `dpi` is what its contents are
     /// drawn at, so a cell built for one display is not silently reused on another.
     pub fn offscreen(&self, px: (u32, u32), dpi: f32, opacity: Opacity) -> Result<Target> {
+        windows_census::count!("d2d.bitmap.offscreen");
         check_dpi(dpi);
         let props = properties(dpi, opacity);
         let size = D2D_SIZE_U {
@@ -151,6 +153,7 @@ impl Gpu {
     ///
     /// When `surface` is not a DXGI surface, or Direct2D rejects it as a bitmap source.
     pub fn adopt(&self, surface: &impl Interface, dpi: f32, opacity: Opacity) -> Result<Target> {
+        windows_census::count!("d2d.bitmap.adopted");
         check_dpi(dpi);
         let surface: IDXGISurface = surface.cast()?;
         let props = properties(dpi, opacity);
@@ -227,6 +230,7 @@ impl Gpu {
     /// Must not be called while a [`Pass`](crate::Pass) has `target` bound: a bitmap being
     /// rendered to cannot also be a copy source.
     pub fn read(&self, target: &Target) -> Result<Readback> {
+        windows_census::count!("d2d.readback");
         let props = D2D1_BITMAP_PROPERTIES1 {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: FORMAT,

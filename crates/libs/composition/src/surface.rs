@@ -31,6 +31,7 @@ impl CompositionGraphicsDevice {
         width: f32,
         height: f32,
     ) -> Result<CompositionDrawingSurface> {
+        windows_census::count!("comp.surface.drawing");
         let surface = self.0.CreateDrawingSurface(
             bindings::Size { width, height },
             bindings::DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -58,6 +59,7 @@ impl CompositionGraphicsDevice {
         format: PixelFormat,
         alpha: AlphaMode,
     ) -> Result<CompositionDrawingSurface> {
+        windows_census::count!("comp.surface.drawing");
         let surface = self.0.CreateDrawingSurface(
             bindings::Size { width, height },
             format.into(),
@@ -79,6 +81,7 @@ impl CompositionGraphicsDevice {
         format: PixelFormat,
         alpha: AlphaMode,
     ) -> Result<CompositionDrawingSurface> {
+        windows_census::count!("comp.surface.drawing");
         let device: bindings::ICompositionGraphicsDevice2 = self.0.cast()?;
         let surface = device.CreateDrawingSurface2(
             bindings::SizeInt32 { width, height },
@@ -109,6 +112,7 @@ impl CompositionGraphicsDevice {
         format: PixelFormat,
         alpha: AlphaMode,
     ) -> Result<CompositionVirtualDrawingSurface> {
+        windows_census::count!("comp.surface.virtual");
         let device: bindings::ICompositionGraphicsDevice2 = self.0.cast()?;
         let surface = device.CreateVirtualDrawingSurface(
             bindings::SizeInt32 { width, height },
@@ -534,6 +538,7 @@ impl Eq for CompositionSurfaceBrush {}
 impl Compositor {
     /// Creates a surface that captures a live visual subtree.
     pub fn create_visual_surface(&self) -> CompositionVisualSurface {
+        windows_census::count!("comp.surface.visual");
         let compositor: bindings::ICompositorWithVisualSurface = self.0.cast().unwrap();
         CompositionVisualSurface(compositor.CreateVisualSurface().unwrap())
     }
@@ -563,6 +568,7 @@ impl Compositor {
         &self,
         handle: *mut core::ffi::c_void,
     ) -> Result<CompositionSurface> {
+        windows_census::count!("comp.surface.handle");
         let interop: bindings::ICompositorInterop = self.0.cast()?;
         let surface = unsafe { interop.CreateCompositionSurfaceForHandle(handle)? };
         Ok(CompositionSurface(surface))

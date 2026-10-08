@@ -76,6 +76,7 @@ impl TextEngine {
     }
 
     fn build_format(&self, spec: &FontSpec, flow: Flow) -> Result<IDWriteTextFormat> {
+        windows_census::count!("dwrite.format");
         let family = wide(self.ladder().name(spec.family));
         let locale = wide(LOCALE);
 

@@ -67,6 +67,7 @@ impl Sealed for CompositionPropertySet {}
 impl Compositor {
     /// Creates an empty property set.
     pub fn create_property_set(&self) -> CompositionPropertySet {
+        windows_census::count!("comp.property_set");
         CompositionPropertySet(self.0.CreatePropertySet().unwrap())
     }
 }

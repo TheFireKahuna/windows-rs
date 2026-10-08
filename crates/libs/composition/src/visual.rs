@@ -153,6 +153,7 @@ impl Visual {
 
     /// Starts an animation on the named property (for example `"Scale"`).
     pub fn start_animation(&self, property: &str, animation: &impl Animation) {
+        windows_census::count!("comp.animation.start");
         let object: bindings::ICompositionObject = self.0.cast().unwrap();
         object
             .StartAnimation(property, &animation.as_animation().0)

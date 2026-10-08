@@ -741,6 +741,7 @@ impl Compositor {
     /// [`try_update_position_by`](InteractionTracker::try_update_position_by) takes this
     /// form: nothing has to observe motion the compositor already carries.
     pub fn create_interaction_tracker(&self) -> Result<InteractionTracker> {
+        windows_census::count!("comp.tracker");
         Ok(InteractionTracker(bindings::InteractionTracker::Create(
             &self.0,
         )?))
@@ -757,6 +758,7 @@ impl Compositor {
         &self,
         handler: impl FnMut(TrackerEvent) + 'static,
     ) -> Result<InteractionTracker> {
+        windows_census::count!("comp.tracker");
         let owner = Owner(core::cell::RefCell::new(Box::new(handler)));
         let owner: bindings::IInteractionTrackerOwner =
             windows_core::ComObject::new(owner).into_interface();
@@ -774,6 +776,7 @@ impl Compositor {
         condition: &ExpressionAnimation,
         resting_value: &ExpressionAnimation,
     ) -> Result<InertiaModifier> {
+        windows_census::count!("comp.inertia_modifier");
         let modifier = bindings::InteractionTrackerInertiaRestingValue::Create(&self.0)?;
         modifier.SetCondition(&condition.0)?;
         modifier.SetRestingValue(&resting_value.0)?;
@@ -787,6 +790,7 @@ impl Compositor {
         condition: &ExpressionAnimation,
         motion: &ExpressionAnimation,
     ) -> Result<InertiaModifier> {
+        windows_census::count!("comp.inertia_modifier");
         let modifier = bindings::InteractionTrackerInertiaMotion::Create(&self.0)?;
         modifier.SetCondition(&condition.0)?;
         modifier.SetMotion(&motion.0)?;
