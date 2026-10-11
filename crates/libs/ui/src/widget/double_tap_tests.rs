@@ -41,7 +41,7 @@ fn native_double_tap_uses_current_local_coordinates_and_declines_child_hits() ->
     let at = Point { x: 100.0, y: 100.0 };
     rig.tick(&[report(at, 1), Report::CaptureLost, report(at, 2)], &mut out)?;
     assert!(out.is_empty());
-    for cancel in [Report::FocusChanged { from: Some(id), to: None },
+    for cancel in [Report::FocusChanged { from: Some(id), to: None, keyboard: true },
         Report::Dismiss { blocker: child, scope: None }]
     {
         rig.tick(&[report(at, 1), cancel, report(at, 2)], &mut out)?;

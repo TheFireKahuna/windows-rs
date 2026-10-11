@@ -332,11 +332,15 @@ pub struct Controls {
     preview_release: Option<u64>,
     reorders: reorder::Reorders,
     translation_changed: bool,
-    /// The window's one focus ring, sprung between controls. Focus is singular, so the ring is per
-    /// window rather than per control, and the glide between two controls is a compositor
-    /// animation rather than a behaviour this crate runs.
+    /// The window's one focus ring. Focus is singular, so the ring is per window rather than per
+    /// control.
     ring: NodeId,
     ring_shown: bool,
+    /// The control the ring stands on, so a layout move of that control follows it and a focus
+    /// move to another control cuts.
+    ring_on: ControlId,
+    /// Focus last moved on keyboard input; the ring shows only while this holds.
+    cue: bool,
     viewport: Option<Vector2>,
 }
 
@@ -604,6 +608,7 @@ impl Controls {
             &mut self.pressed,
             &mut self.focused,
             &mut self.input_focus,
+            &mut self.ring_on,
             &mut self.observed,
             &mut self.grabbed,
             &mut self.dragged,
@@ -760,8 +765,9 @@ impl Controls {
                     self.wash(id, front)?;
                 }
             }
-            Report::FocusChanged { to, .. } => {
+            Report::FocusChanged { to, keyboard, .. } => {
                 self.tapped = ControlId::NONE;
+                self.cue = keyboard;
                 let was = self.input_focus;
                 self.focused = self.live(to);
                 self.input_focus = self.focused;
@@ -1200,8 +1206,15 @@ impl Controls {
         self.translate(front)
     }
 
-    /// Springs the window's one ring onto the focused control, or takes it down.
+    /// Puts the window's one ring on the focused control, or takes it down.
+    ///
+    /// A move to another control cuts in one frame: the ring leaves the old control and appears
+    /// on the new one with no travel and no fade. Only a layout move of the control it already
+    /// stands on is sprung, so the ring keeps to that control's motion.
     fn move_ring(&mut self, front: &mut Front<'_>) -> Result<()> {
+        if !self.cue {
+            return self.hide_ring(front);
+        }
         let Some(entry) = front.scene.hits().entry(self.focused).copied() else {
             return self.hide_ring(front);
         };
@@ -1225,18 +1238,23 @@ impl Controls {
         let Some((at, size)) = focus_box(at, size, self.viewport) else {
             return self.hide_ring(front);
         };
-        if self.ring_shown {
+        if self.ring_shown && self.ring_on == self.focused {
             front.spring(self.ring, Prop::Offset, Value::Vec2(at))?;
             front.spring(self.ring, Prop::Size, Value::Vec2(size))?;
-        } else {
-            // The outline's nine-grid needs a nonzero box before its first reveal.
-            for (prop, value) in [(Prop::Offset, at), (Prop::Size, size)] {
-                front
-                    .scene
-                    .retarget(self.ring, prop, Bind::Set(Value::Vec2(value)), front.back)?;
-            }
+            return Ok(());
+        }
+        // The outline's nine-grid needs a nonzero box before it shows.
+        for (prop, value) in [(Prop::Offset, at), (Prop::Size, size)] {
+            front
+                .scene
+                .retarget(self.ring, prop, Bind::Set(Value::Vec2(value)), front.back)?;
+        }
+        self.ring_on = self.focused;
+        if !self.ring_shown {
             self.ring_shown = true;
-            front.spring(self.ring, Prop::Opacity, Value::Scalar(1.0))?;
+            front
+                .scene
+                .retarget(self.ring, Prop::Opacity, Bind::Set(Value::Scalar(1.0)), front.back)?;
         }
         Ok(())
     }
@@ -1246,7 +1264,10 @@ impl Controls {
             return Ok(());
         }
         self.ring_shown = false;
-        front.spring(self.ring, Prop::Opacity, Value::Scalar(0.0))
+        self.ring_on = ControlId::NONE;
+        front
+            .scene
+            .retarget(self.ring, Prop::Opacity, Bind::Set(Value::Scalar(0.0)), front.back)
     }
 
     /// Returns `id` where it still has a row, and `NONE` otherwise.

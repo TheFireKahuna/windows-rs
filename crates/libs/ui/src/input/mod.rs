@@ -106,6 +106,9 @@ pub enum Report {
     FocusChanged {
         from: Option<ControlId>,
         to: Option<ControlId>,
+        /// The last input before the move was a key rather than a pointer press, which is when
+        /// the window's focus ring shows.
+        keyboard: bool,
     },
     Pressed {
         target: ControlId,
@@ -536,6 +539,7 @@ impl Router {
         // contact has since moved to.
         let sample = self.bell.coords().at_transition(p, env);
         self.census.discrete_hits += 1;
+        self.focus.set_modality(false);
         let Some(hit) = hits.hit(sample.raw, sample.kind()) else {
             self.contacts.cancel_tap();
             // A press on nothing still takes focus away, so clicking the background dismisses
@@ -699,6 +703,9 @@ impl Router {
     fn key(&mut self, event: KeyEvent, hits: &HitTable, out: &mut Vec<Report>) {
         if !self.focus.window_focused() {
             return;
+        }
+        if event.kind == KeyKind::Down {
+            self.focus.set_modality(true);
         }
         // Tab and Esc are taken before any control sees them: focus order has one authority,
         // and an open overlay closes from the keyboard wherever the pointer is.

@@ -22,7 +22,7 @@ fn native_focus_border_survives_pointer_press_and_releases_without_idle_work() -
         flags: flag::FOCUS_WASH, ..ChromeRow::default() };
     rig.adopt(&[(a, row(wa)), (b, row(wb))], &[], &[])?;
     let mut out = Vec::with_capacity(16);
-    rig.tick(&[Report::FocusChanged { from: None, to: Some(a) }], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: None, to: Some(a), keyboard: true }], &mut out)?;
     assert_eq!(rig.controls.wash_target(a), Some((wa, 1.0)));
     rig.tick(&[press(a)], &mut out)?;
     assert!(rig.controls.focused.is_none());
@@ -31,7 +31,7 @@ fn native_focus_border_survives_pointer_press_and_releases_without_idle_work() -
     rig.tick(&[Report::Canceled { target: a, contact: 1 }], &mut out)?;
     assert!(out.iter().all(|intent| matches!(intent.what, What::Canceled(_))));
     out.clear();
-    rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b), keyboard: true }], &mut out)?;
     assert_eq!(rig.controls.wash_target(a), Some((wa, 0.0)));
     assert_eq!(rig.controls.wash_target(b), Some((wb, 1.0)));
     rig.tick(&[hover(ControlId::NONE, b)], &mut out)?;
@@ -42,13 +42,13 @@ fn native_focus_border_survives_pointer_press_and_releases_without_idle_work() -
     rig.tick(&[hover(b, ControlId::NONE)], &mut out)?;
     let minted = rig.visuals_minted();
     for _ in 0..2 {
-        rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a) },
-            Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
+        rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a), keyboard: true },
+            Report::FocusChanged { from: Some(a), to: Some(b), keyboard: true }], &mut out)?;
     }
     let allocations = crate::counting::allocations();
     for _ in 0..100 {
-        rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a) },
-            Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
+        rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a), keyboard: true },
+            Report::FocusChanged { from: Some(a), to: Some(b), keyboard: true }], &mut out)?;
     }
     assert_eq!(crate::counting::allocations(), allocations);
     assert_eq!(rig.visuals_minted(), minted);
@@ -59,7 +59,7 @@ fn native_focus_border_survives_pointer_press_and_releases_without_idle_work() -
     rig.adopt(&[], &[], &[b])?;
     assert!(rig.controls.input_focus.is_none());
     assert_eq!(rig.controls.wash_target(b), None);
-    rig.tick(&[Report::FocusChanged { from: None, to: Some(b) }], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: None, to: Some(b), keyboard: true }], &mut out)?;
     assert!(rig.controls.input_focus.is_none());
     Ok(())
 }
@@ -74,21 +74,21 @@ fn native_focus_outline_follows_keyboard_focus_and_hides_for_pointer_and_retirem
     rig.adopt(&[(a, ChromeRow::default()), (b, ChromeRow::default())], &[], &[])?;
     let minted = rig.visuals_minted();
     let mut out = Vec::with_capacity(16);
-    rig.tick(&[Report::FocusChanged { from: None, to: Some(a) }], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: None, to: Some(a), keyboard: true }], &mut out)?;
     assert!(rig.controls.ring_shown);
-    rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b), keyboard: true }], &mut out)?;
     assert!(rig.controls.ring_shown);
     rig.tick(&[press(b)], &mut out)?;
     assert!(!rig.controls.ring_shown);
-    rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a) }], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a), keyboard: true }], &mut out)?;
     assert!(rig.controls.ring_shown);
-    rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
-    rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a) }], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b), keyboard: true }], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a), keyboard: true }], &mut out)?;
     let before = crate::counting::allocations();
     for i in 0..100 {
         let at = crate::counting::allocations();
-        rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b) }], &mut out)?;
-        rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a) }], &mut out)?;
+        rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b), keyboard: true }], &mut out)?;
+        rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a), keyboard: true }], &mut out)?;
         let rose = crate::counting::allocations() - at;
         if rose != 0 {
             println!("iteration {i}: +{rose} allocations");
@@ -102,6 +102,39 @@ fn native_focus_outline_follows_keyboard_focus_and_hides_for_pointer_and_retirem
     rig.adopt(&[], &[], &[a])?;
     assert!(!rig.controls.ring_shown);
     assert_eq!(rig.visuals_minted(), minted);
+    Ok(())
+}
+
+#[test]
+fn focus_outline_shows_only_for_keyboard_moves_and_cuts_between_controls() -> Result<()> {
+    let mut rig = Rig::new("focus outline modality")?;
+    let ring = rig.overlay_node()?;
+    rig.controls.set_ring(ring);
+    let (a, b) = (rig.ids.mint(), rig.ids.mint());
+    rig.publish_hits(&[entry(a, 10.0, 20.0, 100.0, 32.0), entry(b, 120.0, 20.0, 100.0, 32.0)])?;
+    rig.adopt(&[(a, ChromeRow::default()), (b, ChromeRow::default())], &[], &[])?;
+    let mut out = Vec::with_capacity(16);
+    // A press focuses before it presses, and an overlay a press opened focuses its first row
+    // with no press at all; neither is keyboard focus.
+    rig.tick(&[Report::FocusChanged { from: None, to: Some(a), keyboard: false }, press(a)],
+        &mut out)?;
+    assert!(!rig.controls.ring_shown);
+    rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b), keyboard: false }], &mut out)?;
+    assert!(!rig.controls.ring_shown, "a pointer-driven focus move showed the ring");
+    // A layout pass over a pointer-focused control does not raise it either.
+    rig.publish_hits(&[entry(a, 10.0, 24.0, 100.0, 32.0), entry(b, 120.0, 24.0, 100.0, 32.0)])?;
+    rig.tick(&[], &mut out)?;
+    assert!(!rig.controls.ring_shown);
+    // Keyboard moves show it, and a move between controls is a cut: nothing animates.
+    rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a), keyboard: true }], &mut out)?;
+    assert!(rig.controls.ring_shown);
+    let before = rig.animations();
+    rig.tick(&[Report::FocusChanged { from: Some(a), to: Some(b), keyboard: true }], &mut out)?;
+    assert_eq!(rig.controls.ring_on, b);
+    assert_eq!(rig.animations(), before, "the ring travelled or faded between controls");
+    rig.tick(&[Report::FocusChanged { from: Some(b), to: Some(a), keyboard: false }], &mut out)?;
+    assert!(!rig.controls.ring_shown);
+    assert_eq!(rig.animations(), before, "the ring faded out rather than cutting");
     Ok(())
 }
 
@@ -186,6 +219,7 @@ fn native_a_reveal_survives_crossings_between_the_children_of_one_scope() -> Res
             Report::FocusChanged {
                 from: None,
                 to: Some(b),
+                keyboard: true,
             },
             hover(a, ControlId::NONE),
         ],
@@ -204,6 +238,7 @@ fn native_a_reveal_survives_crossings_between_the_children_of_one_scope() -> Res
         &[Report::FocusChanged {
             from: Some(b),
             to: None,
+            keyboard: true,
         }],
         &mut out,
     )?;
@@ -253,7 +288,7 @@ fn native_control_reveal_keeps_its_enclosing_scope_lit() -> Result<()> {
     rig.tick(&[hover(a, b)], &mut out)?;
     assert_eq!(rig.animations() - before, 3, "two washes and the control reveal only");
     assert!(!rig.controls.revealed.contains(&a) && rig.controls.revealed.contains(&scope));
-    rig.tick(&[Report::FocusChanged { from: None, to: Some(a) }, hover(b, ControlId::NONE)], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: None, to: Some(a), keyboard: true }, hover(b, ControlId::NONE)], &mut out)?;
     assert!(rig.controls.revealed.contains(&a) && rig.controls.revealed.contains(&scope));
     let before = rig.animations();
     rig.tick(&[], &mut out)?;
@@ -334,9 +369,9 @@ fn native_translation_keeps_child_crossings_quiet_and_retires_shared_geometry() 
     rig.tick(&[hover(a, b)], &mut out)?;
     assert_eq!(rig.animations(), before + 1);
     assert!(!rig.controls.take_translation_changed());
-    rig.tick(&[Report::FocusChanged { from: None, to: Some(a) }, hover(b, ControlId::NONE)], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: None, to: Some(a), keyboard: true }, hover(b, ControlId::NONE)], &mut out)?;
     assert_eq!(state.get().y, -3.0);
-    rig.tick(&[Report::FocusChanged { from: Some(a), to: None }], &mut out)?;
+    rig.tick(&[Report::FocusChanged { from: Some(a), to: None, keyboard: true }], &mut out)?;
     assert_eq!(state.get(), Vector2::zero());
     for _ in 0..2 {
         rig.tick(&[hover(ControlId::NONE, a), hover(a, ControlId::NONE)], &mut out)?;

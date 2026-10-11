@@ -56,6 +56,9 @@ pub enum Move {
 pub struct FocusRing {
     current: Option<ControlId>,
     window_focused: bool,
+    /// The last input was a key. A pointer press clears it; a focus move made while it is clear
+    /// shows no ring, whether the press caused the move or an overlay it opened did.
+    keyboard: bool,
     scopes: Vec<Scope>,
     /// Explicit tab positions, keyed by control. Empty for every screen that does not override
     /// the hit array's order.
@@ -115,8 +118,13 @@ impl FocusRing {
     pub(crate) fn report(&self, from: Option<ControlId>, out: &mut Vec<super::Report>) {
         let to = self.keyboard();
         if from != to {
-            out.push(super::Report::FocusChanged { from, to });
+            out.push(super::Report::FocusChanged { from, to, keyboard: self.keyboard });
         }
+    }
+
+    /// Records whether the last input was a key or a pointer press.
+    pub(crate) const fn set_modality(&mut self, keyboard: bool) {
+        self.keyboard = keyboard;
     }
 
     /// Returns the innermost open scope, which `Esc` is delivered to before any control.
@@ -364,7 +372,7 @@ mod tests {
             assert_eq!(ring.keyboard(), from);
             ring.window_focus(active, &hits);
             ring.report(from, &mut reports);
-            assert_eq!(reports.pop(), Some(super::super::Report::FocusChanged { from, to }));
+            assert_eq!(reports.pop(), Some(super::super::Report::FocusChanged { from, to, keyboard: false }));
             assert_eq!(ring.current(), Some(cid(1)));
             ring.window_focus(active, &hits);
             ring.report(to, &mut reports);
