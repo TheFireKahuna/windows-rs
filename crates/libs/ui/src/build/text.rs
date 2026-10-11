@@ -809,6 +809,7 @@ impl Table {
     }
 
     /// The control a run's colour and accessible name belong to.
+    #[cfg(debug_assertions)]
     fn owner(&self, at: usize) -> ControlId {
         self.entries
             .at(at)

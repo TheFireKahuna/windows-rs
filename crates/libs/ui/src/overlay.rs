@@ -619,7 +619,7 @@ struct Open {
     /// so repeated presses of one letter walk the items beginning with it.
     typed: Option<ControlId>,
     /// Dropped on close, which disposes every signal the body created.
-    owner: Owner,
+    _owner: Owner,
     /// Dropped on close, which unmounts the subtree and destroys it with its exit.
     mount: Mount,
     scrim: Option<(NodeId, Mount)>,
@@ -823,7 +823,7 @@ impl Overlays {
             animate_resize: spec.animate_resize,
             binding: None,
             typed: None,
-            owner,
+            _owner: owner,
             mount,
             scrim,
         });

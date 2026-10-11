@@ -506,7 +506,7 @@ impl Controls {
         Ok(())
     }
 
-    pub(crate) fn reorder_landing(&self, epoch: u64, accepted: ControlId, scene: &windows_scene::Scene,
+    pub(crate) fn reorder_landing(&self, epoch: u64, accepted: ControlId, scene: &Scene,
         patch: &windows_scene::SinkPatch)
         -> Option<reorder::Landing>
     {

@@ -20,18 +20,18 @@ pub fn note_enabled() -> bool {
 
 /// Emits a trace note to stderr when enabled, in debug builds only.
 ///
-/// Release builds remove the statement before code generation: the [`cfg`] gates the block
-/// on `debug_assertions`, so a note costs nothing where it is not wanted. `tag` and the
-/// format string must be literals; `tag` prefixes the line as `[tag]`. The enable check
-/// short-circuits before the arguments are formatted, so a disabled note allocates nothing.
+/// Release builds keep the statement only behind a constant `false`: the arguments are
+/// type-checked against the format string and count as used, and none is evaluated, so a
+/// note costs nothing where it is not wanted. An argument must therefore be the expression
+/// that computes the value, not a binding made for the note, or release computes it anyway.
+/// `tag` and the format string must be literals; `tag` prefixes the line as `[tag]`. The
+/// enable check short-circuits before the arguments are formatted, so a disabled note
+/// allocates nothing.
 #[macro_export]
 macro_rules! note {
     ($tag:literal, $format:literal $(, $arg:expr)* $(,)?) => {
-        #[cfg(debug_assertions)]
-        {
-            if $crate::note_enabled() {
-                eprintln!(concat!("[", $tag, "] ", $format) $(, $arg)*);
-            }
+        if cfg!(debug_assertions) && $crate::note_enabled() {
+            eprintln!(concat!("[", $tag, "] ", $format) $(, $arg)*);
         }
     };
 }

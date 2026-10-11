@@ -132,7 +132,7 @@ impl Reorders {
         self.held.as_ref().map(|d| ReorderUpdate { from: d.from as u32, to: d.to as u32, decided: false })
     }
 
-    pub fn landing(&self, epoch: u64, accepted: ControlId, scene: &windows_scene::Scene,
+    pub fn landing(&self, epoch: u64, accepted: ControlId, scene: &Scene,
         patch: &windows_scene::SinkPatch) -> Option<Landing>
     {
         let drag = self.held.as_ref().filter(|drag| drag.epoch == epoch)?;

@@ -166,7 +166,7 @@ pub(crate) fn arrange(
             plan.node == n && plan.iw.to_bits() == iw.to_bits() && plan.gap.to_bits() == gap.to_bits()
         })
         .map(|plan| (plan.cols, plan.count, plan.groups, plan.cells));
-    let (cols, count, groups) = match planned {
+    let (cols, groups) = match planned {
         Some((cols, count, groups, at)) => {
             let Scratch { u, grid_cells, .. } = &mut s.scratch;
             u.extend_from_slice(&grid_cells[at..at + count * CELL]);
@@ -188,7 +188,7 @@ pub(crate) fn arrange(
                 );
                 s.scratch.u.truncate(fresh);
             }
-            (cols, count, groups)
+            (cols, groups)
         }
         None => {
             let mut tracks = [Track::AUTO; COLUMN_CAP];
@@ -198,7 +198,7 @@ pub(crate) fn arrange(
             size_columns(s, n, inner, iw, &tracks[..cols], base, count, &mut groups);
             let gaps = gap * cols.saturating_sub(1) as f32;
             resolve(&mut groups[..cols * STRIDE], (iw - gaps).max(0.0));
-            (cols, count, groups)
+            (cols, groups)
         }
     };
     let mut pairs = [[0.0f32; 2]; ROW_CAP];

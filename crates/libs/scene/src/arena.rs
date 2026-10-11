@@ -332,14 +332,16 @@ impl GlowState {
     /// capture reads the source's coordinate space in pixels, and the capture region is
     /// the node grown by the bleed on every side.
     pub fn resize(&self, id: NodeId, size: Vector2, scale: f32) {
-        let sigma = self.props.scalar("Sigma").unwrap_or(f32::NAN);
-        let opacity = self.sprite.opacity();
-        let host_size = self.host.size();
-        let caster_size = self.caster.size();
         note!(
             "glow",
-            "resize id={} size=({:.0},{:.0}) sigma={} opacity={:.2} host=({:.0},{:.0}) caster=({:.0},{:.0})",
-            id.index(), size.x, size.y, sigma, opacity, host_size.x, host_size.y, caster_size.x, caster_size.y
+            "resize id={} size=({:.0},{:.0}) sigma={} opacity={:.2} host={:.0?} caster={:.0?}",
+            id.index(),
+            size.x,
+            size.y,
+            self.props.scalar("Sigma").unwrap_or(f32::NAN),
+            self.sprite.opacity(),
+            self.host.size(),
+            self.caster.size(),
         );
         self.host.set_size(size.x * scale, size.y * scale);
         self.caster.set_size(size.x, size.y);

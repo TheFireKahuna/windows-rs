@@ -1658,17 +1658,15 @@ pub fn realize(
     // content is what the blur reads, and a capture-source paint is the case that has to
     // be watched.
     if has_halo {
-        let box_ = arena.size(id);
         note!(
             "scene",
-            "glow id={} inputs: paint={:?}, route={:?}, alpha-cell={}, silhouette-from={}, box=({:.0},{:.0})",
+            "glow id={} inputs: paint={:?}, route={:?}, alpha-cell={}, silhouette-from={}, box={:.0?}",
             id.index(),
             paint,
             route,
             alpha.is_some(),
             if chain.is_some() { "chain" } else { "source" },
-            box_.x,
-            box_.y,
+            arena.size(id),
         );
     }
 
@@ -2032,12 +2030,13 @@ fn cast_glow(
         _ => None,
     };
     if let Some((sigma, tint, _)) = lit {
-        let display = ctx.env.apply(tint);
         note!(
             "scene",
-            "glow id={} tint: sigma={} scene=({:.3},{:.3},{:.3},{:.3}) display=({:.4},{:.4},{:.4},{:.4})",
-            id.index(), sigma, tint.r, tint.g, tint.b, tint.a,
-            display.r, display.g, display.b, display.a,
+            "glow id={} tint: sigma={} scene={:.3?} display={:.4?}",
+            id.index(),
+            sigma,
+            tint,
+            ctx.env.apply(tint),
         );
     }
     let Some(((sigma, tint, offset), silhouette)) = lit.zip(silhouette) else {
@@ -2045,12 +2044,13 @@ fn cast_glow(
         // silhouette never arrived is the failure family: the mask or the paint half of the
         // chain came back `None`, and the glow goes with it.
         if lit.is_some() {
-            let kind = match paint {
-                Paint::Captured { .. } => "captured",
-                _ => "halo",
-            };
-            let size = arena.size(id);
-            note!("scene", "glow id={} unlit: silhouette none, paint={}, size=({:.0},{:.0})", id.index(), kind, size.x, size.y);
+            note!(
+                "scene",
+                "glow id={} unlit: silhouette none, paint={}, size={:.0?}",
+                id.index(),
+                if matches!(paint, Paint::Captured { .. }) { "captured" } else { "halo" },
+                arena.size(id),
+            );
         }
         unlight(arena, id, sprite, ctx);
         return Ok(None);
